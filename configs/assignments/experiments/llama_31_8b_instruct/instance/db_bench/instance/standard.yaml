@@ -1,0 +1,39 @@
+import:
+- ../task.yaml
+- ../../../agent.yaml
+- ../../../../../../definition.yaml
+assignment_config:
+  callback_dict:
+    callback_0:
+      name: current_session_saving_callback
+    callback_1:
+      name: consecutive_abnormal_agent_inference_process_handling_callback
+    # Enable the following callback to trace generated tool creation/invocation logs.
+    # callback_2:
+    #   name: generated_tool_logging_callback
+  output_dir: outputs/{TIMESTAMP}
+  # sample_order: default
+  sample_order:
+    - "0"
+    - "1"
+    - "2"
+    - "3"
+    - "4"
+    - "5"
+    - "6"
+    - "7"
+    - "8"
+    - "9"
+  #   - "10"
+  #   - "11"
+  #   - "12"
+  #   - "13"
+  #   - "14"
+  #   - "15"
+  #   - "16"
+  #   - "17"
+  #   - "18"
+  #   - "19"
+
+environment_config:
+  use_task_client_flag: true

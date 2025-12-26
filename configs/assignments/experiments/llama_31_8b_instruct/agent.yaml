@@ -1,0 +1,20 @@
+assignment_config:
+  language_model_list:
+  - name: gpt-oss:20b-64k
+
+  # agent:
+  #   name: language_model_agent
+  #   custom_parameters:
+  #     language_model: gpt-oss:20b-64k
+  #     inference_config_dict:
+  #       temperature: 0.0
+  #       max_tokens: 5000
+  agent:
+    name: self_evolving_agent
+    custom_parameters:
+      language_model: gpt-oss:20b-64k
+      tool_registry_path: outputs/{TIMESTAMP}/generated_tools
+      max_generated_tools_per_run: 2
+      inference_config_dict:
+        temperature: 0.0
+        max_tokens: 5000

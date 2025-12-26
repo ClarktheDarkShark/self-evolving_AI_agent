@@ -1,0 +1,4 @@
+generated_tool_logging_callback:
+  module: "src.self_evolving_agent.callbacks.GeneratedToolLoggingCallback"
+  parameters:
+    log_filename: "generated_tools.log"
