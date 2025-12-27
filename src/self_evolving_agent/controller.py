@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 from typing_extensions import override
 
 from src.agents.agent import Agent
@@ -48,6 +48,7 @@ class SelfEvolvingController(Agent):
         tool_registry_path: str,
         max_generated_tools_per_run: int = 3,
         inference_config_dict: Optional[Mapping[str, Any]] = None,
+        bootstrap_tools: Optional[Sequence[Mapping[str, Any]]] = None,
         system_prompt: str = (
             "You are a helpful assistant that can emit <action> blocks to either "
             "call previously generated tools or request new ones. Always keep task-"
@@ -62,6 +63,7 @@ class SelfEvolvingController(Agent):
         self._registry = get_registry(tool_registry_path)
         self._max_generated_tools_per_run = max_generated_tools_per_run
         self._generated_tool_counter = 0
+        self._bootstrap_tools(bootstrap_tools or [])
 
     def _handle_creation_block(
         self, payload: str, chat_history: ChatHistory
@@ -145,6 +147,35 @@ class SelfEvolvingController(Agent):
             signature=signature,
             description=description,
         )
+
+    def _bootstrap_tools(self, bootstrap_tools: Sequence[Mapping[str, Any]]) -> None:
+        if not bootstrap_tools:
+            return
+        print(
+            f"[SelfEvolvingController] Bootstrapping {len(bootstrap_tools)} tool(s) from config."
+        )
+        for index, tool in enumerate(bootstrap_tools):
+            if not isinstance(tool, Mapping):
+                print(
+                    "[SelfEvolvingController] Skipping non-mapping bootstrap entry at "
+                    f"index {index}."
+                )
+                continue
+            name = str(tool.get("name") or f"bootstrap_tool_{index}")
+            description = str(tool.get("description") or "")
+            signature = str(tool.get("signature") or "run(*args, **kwargs)")
+            code = str(tool.get("code") or "")
+            metadata = self._registry.register_tool(
+                name=name,
+                code=code,
+                signature=signature,
+                description=description,
+            )
+            self._generated_tool_counter += 1
+            print(
+                f"[SelfEvolvingController] Bootstrapped tool '{metadata.name}' with signature "
+                f"'{metadata.signature}'."
+            )
 
     def _inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
         try:

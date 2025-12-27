@@ -53,3 +53,12 @@ self_evolving_agent:
 
 
     inference_config_dict: {}
+    # Optional: pre-seed the registry with a known tool so you can verify persistence
+    # without relying on the model emitting a <action name="create_tool"> block.
+    # bootstrap_tools:
+    #   - name: ping_tool
+    #     description: Returns the provided value.
+    #     signature: run(value)
+    #     code: |
+    #       def run(value):
+    #           return value
