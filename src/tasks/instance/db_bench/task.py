@@ -559,6 +559,17 @@ class DBBench(Task[DBBenchDatasetItem]):
             # Do not do further justification here, since it is too extreme.
             agent_answer = ""
         answer_info = current_dataset_item.answer_info
+        expected_answer: dict[str, Any] = {
+            "answer_type": answer_info.answer_type.value,
+            "ground_truth_sql": answer_info.ground_truth_sql,
+        }
+        if answer_info.answer_md5 is not None:
+            expected_answer["answer_md5"] = answer_info.answer_md5
+        if answer_info.answer_direct is not None:
+            expected_answer["answer_direct"] = [
+                list(row) for row in answer_info.answer_direct
+            ]
+        session.expected_answer = expected_answer
         # endregion
         # region Validate answer
         match answer_info.answer_type:

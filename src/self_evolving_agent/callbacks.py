@@ -34,7 +34,7 @@ class GeneratedToolLoggingCallback(Callback):
         log_path = self._get_log_path()
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload) + "\n")
+            f.write(json.dumps(payload, default=str) + "\n")
 
     def _listener(self, payload: dict[str, Any]) -> None:
         timestamp = datetime.datetime.now(datetime.UTC).isoformat()

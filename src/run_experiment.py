@@ -191,6 +191,16 @@ class ConfigUtility:
         assignment_callback_dict: dict[str, Any] = raw_config["assignment_config"][
             "callback_dict"
         ]
+        generated_tool_callback_name = "generated_tool_logging_callback"
+        if generated_tool_callback_name in raw_config.get("callback_dict", {}):
+            already_enabled = any(
+                info.get("name") == generated_tool_callback_name
+                for info in assignment_callback_dict.values()
+            )
+            if not already_enabled:
+                assignment_callback_dict["callback_generated_tool_logging"] = {
+                    "name": generated_tool_callback_name
+                }
         for callback_key, callback_info_dict in assignment_callback_dict.items():
             default_callback_info_dict = raw_config["callback_dict"][
                 callback_info_dict["name"]

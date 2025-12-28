@@ -159,6 +159,7 @@ class Session(BaseModel):
     finish_reason: Optional[str] = None  # Set for further clarification
     task_output: Optional[dict[str, Optional[str]]] = None  # Answer to user intent
     evaluation_record: SessionEvaluationRecord = SessionEvaluationRecord()
+    expected_answer: Optional[dict[str, Any]] = None
 
 
 class SessionMetricCalculationPartial(BaseModel):

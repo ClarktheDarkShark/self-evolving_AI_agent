@@ -124,7 +124,15 @@ class DBBenchContainer:
             except Exception:
                 # Non-JSON payloads are passed as a single argument string.
                 args = [body]
-        invocation: ToolResult = registry.invoke_tool(tool_name, *args, **kwargs)
+        invocation: ToolResult = registry.invoke_tool(
+            tool_name,
+            *args,
+            **kwargs,
+            invocation_context={
+                "source": "db_bench_container",
+                "action_payload_preview": action_payload[:200],
+            },
+        )
         if invocation.success:
             return str(invocation.output)
         return str(invocation.error)

@@ -499,6 +499,9 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         else:
             agent_answer_list = None
         ground_truth_answer_set = current_dataset_item.answer_set
+        session.expected_answer = {
+            "answer_list": sorted(ground_truth_answer_set),
+        }
         # endregion
         # region Calculate metrics
         # region Calculate f1_score

@@ -244,6 +244,10 @@ class OSInteraction(Task[OSInteractionDatasetItem]):
             self._get_current_dataset_item()
         )
         assert self.container is not None
+        session.expected_answer = {
+            "ground_truth_command": current_dataset_item.evaluation_info.ground_truth_command_item.model_dump(),
+            "evaluation_command": current_dataset_item.evaluation_info.evaluation_command_item.model_dump(),
+        }
         # endregion
         # region Check the correctness of the answer
         # If the command times out, exit_code will be 0 and the answer is considered as incorrect.

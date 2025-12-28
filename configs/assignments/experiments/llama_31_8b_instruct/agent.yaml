@@ -14,7 +14,28 @@ assignment_config:
     custom_parameters:
       language_model: gpt-oss:20b-64k
       tool_registry_path: outputs/{TIMESTAMP}/generated_tools
-      max_generated_tools_per_run: 2
+      max_generated_tools_per_run: 30
+      force_tool_generation_if_missing: true
+      tool_match_min_score: 0.20
+      include_registry_in_prompt: true
       inference_config_dict:
         temperature: 0.0
-        max_tokens: 5000
+        max_tokens: 30000
+
+agent_dict:
+  self_evolving_agent:
+    module: "src.self_evolving_agent.controller.SelfEvolvingController"
+    parameters:
+      language_model: "Fill the parameter 'language_model_name' in assignment config."
+      tool_registry_path: "outputs/{TIMESTAMP}/generated_tools"
+      max_generated_tools_per_run: 3
+      system_prompt: ""               # keep whatever you already have here
+      inference_config_dict: {}
+
+      # ADD THESE (so custom_parameters can override them)
+      force_tool_generation_if_missing: false
+      include_registry_in_prompt: true
+      tool_match_min_score: 0.20
+
+
+

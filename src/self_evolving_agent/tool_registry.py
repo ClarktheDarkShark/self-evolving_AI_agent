@@ -1,11 +1,14 @@
 import datetime
+import hashlib
 import importlib.util
 import json
 import os
 import re
 import threading
+import time
+import traceback
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 from src.typings.config import get_predefined_timestamp_structure
 
@@ -128,6 +131,8 @@ class ToolRegistry:
             metadata.description = description
             self._metadata[sanitized_name] = metadata
             self._save_metadata()
+        code_len = len(normalized_code)
+        code_sha256 = hashlib.sha256(normalized_code.encode("utf-8")).hexdigest()
         self._notify(
             {
                 "event": "register",
@@ -135,6 +140,9 @@ class ToolRegistry:
                 "signature": signature,
                 "description": description,
                 "path": tool_path,
+                "code_len": code_len,
+                "code_sha256": code_sha256,
+                "code_preview": self._preview(normalized_code),
                 "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
             }
         )
@@ -146,41 +154,118 @@ class ToolRegistry:
     def list_tools(self) -> List[ToolMetadata]:
         return list(self._metadata.values())
 
-    def invoke_tool(self, name: str, *args: Any, **kwargs: Any) -> ToolResult:
+
+    @staticmethod
+    def _preview(obj: Any, max_len: int = 300) -> str:
+        try:
+            s = repr(obj)
+        except Exception:
+            s = f"<unreprable {type(obj).__name__}>"
+        return s if len(s) <= max_len else s[: max_len - 3] + "..."
+
+    def invoke_tool(
+        self,
+        name: str,
+        *args: Any,
+        invocation_context: Optional[Mapping[str, Any]] = None,
+        **kwargs: Any,
+    ) -> ToolResult:
+        # --- PRINT 1: start ---
+        print(
+            f"[ToolRegistry] invoke_tool start name={name} args={self._preview(args)} kwargs={self._preview(kwargs)}"
+        )
+        start_time = time.monotonic()
+
         if not self.has_tool(name):
-            return ToolResult.failure(f"Tool '{name}' not found.")
+            print(f"[ToolRegistry] invoke_tool missing tool name={name}")
+            outcome = ToolResult.failure(f"Tool '{name}' not found.")
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            self._notify(
+                {
+                    "event": "invoke",
+                    "tool_name": name,
+                    "args": list(args),
+                    "kwargs": kwargs,
+                    "args_preview": self._preview(args),
+                    "kwargs_preview": self._preview(kwargs),
+                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                    "success": outcome.success,
+                    "error": outcome.error,
+                    "error_type": "ToolNotFoundError",
+                    "duration_ms": duration_ms,
+                    "invocation_context": dict(invocation_context or {}),
+                }
+            )
+            return outcome
+
         tool_path = self._get_tool_path(name)
+        print(f"[ToolRegistry] invoke_tool path name={name} path={tool_path}")
+
         try:
             spec = importlib.util.spec_from_file_location(f"generated_tools.{name}", tool_path)
             if spec is None or spec.loader is None:
                 raise ImportError(f"Unable to import tool '{name}' from '{tool_path}'.")
+
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
+
+            # --- PRINT 2: module loaded ---
+            print(f"[ToolRegistry] invoke_tool loaded name={name} module={getattr(module, '__name__', '<unknown>')}")
+
             if not hasattr(module, "run"):
-                raise AttributeError(
-                    f"Tool '{name}' does not expose a callable 'run' entrypoint."
-                )
-            result = getattr(module, "run")(*args, **kwargs)
+                raise AttributeError(f"Tool '{name}' does not expose a callable 'run' entrypoint.")
+
+            run_fn = getattr(module, "run")
+            if not callable(run_fn):
+                raise TypeError(f"Tool '{name}'.run exists but is not callable.")
+
+            result = run_fn(*args, **kwargs)
+
+            # --- PRINT 3: success result ---
+            print(
+                f"[ToolRegistry] invoke_tool success name={name} result_type={type(result).__name__} result={self._preview(result)}"
+            )
+
             outcome = ToolResult.success_result(result)
+            error_type: str | None = None
+            error_traceback: str | None = None
+
         except Exception as e:
+            # --- PRINT 4: failure ---
+            print(f"[ToolRegistry] invoke_tool failure name={name} error_type={type(e).__name__} error={e}")
+            # Optional: full traceback (comment out if too noisy)
+            print(traceback.format_exc())
             outcome = ToolResult.failure(str(e))
+            error_type = type(e).__name__
+            error_traceback = traceback.format_exc()
+
         with self._lock:
             metadata = self._metadata.get(name)
             if metadata:
                 metadata.usage_count += 1
                 self._save_metadata()
+
+        duration_ms = int((time.monotonic() - start_time) * 1000)
         self._notify(
             {
                 "event": "invoke",
                 "tool_name": name,
                 "args": list(args),
                 "kwargs": kwargs,
+                "args_preview": self._preview(args),
+                "kwargs_preview": self._preview(kwargs),
                 "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
                 "success": outcome.success,
                 "error": outcome.error,
+                "error_type": error_type,
+                "traceback": error_traceback,
+                "result_preview": self._preview(outcome.output),
+                "duration_ms": duration_ms,
+                "invocation_context": dict(invocation_context or {}),
             }
         )
         return outcome
+
 
 
 _REGISTRY_INSTANCE: Optional[ToolRegistry] = None
@@ -204,10 +289,7 @@ def get_registry(
     with _REGISTRY_LOCK:
         if force_reset or _REGISTRY_INSTANCE is None:
             base_path = _resolve_registry_path(
-                tool_registry_path
-                or os.path.join(
-                    os.getcwd(), "generated_tools"
-                )
+                tool_registry_path or os.getcwd()
             )
             print(f"[ToolRegistry] Creating new registry at '{base_path}'")
             _REGISTRY_INSTANCE = ToolRegistry(base_path)
