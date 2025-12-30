@@ -3,6 +3,7 @@ import json
 import re
 from typing import Any, Mapping, Optional, Sequence, Iterable
 import yaml  # add pyyaml dependency if not already present
+from src.typings.config import get_predefined_timestamp_structure
 
 from typing_extensions import override
 
@@ -22,11 +23,14 @@ from src.typings import (
 )
 
 from .tool_registry import ToolMetadata, ToolResult, get_registry
+from .tool_spec import ToolSpec
+from .tool_validation import validate_tool_code
+from .tool_retrieval import retrieve_tools
 
 
 class SelfEvolvingController(Agent):
-    _ACTION_PATTERN = re.compile(
-        r"<action\s+name=\"(?P<name>[^\"]+)\">(?P<body>[\s\S]*?)</action>",
+    _INTERNAL_TOOL_PATTERN = re.compile(
+        r"<internal_tool\s+name=\"(?P<name>[^\"]+)\">(?P<body>[\s\S]*?)</internal_tool>",
         re.MULTILINE,
     )
 
@@ -47,10 +51,13 @@ class SelfEvolvingController(Agent):
         force_tool_generation_if_missing: bool = True,
         tool_match_min_score: float = 0.25,
         include_registry_in_prompt: bool = True,
+        environment_label: str = "unknown",
+        retrieval_top_k: int = 5,
+        reuse_top_k: int = 3,
+        reuse_similarity_threshold: Optional[float] = None,
+        reuse_min_reliability: float = 0.0,
+        canonical_tool_naming: bool = True,
     ):
-        self._max_empty_result_retries = 1
-        self._empty_result_retries_used = 0
-
         self._language_model_agent = LanguageModelAgent(
             language_model=language_model,
             system_prompt=system_prompt,
@@ -58,21 +65,26 @@ class SelfEvolvingController(Agent):
         )
 
         # A SECOND agent whose *only job* is to design tools.
-        # A SECOND agent whose *only job* is to design tools.
         self._toolgen_agent = LanguageModelAgent(
             language_model=language_model,
             system_prompt=(
                 "Reasoning: low\n"
-                "You are a tool generator. Your job is to output EXACTLY ONE tool creation block.\n"
-                "Output format must be a JSON (preferred) or YAML mapping with keys:\n"
+                "You are a tool generator that creates reusable tools to help the main agent solve tasks.\n"
+                "Output EXACTLY ONE JSON (preferred) or YAML mapping with keys:\n"
                 "name, description, signature, code_lines.\n"
-                "name must be lowercase_snake_case.\n"
-                "signature must be run(task_text: str) -> str\n"
-                "code_lines must be a JSON/YAML list of strings, each string is ONE LINE of Python.\n"
-                "The joined code must define a function run(task_text: str) -> str and return a string.\n"
-                "Do NOT include a single multiline string for code. Use code_lines only.\n"
-                "Do NOT include any other text or XML.\n"
-                "Code must be <= 100 lines.\n"
+                "\n"
+                "HARD RULES:\n"
+                "- Output ONLY the mapping. No prose, no markdown.\n"
+                "- name MUST be lowercase_snake_case.\n"
+                "- description MUST be a short human-readable summary.\n"
+                "- signature MUST describe the run() entrypoint.\n"
+                "- code_lines MUST be a JSON/YAML list of strings (1 line per item).\n"
+                "- Joining code_lines with '\\n' MUST produce valid Python.\n"
+                "- Tools must be reusable across multiple tasks; do NOT hard-code a single answer.\n"
+                "- Avoid external dependencies; use only the standard library.\n"
+                "- Include clear MODULE and run() docstrings with usage examples.\n"
+                "- You may optionally include input_schema, tool_type, capabilities, examples.\n"
+                "- Code must be <= 150 lines.\n"
             ),
             # CHANGE: toolgen gets a smaller cap + stop sequence
             inference_config_dict={
@@ -82,9 +94,10 @@ class SelfEvolvingController(Agent):
                 "temperature": 0.0,
             },
         )
-
-
         self._registry = get_registry(tool_registry_path)
+        self._registry.set_run_snapshot(
+            get_predefined_timestamp_structure()["TIMESTAMP"]
+        )
         self._max_generated_tools_per_run = max_generated_tools_per_run
         self._generated_tool_counter = 0
 
@@ -92,54 +105,156 @@ class SelfEvolvingController(Agent):
         self._force_tool_generation_if_missing = force_tool_generation_if_missing
         self._tool_match_min_score = tool_match_min_score
         self._include_registry_in_prompt = include_registry_in_prompt
+        self._retrieval_top_k = retrieval_top_k
+        self._reuse_top_k = reuse_top_k
+        self._reuse_similarity_threshold = (
+            tool_match_min_score
+            if reuse_similarity_threshold is None
+            else reuse_similarity_threshold
+        )
+        self._reuse_min_reliability = reuse_min_reliability
+        self._canonical_tool_naming = canonical_tool_naming
+        self._min_reliability = 0.2
+        self._internal_tool_max_steps = 3
+        self._tool_creation_attempts = 0
+        self._tool_creation_successes = 0
+        self._tool_invocation_attempts = 0
+        self._tool_invocation_successes = 0
+        self._environment_label = environment_label
+        if hasattr(self._registry, "set_canonical_naming"):
+            self._registry.set_canonical_naming(self._canonical_tool_naming)
 
         self._bootstrap_tools(bootstrap_tools or [])
-        self._solver_system_prompt = ("""
-                Reasoning: low\n
-                You are an agent solving DB_BENCH tasks.
+        self._solver_system_prompt = system_prompt
 
-                HARD OUTPUT RULES (follow exactly):
-                - Output EXACTLY ONE action per response.
-                - Your response MUST start with exactly ONE of these lines:
-                    Action: Operation
-                    Action: Answer
-                - Do NOT output any text before the Action line.
 
-                IF Action: Operation:
-                - Output EXACTLY two lines and NOTHING else:
-                    Action: Operation
-                    ```sql
-                    <SQL HERE>
-                    ```
-                - Use a single SQL statement unless the task explicitly requires multiple.
-                - End the SQL with a semicolon.
 
-                IF Action: Answer:
-                - Output EXACTLY two lines and NOTHING else:
-                    Action: Answer
-                    Final Answer: <answer>
-                - The answer must be the final result required by the task/environment (e.g., an MD5 string or direct output).
-                - The answer can be in SQL, MD5 string, or direct output (if direct output, ensure the formatting is a list of tuples)
-                - Ensure the output format is exactly as expected.
+    def _infer_tool_archetype(self, query: str) -> str:
+        q = (query or "").lower()
+        if self._environment_label in {"db_bench", "mysql"}:
+            # DB_Bench pain points
+            if "final answer" in q or "[]" in q or "answer" in q:
+                return "answer_guard"
+            if "sql" in q and ("wrong" in q or "error" in q or "column" in q or "table" in q):
+                return "sql_static_check"
+            return "final_output_formatter"
+        # Generic fallback
+        return "general_helper"
 
-                IMPORTANT:
-                - Never include explanations, reasoning, or multiple actions in one response.
-                - Use the MOST RECENT user message as the source of truth (it contains the table/schema).
-                - If the previous user message contains an SQL error, correct the SQL and respond with Action: Operation.
-                """
+
+    def _toolgen_request_prompt(self, archetype: str, query: str) -> str:
+        # Keep this very structured for small models.
+        existing = []
+        try:
+            existing = [t.name for t in self._registry.list_tools()]
+        except Exception:
+            pass
+
+        # Core IO contracts – these are what make tools reusable + callable.
+        archetype_specs = {
+            "answer_guard": {
+                "name_hint": "answer_guard",
+                "tool_type": "validator",
+                "signature": "run(task_text: str, last_sql: str | None = None, last_db_response: object | None = None) -> dict",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "task_text": {"type": "string"},
+                        "last_sql": {"type": ["string", "null"]},
+                        "last_db_response": {},
+                    },
+                    "required": ["task_text"],
+                },
+                "capabilities": ["classify_task_intent", "can_submit_check", "final_answer_exact_format"],
+                "requirements": [
+                    "Detect mutation vs query tasks from task_text (INSERT/UPDATE/DELETE vs SELECT intent).",
+                    "If last_sql begins with SELECT, final_answer MUST be exactly last_db_response (verbatim repr).",
+                    "If mutation task and last_db_response is [], allow submission with final_answer = [].",
+                    "Return dict with keys: can_submit(bool), final_answer(str), reason(str), intent(str).",
+                    "No external deps; stdlib only."
+                ],
+            },
+            "sql_static_check": {
+                "name_hint": "sql_static_check",
+                "tool_type": "linter",
+                "signature": "run(table_name: str, headers: list[str], sql: str) -> dict",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "table_name": {"type": "string"},
+                        "headers": {"type": "array", "items": {"type": "string"}},
+                        "sql": {"type": "string"},
+                    },
+                    "required": ["table_name", "headers", "sql"],
+                },
+                "capabilities": ["schema_sanity_checks", "common_sql_mistake_detection"],
+                "requirements": [
+                    "Check referenced table_name matches.",
+                    "Check column names used in INSERT/SELECT are subset of headers.",
+                    "Check SQL is single-line (no newline chars).",
+                    "Return dict with keys: valid(bool), errors(list[str]), fixed_sql(optional str)."
+                ],
+            },
+            "final_output_formatter": {
+                "name_hint": "final_output_formatter",
+                "tool_type": "formatter",
+                "signature": "run(mode: str, sql: str | None = None, final_answer: object | None = None) -> str",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"type": "string", "enum": ["Operation", "Answer"]},
+                        "sql": {"type": ["string", "null"]},
+                        "final_answer": {},
+                    },
+                    "required": ["mode"],
+                },
+                "capabilities": ["exact_action_block_formatting"],
+                "requirements": [
+                    "For Operation: output exactly:\nAction: Operation\\n```sql\\n<ONE LINE SQL>\\n```",
+                    "For Answer: output exactly:\nAction: Answer\\nFinal Answer: <repr(final_answer)>",
+                    "Never add extra text.",
+                ],
+            },
+            "general_helper": {
+                "name_hint": "general_helper",
+                "tool_type": "utility",
+                "signature": "run(task_text: str) -> str",
+                "input_schema": {"type": "object", "properties": {"task_text": {"type": "string"}}, "required": ["task_text"]},
+                "capabilities": ["general_parsing"],
+                "requirements": ["Keep it reusable; stdlib only."],
+            },
+        }
+
+        spec = archetype_specs.get(archetype, archetype_specs["general_helper"])
+
+        # IMPORTANT: toolgen needs a “do not duplicate” instruction.
+        return (
+            "You are generating ONE reusable internal tool.\n"
+            f"ENVIRONMENT: {self._environment_label}\n"
+            f"ARCHETYPE: {archetype}\n"
+            f"EXISTING_TOOL_NAMES: {json.dumps(existing)}\n"
+            "\n"
+            "USER_QUERY (context only):\n"
+            f"{query}\n"
+            "\n"
+            "You MUST output a single JSON or YAML mapping ONLY with keys:\n"
+            "name, description, signature, code_lines, tool_type, input_schema, capabilities.\n"
+            "\n"
+            f"REQUIRED tool_type: {spec['tool_type']}\n"
+            f"REQUIRED signature: {spec['signature']}\n"
+            f"REQUIRED input_schema: {json.dumps(spec['input_schema'], ensure_ascii=True)}\n"
+            f"REQUIRED capabilities: {json.dumps(spec['capabilities'], ensure_ascii=True)}\n"
+            "\n"
+            "HARD CONSTRAINTS:\n"
+            "- name must be lowercase_snake_case and NOT in EXISTING_TOOL_NAMES.\n"
+            "- code_lines must join into valid Python. stdlib only.\n"
+            "- Include module docstring + run() docstring.\n"
+            "- Include a small self_test() function that returns True/False (no I/O).\n"
+            "- Keep code <= 150 lines.\n"
+            "\n"
+            "FUNCTIONAL REQUIREMENTS:\n"
+            + "\n".join(f"- {r}" for r in spec["requirements"])
         )
-
-
-    def _is_empty_result(self, txt: str) -> bool:
-        return (txt or "").strip() == "[]"
-
-    def _previous_agent_was_operation(self, chat_history: ChatHistory) -> bool:
-        items = self._history_items(chat_history)
-        # Find the message right before the last USER message
-        for i in range(len(items) - 2, -1, -1):
-            if items[i].role == Role.AGENT:
-                return (items[i].content or "").startswith("Action: Operation")
-        return False
 
     # ---------- helpers to deal with ChatHistory shapes ----------
     def _history_items(self, chat_history: ChatHistory) -> list[ChatHistoryItem]:
@@ -160,37 +275,8 @@ class SelfEvolvingController(Agent):
         return []
 
 
-    def _is_dbbench_observation(self, txt: str) -> bool:
-        t = (txt or "").strip()
-        if not t:
-            return True
-        if t.startswith("[") or t.startswith("("):
-            return True
-        if t[:4].isdigit() and "(" in t and ":" in t:  # e.g., "1146 (42S02): ..."
-            return True
-        return False
-
     def _prune_for_current_task(self, chat_history: ChatHistory) -> ChatHistory:
-        items = self._history_items(chat_history)
-        if not items:
-            return chat_history
-
-        # Find the most recent USER "task prompt" (not an observation/result/error dump)
-        start_idx = 0
-        for i in range(len(items) - 1, -1, -1):
-            it = items[i]
-            if it.role == Role.USER and not self._is_dbbench_observation(it.content or ""):
-                start_idx = i
-                break
-
-        # Keep from that task prompt onward
-        kept = items[start_idx:]
-
-        from src.typings.session import ChatHistory as CH
-        h = CH()
-        for it in kept:
-            h = self._safe_inject(h, it)
-        return h
+        return chat_history
 
 
 
@@ -206,47 +292,244 @@ class SelfEvolvingController(Agent):
 
     # ---------- registry prompt context ----------
     def _registry_prompt_context(self) -> str:
-        # You may need to adapt these method names to your ToolRegistry implementation.
         tools: Iterable[ToolMetadata] = []
-        if hasattr(self._registry, "list_tools"):
+        if hasattr(self._registry, "list_latest_tools"):
+            tools = self._registry.list_latest_tools()
+        else:
             tools = self._registry.list_tools()
-        elif hasattr(self._registry, "tools"):
-            tools = self._registry.tools.values()  # type: ignore[attr-defined]
 
-        tool_lines = []
+        blocks = []
         for t in tools:
-            tool_lines.append(f"- {t.name}: {t.description} (signature: {t.signature})")
-        if not tool_lines:
-            return "GENERATED TOOL REGISTRY: (empty)"
-        return "GENERATED TOOL REGISTRY:\n" + "\n".join(tool_lines)
+            usage = (t.docstring or "").strip()
+            block = (
+                f"TOOL: {t.name}\n"
+                f"Signature: {t.signature}\n"
+                f"Description: {t.description}\n"
+                f"Reliability: {t.reliability_score:.2f}\n"
+            )
+            if usage:
+                block += f"Docstring:\n{usage}\n"
+            if t.tool_type:
+                block += f"Tool Type: {t.tool_type}\n"
+            if t.input_schema is not None:
+                block += f"Input Schema: {json.dumps(t.input_schema, ensure_ascii=True, default=str)}\n"
+            if t.capabilities is not None:
+                block += f"Capabilities: {json.dumps(t.capabilities, ensure_ascii=True, default=str)}\n"
+            blocks.append(block.strip())
 
-    # ---------- tool matching ----------
-    def _score_tool_match(self, query: str, tool: ToolMetadata) -> float:
-        # Dumb-but-effective baseline: token overlap with name+description
-        q = set(re.findall(r"[a-zA-Z_]+", query.lower()))
-        text = f"{tool.name} {tool.description} {tool.signature}".lower()
-        t = set(re.findall(r"[a-zA-Z_]+", text))
-        if not q or not t:
-            return 0.0
-        return len(q & t) / max(1, len(q))
+        if not blocks:
+            return "TOOL_REGISTRY: (empty)"
 
-    def _best_tool_for(self, query: str) -> Optional[ToolMetadata]:
-        tools: Iterable[ToolMetadata] = []
-        if hasattr(self._registry, "list_tools"):
+        return "TOOL_REGISTRY (how to use each tool):\n\n" + "\n\n---\n\n".join(blocks)
+
+
+    def _build_toolbelt(self, query: str) -> str:
+        tools = []
+        if hasattr(self._registry, "list_latest_tools"):
+            tools = self._registry.list_latest_tools()
+        else:
             tools = self._registry.list_tools()
-        elif hasattr(self._registry, "tools"):
-            tools = self._registry.tools.values()  # type: ignore[attr-defined]
+        retrieved = retrieve_tools(
+            query,
+            list(tools),
+            top_k=self._retrieval_top_k,
+            min_reliability=self._min_reliability,
+        )
+        if not retrieved:
+            return ""
+        blocks = []
+        for item in retrieved:
+            t = item.tool
+            block = (
+                f"TOOL: {t.name}\n"
+                f"Signature: {t.signature}\n"
+                f"Description: {t.description}\n"
+                f"Reliability: {t.reliability_score:.2f}\n"
+            )
+            if t.docstring:
+                block += f"Docstring:\n{t.docstring}\n"
+            if t.tool_type:
+                block += f"Tool Type: {t.tool_type}\n"
+            if t.input_schema is not None:
+                block += f"Input Schema: {json.dumps(t.input_schema, ensure_ascii=True, default=str)}\n"
+            if t.capabilities is not None:
+                block += f"Capabilities: {json.dumps(t.capabilities, ensure_ascii=True, default=str)}\n"
+            blocks.append(block.strip())
+        return "TOOLBELT (retrieved tools):\n\n" + "\n\n---\n\n".join(blocks)
 
-        best: Optional[ToolMetadata] = None
-        best_score = 0.0
-        for t in tools:
-            score = self._score_tool_match(query, t)
-            if score > best_score:
-                best_score = score
-                best = t
-        if best and best_score >= self._tool_match_min_score:
-            return best
+    def _augment_system_prompt(self, toolbelt: str) -> str:
+        tool_rules = (
+            "\n\nTOOL USE RULES:\n"
+            "- Prefer existing tools from TOOLBELT when they help.\n"
+            "- Only emit <internal_tool> blocks when you truly need a tool.\n"
+            "- Internal tool calls are NOT environment actions.\n"
+            "- Keep the environment-required action format unchanged.\n"
+            "\nINTERNAL TOOL CALL FORMAT:\n"
+            "<internal_tool name=\"tool_name\">{ \"args\": [...], \"kwargs\": { ... } }</internal_tool>\n"
+            "<internal_tool name=\"create_tool\">{ \"name\": \"...\", \"description\": \"...\", \"signature\": \"...\", \"code_lines\": [...] }</internal_tool>\n"
+        )
+        if self._environment_label == "db_bench":
+            tool_rules += (
+                "\nDB_BENCH POLICY:\n"
+                "- Before emitting 'Action: Answer', prefer calling internal tool 'answer_guard' if available.\n"
+                "- If your last SQL was SELECT, Final Answer MUST equal the raw DB response exactly.\n"
+                "- If task is INSERT/UPDATE/DELETE and DB response is [], you may submit Final Answer: [].\n"
+            )
+
+        sections: list[str] = []
+        if self._include_registry_in_prompt:
+            registry_context = self._registry_prompt_context()
+            if registry_context and registry_context != "TOOL_REGISTRY: (empty)":
+                sections.append(registry_context)
+        if toolbelt:
+            sections.append(toolbelt)
+        sections.append(tool_rules.strip())
+        return (self._solver_system_prompt or "") + "\n\n" + "\n\n".join(sections)
+
+    def _parse_internal_tool_call(
+        self, content: str
+    ) -> Optional[tuple[str, Mapping[str, Any]]]:
+        text = (content or "").strip()
+        if not text:
+            return None
+        match = self._INTERNAL_TOOL_PATTERN.fullmatch(text)
+        if not match:
+            return None
+        name = match.group("name").strip()
+        body = match.group("body").strip()
+        payload = self._parse_creation_payload(body)
+        if payload is None:
+            return name, {
+                "_parse_error": "Unable to parse internal tool payload.",
+                "raw": body,
+            }
+        return name, payload
+
+    def _format_tool_result(self, name: str, result: ToolResult) -> str:
+        payload = {
+            "tool_name": name,
+            "success": result.success,
+            "output": result.output,
+            "error": result.error,
+        }
+        return "ToolResult: " + json.dumps(payload, ensure_ascii=True, default=str)
+
+    def _validate_and_register_tool(
+        self, spec: ToolSpec, chat_history: ChatHistory
+    ) -> Optional[ToolMetadata]:
+        attempts = 0
+        last_error = None
+        while attempts <= 2:
+            attempts += 1
+            self._tool_creation_attempts += 1
+            code = self._join_code_lines(spec.code_lines)
+            if not code:
+                last_error = "empty code"
+            else:
+                result = validate_tool_code(code)
+                if result.success:
+                    metadata = self._registry.register_tool(
+                        name=spec.name,
+                        code=code,
+                        signature=spec.signature,
+                        description=spec.description,
+                        tool_type=spec.tool_type,
+                        input_schema=spec.input_schema,
+                        capabilities=spec.capabilities,
+                    )
+                    if metadata:
+                        self._registry.record_validation_result(
+                            metadata.name, True, self_test_passed=result.self_test_passed
+                        )
+                        self._tool_creation_successes += 1
+                        return metadata
+                    last_error = "registration failed"
+                else:
+                    last_error = result.error
+            if attempts > 2:
+                break
+            repair_spec = self._repair_tool_spec(spec, last_error or "", chat_history)
+            if repair_spec is None:
+                break
+            spec = repair_spec
         return None
+
+    def _repair_tool_spec(
+        self, spec: ToolSpec, error: str, chat_history: ChatHistory
+    ) -> Optional[ToolSpec]:
+        prompt = (
+            "The previous tool failed validation.\n"
+            f"Error: {error}\n"
+            f"Previous spec: {json.dumps(spec.__dict__, ensure_ascii=True, default=str)}\n"
+            "Output a corrected tool spec (JSON/YAML mapping only)."
+        )
+        tool_history = ChatHistory()
+        tool_history = self._safe_inject(
+            tool_history, ChatHistoryItem(role=Role.USER, content=prompt)
+        )
+        response = self._toolgen_agent._inference(tool_history)
+        payload = self._extract_toolgen_payload(response.content)
+        if not isinstance(payload, Mapping):
+            return None
+        return ToolSpec.from_payload(dict(payload))
+
+    def _handle_internal_tool_call(
+        self,
+        tool_name: str,
+        payload: Mapping[str, Any],
+        chat_history: ChatHistory,
+    ) -> ToolResult:
+        if "_parse_error" in payload:
+            return ToolResult.failure(str(payload.get("_parse_error")))
+        if tool_name == "create_tool":
+            spec = ToolSpec.from_payload(dict(payload))
+            metadata = self._validate_and_register_tool(spec, chat_history)
+            if metadata:
+                return ToolResult.success_result(
+                    {"created_tool": metadata.name, "description": metadata.description}
+                )
+            return ToolResult.failure("Tool creation failed validation.")
+
+        resolved_name = (
+            self._registry.resolve_name(tool_name) if hasattr(self._registry, "resolve_name") else None
+        )
+        if resolved_name is None and not self._registry.has_tool(tool_name):
+            last_user = self._get_last_user_item(chat_history)
+            query = last_user.content if last_user else ""
+            if query and self._force_tool_generation_if_missing:
+                created = self._maybe_generate_tool_for_query(query, chat_history)
+                if created:
+                    resolved_name = created.name
+        if resolved_name is None and not self._registry.has_tool(tool_name):
+            return ToolResult.failure(
+                f"Tool '{tool_name}' not found. Use create_tool or answer directly."
+            )
+
+        tool_args = payload.get("args", [])
+        tool_kwargs = payload.get("kwargs", {})
+        # If caller passed a single dict as args[0], treat it as kwargs for typed tools.
+        if len(tool_args) == 1 and isinstance(tool_args[0], dict) and not tool_kwargs:
+            tool_kwargs = dict(tool_args[0])
+            tool_args = []
+
+        if not isinstance(tool_args, list):
+            tool_args = []
+        if not isinstance(tool_kwargs, dict):
+            tool_kwargs = {}
+        if not tool_args and not tool_kwargs:
+            last_user = self._get_last_user_item(chat_history)
+            if last_user and last_user.content:
+                tool_args = [last_user.content]
+        self._tool_invocation_attempts += 1
+        result = self._registry.invoke_tool(
+            resolved_name or tool_name,
+            *tool_args,
+            invocation_context={"environment": self._environment_label},
+            **tool_kwargs,
+        )
+        if result.success:
+            self._tool_invocation_successes += 1
+        return result
 
     # ---------- parsing creation payload robustly ----------
     def _parse_creation_payload(self, payload: str) -> Optional[Mapping[str, Any]]:
@@ -288,9 +571,22 @@ class SelfEvolvingController(Agent):
         text = (content or "").strip()
         if not text:
             return None
-        if match := self._ACTION_PATTERN.search(text):
-            text = match.group("body").strip()
         return self._parse_creation_payload(text)
+
+    def _parse_tool_use_payload(self, content: str) -> Optional[Mapping[str, Any]]:
+        text = (content or "").strip()
+        if not text:
+            return None
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if fence_match:
+            text = fence_match.group(1).strip()
+        return self._parse_creation_payload(text)
+
+    def _get_tool_metadata(self, name: str) -> Optional[ToolMetadata]:
+        for tool in self._registry.list_tools():
+            if tool.name == name:
+                return tool
+        return None
 
     def _join_code_lines(self, code_lines: Sequence[Any]) -> Optional[str]:
         normalized_lines: list[str] = []
@@ -302,12 +598,115 @@ class SelfEvolvingController(Agent):
                 normalized_lines.extend(text.splitlines())
             else:
                 normalized_lines.append(text)
+        normalized_lines = self._normalize_module_docstring_lines(normalized_lines)
+        normalized_lines = self._ensure_tool_header(normalized_lines)
         if not normalized_lines:
             return None
-        if len(normalized_lines) > 100:
-            print("[SelfEvolvingController] Tool code exceeds 100 lines; skipping.")
+        if len(normalized_lines) > 150:
+            print("[SelfEvolvingController] Tool code exceeds 150 lines; skipping.")
             return None
         return "\n".join(normalized_lines).rstrip() + "\n"
+
+    def _normalize_module_docstring_lines(self, lines: Sequence[str]) -> list[str]:
+        # Normalize module docstring to a single contiguous triple-quoted block.
+        normalized = list(lines)
+        doc_quote = None
+
+        def _find_first_code_idx(items: list[str]) -> int:
+            markers = ("def ", "class ", "import ", "from ")
+            return next(
+                (
+                    i
+                    for i, line in enumerate(items)
+                    if line.lstrip().startswith(markers)
+                ),
+                len(items),
+            )
+
+        def _strip_empty_prefix(items: list[str]) -> list[str]:
+            idx = 0
+            while idx < len(items) and items[idx].strip() == "":
+                idx += 1
+            return items[idx:]
+
+        normalized = _strip_empty_prefix(normalized)
+        if not normalized:
+            return normalized
+
+        first_line = normalized[0].strip()
+        if first_line not in {'"""', "'''"}:
+            return normalized
+        doc_quote = first_line
+
+        # Find the first non-empty line after the opening docstring line
+        idx = 1
+        while idx < len(normalized) and normalized[idx].strip() == "":
+            idx += 1
+
+        # If the next non-empty line is the same quote, drop it (empty docstring opener/closer)
+        if idx < len(normalized) and normalized[idx].strip() == doc_quote:
+            normalized.pop(idx)
+
+        # If there is another standalone triple-quote before the first def, treat it as stray and remove it.
+        first_def_idx = _find_first_code_idx(normalized)
+        stray_idx = next(
+            (
+                i
+                for i in range(1, first_def_idx)
+                if normalized[i].strip() in {'"""', "'''"}
+            ),
+            None,
+        )
+        if stray_idx is not None:
+            normalized.pop(stray_idx)
+            first_def_idx = _find_first_code_idx(normalized)
+
+        # Ensure the module docstring closes immediately before the first def.
+        if first_def_idx > 0 and normalized[first_def_idx - 1].strip() != doc_quote:
+            normalized.insert(first_def_idx, doc_quote)
+        return normalized
+
+    def _ensure_tool_header(self, lines: list[str]) -> list[str]:
+        if not lines:
+            return lines
+        header = "from __future__ import annotations"
+        header_present = any(line.strip() == header for line in lines[:5])
+        if lines and lines[0].strip() in {'"""', "'''"}:
+            closing_idx = next(
+                (i for i in range(1, len(lines)) if lines[i].strip() in {'"""', "'''"}),
+                None,
+            )
+            if closing_idx is not None:
+                insert_at = closing_idx + 1
+                while insert_at < len(lines) and lines[insert_at].strip() == "":
+                    insert_at += 1
+                if not header_present:
+                    lines.insert(insert_at, "")
+                    lines.insert(insert_at, header)
+                return self._ensure_tool_imports(lines)
+        if not header_present:
+            lines.insert(0, header)
+            lines.insert(1, "")
+        return self._ensure_tool_imports(lines)
+
+    def _ensure_tool_imports(self, lines: list[str]) -> list[str]:
+        needs_re = any("re." in line for line in lines)
+        has_re = any(
+            line.strip().startswith("import re")
+            or line.strip().startswith("from re import")
+            for line in lines
+        )
+        if not (needs_re and not has_re):
+            return lines
+        insert_at = 0
+        while insert_at < len(lines) and lines[insert_at].strip().startswith(
+            "from __future__ import"
+        ):
+            insert_at += 1
+        while insert_at < len(lines) and lines[insert_at].strip() == "":
+            insert_at += 1
+        lines.insert(insert_at, "import re")
+        return lines
 
     def _register_tool_from_payload(
         self, creation_request: Mapping[str, Any], chat_history: ChatHistory
@@ -315,55 +714,100 @@ class SelfEvolvingController(Agent):
         if self._generated_tool_counter >= self._max_generated_tools_per_run:
             print("[SelfEvolvingController] Reached generated tool limit; skipping.")
             return None
-        code_lines = creation_request.get("code_lines", None)
-        if not isinstance(code_lines, list) or not code_lines:
-            print("[SelfEvolvingController] Missing code_lines for tool creation; skipping.")
-            return None
-        code = self._join_code_lines(code_lines)
-        if not code:
-            print("[SelfEvolvingController] Empty tool code after normalization; skipping.")
+
+        # Enforce schema-bearing tools for reliability
+        tool_type = creation_request.get("tool_type")
+        input_schema = creation_request.get("input_schema")
+        if tool_type in {"validator", "linter", "formatter"} and input_schema is None:
+            print("[SelfEvolvingController] Missing input_schema for typed tool; skipping.")
             return None
 
-        tool_name = str(creation_request.get("name") or "generated_tool")
-        description = str(creation_request.get("description") or "")
-        signature = str(creation_request.get("signature") or "run(task_text: str) -> str")
-        print(f"[SelfEvolvingController] Tool creation request: {tool_name} :: {signature}")
-        metadata = self.plan_and_generate_tool(
-            tool_name=tool_name,
-            description=description,
-            signature=signature,
-            code=code,
-            chat_history=chat_history,
-        )
+        spec = ToolSpec.from_payload(dict(creation_request))
+        metadata = self._validate_and_register_tool(spec, chat_history)
         if metadata:
             self._generated_tool_counter += 1
-            print(f"[SelfEvolvingController] Registered tool '{metadata.name}'.")
+            # print(f"[SelfEvolvingController] Registered tool '{metadata.name}'.")
         return metadata
+
+    def _reuse_existing_tool(self, query: str) -> Optional[ToolMetadata]:
+        tools = (
+            self._registry.list_latest_tools()
+            if hasattr(self._registry, "list_latest_tools")
+            else self._registry.list_tools()
+        )
+        retrieved = retrieve_tools(
+            query,
+            list(tools),
+            top_k=self._reuse_top_k,
+            min_reliability=self._reuse_min_reliability,
+        )
+        if not retrieved:
+            return None
+        best = retrieved[0]
+        if best.score < self._reuse_similarity_threshold:
+            print(
+                "[SelfEvolvingController] Reuse gate skipped: "
+                f"best_score={best.score:.3f} < threshold={self._reuse_similarity_threshold:.3f}"
+            )
+            return None
+        if "run(" not in (best.tool.signature or ""):
+            print(
+                "[SelfEvolvingController] Reuse gate skipped: "
+                f"tool '{best.tool.name}' missing run() signature."
+            )
+            return None
+        print(
+            "[SelfEvolvingController] Reuse gate selected "
+            f"tool='{best.tool.name}' score={best.score:.3f}."
+        )
+        return best.tool
+
 
     def _maybe_generate_tool_for_query(
         self, query: str, chat_history: ChatHistory
     ) -> Optional[ToolMetadata]:
         if not query.strip():
             return None
+        reuse = self._reuse_existing_tool(query)
+        if reuse is not None:
+            return reuse
         if not self._force_tool_generation_if_missing:
             return None
         if self._generated_tool_counter >= self._max_generated_tools_per_run:
             return None
 
-        from src.typings.session import ChatHistory
+        archetype = self._infer_tool_archetype(query)
+        prompt = self._toolgen_request_prompt(archetype, query)
 
         tool_history = ChatHistory()
         tool_history = self._safe_inject(
-            tool_history, ChatHistoryItem(role=Role.USER, content=query)
+            tool_history, ChatHistoryItem(role=Role.USER, content=prompt)
         )
         response = self._toolgen_agent._inference(tool_history)
+
         creation_request = self._extract_toolgen_payload(response.content)
         if not creation_request:
-            print("[SelfEvolvingController] No tool creation payload; ignoring.")
+            # print("[SelfEvolvingController] No tool creation payload; ignoring.")
             return None
         return self._register_tool_from_payload(creation_request, chat_history)
 
-    def _auto_invoke_tool_for_query(
+    def _select_tool_for_query(self, query: str) -> Optional[ToolMetadata]:
+        tools = []
+        if hasattr(self._registry, "list_latest_tools"):
+            tools = self._registry.list_latest_tools()
+        else:
+            tools = self._registry.list_tools()
+        retrieved = retrieve_tools(
+            query,
+            list(tools),
+            top_k=1,
+            min_reliability=self._min_reliability,
+        )
+        if not retrieved:
+            return None
+        return retrieved[0].tool
+
+    def _invoke_tool_for_query(
         self, tool: ToolMetadata, query: str
     ) -> Optional[ToolResult]:
         if not query.strip():
@@ -373,56 +817,47 @@ class SelfEvolvingController(Agent):
             query,
             invocation_context={
                 "source": "self_evolving_controller",
-                "reason": "auto_invoke_for_query",
+                "reason": "model_requested",
                 "query_preview": query[:200],
             },
         )
 
-    def _is_valid_sql(self, sql: str) -> bool:
-        sql_text = (sql or "").strip()
-        if not sql_text:
-            return False
-        if "Action:" in sql_text or "<action" in sql_text:
-            return False
-        return sql_text.endswith(";")
-
-    def _format_operation_response(self, sql: str) -> str:
-        sql_text = sql.strip()
-        return f"Action: Operation\n```sql\n{sql_text}\n```"
-
-    def _format_answer_response(self, result_text: str) -> str:
-        return f"Action: Answer\nFinal Answer: {result_text}"
-
-    def _validate_solver_output(self, content: str) -> bool:
-        if re.fullmatch(r"Action: Answer\nFinal Answer: [^\n]*\n?", content or ""):
-            return True
-        match = re.fullmatch(
-            r"Action: Operation\n```sql\n([\s\S]+)\n```\n?", content or ""
+    def _tool_metrics(self) -> dict[str, Any]:
+        tools = (
+            self._registry.list_latest_tools()
+            if hasattr(self._registry, "list_latest_tools")
+            else self._registry.list_tools()
         )
-        if not match:
-            return False
-        sql = match.group(1).strip()
-        return self._is_valid_sql(sql)
+        reuse_count = sum(1 for t in tools if (t.usage_count or 0) > 1)
+        env_usage: dict[str, int] = {}
+        for tool in tools:
+            for env, count in (tool.environment_usage or {}).items():
+                env_usage[env] = env_usage.get(env, 0) + int(count)
+        creation_rate = (
+            self._tool_creation_successes / self._tool_creation_attempts
+            if self._tool_creation_attempts
+            else 0.0
+        )
+        invocation_rate = (
+            self._tool_invocation_successes / self._tool_invocation_attempts
+            if self._tool_invocation_attempts
+            else 0.0
+        )
+        return {
+            "tool_creation_attempts": self._tool_creation_attempts,
+            "tool_creation_successes": self._tool_creation_successes,
+            "tool_creation_pass_rate": round(creation_rate, 3),
+            "tool_invocation_attempts": self._tool_invocation_attempts,
+            "tool_invocation_successes": self._tool_invocation_successes,
+            "tool_invocation_success_rate": round(invocation_rate, 3),
+            "tool_reuse_count": reuse_count,
+            "per_environment_usage": env_usage,
+        }
 
     def _solver_inference_with_retry(
-        self, chat_history: ChatHistory
+        self, chat_history: ChatHistory, system_prompt: Optional[str] = None
     ) -> ChatHistoryItem:
-        invalid_notice = (
-            "Invalid format. Output again EXACTLY in required format. No other text."
-        )
-        last_response: Optional[ChatHistoryItem] = None
-        for attempt in range(3):
-            if attempt == 0:
-                system_prompt = self._solver_system_prompt
-            else:
-                system_prompt = f"{self._solver_system_prompt}\n\n{invalid_notice}"
-            last_response = self._infer_with_system_prompt(
-                chat_history, system_prompt
-            )
-            if self._validate_solver_output(last_response.content):
-                return last_response
-        fallback_content = self._format_answer_response("")
-        return ChatHistoryItem(role=Role.AGENT, content=fallback_content)
+        return self._infer_with_system_prompt(chat_history, system_prompt)
 
     def _infer_with_system_prompt(
         self, chat_history: ChatHistory, system_prompt: Optional[str] = None
@@ -447,15 +882,21 @@ class SelfEvolvingController(Agent):
         tool_name: str,
         description: str,
         signature: str,
+        tool_type: Optional[Any] = None,
+        input_schema: Optional[Any] = None,
+        capabilities: Optional[Any] = None,
         code: str,
         chat_history: ChatHistory,
     ) -> Optional[ToolMetadata]:
-        print(f"[SelfEvolvingController] Persisting tool '{tool_name}'...")
+        # print(f"[SelfEvolvingController] Persisting tool '{tool_name}'...")
         return self._registry.register_tool(
             name=tool_name,
             code=code,
             signature=signature,
             description=description,
+            tool_type=str(tool_type) if tool_type is not None else None,
+            input_schema=input_schema,
+            capabilities=capabilities,
         )
 
     def _bootstrap_tools(self, bootstrap_tools: Sequence[Mapping[str, Any]]) -> None:
@@ -467,21 +908,23 @@ class SelfEvolvingController(Agent):
                 continue
             name = str(tool.get("name") or f"bootstrap_tool_{index}")
             description = str(tool.get("description") or "")
-            signature = str(tool.get("signature") or "run(*args, **kwargs)")
+            signature = str(tool.get("signature") or "run(task_text: str) -> str")
             code = str(tool.get("code") or "")
+            tool_type = tool.get("tool_type")
+            input_schema = tool.get("input_schema")
+            capabilities = tool.get("capabilities")
             metadata = self._registry.register_tool(
                 name=name,
                 code=code,
                 signature=signature,
                 description=description,
+                tool_type=str(tool_type) if tool_type is not None else None,
+                input_schema=input_schema,
+                capabilities=capabilities,
             )
-            self._generated_tool_counter += 1
-            print(f"[SelfEvolvingController] Bootstrapped '{metadata.name}'.")
-
-
-    from src.typings import Role
-    from src.typings.general import ChatHistoryItem  # or wherever it is
-    from src.typings.session import ChatHistory
+            if metadata:
+                self._generated_tool_counter += 1
+                print(f"[SelfEvolvingController] Bootstrapped '{metadata.name}'.")
 
     def _safe_inject(self, h: ChatHistory, item: ChatHistoryItem) -> ChatHistory:
         """Injects item while respecting ChatHistory rule: roles must alternate."""
@@ -501,67 +944,46 @@ class SelfEvolvingController(Agent):
         return h.inject(item) or h
 
     def _inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
-        last_user = self._get_last_user_item(chat_history)
-        if last_user is None:
-            return ChatHistoryItem(role=Role.AGENT, content=self._format_answer_response(""))
+        working_history = self._prune_for_current_task(chat_history)
+        for _ in range(self._internal_tool_max_steps):
+            last_user = self._get_last_user_item(working_history)
+            query = last_user.content if last_user else ""
+            toolbelt = self._build_toolbelt(query or "")
+            system_prompt = self._augment_system_prompt(toolbelt)
+            try:
+                solver_response = self._solver_inference_with_retry(
+                    working_history, system_prompt=system_prompt
+                )
+            except LanguageModelContextLimitException as e:
+                raise AgentContextLimitException(str(e)) from e
+            except LanguageModelOutOfMemoryException as e:
+                raise AgentOutOfMemoryException(str(e)) from e
+            except LanguageModelUnknownException as e:
+                raise AgentUnknownException(str(e)) from e
 
-        query = last_user.content or ""
-        if not self._is_dbbench_observation(query):
-            self._empty_result_retries_used = 0
-
-        if self._is_dbbench_observation(query):
-            # If result is empty AND it came from our last SQL, try a repair operation first
-            if self._is_empty_result(query) and self._previous_agent_was_operation(chat_history):
-                if self._empty_result_retries_used < self._max_empty_result_retries:
-                    self._empty_result_retries_used += 1
-
-                    # Ask solver to repair SQL (general, not task-specific)
-                    repair_hint = (
-                        "Previous SQL execution returned an empty result ([]). "
-                        "Assume the SQL may be too restrictive or incorrect. "
-                        "Re-check the task requirements, joins, grouping, filters, HAVING vs WHERE, "
-                        "and LIMIT/OFFSET. Produce a corrected SQL statement."
-                    )
-
-                    effective_history = self._prune_for_current_task(chat_history)
-                    effective_history = self._safe_inject(
-                        effective_history,
-                        ChatHistoryItem(role=Role.USER, content=repair_hint),
-                    )
-                    solver_response = self._solver_inference_with_retry(effective_history)
-                    return ChatHistoryItem(role=Role.AGENT, content=solver_response.content)
-
-            # Otherwise, accept the observation as final answer
-            return ChatHistoryItem(role=Role.AGENT, content=self._format_answer_response(query))
-
-
-        tool = self._best_tool_for(query)
-        if tool is None:
-            tool = self._maybe_generate_tool_for_query(query, chat_history)
-
-        if tool is not None:
-            tool_result = self._auto_invoke_tool_for_query(tool, query)
-            if (
-                tool_result is not None
-                and tool_result.success
-                and isinstance(tool_result.output, str)
-                and self._is_valid_sql(tool_result.output)
-            ):
+            internal = self._parse_internal_tool_call(solver_response.content)
+            if internal is None:
                 return ChatHistoryItem(
-                    role=Role.AGENT,
-                    content=self._format_operation_response(tool_result.output),
+                    role=solver_response.role, content=solver_response.content
                 )
 
-        effective_history = self._prune_for_current_task(chat_history)
-        try:
-            solver_response = self._solver_inference_with_retry(effective_history)
-        except LanguageModelContextLimitException as e:
-            raise AgentContextLimitException(str(e)) from e
-        except LanguageModelOutOfMemoryException as e:
-            raise AgentOutOfMemoryException(str(e)) from e
-        except LanguageModelUnknownException as e:
-            raise AgentUnknownException(str(e)) from e
-        return ChatHistoryItem(role=solver_response.role, content=solver_response.content)
+            tool_name, payload = internal
+            working_history = self._safe_inject(working_history, solver_response)
+            tool_result = self._handle_internal_tool_call(
+                tool_name, payload, working_history
+            )
+            working_history = self._safe_inject(
+                working_history,
+                ChatHistoryItem(
+                    role=Role.USER,
+                    content=self._format_tool_result(tool_name, tool_result),
+                ),
+            )
+
+        return ChatHistoryItem(
+            role=Role.AGENT,
+            content="Action: Answer\nFinal Answer: Unable to complete due to internal tool loop.",
+        )
 
     @override
     def get_role_dict(self) -> Mapping[Role, str]:

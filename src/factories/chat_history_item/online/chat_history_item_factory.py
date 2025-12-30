@@ -2,6 +2,7 @@ import json
 from typing import Optional
 
 from src.typings import Role, ChatHistoryItemDict, ChatHistoryItem
+from src.utils import SafeLogger
 from abc import ABC, abstractmethod
 
 
@@ -31,9 +32,28 @@ class ChatHistoryItemFactory(ChatHistoryItemFactoryInterface):
     def construct(
         self, chat_history_item_index: int, expected_role: Optional[Role] = None
     ) -> ChatHistoryItem:
-        result = self._chat_history_item_dict.value[str(chat_history_item_index)]
-        if expected_role is not None:
-            assert result.role == expected_role
+        try:
+            result = self._chat_history_item_dict.value[str(chat_history_item_index)]
+        except KeyError:
+            if expected_role is None:
+                raise
+            SafeLogger.warning(
+                "ChatHistoryItemFactory missing index %s; using fallback role %s.",
+                chat_history_item_index,
+                expected_role,
+            )
+            fallback_content = "OK." if expected_role == Role.AGENT else ""
+            return ChatHistoryItem(role=expected_role, content=fallback_content)
+        if expected_role is not None and result.role != expected_role:
+            SafeLogger.warning(
+                "ChatHistoryItemFactory role mismatch at index %s: expected %s, got %s. "
+                "Using fallback role.",
+                chat_history_item_index,
+                expected_role,
+                result.role,
+            )
+            fallback_content = "OK." if expected_role == Role.AGENT else result.content
+            return ChatHistoryItem(role=expected_role, content=fallback_content)
         return result
 
     def get_chat_history_item_dict_deep_copy(self) -> ChatHistoryItemDict:

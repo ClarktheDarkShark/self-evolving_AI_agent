@@ -13,11 +13,16 @@ assignment_config:
     name: self_evolving_agent
     custom_parameters:
       language_model: gpt-oss:20b-64k
-      tool_registry_path: outputs/{TIMESTAMP}/generated_tools
+      tool_registry_path: outputs/tool_library
       max_generated_tools_per_run: 30
       force_tool_generation_if_missing: true
       tool_match_min_score: 0.20
       include_registry_in_prompt: true
+      retrieval_top_k: 5
+      reuse_top_k: 3
+      reuse_similarity_threshold: 0.20
+      reuse_min_reliability: 0.0
+      canonical_tool_naming: true
       inference_config_dict:
         temperature: 0.0
         max_tokens: 30000
@@ -27,7 +32,7 @@ agent_dict:
     module: "src.self_evolving_agent.controller.SelfEvolvingController"
     parameters:
       language_model: "Fill the parameter 'language_model_name' in assignment config."
-      tool_registry_path: "outputs/{TIMESTAMP}/generated_tools"
+      tool_registry_path: "outputs/tool_library"
       max_generated_tools_per_run: 3
       system_prompt: ""               # keep whatever you already have here
       inference_config_dict: {}
@@ -36,6 +41,9 @@ agent_dict:
       force_tool_generation_if_missing: false
       include_registry_in_prompt: true
       tool_match_min_score: 0.20
-
-
+      retrieval_top_k: 5
+      reuse_top_k: 3
+      reuse_similarity_threshold: 0.20
+      reuse_min_reliability: 0.0
+      canonical_tool_naming: true
 

@@ -40,8 +40,8 @@ def first_present(row: dict[str, Any], candidates: list[str]) -> Optional[str]:
     return None
 
 
-def main() -> None:
-    ds = load_dataset("csyq/LifelongAgentBench", data_dir="db_bench", split="train")
+def _build_for_split(data_dir: str) -> None:
+    ds = load_dataset("csyq/LifelongAgentBench", data_dir=data_dir, split="train")
 
     value: dict[str, dict[str, str]] = {}
     missing_user = 0
@@ -83,14 +83,19 @@ def main() -> None:
         # value[str(sample_index)] = {"role": "agent", "content": agent_txt}
 
     out = {"value": value}
-    out_path = Path("chat_history_items/standard/db_bench.json")
+    out_path = Path(f"chat_history_items/standard/{data_dir}.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"Wrote {len(value)} items -> {out_path.resolve()}")
-    print(f"Missing user field: {missing_user}")
-    print(f"Missing agent field: {missing_agent}")
-    print("Note: output stores role='user' by default. Change to 'agent' if needed.")
+    print(f"[{data_dir}] Wrote {len(value)} items -> {out_path.resolve()}")
+    print(f"[{data_dir}] Missing user field: {missing_user}")
+    print(f"[{data_dir}] Missing agent field: {missing_agent}")
+    print(f"[{data_dir}] Note: output stores role='user' by default. Change to 'agent' if needed.")
+
+
+def main() -> None:
+    for data_dir in ("db_bench", "os_interaction", "knowledge_graph"):
+        _build_for_split(data_dir)
 
 
 if __name__ == "__main__":

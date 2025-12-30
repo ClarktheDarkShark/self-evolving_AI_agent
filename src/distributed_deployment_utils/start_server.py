@@ -2,6 +2,8 @@ import argparse
 import re
 import time
 import multiprocessing as mp
+import sys
+import traceback
 
 
 class ServerStarterUtility:
@@ -56,7 +58,12 @@ def _start_chat_history_item_factory_server(config_path: str) -> None:
         factory = chat_hist_factory_instance_factory.create()
         ChatHistoryItemFactoryServer.start_server(factory, port, prefix)
     except Exception:
-        logger.exception("Chat History Item Factory Server crashed")
+        tb = traceback.format_exc()
+        try:
+            logger.error("Chat History Item Factory Server crashed\n%s", tb)
+        except Exception:
+            print("Chat History Item Factory Server crashed\n" + tb, file=sys.stderr)
+        raise
 
 
 def _start_task_server(config_path: str) -> None:
@@ -90,7 +97,12 @@ def _start_task_server(config_path: str) -> None:
         task = task_instance_factory.create()
         TaskServer.start_server(task, port, prefix)
     except Exception:
-        logger.exception("Task Server crashed")
+        tb = traceback.format_exc()
+        try:
+            logger.error("Task Server crashed\n%s", tb)
+        except Exception:
+            print("Task Server crashed\n" + tb, file=sys.stderr)
+        raise
 
 
 def main() -> None:

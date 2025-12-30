@@ -22,7 +22,7 @@ class ChatHistoryItemFactoryClient(Client, ChatHistoryItemFactoryInterface):
     def construct(  # type: ignore[override]  # noqa
         self, chat_history_item_index: int, expected_role: Optional[Role] = None
     ) -> ChatHistoryItem:
-        response: ChatHistoryItemFactoryResponse.Construct = self._call_server(
+        response: ChatHistoryItemFactoryResponse.Construct = self._call_server_once(
             "/construct",
             ChatHistoryItemFactoryRequest.Construct(
                 chat_history_item_index=chat_history_item_index,

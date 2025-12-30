@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 import uvicorn
 
 from .chat_history_item_factory import ChatHistoryItemFactory
@@ -7,7 +7,7 @@ from src.typings import (
     ChatHistoryItemFactoryRequest,
     ChatHistoryItemFactoryResponse,
 )
-from src.utils import Server
+from src.utils import Server, SafeLogger
 
 
 class ChatHistoryItemFactoryServer(Server):
@@ -25,12 +25,18 @@ class ChatHistoryItemFactoryServer(Server):
     def construct(
         self, data: ChatHistoryItemFactoryRequest.Construct
     ) -> ChatHistoryItemFactoryResponse.Construct:
-        chat_history_item = self._chat_history_item_factory.construct(
-            **data.model_dump()
-        )
-        return ChatHistoryItemFactoryResponse.Construct(
-            chat_history_item=chat_history_item
-        )
+        try:
+            chat_history_item = self._chat_history_item_factory.construct(
+                **data.model_dump()
+            )
+            return ChatHistoryItemFactoryResponse.Construct(
+                chat_history_item=chat_history_item
+            )
+        except Exception as exc:
+            SafeLogger.error(
+                "ChatHistoryItemFactory construct failed: %s", exc, exc_info=True
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     def get_chat_history_item_dict_deep_copy(
         self,

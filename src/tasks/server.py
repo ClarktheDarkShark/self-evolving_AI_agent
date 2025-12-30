@@ -1,9 +1,9 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 import uvicorn
 
 from .task import Task, DatasetItem
 from src.typings import TaskRequest, TaskResponse
-from src.utils import Server
+from src.utils import Server, SafeLogger
 
 
 class TaskServer(Server):
@@ -22,8 +22,12 @@ class TaskServer(Server):
         return TaskResponse.GetSampleIndexList(sample_index_list=sample_index_list)
 
     def reset(self, data: TaskRequest.Reset) -> TaskResponse.Reset:
-        self.task.reset(data.session)
-        return TaskResponse.Reset(session=data.session)
+        try:
+            self.task.reset(data.session)
+            return TaskResponse.Reset(session=data.session)
+        except Exception as exc:
+            SafeLogger.error("Task reset failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     def interact(self, data: TaskRequest.Interact) -> TaskResponse.Interact:
         self.task.interact(data.session)

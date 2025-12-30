@@ -1,7 +1,9 @@
 import json
-import re
-from typing import Union, Optional, Sequence, Any
+import logging
 import os
+import re
+from pathlib import Path
+from typing import Union, Optional, Sequence, Any
 from pydantic import BaseModel
 import inspect
 from enum import StrEnum
@@ -41,22 +43,110 @@ class KnowledgeGraphAPIException(Exception):
     pass
 
 
+def resolve_ontology_dir(ontology_dir_path: Optional[str | Path]) -> Optional[Path]:
+    ontology_path = Path(ontology_dir_path) if ontology_dir_path is not None else None
+    tried_paths: list[Path] = []
+    required_files = ["vocab.json", "fb_roles"]
+
+    def _is_valid(path: Path) -> bool:
+        return all((path / fname).exists() for fname in required_files)
+
+    if ontology_path is not None:
+        if _is_valid(ontology_path):
+            return ontology_path
+        tried_paths.append(ontology_path)
+
+    repo_root = Path(__file__).resolve().parents[4]
+    candidates = [
+        repo_root / "data" / "v0121" / "knowledge_graph" / "ontology",
+        repo_root / "src" / "tasks" / "instance" / "knowledge_graph" / "ontology",
+        repo_root
+        / "src"
+        / "tasks"
+        / "instance"
+        / "knowledge_graph"
+        / "assets"
+        / "ontology",
+    ]
+    for candidate in candidates:
+        if _is_valid(candidate):
+            return candidate
+        tried_paths.append(candidate)
+
+    repo_id = os.getenv("LIFELONG_KG_ONTOLOGY_REPO")
+    subdir = os.getenv("LIFELONG_KG_ONTOLOGY_SUBDIR")
+    if repo_id:
+        if not subdir:
+            subdir = "data/v0121/knowledge_graph/ontology"
+        repo_type = os.getenv("LIFELONG_KG_ONTOLOGY_REPO_TYPE", "dataset")
+        try:
+            from huggingface_hub import hf_hub_download
+
+            local_paths = []
+            for fname in required_files:
+                local_paths.append(
+                    hf_hub_download(
+                        repo_id=repo_id,
+                        repo_type=repo_type,
+                        filename=f"{subdir}/{fname}",
+                    )
+                )
+            return Path(local_paths[0]).parent
+        except Exception:
+            pass
+
+    strict_flag = os.getenv("LIFELONG_KG_ONTOLOGY_STRICT", "0")
+    if strict_flag == "1":
+        tried_str = "\n".join(str(path) for path in tried_paths)
+        raise FileNotFoundError(
+            "KG ontology assets not found. Expected vocab.json and fb_roles in one of:\n"
+            f"{tried_str}\n"
+            "Provide them by either:\n"
+            "(1) setting ontology_dir_path in the YAML to a directory containing vocab.json, or\n"
+            "(2) setting LIFELONG_KG_ONTOLOGY_REPO/LIFELONG_KG_ONTOLOGY_SUBDIR so the code can auto-download."
+        )
+    return None
+
+
 class KnowledgeGraphAPI:
     class ExtremumFunction(StrEnum):
         ARGMAX = "argmax"
         ARGMIN = "argmin"
 
     def __init__(self, ontology_dir_path: str, sparql_executor: SparqlExecutor):
-        with open(os.path.join(ontology_dir_path, "vocab.json")) as f:
-            vocab = json.load(f)
-            self.attributes = vocab["attributes"]
-            self.relations = vocab["relations"]
-        self.range_info = {}
-        with open(os.path.join(ontology_dir_path, "fb_roles"), "r") as f:
-            for line in f:
-                line = line.replace("\n", "")
-                fields = line.split(" ")
-                self.range_info[fields[1]] = fields[2]
+        logger = logging.getLogger(__name__)
+        ontology_dir = resolve_ontology_dir(ontology_dir_path)
+        if ontology_dir is None:
+            logger.warning(
+                "KG ontology assets not found; continuing with empty vocab/fb_roles. "
+                "For full KG guidance, set ontology_dir_path or LIFELONG_KG_ONTOLOGY_REPO."
+            )
+            self.attributes = []
+            self.relations = []
+            self.range_info = {}
+        else:
+            vocab_path = ontology_dir / "vocab.json"
+            roles_path = ontology_dir / "fb_roles"
+            if not vocab_path.exists() or not roles_path.exists():
+                logger.warning(
+                    "KG ontology assets missing expected files; continuing with empty vocab/fb_roles. "
+                    "Set ontology_dir_path or LIFELONG_KG_ONTOLOGY_REPO for full KG guidance."
+                )
+                self.attributes = []
+                self.relations = []
+                self.range_info = {}
+            else:
+                with open(vocab_path) as f:
+                    vocab = json.load(f)
+                    self.attributes = vocab.get("attributes", [])
+                    self.relations = vocab.get("relations", [])
+                self.range_info = {}
+                with open(roles_path, "r") as f:
+                    for line in f:
+                        line = line.replace("\n", "")
+                        fields = line.split(" ")
+                        if len(fields) >= 3:
+                            self.range_info[fields[1]] = fields[2]
         self.variable_to_relations_cache: dict[Variable | str, list[str]] = {}
         self.variable_to_attributes_cache: dict[Variable, list[str]] = {}
         self.sparql_executor = sparql_executor

@@ -1,6 +1,8 @@
 import json
-from typing import Optional, Callable, Any, Sequence
+import logging
+import os
 import re
+from typing import Optional, Callable, Any, Sequence
 from pydantic import field_validator
 import inspect
 
@@ -23,6 +25,7 @@ from src.typings import (
     SessionMetricCalculationPartial,
 )
 from src.factories.chat_history_item import ChatHistoryItemFactory
+from src.utils.struct_coercion import coerce_struct
 from .api import KnowledgeGraphAPI, Variable, KnowledgeGraphAPIException
 from .utils.sparql_executor import SparqlExecutor
 
@@ -39,6 +42,10 @@ class KnowledgeGraphDatasetItem(DatasetItem):
     @field_validator("entity_dict", mode="before")  # noqa
     @classmethod
     def _validate_parentheses_pair(cls, entity_dict: dict[str, str]) -> dict[str, str]:
+        if isinstance(entity_dict, str):
+            entity_dict = coerce_struct(entity_dict)
+        if not isinstance(entity_dict, dict):
+            return entity_dict
         for entity in entity_dict.keys():
             error_message = f"Invalid parentheses pair in entity: {entity}"
             left_parentheses_count = 0
@@ -56,6 +63,10 @@ class KnowledgeGraphDatasetItem(DatasetItem):
     @field_validator("entity_dict", mode="before")  # noqa
     @classmethod
     def _validate_entity_name(cls, entity_dict: dict[str, str]) -> dict[str, str]:
+        if isinstance(entity_dict, str):
+            entity_dict = coerce_struct(entity_dict)
+        if not isinstance(entity_dict, dict):
+            return entity_dict
         for entity in entity_dict.keys():
             if "#" in entity:
                 raise ValueError(f"Invalid entity name: {entity}")
@@ -77,16 +88,58 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         ontology_dir_path: str,
         data_file_path: str,
         max_round: int,
+        data_source: str = "auto",
+        hf_dataset_name: str = "csyq/LifelongAgentBench",
+        hf_dataset_config: Optional[str] = None,
+        hf_data_dir: Optional[str] = "knowledge_graph",
+        hf_split: str = "train",
+        hf_cache_dir: Optional[str] = None,
     ):
         super().__init__(task_name, chat_history_item_factory, max_round)
         sparql_executor = SparqlExecutor(sparql_url)
         self.knowledge_graph_api = KnowledgeGraphAPI(ontology_dir_path, sparql_executor)
-        raw_dataset: dict[str, dict[str, Any]] = json.load(open(data_file_path, "r"))
+        raw_dataset = self._load_data(
+            data_file_path=data_file_path,
+            data_source=data_source,
+            hf_dataset_name=hf_dataset_name,
+            hf_dataset_config=hf_dataset_config,
+            hf_data_dir=hf_data_dir,
+            hf_split=hf_split,
+            hf_cache_dir=hf_cache_dir,
+        )
         dataset: dict[SampleIndex, KnowledgeGraphDatasetItem] = {}
         for key, item in raw_dataset.items():
-            question = item["question"]
-            entity_dict = item["entity_dict"]
-            answer_set = set(item["answer_list"])
+            row = dict(item)
+            row["entity_dict"] = coerce_struct(row.get("entity_dict"))
+            row["action_list"] = coerce_struct(row.get("action_list"))
+            row["answer_list"] = coerce_struct(row.get("answer_list"))
+            row["skill_list"] = coerce_struct(row.get("skill_list"))
+
+            idx = row.get("sample_index", "<unknown>")
+            if not isinstance(row.get("entity_dict"), dict):
+                raise TypeError(
+                    "knowledge_graph: entity_dict not dict after coercion "
+                    f"(sample_index={idx}, type={type(row.get('entity_dict'))})"
+                )
+            if not isinstance(row.get("action_list"), list):
+                raise TypeError(
+                    "knowledge_graph: action_list not list after coercion "
+                    f"(sample_index={idx}, type={type(row.get('action_list'))})"
+                )
+            if not isinstance(row.get("answer_list"), list):
+                raise TypeError(
+                    "knowledge_graph: answer_list not list after coercion "
+                    f"(sample_index={idx}, type={type(row.get('answer_list'))})"
+                )
+            if not isinstance(row.get("skill_list"), list):
+                raise TypeError(
+                    "knowledge_graph: skill_list not list after coercion "
+                    f"(sample_index={idx}, type={type(row.get('skill_list'))})"
+                )
+
+            question = row["question"]
+            entity_dict = row["entity_dict"]
+            answer_set = set(row["answer_list"])
             dataset[key] = KnowledgeGraphDatasetItem(
                 question=question,
                 entity_dict=entity_dict,
@@ -94,6 +147,83 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             )
         self._set_dataset(dataset)
         self.variable_list: Optional[list[Variable]] = None
+
+    @staticmethod
+    def _load_data(
+        *,
+        data_file_path: str,
+        data_source: str,
+        hf_dataset_name: str,
+        hf_dataset_config: Optional[str],
+        hf_data_dir: Optional[str],
+        hf_split: str,
+        hf_cache_dir: Optional[str],
+    ) -> dict[str, dict[str, Any]]:
+        source = data_source.lower()
+        if source not in {"local", "huggingface", "auto"}:
+            raise ValueError(
+                f"Unsupported data_source: {data_source}. Use local, huggingface, or auto."
+            )
+        if source in {"local", "auto"} and os.path.exists(data_file_path):
+            with open(data_file_path, "r") as f:
+                return json.load(f)
+        if source == "local":
+            raise FileNotFoundError(
+                "KnowledgeGraph local data file not found. "
+                f"Missing path: {data_file_path}. "
+                "Set data_source to 'huggingface' or 'auto' to load from HF."
+            )
+        try:
+            from src.utils.hf_dataset_loader import load_hf_env_parquet, HfEnvLoadSpec
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to import HF dataset loader. "
+                "Ensure src/utils/hf_dataset_loader.py is available."
+            ) from exc
+        try:
+            dataset = load_hf_env_parquet(
+                HfEnvLoadSpec(
+                    dataset_name=hf_dataset_name,
+                    env="knowledge_graph",
+                    split=hf_split,
+                    cache_dir=hf_cache_dir,
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to load KnowledgeGraph dataset from Hugging Face: "
+                f"{hf_dataset_name} [{hf_split}]."
+            ) from exc
+
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "Loaded HF knowledge_graph: rows=%d cols=%s",
+            len(dataset),
+            dataset.column_names,
+        )
+        logger.info(
+            "First row keys=%s",
+            list(dataset[0].keys()) if len(dataset) else None,
+        )
+
+        required = ["question", "entity_dict", "answer_list"]
+        missing = [key for key in required if key not in dataset.column_names]
+        if missing:
+            raise RuntimeError(
+                "knowledge_graph dataset missing required columns: "
+                f"{missing}. cols={dataset.column_names}"
+            )
+
+        data: dict[str, dict[str, Any]] = {}
+        for idx, row in enumerate(dataset):
+            row_dict = dict(row)
+            sample_key = row_dict.get("sample_index")
+            if sample_key is None:
+                sample_key = str(idx)
+            else:
+                sample_key = str(sample_key)
+            data[sample_key] = row_dict
+        return data
 
     def _get_default_task_output(self) -> dict[str, Optional[str]]:
         return {"answer": None}

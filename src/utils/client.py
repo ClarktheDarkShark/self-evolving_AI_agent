@@ -69,16 +69,7 @@ class Client(BaseModel):
     ) -> None:
         pass
 
-    @RetryHandler.handle(
-        max_retries=20,
-        retry_on=(
-            requests.exceptions.Timeout,
-            requests.exceptions.HTTPError,
-            HttpException,
-        ),
-        waiting_strategy=ExponentialBackoffStrategy(interval=(None, 30), multiplier=2),
-    )  # The retry will take at most 10 minutes.
-    def _call_server(
+    def _call_server_once(
         self,
         api: str,
         data: Optional[BaseModel],
@@ -182,6 +173,23 @@ class Client(BaseModel):
                 raise HttpUnknownException(error_message) from e
             return None  # Will never reach here, added for type checking
         # endregion
+
+    @RetryHandler.handle(
+        max_retries=20,
+        retry_on=(
+            requests.exceptions.Timeout,
+            requests.exceptions.HTTPError,
+            HttpException,
+        ),
+        waiting_strategy=ExponentialBackoffStrategy(interval=(None, 30), multiplier=2),
+    )  # The retry will take at most 10 minutes.
+    def _call_server(
+        self,
+        api: str,
+        data: Optional[BaseModel],
+        response_cls: Optional[Type[T]],
+    ) -> Optional[T]:
+        return self._call_server_once(api, data, response_cls)
 
     def __getattr__(self, name: str) -> Any:
         """

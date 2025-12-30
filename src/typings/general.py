@@ -16,6 +16,19 @@ class ChatHistoryItem(BaseModel):
     role: Role
     content: str
 
+    @field_validator("role", mode="before")  # noqa
+    @classmethod
+    def _normalize_role(cls, value: object) -> object:
+        if isinstance(value, Role):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "assistant":
+                return Role.AGENT
+            if normalized in ("agent", "user"):
+                return Role(normalized)
+        return value
+
 
 class ChatHistoryItemDict(BaseModel):
     value: dict[str, ChatHistoryItem]

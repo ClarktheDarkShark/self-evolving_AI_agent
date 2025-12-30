@@ -1,7 +1,10 @@
+import ast
 import json
+import logging
+import os
+import re
 from pydantic import BaseModel
 from typing import Optional, Any, Sequence
-import re
 
 from .container import OSInteractionContainer
 from .utility import (
@@ -95,9 +98,23 @@ class OSInteraction(Task[OSInteractionDatasetItem]):
         data_file_path: str,
         max_round: int,
         command_execution_timeout: int,
+        data_source: str = "auto",
+        hf_dataset_name: str = "csyq/LifelongAgentBench",
+        hf_dataset_config: Optional[str] = None,
+        hf_data_dir: Optional[str] = "os_interaction",
+        hf_split: str = "train",
+        hf_cache_dir: Optional[str] = None,
     ):
         super().__init__(task_name, chat_history_item_factory, max_round)
-        data: dict[str, dict[str, Any]] = json.load(open(data_file_path))
+        data = self._load_data(
+            data_file_path=data_file_path,
+            data_source=data_source,
+            hf_dataset_name=hf_dataset_name,
+            hf_dataset_config=hf_dataset_config,
+            hf_data_dir=hf_data_dir,
+            hf_split=hf_split,
+            hf_cache_dir=hf_cache_dir,
+        )
         # self.dataset can also be implemented as a list, but it is implemented as a dict for forward compatibility
         dataset: dict[SampleIndex, OSInteractionDatasetItem] = {}
         for key, item in data.items():
@@ -111,9 +128,133 @@ class OSInteraction(Task[OSInteractionDatasetItem]):
 
     @staticmethod
     def _construct_dataset_item(entry: dict[str, Any]) -> OSInteractionDatasetItem:
+        entry = dict(entry)
+        entry["initialization_command_item"] = OSInteraction._coerce_struct(
+            entry.get("initialization_command_item")
+        )
+        entry["evaluation_info"] = OSInteraction._coerce_struct(
+            entry.get("evaluation_info")
+        )
+        entry["skill_list"] = OSInteraction._coerce_struct(entry.get("skill_list"))
+        sample_index = entry.get("sample_index", "<unknown>")
+        if not isinstance(entry.get("initialization_command_item"), dict):
+            raise ValueError(
+                "os_interaction: init_command_item not dict after coercion "
+                f"(sample_index={sample_index}, type={type(entry.get('initialization_command_item'))})"
+            )
+        if not isinstance(entry.get("evaluation_info"), dict):
+            raise ValueError(
+                "os_interaction: evaluation_info not dict after coercion "
+                f"(sample_index={sample_index}, type={type(entry.get('evaluation_info'))})"
+            )
+        if not isinstance(entry.get("skill_list"), list):
+            raise ValueError(
+                "os_interaction: skill_list not list after coercion "
+                f"(sample_index={sample_index}, type={type(entry.get('skill_list'))})"
+            )
         # Use del instead of pop to promote early detection of errors
         del entry["raw_entry_hash"]
         return OSInteractionDatasetItem.model_validate(entry)
+
+    @staticmethod
+    def _coerce_struct(value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        if value is None:
+            return value
+        if not isinstance(value, str):
+            return value
+        s = value.strip()
+        if not s:
+            return value
+        try:
+            if s[0] in "{[" and s[-1] in "}]":
+                return json.loads(s)
+        except Exception:
+            pass
+        try:
+            return ast.literal_eval(s)
+        except Exception:
+            return value
+
+    @staticmethod
+    def _load_data(
+        *,
+        data_file_path: str,
+        data_source: str,
+        hf_dataset_name: str,
+        hf_dataset_config: Optional[str],
+        hf_data_dir: Optional[str],
+        hf_split: str,
+        hf_cache_dir: Optional[str],
+    ) -> dict[str, dict[str, Any]]:
+        source = data_source.lower()
+        if source not in {"local", "huggingface", "auto"}:
+            raise ValueError(
+                f"Unsupported data_source: {data_source}. Use local, huggingface, or auto."
+            )
+        if source in {"local", "auto"} and os.path.exists(data_file_path):
+            with open(data_file_path, "r") as f:
+                return json.load(f)
+        if source == "local":
+            raise FileNotFoundError(
+                "OSInteraction local data file not found. "
+                f"Missing path: {data_file_path}. "
+                "Set data_source to 'huggingface' or 'auto' to load from HF."
+            )
+        try:
+            from src.utils.hf_dataset_loader import load_hf_env_parquet, HfEnvLoadSpec
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to import HF dataset loader. "
+                "Ensure src/utils/hf_dataset_loader.py is available."
+            ) from exc
+        try:
+            dataset = load_hf_env_parquet(
+                HfEnvLoadSpec(
+                    dataset_name=hf_dataset_name,
+                    env="os_interaction",
+                    split=hf_split,
+                    cache_dir=hf_cache_dir,
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to load OSInteraction dataset from Hugging Face: "
+                f"{hf_dataset_name} [{hf_split}]."
+            ) from exc
+
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "Loaded HF os_interaction: rows=%d cols=%s",
+            len(dataset),
+            dataset.column_names,
+        )
+        logger.info(
+            "First row keys=%s",
+            list(dataset[0].keys()) if len(dataset) else None,
+        )
+
+        required = list(OSInteractionDatasetItem.model_fields.keys()) + [
+            "raw_entry_hash"
+        ]
+        missing = [key for key in required if key not in dataset.column_names]
+        if missing:
+            raise RuntimeError(
+                "os_interaction dataset missing required columns: "
+                f"{missing}. cols={dataset.column_names}"
+            )
+
+        data: dict[str, dict[str, Any]] = {}
+        for idx, row in enumerate(dataset):
+            row_dict = dict(row)
+            sample_key = row_dict.get("sample_index")
+            if sample_key is None:
+                sample_key = str(idx)
+            else:
+                sample_key = str(sample_key)
+            data[sample_key] = row_dict
+        return data
 
     def _get_default_task_output(self) -> dict[str, Optional[str]]:
         return {"answer": None}

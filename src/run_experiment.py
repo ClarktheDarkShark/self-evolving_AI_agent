@@ -326,8 +326,7 @@ def main() -> None:
     else:
         # Write the config file to the output directory.
         config_output_dir = os.path.dirname(config_output_path)
-        if not os.path.exists(config_output_dir):
-            os.makedirs(config_output_dir)
+        os.makedirs(config_output_dir, exist_ok=True)
         yaml.dump(
             cleaned_config,
             open(config_output_path, "w"),

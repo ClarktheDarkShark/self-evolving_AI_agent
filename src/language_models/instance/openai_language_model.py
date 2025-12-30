@@ -2,6 +2,7 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 import openai
 import os
+import logging
 from typing import Any, Optional, Sequence, Mapping, TypeGuard
 import json
 
@@ -74,13 +75,24 @@ class OpenaiLanguageModel(LanguageModel):
         https://platform.openai.com/docs/guides/error-codes#python-library-error-types
         https://github.com/run-llama/llama_index/discussions/11889
         """
+        logger = logging.getLogger(__name__)
+        stripped_fields: dict[str, Any] = {}
+        sanitized_config = dict(inference_config_dict)
+        for key in ("tools", "tool_choice", "parallel_tool_calls", "response_format"):
+            if key in sanitized_config:
+                stripped_fields[key] = sanitized_config.pop(key)
+        if stripped_fields:
+            logger.warning(
+                "Stripped unsupported tool fields from inference_config: %s",
+                sorted(stripped_fields.keys()),
+            )
         try:
             completion = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=message_list,
-                **inference_config_dict,
+                **sanitized_config,
             )
-            # # right after create(...)
+            # right after create(...)
             # print("=== RAW COMPLETION OBJECT ===")
             # print(completion.model_dump_json(indent=2))
 
@@ -103,6 +115,24 @@ class OpenaiLanguageModel(LanguageModel):
             else:
                 # Raise the original exception to retry.
                 raise e
+        except openai.InternalServerError as e:
+            try:
+                message_size = len(
+                    json.dumps(message_list, ensure_ascii=True, default=str)
+                )
+            except Exception:
+                message_size = -1
+            logger.error(
+                "OpenAI server error. model=%s message_count=%d message_json_len=%s "
+                "inference_config=%s stripped=%s error=%s",
+                self.model_name,
+                len(message_list),
+                message_size,
+                sanitized_config,
+                sorted(stripped_fields.keys()),
+                e,
+            )
+            raise
 
         if (
             completion.usage is not None
@@ -116,12 +146,60 @@ class OpenaiLanguageModel(LanguageModel):
             )
         content_list: list[str] = []
         content_all_invalid_flag: bool = True
+        logger = logging.getLogger(__name__)
         for choice in completion.choices:
-            content = choice.message.content
+            message = choice.message
+            content = message.content
+            if not content:
+                tool_calls = getattr(message, "tool_calls", None)
+                if tool_calls:
+                    first = tool_calls[0]
+                    func = getattr(first, "function", None)
+                    name = getattr(func, "name", None)
+                    args = getattr(func, "arguments", None)
+                    if name:
+                        if args is None:
+                            args = "{}"
+                        if not isinstance(args, str):
+                            args = json.dumps(args, ensure_ascii=True, default=str)
+                        content = f'<internal_tool name="{name}">{args}</internal_tool>'
+                        if len(tool_calls) > 1:
+                            logger.warning(
+                                "Multiple tool_calls returned; using first only. count=%d",
+                                len(tool_calls),
+                            )
             if content is not None and len(content) > 0:
                 content_all_invalid_flag = False
             content_list.append(content or "")
         if content_all_invalid_flag:
+            logger = logging.getLogger(__name__)
+            try:
+                message_size = len(
+                    json.dumps(message_list, ensure_ascii=True, default=str)
+                )
+            except Exception:
+                message_size = -1
+            choices_info = []
+            for choice in completion.choices:
+                message = choice.message
+                tool_calls = getattr(message, "tool_calls", None)
+                choices_info.append(
+                    {
+                        "finish_reason": choice.finish_reason,
+                        "content_len": len(message.content or ""),
+                        "tool_calls": bool(tool_calls),
+                    }
+                )
+            logger.error(
+                "OpenAI completion returned empty content. model=%s message_count=%d "
+                "message_json_len=%s inference_config=%s usage=%s choices=%s",
+                self.model_name,
+                len(message_list),
+                message_size,
+                inference_config_dict,
+                getattr(completion, "usage", None),
+                choices_info,
+            )
             raise LanguageModelContextLimitException(
                 f"Model {self.model_name} returns empty response. The context limit may be reached."
             )
