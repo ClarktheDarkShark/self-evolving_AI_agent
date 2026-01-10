@@ -1,5 +1,3 @@
-#tool_validation.py
-
 from __future__ import annotations
 
 import ast
@@ -86,17 +84,14 @@ def _build_variation_args(
             return "alt"
         return val
 
-    # Prefer modifying the first required parameter.
     if args:
         args[0] = _alt(args[0])
         return args, kwargs
 
-    # Otherwise modify the first kwarg.
     for key in list(kwargs.keys()):
         kwargs[key] = _alt(kwargs[key])
         return args, kwargs
 
-    # If no args/kwargs were generated, fallback to a single string arg.
     return ["alt"], {}
 
 
@@ -162,14 +157,12 @@ def validate_tool_code(
     except Exception as exc:
         return ToolValidationResult(success=False, error=f"smoke test failed: {exc}")
 
-    variance_checked = False
     if len(inspect.signature(run_fn).parameters) == 1 and isinstance(result, str):
         alt_args, alt_kwargs = _build_variation_args(run_fn, args, kwargs)
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(run_fn, *alt_args, **alt_kwargs)
                 alt_result = future.result(timeout=timeout_s)
-            variance_checked = True
             if isinstance(alt_result, str) and alt_result == result:
                 return ToolValidationResult(
                     success=False,

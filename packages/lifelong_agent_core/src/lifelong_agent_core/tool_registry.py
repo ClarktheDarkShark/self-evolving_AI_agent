@@ -1,5 +1,3 @@
-#tool_registry.py
-
 import ast
 import datetime
 import hashlib
@@ -15,7 +13,7 @@ import traceback
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from src.typings.config import get_predefined_timestamp_structure
+from .utils import get_predefined_timestamp_structure
 
 
 @dataclass
@@ -27,7 +25,6 @@ class ToolMetadata:
     usage_count: int = 0
     docstring: str = ""
     tool_type: Optional[str] = None
-    tool_category: Optional[str] = None
     input_schema: Optional[Any] = None
     capabilities: Optional[Any] = None
     base_name: str = ""
@@ -102,12 +99,7 @@ class ToolRegistry:
                 if not tool_metadata.docstring:
                     tool_metadata.docstring = tool_metadata.description
                 if not tool_metadata.base_name:
-                    # supports: foo__v3, foo__a9c40609eb, foo__advanced__247f4ae812
-                    parts = tool_metadata.name.split("__")
-                    if len(parts) >= 2 and re.fullmatch(r"[0-9a-fA-F]{6,}", parts[-1]):
-                        tool_metadata.base_name = "__".join(parts[:-1])
-                    else:
-                        tool_metadata.base_name = tool_metadata.name.split("__v")[0]
+                    tool_metadata.base_name = tool_metadata.name.split("__v")[0]
                 if not tool_metadata.code_hash:
                     tool_metadata.code_hash = ""
                 if tool_metadata.environment_usage is None:
@@ -151,7 +143,7 @@ class ToolRegistry:
                 with open(tool_path, "r", encoding="utf-8") as f:
                     code = f.read()
                 fingerprint = self._compute_fingerprint(
-                    meta.tool_type, getattr(meta, "tool_category", None), meta.signature, code
+                    meta.tool_type, meta.signature, code
                 )
             except Exception:
                 continue
@@ -245,10 +237,10 @@ class ToolRegistry:
                     node.body = node.body[1:]
 
     def _compute_fingerprint(
-        self, tool_type: Optional[str], tool_category: Optional[str], signature: str, code: str
+        self, tool_type: Optional[str], signature: str, code: str
     ) -> str:
         normalized = self._normalize_code_for_fingerprint(code)
-        base = f"{tool_type or ''}\n{tool_category or ''}\n{signature.strip()}\n{normalized}"
+        base = f"{tool_type or ''}\n{signature.strip()}\n{normalized}"
         return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     def _canonical_name(self, base_name: str, fingerprint: str) -> str:
@@ -403,7 +395,6 @@ class ToolRegistry:
         signature: str,
         description: str,
         tool_type: Optional[str] = None,
-        tool_category: Optional[str] = None,
         input_schema: Optional[Any] = None,
         capabilities: Optional[Any] = None,
     ) -> Optional[ToolMetadata]:
@@ -443,7 +434,7 @@ class ToolRegistry:
 
         fingerprint = ""
         try:
-            fingerprint = self._compute_fingerprint(tool_type, tool_category, signature, normalized_code)
+            fingerprint = self._compute_fingerprint(tool_type, signature, normalized_code)
         except Exception:
             fingerprint = ""
         if fingerprint:
@@ -523,10 +514,9 @@ class ToolRegistry:
             metadata.description = description
             metadata.docstring = docstring
             metadata.tool_type = tool_type
-            metadata.tool_category = tool_category
             metadata.input_schema = input_schema
             metadata.capabilities = capabilities
-            metadata.base_name = base_name
+            metadata.base_name = base_name if not self._canonical_naming else tool_name
             metadata.version = version
             metadata.code_hash = code_hash
             if metadata.environment_usage is None:
@@ -548,7 +538,6 @@ class ToolRegistry:
                 "description": description,
                 "docstring": docstring,
                 "tool_type": tool_type,
-                "tool_category": tool_category,
                 "input_schema": input_schema,
                 "capabilities": capabilities,
                 "path": tool_path,
@@ -604,7 +593,6 @@ class ToolRegistry:
                 "docstring": m.docstring,
                 "usage_count": m.usage_count,
                 "tool_type": m.tool_type,
-                "tool_category": getattr(m, "tool_category", None),
                 "input_schema": m.input_schema,
                 "capabilities": m.capabilities,
             }

@@ -1,4 +1,3 @@
-# tool_spec.py (or tool_specs.py if that's the real filename)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,7 +11,6 @@ class ToolSpec:
     signature: str
     code_lines: Sequence[str]
     tool_type: Optional[str] = None
-    tool_category: Optional[str] = None   # <-- ADD
     input_schema: Optional[Any] = None
     capabilities: Optional[Any] = None
     examples: Optional[Sequence[str]] = None
@@ -28,7 +26,6 @@ class ToolSpec:
             signature=str(payload.get("signature") or "run()"),
             code_lines=code_lines,
             tool_type=payload.get("tool_type"),
-            tool_category=payload.get("tool_category"),  # <-- ADD
             input_schema=payload.get("input_schema"),
             capabilities=payload.get("capabilities"),
             examples=payload.get("examples"),

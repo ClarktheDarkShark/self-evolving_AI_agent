@@ -23,9 +23,11 @@ assignment_config:
       reuse_similarity_threshold: 0.20
       reuse_min_reliability: 0.0
       canonical_tool_naming: true
+      use_packaged_agent: false
       inference_config_dict:
         temperature: 0.0
         max_tokens: 30000
+        allow_internal_tool_protocol: true
 
 agent_dict:
   self_evolving_agent:
@@ -46,4 +48,4 @@ agent_dict:
       reuse_similarity_threshold: 0.20
       reuse_min_reliability: 0.0
       canonical_tool_naming: true
-
+      use_packaged_agent: false

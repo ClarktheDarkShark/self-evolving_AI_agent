@@ -16,7 +16,6 @@ def construct_offline(root_path: str, requirement_suffix: str) -> None:
                     "role": "user",
                     "content": f"""{TASK_REQUIREMENT_DICT[task_name]}{requirement_suffix}""",
                 },
-                1: {"role": "agent", "content": "OK."},  # type: ignore[dict-item]
             }
         )
         with open(os.path.join(root_path, f"{task_name}.json"), "w") as f:

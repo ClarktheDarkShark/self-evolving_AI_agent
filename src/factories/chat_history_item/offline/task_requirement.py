@@ -60,8 +60,7 @@ Once you commit your answer or the number of rounds reaches 3, the task will be 
     TaskName.KNOWLEDGE_GRAPH: """You are an intelligent agent tasked with answering questions by querying a knowledge base. Your goal is to efficiently retrieve and process information using the tools provided.
 
 ### Interaction Rules:
-    - Before performing any action, carefully analyze the task and explain your thought process.
-    - Include a detailed explanation of the logic behind your choice of commands and approach.
+    - Think silently. Do not output analysis.
     - Perform **only one action per turn** or provide the **Final Answer**.
     - You can only choose one action from the available set at each turn.
     - Adhere strictly to the specified formats for each action.
@@ -79,6 +78,7 @@ Once you commit your answer or the number of rounds reaches 3, the task will be 
     - Retrieves entities connected to the input Variable or str via the specified relation.
     - **Input**: Variable or str and a relation from get_relations().
     - **Prerequisite**: Use get_relations() to find the set of viable relations.
+    - **Prerequisite rule**: Before calling get_neighbors(X, ...), you MUST have already called get_relations(X) earlier in the conversation, even when X is a Variable like #0.
     - **Example**: Action: get_neighbors(#0, people.person.profession) or Action: get_neighbors(Barack Obama, people.person.profession).
 
 3. **intersection(var1: Variable, var2: Variable) -> Variable**
@@ -120,5 +120,25 @@ Submit your final answer in the following format:
 ### Task Completion
     - The task will conclude either when you select the "finish" action or when the number of rounds reaches 15.
     - The system will evaluate your performance to determine if the task was successfully completed.
+
+### OUTPUT CONTRACT (read carefully)
+Your entire response MUST be EXACTLY ONE LINE and match ONE of the two patterns below:
+
+1) Tool call:
+Action: <tool_name>(<arguments>)
+- Example: Action: get_relations(cows)
+- Example: Action: get_neighbors(#0, food.cheese_milk_source.cheeses)
+
+2) Final answer:
+Final Answer: #<number>
+- Example: Final Answer: #3
+
+ABSOLUTE RULES:
+- Do NOT output any other text (no explanations, no “we need to…”, no quotes, no markdown).
+- Do NOT output two actions or repeat an action (only one line total).
+- Do NOT add a trailing period.
+- NEVER output entity names in the final answer (e.g., “Cottage cheese” is invalid).
+  If you know the name, you MUST still return the variable id (#) that contains it.
+- If you receive an environment error message, respond with the single Action line that fixes it.
 """,
 }

@@ -386,6 +386,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         self.knowledge_graph_api.reset_cache()
 
     def _interact(self, session: Session) -> None:
+        logger = logging.getLogger(__name__)
         # region Parse agent response, ensure the code pass the type check
         parser_result = KnowledgeGraph._parse_agent_response(
             session.chat_history.get_item_deep_copy(-1).content
@@ -466,6 +467,13 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                                     }
                                 )
                                 return
+                            logger.info(
+                                "KG resolve var: token=%s idx=%d type=%s program=%s",
+                                raw_argument,
+                                variable_index,
+                                processed_argument.type,
+                                processed_argument.program[:500],
+                            )
                             # endregion
                         else:
                             # region Argument is neither an entity nor a variable
@@ -569,6 +577,12 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                     )
                     assert isinstance(new_variable, Variable)  # Type narrowing
                     self.variable_list.append(new_variable)
+                    logger.info(
+                        "KG store var: new_idx=%d type=%s program=%s",
+                        len(self.variable_list) - 1,
+                        new_variable.type,
+                        new_variable.program[:500],
+                    )
                 session.chat_history.inject(
                     {"role": Role.USER, "content": execution_message}
                 )

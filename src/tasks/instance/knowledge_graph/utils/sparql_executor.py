@@ -9,20 +9,73 @@ from src.utils import SafeLogger
 
 class SparqlExecutor:
     def __init__(self, url: str):
+        self.url = url
         self.sparql_wrapper = SPARQLWrapper(url)
         self.sparql_wrapper.setReturnFormat(JSON)
 
+    def get_endpoint_url(self) -> str:
+        return self.url
+
+    @staticmethod
+    def _escape_literal(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    def find_entities_by_name(self, name: str, limit: int = 5) -> List[str]:
+        escaped = self._escape_literal(name)
+        queries = [
+            f"""PREFIX : <http://rdf.freebase.com/ns/>
+SELECT DISTINCT ?e WHERE {{
+  ?e :type.object.name "{escaped}"@en .
+}} LIMIT {limit}""",
+            f"""PREFIX : <http://rdf.freebase.com/ns/>
+SELECT DISTINCT ?e WHERE {{
+  ?e :type.object.name ?name .
+  FILTER(CONTAINS(LCASE(STR(?name)), "{escaped.lower()}"))
+}} LIMIT {limit}""",
+            f"""PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT DISTINCT ?e WHERE {{
+  ?e rdfs:label ?name .
+  FILTER(CONTAINS(LCASE(STR(?name)), "{escaped.lower()}"))
+}} LIMIT {limit}""",
+        ]
+        matches: List[str] = []
+        for query in queries:
+            results = self._query_endpoint(query)
+            for result in results["results"]["bindings"]:
+                value = result["e"]["value"]
+                matches.append(
+                    value.replace("http://rdf.freebase.com/ns/", "")
+                )
+            if matches:
+                break
+        # Deduplicate while preserving order
+        seen = set()
+        unique: List[str] = []
+        for item in matches:
+            if item not in seen:
+                seen.add(item)
+                unique.append(item)
+        return unique[:limit]
+
     def _query_endpoint(self, query: str) -> dict[str, Any]:
+        SafeLogger.info(
+            "SPARQL request url=%s query=%s",
+            self.url,
+            query.replace("\n", " ")[:500],
+        )
         self.sparql_wrapper.setQuery(query)
         try:
             results = self.sparql_wrapper.query().convert()
         except urllib.error.URLError as e:
             SafeLogger.error(
-                f"Cannot get result for query: {query}. Check whether the endpoint is reachable."
+                f"SPARQL request failed url={self.url} query={query}"
             )
             raise TaskEnvironmentException(f"Query failed:\n{query}") from e
         assert isinstance(results, dict)
         return results
+
+    def execute_raw(self, query: str) -> dict[str, Any]:
+        return self._query_endpoint(query)
 
     def execute_query(self, query: str) -> List[str]:
         results = self._query_endpoint(query)

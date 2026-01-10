@@ -22,21 +22,17 @@ class Variable(BaseModel):
     def __eq__(self, __value: object) -> bool:
         if isinstance(__value, Variable):
             return self.program == __value.program
-        else:
-            return False
+        return False
 
     def __repr__(self) -> str:
         return self.program
 
     def is_callable(self) -> bool:
-        for not_callable_name in [
-            "count",
-            "argmax",
-            "argmin",
-        ]:
+        for not_callable_name in ["count", "argmax", "argmin"]:
             if self.program.startswith(f"({not_callable_name.upper()} "):
                 return False
         return True
+
 
 
 class KnowledgeGraphAPIException(Exception):
@@ -51,6 +47,13 @@ def resolve_ontology_dir(ontology_dir_path: Optional[str | Path]) -> Optional[Pa
     def _is_valid(path: Path) -> bool:
         return all((path / fname).exists() for fname in required_files)
 
+    env_dir = os.getenv("LIFELONG_KG_ONTOLOGY_DIR")
+    if env_dir:
+        env_path = Path(env_dir).expanduser()
+        if _is_valid(env_path):
+            return env_path
+        tried_paths.append(env_path)
+
     if ontology_path is not None:
         if _is_valid(ontology_path):
             return ontology_path
@@ -58,6 +61,7 @@ def resolve_ontology_dir(ontology_dir_path: Optional[str | Path]) -> Optional[Pa
 
     repo_root = Path(__file__).resolve().parents[4]
     candidates = [
+        repo_root / "data" / "knowledge_graph" / "ontology",
         repo_root / "data" / "v0121" / "knowledge_graph" / "ontology",
         repo_root / "src" / "tasks" / "instance" / "knowledge_graph" / "ontology",
         repo_root
@@ -116,6 +120,8 @@ class KnowledgeGraphAPI:
     def __init__(self, ontology_dir_path: str, sparql_executor: SparqlExecutor):
         logger = logging.getLogger(__name__)
         ontology_dir = resolve_ontology_dir(ontology_dir_path)
+        self.ontology_dir = ontology_dir
+        logger.warning("KG ontology_dir=%s", ontology_dir)
         if ontology_dir is None:
             logger.warning(
                 "KG ontology assets not found; continuing with empty vocab/fb_roles. "
@@ -127,6 +133,11 @@ class KnowledgeGraphAPI:
         else:
             vocab_path = ontology_dir / "vocab.json"
             roles_path = ontology_dir / "fb_roles"
+            logger.warning(
+                "KG roles_path=%s exists=%s",
+                roles_path,
+                roles_path.exists(),
+            )
             if not vocab_path.exists() or not roles_path.exists():
                 logger.warning(
                     "KG ontology assets missing expected files; continuing with empty vocab/fb_roles. "
@@ -144,9 +155,14 @@ class KnowledgeGraphAPI:
                 with open(roles_path, "r") as f:
                     for line in f:
                         line = line.replace("\n", "")
-                        fields = line.split(" ")
+                        fields = line.split()
                         if len(fields) >= 3:
                             self.range_info[fields[1]] = fields[2]
+            logger.warning(
+                "KG range_info size=%d has_cheese=%s",
+                len(self.range_info),
+                "food.cheese_milk_source.cheeses" in self.range_info,
+            )
         self.variable_to_relations_cache: dict[Variable | str, list[str]] = {}
         self.variable_to_attributes_cache: dict[Variable, list[str]] = {}
         self.sparql_executor = sparql_executor
@@ -221,8 +237,43 @@ class KnowledgeGraphAPI:
         # Freebase ID (or entity ID) can only start with 'g' or 'm', instead of 'm' or 'f'.
         if re.match(r"^([gm])\.[\w_]+$", argument):
             return True
-        else:
-            return False
+        return False
+
+    @staticmethod
+    def _normalize_entity_id(text: str) -> Optional[str]:
+        if text.startswith("http://rdf.freebase.com/ns/"):
+            return text.replace("http://rdf.freebase.com/ns/", "")
+        if KnowledgeGraphAPI._is_valid_entity(text):
+            return text
+        return None
+
+    def _resolve_entity_ids(self, text: str, limit: int = 5) -> list[str]:
+        cleaned = text.strip().strip('"').strip("'")
+        normalized = self._normalize_entity_id(cleaned)
+        if normalized:
+            return [normalized]
+
+        candidates = [cleaned]
+        if cleaned.endswith("s") and len(cleaned) > 3:
+            candidates.append(cleaned[:-1])
+
+        for candidate in candidates:
+            matches = self.sparql_executor.find_entities_by_name(candidate, limit=limit)
+            if matches:
+                return matches
+        return []
+
+    @staticmethod
+    def _filter_noise_relations(relations: list[str]) -> list[str]:
+        noise = {
+            "type.object.name",
+            "type.object.type",
+            "type.object.key",
+            "type.object.id",
+            "common.topic.alias",
+            "common.topic.description",
+        }
+        return [rel for rel in relations if rel not in noise]
 
     def final_execute(self, variable: Variable) -> list[str]:
         program = variable.program
@@ -232,16 +283,23 @@ class KnowledgeGraphAPI:
         return results
 
     def get_relations(self, argument: Union[Variable, str]) -> tuple[None, str]:
+        logger = logging.getLogger(__name__)
+        resolved_candidates: list[str] = []
+        debug_override = False
         # region Validate argument
         if isinstance(argument, Variable):
             KnowledgeGraphAPI._validate_variable("get_relations", [argument])
-        elif KnowledgeGraphAPI._is_valid_entity(argument):
-            pass
         else:
-            raise KnowledgeGraphAPIException(
-                "get_relations: <<ARGUMENT0>> is neither a Variable nor an entity. "
-                "The argument of get_relations must be a Variable or an entity."
-            )
+            if argument == "__DEBUG_GOAT__":
+                resolved_candidates = ["m.03fwl"]
+                debug_override = True
+            else:
+                resolved_candidates = self._resolve_entity_ids(argument)
+            if not resolved_candidates:
+                raise KnowledgeGraphAPIException(
+                    "get_relations: <<ARGUMENT0>> is neither a Variable nor an entity. "
+                    "The argument of get_relations must be a Variable or an entity."
+                )
         # endregion
         if isinstance(argument, Variable):
             program = argument.program
@@ -256,30 +314,80 @@ class KnowledgeGraphAPI:
             new_clauses.append("}\n}")
             new_query = "\n".join(new_clauses)
             out_relations = self.sparql_executor.execute_query(new_query)
+            resolved_entity = None
+            raw_predicates: list[str] = []
         else:
-            out_relations = self.sparql_executor.get_out_relations(argument)
-        out_relations = sorted(
-            list(set(out_relations).intersection(set(self.relations)))
+            resolved_entity = resolved_candidates[0]
+            out_relations = self.sparql_executor.get_out_relations(resolved_entity)
+            raw_predicates = []
+            try:
+                raw_query = (
+                    "SELECT ?p WHERE { "
+                    f"<http://rdf.freebase.com/ns/{resolved_entity}> ?p ?o . "
+                    "} LIMIT 2000"
+                )
+                raw_results = self.sparql_executor.execute_raw(raw_query)
+                for result in raw_results["results"]["bindings"]:
+                    raw_predicates.append(result["p"]["value"])
+            except Exception:
+                raw_predicates = []
+
+        raw_predicate_count = len(raw_predicates)
+        raw_relations = sorted(set(out_relations))
+        if self.relations:
+            intersected = sorted(
+                list(set(raw_relations).intersection(set(self.relations)))
+            )
+            filtered_relations = intersected
+        else:
+            filtered_relations = self._filter_noise_relations(raw_relations)
+
+        fail_open = False
+        if not filtered_relations and raw_predicates:
+            raw_predicates_clean = [
+                rel.replace("http://rdf.freebase.com/ns/", "")
+                for rel in raw_predicates
+            ]
+            filtered_relations = self._filter_noise_relations(
+                sorted(set(raw_predicates_clean))
+            )
+            fail_open = True
+
+        raw_predicate_sample = raw_predicates[:10]
+        logger.info(
+            "KG get_relations: input=%s resolved_candidates=%s chosen=%s debug=%s endpoint=%s raw_count=%d raw_predicate_count=%d filtered_count=%d fail_open=%s raw_sample=%s raw_pred_sample=%s",
+            argument,
+            resolved_candidates,
+            resolved_entity,
+            debug_override,
+            self.sparql_executor.get_endpoint_url(),
+            len(raw_relations),
+            raw_predicate_count,
+            len(filtered_relations),
+            fail_open,
+            raw_relations[:10],
+            raw_predicate_sample,
         )
         execution_message = KnowledgeGraphAPI._construct_execution_message(
-            f"[{', '.join(out_relations)}]"
+            f"[{', '.join(filtered_relations)}]"
         )
-        self.variable_to_relations_cache[argument] = out_relations
+        self.variable_to_relations_cache[argument] = filtered_relations
         return None, execution_message
 
     def get_neighbors(
         self, argument: Union[Variable, str], relation: str
     ) -> tuple[Variable, str]:
+        logger = logging.getLogger(__name__)
         # region Validate arguments
         if isinstance(argument, Variable):
             KnowledgeGraphAPI._validate_variable("get_neighbors", [argument])
-        elif KnowledgeGraphAPI._is_valid_entity(argument):
-            pass
         else:
-            raise KnowledgeGraphAPIException(
-                "get_neighbors: <<ARGUMENT0>> is neither a Variable nor an entity. "
-                "The first argument of get_neighbors must be a Variable or an entity."
-            )
+            resolved = self._resolve_entity_ids(argument)
+            if not resolved:
+                raise KnowledgeGraphAPIException(
+                    "get_neighbors: <<ARGUMENT0>> is neither a Variable nor an entity. "
+                    "The first argument of get_neighbors must be a Variable or an entity."
+                )
         if argument not in self.variable_to_relations_cache.keys():
             raise KnowledgeGraphAPIException(
                 f"get_neighbors: Execute get_relations for <<ARGUMENT0>> before executing get_neighbors"
@@ -290,12 +398,29 @@ class KnowledgeGraphAPI:
                 f"<<ARGUMENT0>> has the following relations: {self.variable_to_relations_cache[argument]}"
             )
         # endregion
+        resolved_entity = resolved[0] if not isinstance(argument, Variable) else None
+        logger.info(
+            "KG get_neighbors: input=%s resolved=%s relation=%s endpoint=%s",
+            argument,
+            resolved_entity,
+            relation,
+            self.sparql_executor.get_endpoint_url(),
+        )
+        range_type = self.range_info.get(relation)
+        if not range_type:
+            logger.warning(
+                "KG missing range type for relation=%s; ontology_dir=%s; range_info_size=%d",
+                relation,
+                self.ontology_dir,
+                len(self.range_info),
+            )
+            range_type = "type.object"
         new_variable = Variable(
-            type=self.range_info[relation],
-            program=f"(JOIN {relation + '_inv'} {argument.program if isinstance(argument, Variable) else argument})",
+            type=range_type,
+            program=f"(JOIN {relation + '_inv'} {argument.program if isinstance(argument, Variable) else resolved_entity})",
         )
         execution_message = KnowledgeGraphAPI._construct_execution_message(
-            f"Variable <<NEW_VARIABLE>>, which are instances of {self.range_info[relation]}"
+            f"Variable <<NEW_VARIABLE>>, which are instances of {range_type}"
         )
         return new_variable, execution_message
 

@@ -263,12 +263,14 @@ class OSInteraction(Task[OSInteractionDatasetItem]):
     def _parse_agent_response(
         agent_response: str,
     ) -> AgentResponseParserResult:
-        action_match = re.search(r"Act:\s*(.+)", agent_response)
+        action_match = re.search(r"(?:Act|Action):\s*(.+)", agent_response)
         if action_match is None:
             return AgentResponseParserResult(
                 action=AgentAction.INVALID,
                 content=None,
-                finish_reason=r'Cannot extract action from agent response. Pattern: "Act:\s*(.+)"',
+                finish_reason=(
+                    r'Cannot extract action from agent response. Pattern: "(Act|Action):\s*(.+)"'
+                ),
             )
         action_str = action_match.group(1)
         if action_str.lower().startswith("bash"):
@@ -289,7 +291,9 @@ class OSInteraction(Task[OSInteractionDatasetItem]):
             return AgentResponseParserResult(
                 action=AgentAction.INVALID,
                 content=None,
-                finish_reason=r'Invalid action string matched by pattern "Act:\s*(.+)"',
+                finish_reason=(
+                    r'Invalid action string matched by pattern "(Act|Action):\s*(.+)"'
+                ),
             )
 
     def _reset(self, session: Session) -> None:

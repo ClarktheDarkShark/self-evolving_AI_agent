@@ -1,28 +1,17 @@
-#controller.py 
-
 import ast
 import json
 import re
 from typing import Any, Mapping, Optional, Sequence, Iterable
 import yaml  # add pyyaml dependency if not already present
-from src.typings.config import get_predefined_timestamp_structure
 
-from typing_extensions import override
-
-from src.agents.agent import Agent
-from src.agents.instance.language_model_agent import LanguageModelAgent
-from src.language_models import LanguageModel
-from src.typings import (
-    AgentContextLimitException,
-    AgentOutOfMemoryException,
-    AgentUnknownException,
-    ChatHistory,
-    ChatHistoryItem,
-    LanguageModelContextLimitException,
-    LanguageModelOutOfMemoryException,
-    LanguageModelUnknownException,
-    Role,
+from .exceptions import (
+    AgentContextLimitError,
+    AgentOutOfMemoryError,
+    AgentUnknownError,
 )
+from .model import LanguageModelAgent
+from .types import ChatHistory, ChatHistoryItem, Role
+from .utils import get_predefined_timestamp_structure
 
 from .tool_registry import ToolMetadata, ToolResult, get_registry
 from .tool_spec import ToolSpec
@@ -30,10 +19,7 @@ from .tool_validation import validate_tool_code
 from .tool_retrieval import retrieve_tools
 
 
-USE_PACKAGED_AGENT = False
-
-
-class SelfEvolvingController(Agent):
+class SelfEvolvingController:
     _INTERNAL_TOOL_PATTERN = re.compile(
         r"<internal_tool\s+name=\"(?P<name>[^\"]+)\">(?P<body>[\s\S]*?)</internal_tool>",
         re.MULTILINE,
@@ -42,7 +28,7 @@ class SelfEvolvingController(Agent):
 
     def __init__(
         self,
-        language_model: LanguageModel,
+        language_model: Any,
         tool_registry_path: str,
         max_generated_tools_per_run: int = 3,
         inference_config_dict: Optional[Mapping[str, Any]] = None,
@@ -54,7 +40,7 @@ class SelfEvolvingController(Agent):
         ),
         # NEW:
         force_tool_generation_if_missing: bool = True,
-        tool_match_min_score: float = 0.7,
+        tool_match_min_score: float = 0.25,
         include_registry_in_prompt: bool = True,
         environment_label: str = "unknown",
         retrieval_top_k: int = 5,
@@ -62,34 +48,7 @@ class SelfEvolvingController(Agent):
         reuse_similarity_threshold: Optional[float] = None,
         reuse_min_reliability: float = 0.0,
         canonical_tool_naming: bool = True,
-        use_packaged_agent: bool = USE_PACKAGED_AGENT,
     ):
-        self._tasks_seen = 0
-        self._explore_every_n_tasks = 30   # tune: 20–50
-
-        self._use_packaged_agent = use_packaged_agent
-        self._packaged_shim = None
-        if self._use_packaged_agent:
-            from .packaged_shim import PackagedSelfEvolvingShim
-
-            self._packaged_shim = PackagedSelfEvolvingShim(
-                language_model=language_model,
-                tool_registry_path=tool_registry_path,
-                max_generated_tools_per_run=max_generated_tools_per_run,
-                inference_config_dict=inference_config_dict,
-                bootstrap_tools=bootstrap_tools,
-                system_prompt=system_prompt,
-                force_tool_generation_if_missing=force_tool_generation_if_missing,
-                tool_match_min_score=tool_match_min_score,
-                include_registry_in_prompt=include_registry_in_prompt,
-                environment_label=environment_label,
-                retrieval_top_k=retrieval_top_k,
-                reuse_top_k=reuse_top_k,
-                reuse_similarity_threshold=reuse_similarity_threshold,
-                reuse_min_reliability=reuse_min_reliability,
-                canonical_tool_naming=canonical_tool_naming,
-            )
-            return
         self._language_model_agent = LanguageModelAgent(
             language_model=language_model,
             system_prompt=system_prompt,
@@ -101,61 +60,27 @@ class SelfEvolvingController(Agent):
             language_model=language_model,
             system_prompt=(
                 "Reasoning: low\n"
-                "You are ToolGen, an internal tool generator. Your job is to create HIGH-QUALITY, "
-                "HIGH-ROI, COMPOSABLE utilities (NOT task solvers) that the main agent can reuse "
-                "across many tasks in the same environment.\n"
+                "You are a tool generator that creates reusable tools to help the main agent solve tasks.\n"
+                "Output EXACTLY ONE JSON (preferred) or YAML mapping with keys:\n"
+                "name, description, signature, code_lines.\n"
                 "\n"
-                "OUTPUT FORMAT (HARD):\n"
-                "- Output EXACTLY ONE JSON or YAML mapping. No prose. No markdown. No extra keys unless optional.\n"
-                "- Required keys: name, description, signature, tool_type, tool_category, input_schema, capabilities, code_lines.\n"
-                "- code_lines MUST be a list of strings. Joining with '\\n' MUST produce valid Python.\n"
+                "HARD RULES:\n"
+                "- Output ONLY the mapping. No prose, no markdown.\n"
                 "- name MUST be lowercase_snake_case.\n"
-                "- Use only Python standard library.\n"
+                "- description MUST be a short human-readable summary.\n"
+                "- signature MUST describe the run() entrypoint.\n"
+                "- code_lines MUST be a JSON/YAML list of strings (1 line per item).\n"
+                "- Joining code_lines with '\\n' MUST produce valid Python.\n"
+                "- Tools must be reusable across multiple tasks; do NOT hard-code a single answer.\n"
+                "- run() MUST use its input parameters (no constant outputs).\n"
+                "- The output should vary for distinct inputs (no static SQL).\n"
+                "- Prefer helper utilities (parsers/validators/formatters) over direct task solvers.\n"
+                "- Avoid external dependencies; use only the standard library.\n"
+                "- Include clear MODULE and run() docstrings with usage examples.\n"
+                "- Include a self_test() that tries at least two distinct inputs and returns True only if outputs differ.\n"
+                "- You may optionally include input_schema, tool_type, capabilities, examples.\n"
                 "- Code must be <= 150 lines.\n"
-                "\n"
-                "PRIMARY GOAL:\n"
-                "- Build a generic transformation/validation/planning primitive that applies to 20+ tasks "
-                "in this environment.\n"
-                "- If you cannot honestly meet the 20+ tasks bar, generate a SMALLER primitive instead "
-                "(usually a parser, validator/linter, or formatter) that still provides reusable value.\n"
-                "\n"
-                "ABSOLUTELY FORBIDDEN:\n"
-                "- Do NOT hard-code a single final answer.\n"
-                "- Do NOT hard-code a single SQL query or a single table/column set as the only supported case.\n"
-                "- Do NOT embed environment-specific actions (no 'Action: Operation' output here unless the tool_category is formatter).\n"
-                "- Do NOT return constant outputs; outputs must meaningfully vary for distinct inputs.\n"
-                "\n"
-                "TOOL CATEGORIES (tool_category MUST be one of):\n"
-                "1) parser      - Extract structured fields from task text (tables, columns, limits, offsets, intent).\n"
-                "2) normalizer  - Convert raw task text into a canonical normalized representation to improve retrieval/reuse.\n"
-                "3) planner     - Produce a structured plan (steps + required mode) WITHOUT solving the task directly.\n"
-                "4) validator   - Validate correctness/invariants of a candidate output (format, intent, safety checks).\n"
-                "5) linter      - Static checks + common mistake detection; may propose fixed variants.\n"
-                "6) formatter   - Produce exact required output strings given structured inputs (no extra text).\n"
-                "\n"
-                "TOOL TYPE (tool_type MUST be one of):\n"
-                "- utility, validator, linter, formatter\n"
-                "(Use validator/linter/formatter when appropriate; otherwise utility.)\n"
-                "\n"
-                "INPUT/OUTPUT CONTRACTS:\n"
-                "- input_schema MUST be a JSON-schema-like object describing required properties.\n"
-                "- run() MUST validate required fields and return structured outputs (dict/str) appropriate to the category.\n"
-                "- Prefer returning dicts with explicit fields over freeform text.\n"
-                "\n"
-                "QUALITY REQUIREMENTS:\n"
-                "- Include a module docstring describing purpose and how it composes with other tools.\n"
-                "- Include a run() docstring with at least 2 short usage examples.\n"
-                "- Include self_test() with 3+ tests:\n"
-                "  (a) two distinct 'good' inputs, (b) one 'bad' input, (c) assert meaningful invariants.\n"
-                "- self_test() must return True only if all assertions pass.\n"
-                "- Deterministic behavior; no randomness unless explicitly justified.\n"
-                "\n"
-                "DEFAULT OUTPUT SHAPES BY CATEGORY:\n"
-                "- parser/normalizer/planner: return dict with stable keys.\n"
-                "- validator/linter: return dict with keys like valid(bool), errors(list[str]), warnings(list[str]), fixed(optional).\n"
-                "- formatter: return a single string in the exact target format with no extra text.\n"
             ),
-
             # CHANGE: toolgen gets a smaller cap + stop sequence
             inference_config_dict={
                 **(dict(inference_config_dict) if inference_config_dict else {}),
@@ -191,7 +116,6 @@ class SelfEvolvingController(Agent):
         self._tool_invocation_attempts = 0
         self._tool_invocation_successes = 0
         self._environment_label = environment_label
-        self._toolgen_attempted_queries: set[str] = set()
         if hasattr(self._registry, "set_canonical_naming"):
             self._registry.set_canonical_naming(self._canonical_tool_naming)
 
@@ -226,7 +150,6 @@ class SelfEvolvingController(Agent):
             "answer_guard": {
                 "name_hint": "answer_guard",
                 "tool_type": "validator",
-                "tool_category": "validator",
                 "signature": "run(task_text: str, last_sql: str | None = None, last_db_response: object | None = None) -> dict",
                 "input_schema": {
                     "type": "object",
@@ -237,23 +160,18 @@ class SelfEvolvingController(Agent):
                     },
                     "required": ["task_text"],
                 },
-                "capabilities": [
-                    "classify_task_intent",
-                    "final_answer_format_guard",
-                    "select_result_passthrough",
-                ],
+                "capabilities": ["classify_task_intent", "can_submit_check", "final_answer_exact_format"],
                 "requirements": [
-                    "Detect whether task intent is SELECT vs mutation (INSERT/UPDATE/DELETE) from task_text.",
-                    "If last_sql starts with SELECT, final_answer MUST be exactly repr(last_db_response).",
-                    "Return a dict with keys: can_submit(bool), final_answer(str), reason(str), intent(str).",
-                    "Never raise; on error return can_submit=False with a reason.",
-                    "Use stdlib only; keep logic general across many DB tasks.",
+                    "Detect mutation vs query tasks from task_text (INSERT/UPDATE/DELETE vs SELECT intent).",
+                    "If last_sql begins with SELECT, final_answer MUST be exactly last_db_response (verbatim repr).",
+                    "If mutation task and last_db_response is [], allow submission with final_answer = [].",
+                    "Return dict with keys: can_submit(bool), final_answer(str), reason(str), intent(str).",
+                    "No external deps; stdlib only."
                 ],
             },
             "sql_static_check": {
                 "name_hint": "sql_static_check",
                 "tool_type": "linter",
-                "tool_category": "linter",
                 "signature": "run(table_name: str, headers: list[str], sql: str) -> dict",
                 "input_schema": {
                     "type": "object",
@@ -264,24 +182,17 @@ class SelfEvolvingController(Agent):
                     },
                     "required": ["table_name", "headers", "sql"],
                 },
-                "capabilities": [
-                    "single_line_sql_check",
-                    "unknown_column_detection",
-                    "table_name_sanity_check",
-                ],
+                "capabilities": ["schema_sanity_checks", "common_sql_mistake_detection"],
                 "requirements": [
-                    "Validate sql is a single line (no '\\n' characters).",
-                    "Check referenced columns in simple SELECT/INSERT patterns are a subset of headers (best-effort heuristics).",
-                    "Check table_name appears to match expected table (best-effort).",
-                    "Return dict with keys: valid(bool), errors(list[str]), warnings(list[str]), fixed_sql(optional str).",
-                    "If you propose fixed_sql, keep it semantically close and still single-line.",
-                    "Use stdlib only; keep logic general.",
+                    "Check referenced table_name matches.",
+                    "Check column names used in INSERT/SELECT are subset of headers.",
+                    "Check SQL is single-line (no newline chars).",
+                    "Return dict with keys: valid(bool), errors(list[str]), fixed_sql(optional str)."
                 ],
             },
             "final_output_formatter": {
                 "name_hint": "final_output_formatter",
                 "tool_type": "formatter",
-                "tool_category": "formatter",
                 "signature": "run(mode: str, sql: str | None = None, final_answer: object | None = None) -> str",
                 "input_schema": {
                     "type": "object",
@@ -292,42 +203,22 @@ class SelfEvolvingController(Agent):
                     },
                     "required": ["mode"],
                 },
-                "capabilities": [
-                    "emit_exact_action_block",
-                    "emit_sql_fence",
-                    "emit_final_answer_line",
-                ],
+                "capabilities": ["exact_action_block_formatting"],
                 "requirements": [
                     "For Operation: output exactly:\nAction: Operation\\n```sql\\n<ONE LINE SQL>\\n```",
                     "For Answer: output exactly:\nAction: Answer\\nFinal Answer: <repr(final_answer)>",
-                    "Never add extra text outside the required format.",
-                    "If mode=Operation and sql is missing/empty, return an error string explaining missing sql (still no extra formatting).",
+                    "Never add extra text.",
                 ],
             },
             "general_helper": {
                 "name_hint": "general_helper",
                 "tool_type": "utility",
-                "tool_category": "parser",
-                "signature": "run(task_text: str) -> dict",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"task_text": {"type": "string"}},
-                    "required": ["task_text"],
-                },
-                "capabilities": [
-                    "extract_intent",
-                    "extract_constraints",
-                    "extract_table_and_headers_when_present",
-                ],
-                "requirements": [
-                    "Parse task_text and extract a small structured dict: intent, table_name (if present), limit/offset (if present), and any mentioned columns (best-effort).",
-                    "Return stable keys even when fields are missing (use None).",
-                    "Use stdlib only; keep it general across tasks.",
-                ],
+                "signature": "run(task_text: str) -> str",
+                "input_schema": {"type": "object", "properties": {"task_text": {"type": "string"}}, "required": ["task_text"]},
+                "capabilities": ["general_parsing"],
+                "requirements": ["Keep it reusable; stdlib only."],
             },
         }
-
-
 
         spec = archetype_specs.get(archetype, archetype_specs["general_helper"])
 
@@ -342,10 +233,9 @@ class SelfEvolvingController(Agent):
             f"{query}\n"
             "\n"
             "You MUST output a single JSON or YAML mapping ONLY with keys:\n"
-            "name, description, signature, code_lines, tool_type, tool_category, input_schema, capabilities.\n"
+            "name, description, signature, code_lines, tool_type, input_schema, capabilities.\n"
             "\n"
             f"REQUIRED tool_type: {spec['tool_type']}\n"
-            f"REQUIRED tool_category: {spec['tool_category']}\n"
             f"REQUIRED signature: {spec['signature']}\n"
             f"REQUIRED input_schema: {json.dumps(spec['input_schema'], ensure_ascii=True)}\n"
             f"REQUIRED capabilities: {json.dumps(spec['capabilities'], ensure_ascii=True)}\n"
@@ -379,14 +269,6 @@ class SelfEvolvingController(Agent):
 
         print("[SelfEvolvingController] Unable to read ChatHistory via supported methods; skipping.")
         return []
-
-    def _clone_history(self, chat_history: ChatHistory) -> ChatHistory:
-        cloned = ChatHistory()
-        for item in self._history_items(chat_history):
-            cloned = self._safe_inject(
-                cloned, ChatHistoryItem(role=item.role, content=item.content)
-            )
-        return cloned
 
 
     def _prune_for_current_task(self, chat_history: ChatHistory) -> ChatHistory:
@@ -474,40 +356,21 @@ class SelfEvolvingController(Agent):
     def _augment_system_prompt(self, toolbelt: str) -> str:
         tool_rules = (
             "\n\nTOOL USE RULES:\n"
-            "- First consider whether any tool in the TOOLBELT can help with the task.\n"
-            "- If no available tool is adequate, consider creating a NEW reusable tool.\n"
-            "- Emit <internal_tool> blocks when you truly need a tool.\n"
+            "- Prefer existing tools from TOOLBELT when they help.\n"
+            "- Only emit <internal_tool> blocks when you truly need a tool.\n"
             "- Internal tool calls are NOT environment actions.\n"
             "- Keep the environment-required action format unchanged.\n"
             "\nINTERNAL TOOL CALL FORMAT:\n"
-            "<internal_tool name=\"tool_name\">"
-            "{ \"args\": [...], \"kwargs\": { ... } }"
-            "</internal_tool>\n"
-            "\nCREATE_TOOL FORMAT (MUST MATCH TOOLGEN CONTRACT):\n"
-            "<internal_tool name=\"create_tool\">"
-            "{ "
-            "\"name\": \"lowercase_snake_case\", "
-            "\"description\": \"short summary\", "
-            "\"signature\": \"run(...) -> ...\", "
-            "\"tool_type\": \"utility|validator|linter|formatter\", "
-            "\"tool_category\": \"parser|normalizer|planner|validator|linter|formatter\", "
-            "\"input_schema\": {\"type\":\"object\",\"properties\":{...},\"required\":[...]}, "
-            "\"capabilities\": [\"capability_a\", \"capability_b\"], "
-            "\"code_lines\": [\"line 1\", \"line 2\", \"...\"] "
-            "}"
-            "</internal_tool>\n"
-            "\nNOTES:\n"
-            "- Output ONLY the <internal_tool> block when calling tools.\n"
-            "- code_lines must join into valid Python; stdlib only.\n"
+            "<internal_tool name=\"tool_name\">{ \"args\": [...], \"kwargs\": { ... } }</internal_tool>\n"
+            "<internal_tool name=\"create_tool\">{ \"name\": \"...\", \"description\": \"...\", \"signature\": \"...\", \"code_lines\": [...] }</internal_tool>\n"
         )
-
-        # if self._environment_label == "db_bench":
-        #     tool_rules += (
-        #         "\nDB_BENCH POLICY:\n"
-        #         "- Before emitting 'Action: Answer', prefer calling internal tool 'answer_guard' if available.\n"
-        #         "- If your last SQL was SELECT, Final Answer MUST equal the raw DB response exactly.\n"
-        #         "- If task is INSERT/UPDATE/DELETE and DB response is [], you may submit Final Answer: [].\n"
-        #     )
+        if self._environment_label == "db_bench":
+            tool_rules += (
+                "\nDB_BENCH POLICY:\n"
+                "- Before emitting 'Action: Answer', prefer calling internal tool 'answer_guard' if available.\n"
+                "- If your last SQL was SELECT, Final Answer MUST equal the raw DB response exactly.\n"
+                "- If task is INSERT/UPDATE/DELETE and DB response is [], you may submit Final Answer: [].\n"
+            )
 
         sections: list[str] = []
         if self._include_registry_in_prompt:
@@ -518,40 +381,6 @@ class SelfEvolvingController(Agent):
             sections.append(toolbelt)
         sections.append(tool_rules.strip())
         return (self._solver_system_prompt or "") + "\n\n" + "\n\n".join(sections)
-
-    def _consider_tool_generation(
-        self, query: str, chat_history: ChatHistory
-    ) -> Optional[ToolMetadata]:
-        if not query.strip():
-            return None
-        if not self._force_tool_generation_if_missing:
-            return None
-        normalized = (
-            self._normalize_retrieval_query(query)
-            if hasattr(self, "_normalize_retrieval_query")
-            else query.strip()
-        )
-        if not normalized or normalized in self._toolgen_attempted_queries:
-            return None
-        self._toolgen_attempted_queries.add(normalized)
-
-        tools = (
-            self._registry.list_latest_tools()
-            if hasattr(self._registry, "list_latest_tools")
-            else self._registry.list_tools()
-        )
-        retrieved = retrieve_tools(
-            normalized,
-            list(tools),
-            top_k=1,
-            min_reliability=self._reuse_min_reliability,
-        )
-        if retrieved:
-            best = retrieved[0]
-            if best.score >= self._reuse_similarity_threshold:
-                return best.tool
-
-        return self._maybe_generate_tool_for_query(query, chat_history)
 
     def _parse_internal_tool_call(
         self, content: str
@@ -601,11 +430,9 @@ class SelfEvolvingController(Agent):
                         signature=spec.signature,
                         description=spec.description,
                         tool_type=spec.tool_type,
-                        tool_category=spec.tool_category,   # <-- ADD (after you update register_tool)
                         input_schema=spec.input_schema,
                         capabilities=spec.capabilities,
                     )
-
                     if metadata:
                         self._registry.record_validation_result(
                             metadata.name, True, self_test_passed=result.self_test_passed
@@ -648,28 +475,20 @@ class SelfEvolvingController(Agent):
         payload: Mapping[str, Any],
         chat_history: ChatHistory,
     ) -> ToolResult:
-        # Parse error from <internal_tool> payload extraction
         if "_parse_error" in payload:
             return ToolResult.failure(str(payload.get("_parse_error")))
-
-        # CREATE_TOOL: route through the same validation/registration pipeline
-        # so tool_category + input_schema gates always apply.
         if tool_name == "create_tool":
-            metadata = self._register_tool_from_payload(payload, chat_history)
+            spec = ToolSpec.from_payload(dict(payload))
+            metadata = self._validate_and_register_tool(spec, chat_history)
             if metadata:
                 return ToolResult.success_result(
                     {"created_tool": metadata.name, "description": metadata.description}
                 )
             return ToolResult.failure("Tool creation failed validation.")
 
-        # Resolve canonical name (if your registry supports it)
         resolved_name = (
-            self._registry.resolve_name(tool_name)
-            if hasattr(self._registry, "resolve_name")
-            else None
+            self._registry.resolve_name(tool_name) if hasattr(self._registry, "resolve_name") else None
         )
-
-        # If tool isn't found, optionally auto-generate a tool for the current query
         if resolved_name is None and not self._registry.has_tool(tool_name):
             last_user = self._get_last_user_item(chat_history)
             query = last_user.content if last_user else ""
@@ -677,35 +496,26 @@ class SelfEvolvingController(Agent):
                 created = self._maybe_generate_tool_for_query(query, chat_history)
                 if created:
                     resolved_name = created.name
-
-        # Still not found -> fail
         if resolved_name is None and not self._registry.has_tool(tool_name):
             return ToolResult.failure(
                 f"Tool '{tool_name}' not found. Use create_tool or answer directly."
             )
 
-        # Extract args/kwargs
         tool_args = payload.get("args", [])
         tool_kwargs = payload.get("kwargs", {})
-
-        # If caller passed a single dict as args[0], treat it as kwargs.
+        # If caller passed a single dict as args[0], treat it as kwargs for typed tools.
         if len(tool_args) == 1 and isinstance(tool_args[0], dict) and not tool_kwargs:
             tool_kwargs = dict(tool_args[0])
             tool_args = []
 
-        # Defensive normalization
         if not isinstance(tool_args, list):
             tool_args = []
         if not isinstance(tool_kwargs, dict):
             tool_kwargs = {}
-
-        # Default behavior: if no args were given, pass last user message content
         if not tool_args and not tool_kwargs:
             last_user = self._get_last_user_item(chat_history)
             if last_user and last_user.content:
                 tool_args = [last_user.content]
-
-        # Invoke tool
         self._tool_invocation_attempts += 1
         result = self._registry.invoke_tool(
             resolved_name or tool_name,
@@ -716,42 +526,6 @@ class SelfEvolvingController(Agent):
         if result.success:
             self._tool_invocation_successes += 1
         return result
-
-
-
-    def _normalize_retrieval_query(self, query: str) -> str:
-        q = (query or "").strip()
-        if not q:
-            return ""
-
-        # Keep the *actual task* lines; drop long boilerplate instructions
-        # Heuristic: keep last ~40 lines and remove lines that look like meta-instructions.
-        lines = q.splitlines()
-        tail = lines[-40:]  # keep the most recent / relevant
-        drop_prefixes = (
-            "i will ask you a question",
-            "you have to explain",
-            "after thinking",
-            "to do operation",
-            "you must put sql",
-            "every time you",
-            "if the sql",
-            "if you have obtain",
-            "we note that",
-            "once you commit",
-            "now, i will give you",
-        )
-
-        kept = []
-        for line in tail:
-            l = line.strip().lower()
-            if any(l.startswith(p) for p in drop_prefixes):
-                continue
-            kept.append(line.strip())
-
-        # limit length to avoid matching on huge schemas
-        compact = "\n".join([x for x in kept if x])[:1200]
-        return compact
 
     # ---------- parsing creation payload robustly ----------
     def _parse_creation_payload(self, payload: str) -> Optional[Mapping[str, Any]]:
@@ -944,12 +718,6 @@ class SelfEvolvingController(Agent):
             print("[SelfEvolvingController] Missing input_schema for typed tool; skipping.")
             return None
 
-        tool_category = creation_request.get("tool_category")
-        allowed_categories = {"parser", "normalizer", "planner", "validator", "linter", "formatter"}
-        if tool_category not in allowed_categories:
-            print(f"[SelfEvolvingController] Missing/invalid tool_category={tool_category}; skipping.")
-            return None
-
         spec = ToolSpec.from_payload(dict(creation_request))
         metadata = self._validate_and_register_tool(spec, chat_history)
         if metadata:
@@ -957,16 +725,7 @@ class SelfEvolvingController(Agent):
             # print(f"[SelfEvolvingController] Registered tool '{metadata.name}'.")
         return metadata
 
-
-    def _expected_tool_type_for_archetype(self, archetype: str) -> Optional[str]:
-        return {
-            "answer_guard": "validator",
-            "sql_static_check": "linter",
-            "final_output_formatter": "formatter",
-            "general_helper": "utility",
-        }.get(archetype)
-
-    def _reuse_existing_tool(self, query: str, needed_archetype: Optional[str] = None) -> Optional[ToolMetadata]:
+    def _reuse_existing_tool(self, query: str) -> Optional[ToolMetadata]:
         tools = (
             self._registry.list_latest_tools()
             if hasattr(self._registry, "list_latest_tools")
@@ -981,23 +740,6 @@ class SelfEvolvingController(Agent):
         if not retrieved:
             return None
         best = retrieved[0]
-        if needed_archetype:
-            expected_type = self._expected_tool_type_for_archetype(needed_archetype)
-            if expected_type and (best.tool.tool_type or "") != expected_type:
-                print(
-                    "[SelfEvolvingController] Reuse gate skipped: "
-                    f"tool_type='{best.tool.tool_type}' != expected='{expected_type}'"
-                )
-                return None
-
-        if getattr(best.tool, "self_test_passed", True) is False:
-            print("[SelfEvolvingController] Reuse gate skipped: self_test failed.")
-            return None
-        if getattr(best.tool, "reliability_score", 0.0) < 0.4:
-            print("[SelfEvolvingController] Reuse gate skipped: low reliability.")
-            return None
-
-
         if best.score < self._reuse_similarity_threshold:
             print(
                 "[SelfEvolvingController] Reuse gate skipped: "
@@ -1015,167 +757,35 @@ class SelfEvolvingController(Agent):
             f"tool='{best.tool.name}' score={best.score:.3f}."
         )
         return best.tool
-    
-    def _get_archetype_specs(self) -> dict[str, dict[str, Any]]:
-        return {
-            "answer_guard": {
-                "name_hint": "answer_guard",
-                "tool_type": "validator",
-                "tool_category": "validator",
-                "signature": "run(task_text: str, last_sql: str | None = None, last_db_response: object | None = None) -> dict",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "task_text": {"type": "string"},
-                        "last_sql": {"type": ["string", "null"]},
-                        "last_db_response": {},
-                    },
-                    "required": ["task_text"],
-                },
-                "capabilities": [
-                    "classify_task_intent",
-                    "final_answer_format_guard",
-                    "select_result_passthrough",
-                ],
-                "requirements": [
-                    "Detect whether task intent is SELECT vs mutation (INSERT/UPDATE/DELETE) from task_text.",
-                    "If last_sql starts with SELECT, final_answer MUST be exactly repr(last_db_response).",
-                    "Return a dict with keys: can_submit(bool), final_answer(str), reason(str), intent(str).",
-                    "Never raise; on error return can_submit=False with a reason.",
-                    "Use stdlib only; keep logic general across many DB tasks.",
-                ],
-            },
-            "sql_static_check": {
-                "name_hint": "sql_static_check",
-                "tool_type": "linter",
-                "tool_category": "linter",
-                "signature": "run(table_name: str, headers: list[str], sql: str) -> dict",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "table_name": {"type": "string"},
-                        "headers": {"type": "array", "items": {"type": "string"}},
-                        "sql": {"type": "string"},
-                    },
-                    "required": ["table_name", "headers", "sql"],
-                },
-                "capabilities": [
-                    "single_line_sql_check",
-                    "unknown_column_detection",
-                    "table_name_sanity_check",
-                ],
-                "requirements": [
-                    "Validate sql is a single line (no '\\n' characters).",
-                    "Check referenced columns in simple SELECT/INSERT patterns are a subset of headers (best-effort heuristics).",
-                    "Check table_name appears to match expected table (best-effort).",
-                    "Return dict with keys: valid(bool), errors(list[str]), warnings(list[str]), fixed_sql(optional str).",
-                    "If you propose fixed_sql, keep it semantically close and still single-line.",
-                    "Use stdlib only; keep logic general.",
-                ],
-            },
-            "final_output_formatter": {
-                "name_hint": "final_output_formatter",
-                "tool_type": "formatter",
-                "tool_category": "formatter",
-                "signature": "run(mode: str, sql: str | None = None, final_answer: object | None = None) -> str",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "mode": {"type": "string", "enum": ["Operation", "Answer"]},
-                        "sql": {"type": ["string", "null"]},
-                        "final_answer": {},
-                    },
-                    "required": ["mode"],
-                },
-                "capabilities": [
-                    "emit_exact_action_block",
-                    "emit_sql_fence",
-                    "emit_final_answer_line",
-                ],
-                "requirements": [
-                    "For Operation: output exactly:\nAction: Operation\\n```sql\\n<ONE LINE SQL>\\n```",
-                    "For Answer: output exactly:\nAction: Answer\\nFinal Answer: <repr(final_answer)>",
-                    "Never add extra text outside the required format.",
-                    "If mode=Operation and sql is missing/empty, return an error string explaining missing sql (still no extra formatting).",
-                ],
-            },
-            "general_helper": {
-                "name_hint": "general_helper",
-                "tool_type": "utility",
-                "tool_category": "parser",
-                "signature": "run(task_text: str) -> dict",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"task_text": {"type": "string"}},
-                    "required": ["task_text"],
-                },
-                "capabilities": [
-                    "extract_intent",
-                    "extract_constraints",
-                    "extract_table_and_headers_when_present",
-                ],
-                "requirements": [
-                    "Parse task_text and extract a small structured dict: intent, table_name (if present), limit/offset (if present), and any mentioned columns (best-effort).",
-                    "Return stable keys even when fields are missing (use None).",
-                    "Use stdlib only; keep it general across tasks.",
-                ],
-            },
-        }
 
 
-
-    def _find_existing_singleton(self, tool_category: str, tool_type: str | None) -> Optional[ToolMetadata]:
-        tools = self._registry.list_latest_tools() if hasattr(self._registry, "list_latest_tools") else self._registry.list_tools()
-        candidates = []
-        for t in tools:
-            if (getattr(t, "tool_category", None) == tool_category) and ((tool_type is None) or (t.tool_type == tool_type)):
-                candidates.append(t)
-        if not candidates:
-            return None
-        # Prefer the most reliable one
-        candidates.sort(key=lambda x: (x.reliability_score, x.usage_count), reverse=True)
-        return candidates[0]
-
-    def _maybe_generate_tool_for_query(self, query: str, chat_history: ChatHistory) -> Optional[ToolMetadata]:
+    def _maybe_generate_tool_for_query(
+        self, query: str, chat_history: ChatHistory
+    ) -> Optional[ToolMetadata]:
         if not query.strip():
             return None
-
-        # Always compute first (used by reuse gating + toolgen)
-        archetype = self._infer_tool_archetype(query)
-        archetype_specs = self._get_archetype_specs()
-        spec = archetype_specs.get(archetype, archetype_specs["general_helper"])
-        singleton = self._find_existing_singleton(spec["tool_category"], spec["tool_type"])
-        if singleton is not None:
-            return singleton
-
-
-        # Optional: exploration budget (if you added it)
-        self._tasks_seen = getattr(self, "_tasks_seen", 0) + 1
-        explore_every = getattr(self, "_explore_every_n_tasks", 0)  # 0 means disabled
-        force_explore = (explore_every and self._tasks_seen % explore_every == 0)
-
-        # Reuse gate (skip if forcing exploration)
-        if not force_explore:
-            reuse_query = self._normalize_retrieval_query(query) if hasattr(self, "_normalize_retrieval_query") else query
-            reuse = self._reuse_existing_tool(reuse_query, needed_archetype=archetype)
-            if reuse is not None:
-                return reuse
-
+        reuse = self._reuse_existing_tool(query)
+        if reuse is not None:
+            return reuse
         if not self._force_tool_generation_if_missing:
             return None
         if self._generated_tool_counter >= self._max_generated_tools_per_run:
             return None
 
+        archetype = self._infer_tool_archetype(query)
         prompt = self._toolgen_request_prompt(archetype, query)
+
         tool_history = ChatHistory()
-        tool_history = self._safe_inject(tool_history, ChatHistoryItem(role=Role.USER, content=prompt))
+        tool_history = self._safe_inject(
+            tool_history, ChatHistoryItem(role=Role.USER, content=prompt)
+        )
         response = self._toolgen_agent._inference(tool_history)
 
         creation_request = self._extract_toolgen_payload(response.content)
         if not creation_request:
+            # print("[SelfEvolvingController] No tool creation payload; ignoring.")
             return None
         return self._register_tool_from_payload(creation_request, chat_history)
-
 
     def _select_tool_for_query(self, query: str) -> Optional[ToolMetadata]:
         tools = []
@@ -1297,7 +907,6 @@ class SelfEvolvingController(Agent):
             signature = str(tool.get("signature") or "run(task_text: str) -> str")
             code = str(tool.get("code") or "")
             tool_type = tool.get("tool_type")
-            tool_category = tool.get("tool_category")
             input_schema = tool.get("input_schema")
             capabilities = tool.get("capabilities")
             metadata = self._registry.register_tool(
@@ -1306,7 +915,6 @@ class SelfEvolvingController(Agent):
                 signature=signature,
                 description=description,
                 tool_type=str(tool_type) if tool_type is not None else None,
-                tool_category=str(tool_category) if tool_category is not None else None,
                 input_schema=input_schema,
                 capabilities=capabilities,
             )
@@ -1331,88 +939,28 @@ class SelfEvolvingController(Agent):
 
         return h.inject(item) or h
 
-
-    def _is_parseable_env_output(self, text: str) -> bool:
-        t = (text or "").strip()
-        if not t:
-            return False
-        if self._parse_internal_tool_call(t):
-            return True
-        if t.startswith("Action:"):
-            return True
-        if t.startswith("Final Answer:"):
-            return True
-        return False
-
-    def _is_wrapper_parse_error_prompt(self, text: str) -> bool:
-        if not text:
-            return False
-        return "Your last response was not parseable" in text and "Bad output was:" in text
-
-    def _extract_bad_output(self, text: str) -> Optional[str]:
-        if not text:
-            return None
-        match = re.search(r"Bad output was:\s*([\\s\\S]+)$", text.strip())
-        if not match:
-            return None
-        raw = match.group(1).strip()
-        if (raw.startswith("'") and raw.endswith("'")) or (raw.startswith('"') and raw.endswith('"')):
-            raw = raw[1:-1]
-        try:
-            return bytes(raw, "utf-8").decode("unicode_escape")
-        except Exception:
-            return raw
-
     def _inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
-        if self._use_packaged_agent and self._packaged_shim is not None:
-            return self._packaged_shim.inference(chat_history)
-        working_history = self._clone_history(self._prune_for_current_task(chat_history))
+        working_history = self._prune_for_current_task(chat_history)
         for _ in range(self._internal_tool_max_steps):
             last_user = self._get_last_user_item(working_history)
             query = last_user.content if last_user else ""
-            # Never inject one-line parse repair constraints; recover deterministically
-            # from wrapper prompts and retry once with the original required format.
-            if last_user and self._is_wrapper_parse_error_prompt(last_user.content):
-                recovered = self._extract_bad_output(last_user.content)
-                if recovered:
-                    return ChatHistoryItem(role=Role.AGENT, content=recovered)
-            self._consider_tool_generation(query, working_history)
             toolbelt = self._build_toolbelt(query or "")
             system_prompt = self._augment_system_prompt(toolbelt)
             try:
                 solver_response = self._solver_inference_with_retry(
                     working_history, system_prompt=system_prompt
                 )
-            except LanguageModelContextLimitException as e:
-                raise AgentContextLimitException(str(e)) from e
-            except LanguageModelOutOfMemoryException as e:
-                raise AgentOutOfMemoryException(str(e)) from e
-            except LanguageModelUnknownException as e:
-                raise AgentUnknownException(str(e)) from e
+            except AgentContextLimitError as e:
+                raise AgentContextLimitError(str(e)) from e
+            except AgentOutOfMemoryError as e:
+                raise AgentOutOfMemoryError(str(e)) from e
+            except AgentUnknownError as e:
+                raise AgentUnknownError(str(e)) from e
 
             internal = self._parse_internal_tool_call(solver_response.content)
             if internal is None:
-                if not self._is_parseable_env_output(solver_response.content):
-                    soft_retry_msg = (
-                        "Output using the required environment format "
-                        "(e.g., Act: bash + fenced block / Action: Operation + fenced sql). "
-                        "Output only that."
-                    )
-                    working_history = self._safe_inject(
-                        working_history, ChatHistoryItem(role=Role.USER, content=soft_retry_msg)
-                    )
-                    solver_response = self._solver_inference_with_retry(
-                        working_history, system_prompt=system_prompt
-                    )
-                    internal = self._parse_internal_tool_call(solver_response.content)
-                    if internal is None and not self._is_parseable_env_output(
-                        solver_response.content
-                    ):
-                        return ChatHistoryItem(
-                            role=Role.AGENT, content=solver_response.content
-                        )
                 return ChatHistoryItem(
-                    role=Role.AGENT, content=solver_response.content
+                    role=solver_response.role, content=solver_response.content
                 )
 
             tool_name, payload = internal
@@ -1433,8 +981,5 @@ class SelfEvolvingController(Agent):
             content="Action: Answer\nFinal Answer: Unable to complete due to internal tool loop.",
         )
 
-    @override
     def get_role_dict(self) -> Mapping[Role, str]:
-        if self._use_packaged_agent and self._packaged_shim is not None:
-            return self._packaged_shim.get_role_dict()
         return self._language_model_agent.get_role_dict()

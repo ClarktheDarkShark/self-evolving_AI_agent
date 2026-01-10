@@ -13,6 +13,10 @@ from src.typings import (
     Session,
     AgentOutOfMemoryException,
 )
+from src.language_models.inference_context import (
+    set_inference_context,
+    clear_inference_context,
+)
 
 
 class Agent(ABC):
@@ -22,6 +26,11 @@ class Agent(ABC):
         chat_history = session.chat_history
         assert chat_history.get_item_deep_copy(-1).role == Role.USER
         try:
+            set_inference_context(
+                task_name=str(session.task_name),
+                sample_index=str(session.sample_index),
+                chat_history_len=chat_history.get_value_length(),
+            )
             chat_history_item = self._inference(chat_history)
         except AgentException as e:
             session.finish_reason = str(e)
@@ -40,6 +49,8 @@ class Agent(ABC):
             session.finish_reason = str(AgentUnknownException.from_exception(e))
             session.sample_status = SampleStatus.AGENT_UNKNOWN_ERROR
             chat_history_item = ChatHistoryItem(role=Role.AGENT, content="")
+        finally:
+            clear_inference_context()
         session.chat_history.inject(chat_history_item)
 
     @abstractmethod

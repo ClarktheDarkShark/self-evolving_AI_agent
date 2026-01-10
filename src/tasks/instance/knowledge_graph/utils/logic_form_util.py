@@ -303,11 +303,12 @@ class LogicFormUtil:
             clauses.append(f"FILTER (?x != ns:{entity})")
         clauses.insert(
             0,
-            f"FILTER (!isLiteral(?x) OR lang(?x) = '' OR langMatches(lang(?x), 'en'))",
+            "FILTER (!isLiteral(?x) || lang(?x) = '' || langMatches(lang(?x), 'en'))",
         )
+
         clauses.insert(0, "WHERE {")
         if count:
-            clauses.insert(0, f"SELECT COUNT DISTINCT ?x")
+            clauses.insert(0, "SELECT (COUNT(DISTINCT ?x) AS ?count)")
         elif superlative:
             clauses.insert(0, "{SELECT ?sk0")
             clauses = arg_clauses + clauses

@@ -15,6 +15,7 @@ from src.typings import (
     LoggerConfig,
     ContinualAgentBenchException,
     Session,
+    SessionEvaluationOutcome,
     SampleIndex,
     PathConfig,
     GeneralInstanceFactory,
@@ -336,6 +337,12 @@ def main() -> None:
     logger = SingletonLogger.get_instance(logger_config)
     coredumpy.patch_except(directory=path_config.coredumpy_output_dir)
     # endregion
+    # region Configure model output logging path
+    os.environ.setdefault(
+        "LIFELONG_MODEL_OUTPUT_PATH",
+        os.path.join(assignment_config.output_dir, "model_outputs.jsonl"),
+    )
+    # endregion
     # region Construct variable, valid config
     config_utility.preprocess()
     task, agent, callback_dict = config_utility.construct()
@@ -436,6 +443,38 @@ def main() -> None:
         indent=2,
     )
     logger.info(f"Metric file has been saved to {assignment_config.output_dir}.")
+    # Write a simple per-task outcome summary for quick review.
+    completed_count = 0
+    not_completed_count = 0
+    outcome_rows = []
+    for session in session_list:
+        completed = session.sample_status == SampleStatus.COMPLETED
+        if completed:
+            completed_count += 1
+        else:
+            not_completed_count += 1
+        outcome_rows.append(
+            {
+                "sample_index": session.sample_index,
+                "task_name": str(session.task_name),
+                "completed": completed,
+                "correct": session.evaluation_record.outcome
+                == SessionEvaluationOutcome.CORRECT,
+                "outcome": str(session.evaluation_record.outcome),
+                "not_completed_reason": None
+                if completed
+                else (session.finish_reason or str(session.sample_status)),
+            }
+        )
+    task_summary = {
+        "total_samples": len(session_list),
+        "completed_count": completed_count,
+        "not_completed_count": not_completed_count,
+        "results": outcome_rows,
+    }
+    summary_path = os.path.join(assignment_config.output_dir, "task_outcomes.json")
+    json.dump(task_summary, open(summary_path, "w"), indent=2)  # noqa
+    logger.info("Task outcome summary saved to %s.", summary_path)
     # endregion
     # region Release
     task.release()
