@@ -15,6 +15,10 @@ assignment_config:
       language_model: gpt-oss:20b-64k
       tool_registry_path: outputs/tool_library
       max_generated_tools_per_run: 30
+      environment_label: os_interaction
+      system_prompt: |
+        You are a helpful assistant. You can generate a new tool that will to assist with your task or call an internal tools using <internal_tool> blocks when helpful.
+        Always respect the environment's required output format.
       force_tool_generation_if_missing: true
       tool_match_min_score: 0.20
       include_registry_in_prompt: true
@@ -36,7 +40,9 @@ agent_dict:
       language_model: "Fill the parameter 'language_model_name' in assignment config."
       tool_registry_path: "outputs/tool_library"
       max_generated_tools_per_run: 3
-      system_prompt: ""               # keep whatever you already have here
+      system_prompt: |
+        You are a helpful assistant. You may generate a new tool to assist with your task or call an internal tools using <internal_tool> blocks when helpful.
+        Always respect the environment's required output format.
       inference_config_dict: {}
 
       # ADD THESE (so custom_parameters can override them)
@@ -47,5 +53,6 @@ agent_dict:
       reuse_top_k: 3
       reuse_similarity_threshold: 0.20
       reuse_min_reliability: 0.0
+      environment_label: "unknown"
       canonical_tool_naming: true
       use_packaged_agent: false

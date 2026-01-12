@@ -5,6 +5,7 @@ from typing import Any, Mapping, Optional
 
 from src.callbacks import Callback, CallbackArguments
 from src.typings import Role
+from src.utils.output_paths import prefix_filename
 
 from .tool_registry import get_registry
 
@@ -28,7 +29,7 @@ class GeneratedToolLoggingCallback(Callback):
         # callback_state/<id> -> outputs/<run>
         state_dir = self.get_state_dir()
         run_dir = os.path.abspath(os.path.join(state_dir, os.pardir, os.pardir))
-        return os.path.join(run_dir, self._log_filename)
+        return os.path.join(run_dir, prefix_filename(self._log_filename))
 
     def _append_log(self, payload: Mapping[str, Any]) -> None:
         log_path = self._get_log_path()

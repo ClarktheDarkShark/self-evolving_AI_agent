@@ -5,6 +5,7 @@ self_evolving_agent:
     tool_registry_path: "outputs/tool_library"
     max_generated_tools_per_run: 3
     use_packaged_agent: false
+    environment_label: "unknown"
     system_prompt: "You are a useful assistant."
     # system_prompt: |
     #     You are a protocol-following agent for interactive benchmarks.

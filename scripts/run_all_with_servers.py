@@ -18,9 +18,9 @@ from pathlib import Path
 import kg_sparql_server
 
 CONFIG_PATHS = [
+    "configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/standard.yaml",
     "configs/assignments/experiments/llama_31_8b_instruct/instance/db_bench/instance/standard.yaml",
     "configs/assignments/experiments/llama_31_8b_instruct/instance/os_interaction/instance/standard.yaml",
-    "configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/standard.yaml",
     
 ]
 
@@ -126,6 +126,15 @@ def _tail_file(path: Path, n_lines: int = 200) -> str:
 
 def _sanitize_log_name(config_path: str) -> str:
     return config_path.replace("/", "_").replace(".yaml", "") + ".log"
+
+
+def _extract_task_name(config_path: str) -> str:
+    parts = config_path.split("/")
+    if "instance" in parts:
+        idx = parts.index("instance")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return Path(config_path).stem
 
 
 def _pid_exists(pid: int) -> bool:
@@ -416,6 +425,8 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / _sanitize_log_name(config_path)
     fuseki_log_path = log_path.with_suffix(".fuseki.log")
+    task_name = _extract_task_name(config_path)
+    config_name = Path(config_path).stem
 
     # SELF-CONTAINED: ensure Fuseki is up BEFORE anything else for KG
     started_fuseki = False
@@ -440,15 +451,14 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
     env = os.environ.copy()
     env_py_path = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env_py_path}" if env_py_path else str(repo_root)
+    env["LIFELONG_OUTPUT_DIR"] = str(combined_dir / task_name / config_name)
+    env["LIFELONG_OUTPUT_TAG"] = ""
     if is_kg:
         ontology_dir = str(repo_root / "data" / "knowledge_graph" / "ontology")
         if not env.get("KG_ONTOLOGY_DIR"):
             env["KG_ONTOLOGY_DIR"] = ontology_dir
         if not env.get("LIFELONG_KG_ONTOLOGY_DIR"):
             env["LIFELONG_KG_ONTOLOGY_DIR"] = ontology_dir
-
-    outputs_root = repo_root / "outputs"
-    before_outputs = _list_output_dirs(outputs_root)
 
     print(f"[run_all_with_servers] Starting server: {config_path}")
     _preflight_kill_ports([8000, 8001])
@@ -485,15 +495,6 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
             print(_tail_file(log_path))
             return result.returncode
 
-        after_outputs = _list_output_dirs(outputs_root)
-        output_dir = _pick_output_dir(before_outputs, after_outputs)
-        if output_dir is None:
-            print("[run_all_with_servers] Unable to locate output directory for merge.")
-        else:
-            _merge_runs(output_dir, combined_dir)
-            _merge_metrics(output_dir, combined_dir)
-            tag = output_dir.name
-            _copy_aux_files(output_dir, combined_dir, tag)
 
     finally:
         if server_proc.poll() is None:

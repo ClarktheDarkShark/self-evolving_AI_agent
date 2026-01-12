@@ -8,6 +8,7 @@ from src.typings import AssignmentConfig, Role
 from .instance import *
 from .callback import Callback
 from src.self_evolving_agent.callbacks import GeneratedToolLoggingCallback
+from src.utils.output_paths import get_output_prefix, prefix_filename
 
 
 class CallbackConstructor:
@@ -19,6 +20,7 @@ class CallbackConstructor:
         language_model_dict: Mapping[str, LanguageModel],
     ) -> dict[str, Callback]:
         instanced_unique_callback_name_set: set[str] = set()
+        output_prefix = get_output_prefix()
         for (
             callback_id,
             general_instance_factory,
@@ -37,7 +39,8 @@ class CallbackConstructor:
                 case CurrentSessionSavingCallback.__name__:
                     unique_flag = CurrentSessionSavingCallback.is_unique()
                     saving_path = os.path.join(
-                        assignment_config.output_dir, "current_session.json"
+                        assignment_config.output_dir,
+                        prefix_filename("current_session.json"),
                     )
                     general_instance_factory.parameters["saving_path"] = saving_path
                 case GroupSelfConsistencyCallback.__name__:
@@ -65,9 +68,10 @@ class CallbackConstructor:
             for callback_id, general_instance_factory in assignment_config.callback_dict.items()
         }
         for callback_id, callback in callback_dict.items():
+            state_id = f"{output_prefix}{callback_id}" if output_prefix else callback_id
             callback.set_state_dir(
                 os.path.join(
-                    assignment_config.output_dir, "callback_state", callback_id
+                    assignment_config.output_dir, "callback_state", state_id
                 )
             )
         return callback_dict

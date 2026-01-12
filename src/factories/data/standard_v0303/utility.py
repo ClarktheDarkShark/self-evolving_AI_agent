@@ -208,9 +208,26 @@ class DataFactoryUtility:
     ) -> tuple[ChatCompletion, TokenUsageInfo]:
         log_prefix = log_prefix or ""
         try:
-            chat_completion = client.chat.completions.create(
-                model=model_name, messages=message_list, n=1
+            from src.language_models.instance.openai_language_model import (
+                OpenaiLanguageModel,
             )
+
+            role_dict = {"user": "user", "agent": "assistant"}
+            language_model = OpenaiLanguageModel(
+                model_name=model_name,
+                role_dict=role_dict,
+                api_key=getattr(client, "api_key", None),
+                base_url=getattr(client, "base_url", None),
+                disable_api_tools=True,
+            )
+            outputs, chat_completion = language_model._get_completion_content(
+                message_list=message_list,
+                inference_config_dict={"n": 1},
+                allow_tools=False,
+                return_completion=True,
+            )
+            if not outputs:
+                raise OpenaiCompletionException("Empty completion content.")
         except Exception as e:
             SafeLogger.error(
                 f"{log_prefix}Failed to send a request to the model {model_name}."

@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence, Optional
 import coredumpy  # type: ignore[import-untyped]
 
 from src.utils import ConfigLoader, SingletonLogger
+from src.utils.output_paths import get_output_dir_override, prefix_filename
 from src.typings import (
     AssignmentConfig,
     EnvironmentConfig,
@@ -153,6 +154,9 @@ class ConfigUtility:
         raw_config: Mapping[str, Any], caller: ConfigUtilityCaller
     ) -> tuple[AssignmentConfig, EnvironmentConfig, LoggerConfig, PathConfig]:
         raw_config = copy.deepcopy(raw_config)  # Avoid modifying the original config.
+        output_dir_override = get_output_dir_override()
+        if output_dir_override:
+            raw_config["assignment_config"]["output_dir"] = output_dir_override
         # region Convert raw_config into assignment_config
         # region Construct assignment_language_model_dict
         assignment_language_model_list: Sequence[Mapping[str, Any]] = raw_config[
@@ -247,11 +251,13 @@ class ConfigUtility:
                 match caller:
                     case ConfigUtilityCaller.CLIENT:
                         log_file_path = os.path.join(
-                            assignment_config.output_dir, "singleton_logger_client.log"
+                            assignment_config.output_dir,
+                            prefix_filename("singleton_logger_client.log"),
                         )
                     case ConfigUtilityCaller.SERVER:
                         log_file_path = os.path.join(
-                            assignment_config.output_dir, "singleton_logger_server.log"
+                            assignment_config.output_dir,
+                            prefix_filename("singleton_logger_server.log"),
                         )
                     case ConfigUtilityCaller.CLIENT_SIDE_CONTROLLER:
                         log_file_path = (
@@ -261,7 +267,8 @@ class ConfigUtility:
                         raise NotImplementedError()
             else:
                 log_file_path = os.path.join(
-                    assignment_config.output_dir, "singleton_logger.log"
+                    assignment_config.output_dir,
+                    prefix_filename("singleton_logger.log"),
                 )
         else:
             log_file_path = raw_config["logger_config"]["log_file_path"]
@@ -274,19 +281,19 @@ class ConfigUtility:
         # region Construct path_config from assignment_config
         path_config = PathConfig(
             exception_record_file_path=os.path.join(
-                assignment_config.output_dir, "exception.txt"
+                assignment_config.output_dir, prefix_filename("exception.txt")
             ),
             config_output_path=os.path.join(
-                assignment_config.output_dir, "config.yaml"
+                assignment_config.output_dir, prefix_filename("config.yaml")
             ),
             session_list_output_path=os.path.join(
-                assignment_config.output_dir, "runs.json"
+                assignment_config.output_dir, prefix_filename("runs.json")
             ),
             metric_output_path=os.path.join(
-                assignment_config.output_dir, "metric.json"
+                assignment_config.output_dir, prefix_filename("metric.json")
             ),
             coredumpy_output_dir=os.path.join(
-                assignment_config.output_dir, "coredumpy"
+                assignment_config.output_dir, prefix_filename("coredumpy")
             ),
         )
         # endregion
@@ -340,7 +347,9 @@ def main() -> None:
     # region Configure model output logging path
     os.environ.setdefault(
         "LIFELONG_MODEL_OUTPUT_PATH",
-        os.path.join(assignment_config.output_dir, "model_outputs.jsonl"),
+        os.path.join(
+            assignment_config.output_dir, prefix_filename("model_outputs.jsonl")
+        ),
     )
     # endregion
     # region Construct variable, valid config
@@ -472,7 +481,9 @@ def main() -> None:
         "not_completed_count": not_completed_count,
         "results": outcome_rows,
     }
-    summary_path = os.path.join(assignment_config.output_dir, "task_outcomes.json")
+    summary_path = os.path.join(
+        assignment_config.output_dir, prefix_filename("task_outcomes.json")
+    )
     json.dump(task_summary, open(summary_path, "w"), indent=2)  # noqa
     logger.info("Task outcome summary saved to %s.", summary_path)
     # endregion

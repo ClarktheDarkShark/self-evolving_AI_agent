@@ -33,9 +33,11 @@ class LanguageModelAgent(Agent):
 
     def _inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
         try:
-            return self._language_model.inference(
-                [chat_history], self._inference_config_dict, self._system_prompt
-            )[0]
+            batch = [chat_history]
+            result = self._language_model.inference(batch, self._inference_config_dict, self._system_prompt)
+            item0 = result[0]
+            return item0
+
         except LanguageModelContextLimitException as e:
             raise AgentContextLimitException(str(e)) from e
         except LanguageModelOutOfMemoryException as e:

@@ -46,6 +46,9 @@ def test_generated_tool_logging_callback(tmp_path) -> None:
         description="Echoes a value.",
     )
     registry.invoke_tool("echo", "ping")
+    resolved = registry.resolve_name("echo") or "echo"
+    metadata = next(m for m in registry.list_tools() if m.name == resolved)
+    assert metadata.usage_count == 1
 
     log_path = output_dir / "generated_tools.log"
     assert log_path.exists()
