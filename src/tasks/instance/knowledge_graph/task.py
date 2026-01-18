@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Optional, Callable, Any, Sequence
 from pydantic import field_validator
 import inspect
@@ -528,6 +529,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                 # endregion
                 # region Call API with arguments
                 try:
+                    call_start = time.monotonic()
                     new_variable, execution_message = api(*processed_argument_list)
                 except KnowledgeGraphAPIException as e:
                     error_message = str(e)
@@ -569,6 +571,33 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                 except Exception as e:
                     session.task_output = self._get_default_task_output()
                     raise TaskEnvironmentException(str(e))
+                elapsed_ms = (time.monotonic() - call_start) * 1000.0
+                result_size = None
+                if api_name == "get_relations":
+                    cache_key = processed_argument_list[0]
+                    result_size = len(
+                        self.knowledge_graph_api.variable_to_relations_cache.get(
+                            cache_key, []
+                        )
+                    )
+                elif api_name == "get_attributes":
+                    cache_key = processed_argument_list[0]
+                    result_size = len(
+                        self.knowledge_graph_api.variable_to_attributes_cache.get(
+                            cache_key, []
+                        )
+                    )
+                if isinstance(new_variable, Variable):
+                    result_meta = f"type={new_variable.type} program_len={len(new_variable.program)}"
+                else:
+                    result_meta = "none"
+                logger.info(
+                    "KG tool exec: api=%s elapsed_ms=%.1f result_size=%s result_meta=%s",
+                    api_name,
+                    elapsed_ms,
+                    result_size,
+                    result_meta,
+                )
                 execution_message = execution_message.replace("<<API_STR>>", api_str)
                 if "<<NEW_VARIABLE>>" in execution_message:
                     # the execution message contains a variable

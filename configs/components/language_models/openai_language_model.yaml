@@ -15,6 +15,12 @@ gpt-oss:20b-64k:
     maximum_prompt_token_count: 64000   # override per model if needed
 
 
+gpt-oss:20b-120k:
+  parameters:
+    model_name: "gpt-oss:20b-120k"
+    maximum_prompt_token_count: 120000   # override per model if needed
+
+
 gpt-4o-mini:
   parameters:
     model_name: "gpt-4o-mini"

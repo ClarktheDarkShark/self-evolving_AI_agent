@@ -33,6 +33,20 @@ def _append_log(log_path: Optional[Path], text: str) -> None:
             f.write("\n")
 
 
+def _log_json_preview(
+    *,
+    source: str,
+    status_code: str,
+    content_type: str,
+    body: str,
+) -> None:
+    preview = (body or "").replace("\n", "\\n")[:200]
+    print(
+        f"[json-parse] source={source} status={status_code} "
+        f"content_type={content_type} body_head={preview}"
+    )
+
+
 def _run(cmd: list[str], *, log_path: Optional[Path] = None) -> subprocess.CompletedProcess:
     _append_log(log_path, f"$ {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -206,11 +220,30 @@ def sparql_health(endpoint_url: str, timeout_s: float = 5.0) -> SparqlHealth:
         req = urllib.request.Request(
             endpoint_url,
             data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/sparql-results+json",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             payload = resp.read().decode("utf-8")
+            _log_json_preview(
+                source=endpoint_url,
+                status_code=str(resp.status),
+                content_type=str(resp.headers.get("Content-Type", "")),
+                body=payload,
+            )
+            content_type = str(resp.headers.get("Content-Type", ""))
+            if "json" not in content_type.lower():
+                raise RuntimeError(
+                    f"SPARQL health returned non-JSON: {endpoint_url} "
+                    f"(content_type={content_type}) body_head={payload[:200]}"
+                )
+            if not payload.strip():
+                raise RuntimeError(
+                    f"SPARQL health returned empty body: {endpoint_url}"
+                )
         obj = json.loads(payload)
         has_data = bool(obj.get("boolean"))
         return SparqlHealth(reachable=True, has_data=has_data)

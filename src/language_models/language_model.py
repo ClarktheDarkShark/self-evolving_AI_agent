@@ -10,6 +10,28 @@ from src.typings import (
 )
 
 
+TOOL_CALL_KEYS = {"tools", "tool_choice", "functions", "function_call"}
+
+def _strip_tool_calling(obj: Any) -> Any:
+    """
+    Recursively remove tool-calling fields from dicts/lists so Ollama never sees them.
+    This prevents Ollama's 'error parsing tool call' 500 forever.
+    """
+    if isinstance(obj, dict):
+        # copy so we never mutate caller-owned dicts
+        new_d = {}
+        for k, v in obj.items():
+            if k in TOOL_CALL_KEYS:
+                continue
+            new_d[k] = _strip_tool_calling(v)
+        return new_d
+    if isinstance(obj, list):
+        return [_strip_tool_calling(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_strip_tool_calling(x) for x in obj)
+    return obj
+
+
 class LanguageModel(ABC):
     def __init__(self, role_dict: Mapping[str, str]) -> None:
         self.role_dict: Mapping[Role, str] = {
@@ -42,9 +64,15 @@ class LanguageModel(ABC):
         try:
             if inference_config_dict is None:
                 inference_config_dict = {}
-            inference_result = self._inference(
-                batch_chat_history, inference_config_dict, system_prompt
-            )
+
+            # ---- GLOBAL KILL SWITCH (prevents Ollama tool-call parsing 500) ----
+            # Convert Mapping -> dict then recursively strip tool calling keys.
+            cleaned = _strip_tool_calling(dict(inference_config_dict))
+            if any(k in cleaned for k in TOOL_CALL_KEYS):
+                raise RuntimeError(
+                    f"Tool calling leaked after sanitize: {set(cleaned.keys())}"
+                )
+            inference_result = self._inference(batch_chat_history, cleaned, system_prompt)
         except ModelException as e:
             raise e
         except Exception as e:

@@ -1,4 +1,7 @@
 from typing import Any, Optional, Type, TypeVar, overload, reveal_type
+from datetime import datetime, timezone
+import json
+import time
 import requests
 from pydantic import BaseModel
 
@@ -91,6 +94,8 @@ class Client(BaseModel):
             data_dict = {}
         else:
             data_dict = data.model_dump()
+        payload_json = json.dumps(data_dict, ensure_ascii=True, default=str)
+        payload_bytes = len(payload_json.encode("utf-8"))
         request_info_str = (
             f"Request information:\n"
             f"- address: {address}\n"
@@ -103,17 +108,41 @@ class Client(BaseModel):
         error_message_template = f"{error_description_placeholder}\n{request_info_str}"
         # endregion
         # region Send request
+        start_ts = datetime.now(timezone.utc).isoformat()
+        start_time = time.monotonic()
+        SafeLogger.info(
+            "HTTP request start api=%s address=%s timeout_s=%s payload_bytes=%d start_ts=%s",
+            api,
+            address,
+            self.request_timeout,
+            payload_bytes,
+            start_ts,
+        )
         try:
             response = requests.post(
                 address, json=data_dict, timeout=self.request_timeout
             )
         except requests.exceptions.Timeout as e:
+            elapsed_ms = (time.monotonic() - start_time) * 1000.0
+            SafeLogger.error(
+                "HTTP request timeout api=%s address=%s elapsed_ms=%.1f",
+                api,
+                address,
+                elapsed_ms,
+            )
             error_message = error_message_template.replace(
                 error_description_placeholder, "Request timeout."
             )
             SafeLogger.error(error_message)
             raise HttpTimeoutException(error_message) from e
         except requests.exceptions.ConnectionError as e:
+            elapsed_ms = (time.monotonic() - start_time) * 1000.0
+            SafeLogger.error(
+                "HTTP request connection error api=%s address=%s elapsed_ms=%.1f",
+                api,
+                address,
+                elapsed_ms,
+            )
             error_message = error_message_template.replace(
                 error_description_placeholder,
                 "Error occurs when reaching the destination server. Do you start the server?",
@@ -121,12 +150,29 @@ class Client(BaseModel):
             SafeLogger.error(error_message)
             raise HttpServerException(error_message) from e
         except Exception as e:
+            elapsed_ms = (time.monotonic() - start_time) * 1000.0
+            SafeLogger.error(
+                "HTTP request unknown error api=%s address=%s elapsed_ms=%.1f",
+                api,
+                address,
+                elapsed_ms,
+            )
             error_message = error_message_template.replace(
                 error_description_placeholder,
                 "Unknown error occurs when sending request.",
             )
             SafeLogger.error(error_message)
             raise HttpUnknownException(error_message) from e
+        elapsed_ms = (time.monotonic() - start_time) * 1000.0
+        end_ts = datetime.now(timezone.utc).isoformat()
+        SafeLogger.info(
+            "HTTP request end api=%s address=%s status=%s elapsed_ms=%.1f end_ts=%s",
+            api,
+            address,
+            response.status_code,
+            elapsed_ms,
+            end_ts,
+        )
         # endregion
         # region Process response
         if response.ok:  # response will always be assigned in the try block.

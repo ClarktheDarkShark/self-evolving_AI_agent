@@ -106,8 +106,8 @@ class OpenaiLanguageModel(LanguageModel):
         http_client = self._build_httpx_client()
 
         if http_client is None:
-            if os.getenv("LIFELONG_HTTPX_LOG", "").strip():
-                print("[LM] WARNING: httpx logging requested but client not available.")
+            # if os.getenv("LIFELONG_HTTPX_LOG", "").strip():
+                # print("[LM] WARNING: httpx logging requested but client not available.")
             self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         else:
             try:
@@ -119,7 +119,7 @@ class OpenaiLanguageModel(LanguageModel):
                 )
             except TypeError:
                 # Older SDKs might not support http_client.
-                print("[LM] WARNING: OpenAI client does not accept http_client; httpx logging disabled.")
+                # print("[LM] WARNING: OpenAI client does not accept http_client; httpx logging disabled.")
                 self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         self.base_url = base_url
         self.maximum_prompt_token_count = maximum_prompt_token_count
@@ -127,6 +127,7 @@ class OpenaiLanguageModel(LanguageModel):
         # If True: prevents OpenAI/ChatCompletions tool calls from being used,
         # while still allowing plain-text tool instructions in the prompt.
         self.disable_api_tools = disable_api_tools
+        self._last_tool_call_fallback: Optional[dict[str, Any]] = None
 
 
 
@@ -473,6 +474,12 @@ class OpenaiLanguageModel(LanguageModel):
                     return nested
         return None
 
+    def get_last_tool_call_fallback(self, *, clear: bool = False) -> Optional[dict[str, Any]]:
+        data = self._last_tool_call_fallback
+        if clear:
+            self._last_tool_call_fallback = None
+        return dict(data) if isinstance(data, dict) else None
+
     def _send_completion(
         self,
         *,
@@ -534,22 +541,25 @@ class OpenaiLanguageModel(LanguageModel):
 
         is_ollama = self._is_ollama_endpoint()
 
-        print(
-            "[LM] _get_completion_content | "
-            f"is_ollama={is_ollama} | base_url={self.base_url} | model={self.model_name}"
-        )
-        print(
-            "[LM] flags | "
-            f"disable_api_tools={self.disable_api_tools} | "
-            f"allow_internal_tool_protocol={bool(inference_config_dict.get('allow_internal_tool_protocol'))}"
-        )
-        print(
-            "[LM] incoming cfg keys:",
-            sorted(list(inference_config_dict.keys()))
-        )
+        # print(
+        #     "[LM] _get_completion_content | "
+        #     f"is_ollama={is_ollama} | base_url={self.base_url} | model={self.model_name}"
+        # )
+        # print(
+        #     "[LM] flags | "
+        #     f"disable_api_tools={self.disable_api_tools} | "
+        #     f"allow_internal_tool_protocol={bool(inference_config_dict.get('allow_internal_tool_protocol'))}"
+        # )
+        # print(
+        #     "[LM] incoming cfg keys:",
+        #     sorted(list(inference_config_dict.keys()))
+        # )
 
         allow_internal_tool_protocol = bool(
             inference_config_dict.get("allow_internal_tool_protocol")
+        )
+        toolgen_extract_tool_calls = bool(
+            inference_config_dict.get("toolgen_extract_tool_calls")
         )
 
         # Hard-disable API tool usage; we only allow plain-text <internal_tool> blocks.
@@ -562,12 +572,13 @@ class OpenaiLanguageModel(LanguageModel):
         sanitized_config = dict(inference_config_dict)
         sanitized_config.pop("stop", None)
         sanitized_config.pop("allow_internal_tool_protocol", None)
+        sanitized_config.pop("toolgen_extract_tool_calls", None)
 
-        print(f"[LM] messages | base_len={len(base_messages)} request_len={len(request_messages)}")
-        if request_messages:
-            print(f"[LM] first msg role={request_messages[0].get('role')} head={_dbg_preview(request_messages[0].get('content'))}")
-            print(f"[LM] last  msg role={request_messages[-1].get('role')} head={_dbg_preview(request_messages[-1].get('content'))}")
-        print("[LM] sanitized_config:", {k: sanitized_config.get(k) for k in sorted(sanitized_config.keys())})
+        # print(f"[LM] messages | base_len={len(base_messages)} request_len={len(request_messages)}")
+        # if request_messages:
+            # print(f"[LM] first msg role={request_messages[0].get('role')} head={_dbg_preview(request_messages[0].get('content'))}")
+            # print(f"[LM] last  msg role={request_messages[-1].get('role')} head={_dbg_preview(request_messages[-1].get('content'))}")
+        # print("[LM] sanitized_config:", {k: sanitized_config.get(k) for k in sorted(sanitized_config.keys())})
 
         if is_ollama:
             # Ollama lane: enforce JSON tool-parser output + strip tool roles.
@@ -582,11 +593,13 @@ class OpenaiLanguageModel(LanguageModel):
             config: Mapping[str, Any],
         ) -> ChatCompletion:
             request_config = dict(config)
+            forced_tool_call = False
 
             if is_ollama:
                 # Force Ollama to always return a tool call with JSON args.
                 request_config["tools"] = OLLAMA_RESPOND_TOOL
                 request_config["tool_choice"] = {"type": "function", "function": {"name": "respond"}}
+                forced_tool_call = True
 
             # Still strip any stray tool fields for non-ollama
             if not is_ollama:
@@ -594,13 +607,28 @@ class OpenaiLanguageModel(LanguageModel):
 
             self._assert_no_tool_request_fields(request_config, is_ollama=is_ollama)
 
-            return self._send_completion(
-                client=client,
-                model=self.model_name,
-                messages=messages,
-                config=request_config,
-                is_ollama=is_ollama,
-            )
+            try:
+                return self._send_completion(
+                    client=client,
+                    model=self.model_name,
+                    messages=messages,
+                    config=request_config,
+                    is_ollama=is_ollama,
+                )
+            except Exception as exc:
+                if is_ollama and forced_tool_call and self._is_tool_parse_error(exc):
+                    logger.warning(
+                        "[LM] Ollama tool-call parse error; retrying without tools."
+                    )
+                    fallback_config = self._strip_tool_request_fields(dict(config))
+                    return self._send_completion(
+                        client=client,
+                        model=self.model_name,
+                        messages=messages,
+                        config=fallback_config,
+                        is_ollama=is_ollama,
+                    )
+                raise
 
 
         completion = _request_completion(request_messages, sanitized_config)
@@ -615,16 +643,16 @@ class OpenaiLanguageModel(LanguageModel):
         )
 
         # Optional debug
-        print("=== RAW COMPLETION OBJECT ===")
-        print(completion.model_dump_json(indent=2))
-        print("=== REQUEST PAYLOAD (model/messages/config) ===")
-        print(
-            json.dumps(
-                {"model": self.model_name, "messages": base_messages, **sanitized_config},
-                indent=2,
-                default=str,
-            )
-        )
+        # print("=== RAW COMPLETION OBJECT ===")
+        # print(completion.model_dump_json(indent=2))
+        # print("=== REQUEST PAYLOAD (model/messages/config) ===")
+        # print(
+        #     json.dumps(
+        #         {"model": self.model_name, "messages": base_messages, **sanitized_config},
+        #         indent=2,
+        #         default=str,
+        #     )
+        # )
 
         out: list[str] = []
         is_os_prompt = self._is_os_interaction_prompt(base_messages)
@@ -632,6 +660,11 @@ class OpenaiLanguageModel(LanguageModel):
         for choice in completion.choices:
             content = choice.message.content or ""
             tool_calls = getattr(choice.message, "tool_calls", None)
+            function_call = getattr(choice.message, "function_call", None)
+            raw_output = ""
+            fallback_source = "content" if content.strip() else "none"
+            has_tool_calls = bool(tool_calls)
+            has_function_call = bool(function_call)
 
             if is_ollama:
                 extracted = self._extract_ollama_tool_content(
@@ -646,14 +679,40 @@ class OpenaiLanguageModel(LanguageModel):
             # preserve the tool call as <internal_tool ...>.
             # If tools are NOT allowed (benchmark-safe mode), DO NOT emit <internal_tool ...>;
             # instead, force a repair pass below.
-            if (not content) and tool_calls:
-                first = tool_calls[0]
-                func = getattr(first, "function", None)
-                name = getattr(func, "name", None)
-                args = getattr(func, "arguments", None) or "{}"
-                if not isinstance(args, str):
-                    args = json.dumps(args, ensure_ascii=True, default=str)
-                content = f'<internal_tool name="{name}">{args}</internal_tool>'
+            if not content:
+                if tool_calls:
+                    first = tool_calls[0]
+                    func = getattr(first, "function", None)
+                    raw_args = getattr(func, "arguments", None) or ""
+                    if not isinstance(raw_args, str):
+                        raw_args = json.dumps(raw_args, ensure_ascii=True, default=str)
+                    raw_output = raw_args
+                    fallback_source = "tool_calls.function.arguments"
+                    if toolgen_extract_tool_calls and raw_output:
+                        content = raw_output
+                    else:
+                        name = getattr(func, "name", None)
+                        args = raw_args or "{}"
+                        content = f'<internal_tool name="{name}">{args}</internal_tool>'
+                elif function_call is not None:
+                    raw_args = getattr(function_call, "arguments", None) or ""
+                    if not isinstance(raw_args, str):
+                        raw_args = json.dumps(raw_args, ensure_ascii=True, default=str)
+                    raw_output = raw_args
+                    fallback_source = "function_call.arguments"
+                    if toolgen_extract_tool_calls and raw_output:
+                        content = raw_output
+
+            if toolgen_extract_tool_calls:
+                self._last_tool_call_fallback = {
+                    "content_len": len(content or ""),
+                    "raw_output_len": len(raw_output or ""),
+                    "raw_output": raw_output or "",
+                    "fallback_source": fallback_source,
+                    "has_tool_calls": has_tool_calls,
+                    "has_function_call": has_function_call,
+                    "finish_reason": getattr(choice, "finish_reason", None),
+                }
 
 
             # OS-interaction bash fence repair (kept as-is)

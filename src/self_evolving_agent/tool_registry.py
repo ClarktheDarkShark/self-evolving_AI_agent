@@ -78,7 +78,7 @@ class ToolRegistry:
         self.snapshots_dir = os.path.join(self.base_path, "run_snapshots")
         os.makedirs(self.tools_dir, exist_ok=True)
         os.makedirs(self.snapshots_dir, exist_ok=True)
-        print(f"[ToolRegistry] Initialized registry at '{self.base_path}'")
+        # print(f"[ToolRegistry] Initialized registry at '{self.base_path}'")
         self._metadata: Dict[str, ToolMetadata] = {}
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._lock = threading.Lock()
@@ -361,9 +361,6 @@ class ToolRegistry:
             issues.append("Missing top-level function 'run'.")
             return issues
 
-        if ast.get_docstring(run_fn) is None:
-            issues.append("Missing docstring for function 'run'.")
-
         return issues
 
     def _make_invalid_tool_stub(self, issues: list[str]) -> str:
@@ -505,8 +502,16 @@ class ToolRegistry:
         docstring = run_doc or module_doc or description
         with self._lock:
             # print(f"[ToolRegistry] Persisting tool '{tool_name}' to '{tool_path}'")
-            with open(tool_path, "w", encoding="utf-8") as f:
-                f.write(normalized_code)
+            try:
+                with open(tool_path, "w", encoding="utf-8") as f:
+                    f.write(normalized_code)
+            except Exception as exc:
+                print(
+                    f"[ToolRegistry] persist failure name={tool_name} "
+                    f"error_type={type(exc).__name__} error={exc}"
+                )
+                print(traceback.format_exc())
+                return None
 
             metadata = self._metadata.get(
                 tool_name,
@@ -641,6 +646,13 @@ class ToolRegistry:
             )
         # If **kwargs exists, accept any kw
         return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+    @staticmethod
+    def _signature_is_payload(signature: str) -> bool:
+        if not signature:
+            return False
+        normalized = re.sub(r"\s+", "", signature)
+        return normalized == "run(payload:dict)->dict"
 
     def _auto_adapt_call(
         self, run_fn: Callable[..., Any], query: str
@@ -777,14 +789,38 @@ class ToolRegistry:
             )
             return outcome
 
+        metadata = self._metadata.get(resolved_name)
+        if metadata and self._signature_is_payload(metadata.signature):
+            payload_arg: Any = None
+            if kwargs:
+                if "payload" in kwargs and len(kwargs) == 1 and not args:
+                    payload_arg = kwargs.get("payload")
+                    kwargs = {}
+                elif not args:
+                    payload_arg = dict(kwargs)
+                    kwargs = {}
+            if args:
+                if len(args) == 1 and isinstance(args[0], dict) and "payload" in args[0]:
+                    payload_arg = args[0].get("payload")
+                elif len(args) == 1:
+                    payload_arg = args[0]
+            if payload_arg is None:
+                return ToolResult.failure("payload tool requires a single dict argument")
+            if not isinstance(payload_arg, dict):
+                return ToolResult.failure("payload must be a dict")
+            args = [payload_arg]
+            kwargs = {}
+
         tool_path = self._get_tool_path(resolved_name)
         # print(f"[ToolRegistry] invoke_tool path name={resolved_name} path={tool_path}")
 
         error_type: str | None = None
         error_traceback: str | None = None
 
+        stage = "import"
         try:
             module = self._load_tool_module(resolved_name, tool_path)
+            stage = "run"
             # print(
             #     f"[ToolRegistry] invoke_tool loaded name={resolved_name} "
             #     f"module={getattr(module, '__name__', '<unknown>')}"
@@ -808,7 +844,7 @@ class ToolRegistry:
 
         except Exception as e:
             print(
-                f"[ToolRegistry] invoke_tool failure name={resolved_name} "
+                f"[ToolRegistry] invoke_tool failure stage={stage} name={resolved_name} "
                 f"error_type={type(e).__name__} error={e}"
             )
             print(traceback.format_exc())
@@ -885,10 +921,10 @@ def get_registry(
     with _REGISTRY_LOCK:
         if force_reset or _REGISTRY_INSTANCE is None:
             base_path = _resolve_registry_path(tool_registry_path or os.getcwd())
-            print(f"[ToolRegistry] Creating new registry at '{base_path}'")
+            # print(f"[ToolRegistry] Creating new registry at '{base_path}'")
             _REGISTRY_INSTANCE = ToolRegistry(base_path)
         elif tool_registry_path and os.path.abspath(_resolve_registry_path(tool_registry_path)) != _REGISTRY_INSTANCE.base_path:
             resolved_path = _resolve_registry_path(tool_registry_path)
-            print(f"[ToolRegistry] Switching registry base path to '{resolved_path}'")
+            # print(f"[ToolRegistry] Switching registry base path to '{resolved_path}'")
             _REGISTRY_INSTANCE = ToolRegistry(resolved_path)
     return _REGISTRY_INSTANCE

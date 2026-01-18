@@ -1,4 +1,6 @@
 from typing import List, Tuple, Any
+import os
+import time
 from SPARQLWrapper import SPARQLWrapper, JSON
 import urllib
 from urllib.error import URLError
@@ -11,6 +13,11 @@ class SparqlExecutor:
     def __init__(self, url: str):
         self.url = url
         self.sparql_wrapper = SPARQLWrapper(url)
+        timeout_s = os.getenv("LIFELONG_SPARQL_TIMEOUT_S", "240").strip()
+        try:
+            self.sparql_wrapper.setTimeout(float(timeout_s))
+        except Exception:
+            pass
         self.sparql_wrapper.setReturnFormat(JSON)
 
     def get_endpoint_url(self) -> str:
@@ -58,6 +65,7 @@ SELECT DISTINCT ?e WHERE {{
         return unique[:limit]
 
     def _query_endpoint(self, query: str) -> dict[str, Any]:
+        start_time = time.monotonic()
         SafeLogger.info(
             "SPARQL request url=%s query=%s",
             self.url,
@@ -66,12 +74,31 @@ SELECT DISTINCT ?e WHERE {{
         self.sparql_wrapper.setQuery(query)
         try:
             results = self.sparql_wrapper.query().convert()
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, TimeoutError) as e:
+            elapsed_ms = (time.monotonic() - start_time) * 1000.0
             SafeLogger.error(
-                f"SPARQL request failed url={self.url} query={query}"
+                "SPARQL request failed url=%s elapsed_ms=%.1f query=%s error=%s",
+                self.url,
+                elapsed_ms,
+                query.replace("\n", " ")[:500],
+                e,
             )
-            raise TaskEnvironmentException(f"Query failed:\n{query}") from e
+            raise TaskEnvironmentException(
+                f"SPARQL request failed after {elapsed_ms:.1f}ms:\n{query}"
+            ) from e
         assert isinstance(results, dict)
+        elapsed_ms = (time.monotonic() - start_time) * 1000.0
+        binding_count = None
+        try:
+            binding_count = len(results.get("results", {}).get("bindings", []))
+        except Exception:
+            binding_count = None
+        SafeLogger.info(
+            "SPARQL response url=%s elapsed_ms=%.1f bindings=%s",
+            self.url,
+            elapsed_ms,
+            binding_count,
+        )
         return results
 
     def execute_raw(self, query: str) -> dict[str, Any]:

@@ -100,36 +100,6 @@ def _build_variation_args(
     return ["alt"], {}
 
 
-def _run_uses_input(code: str) -> tuple[bool, Optional[str]]:
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as exc:
-        return False, f"syntax error: {exc}"
-    run_fn: ast.FunctionDef | None = None
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "run":
-            run_fn = node
-            break
-    if run_fn is None:
-        return False, "run() definition not found"
-
-    param_names: list[str] = []
-    for arg in run_fn.args.args:
-        param_names.append(arg.arg)
-    if not param_names:
-        return False, "run() must accept at least one input parameter"
-
-    used_names: set[str] = set()
-    for node in ast.walk(run_fn):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            used_names.add(node.id)
-
-    if not any(name in used_names for name in param_names):
-        return False, "run() does not reference its input parameters"
-
-    return True, None
-
-
 def validate_tool_code(
     code: str, *, timeout_s: float = 2.0
 ) -> ToolValidationResult:
@@ -137,10 +107,6 @@ def validate_tool_code(
         compiled = compile(code, "<generated_tool>", "exec")
     except Exception as exc:
         return ToolValidationResult(success=False, error=f"compile failed: {exc}")
-
-    uses_input, input_issue = _run_uses_input(code)
-    if not uses_input:
-        return ToolValidationResult(success=False, error=input_issue)
 
     module = types.ModuleType("generated_tool")
     try:
@@ -152,42 +118,46 @@ def validate_tool_code(
     if not callable(run_fn):
         return ToolValidationResult(success=False, error="run() not found or not callable")
 
-    args, kwargs = _build_smoke_args(run_fn)
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_fn, *args, **kwargs)
-            result = future.result(timeout=timeout_s)
-    except TimeoutError:
-        return ToolValidationResult(success=False, error="smoke test timed out")
-    except Exception as exc:
-        return ToolValidationResult(success=False, error=f"smoke test failed: {exc}")
-
-    variance_checked = False
-    if len(inspect.signature(run_fn).parameters) == 1 and isinstance(result, str):
-        alt_args, alt_kwargs = _build_variation_args(run_fn, args, kwargs)
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(run_fn, *alt_args, **alt_kwargs)
-                alt_result = future.result(timeout=timeout_s)
-            variance_checked = True
-            if isinstance(alt_result, str) and alt_result == result:
-                return ToolValidationResult(
-                    success=False,
-                    error="run() returned identical output for distinct inputs",
-                )
-        except TimeoutError:
-            return ToolValidationResult(success=False, error="variance test timed out")
-        except Exception as exc:
-            return ToolValidationResult(
-                success=False, error=f"variance test failed: {exc}"
-            )
-
     self_test_fn = getattr(module, "self_test", None)
     if not callable(self_test_fn):
         return ToolValidationResult(
             success=False,
             error="self_test() not found or not callable",
         )
+
+    sig = inspect.signature(run_fn)
+    params = [
+        p
+        for p in sig.parameters.values()
+        if p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+    ]
+    required = [
+        p
+        for p in params
+        if p.default is p.empty
+        and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+    ]
+    if len(required) != 1 or required[0].name != "payload":
+        return ToolValidationResult(
+            success=False,
+            error="run() must accept exactly one required parameter named 'payload'",
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_fn, {"_smoke": True})
+            result = future.result(timeout=timeout_s)
+    except TimeoutError:
+        return ToolValidationResult(success=False, error="smoke test timed out")
+    except Exception as exc:
+        return ToolValidationResult(success=False, error=f"smoke test failed: {exc}")
+
+    if not isinstance(result, dict):
+        return ToolValidationResult(
+            success=False,
+            error="run() must return a dict",
+        )
+
     self_test_passed = False
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -197,6 +167,9 @@ def validate_tool_code(
         return ToolValidationResult(success=False, error="self_test timed out")
     except Exception as exc:
         return ToolValidationResult(success=False, error=f"self_test failed: {exc}")
+
+    if not self_test_passed:
+        return ToolValidationResult(success=False, error="self_test failed")
 
     return ToolValidationResult(
         success=True, smoke_output=result, self_test_passed=self_test_passed

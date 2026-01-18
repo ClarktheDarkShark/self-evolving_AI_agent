@@ -18,8 +18,8 @@ from pathlib import Path
 import kg_sparql_server
 
 CONFIG_PATHS = [
-    "configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/standard.yaml",
     "configs/assignments/experiments/llama_31_8b_instruct/instance/db_bench/instance/standard.yaml",
+    "configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/standard.yaml",
     "configs/assignments/experiments/llama_31_8b_instruct/instance/os_interaction/instance/standard.yaml",
     
 ]
@@ -44,6 +44,20 @@ def _append_log(log_path: Path | None, text: str) -> None:
         f.write(text)
         if not text.endswith("\n"):
             f.write("\n")
+
+
+def _log_json_preview(
+    *,
+    source: str,
+    status_code: str,
+    content_type: str,
+    body: str,
+) -> None:
+    preview = (body or "").replace("\n", "\\n")[:200]
+    print(
+        f"[json-parse] source={source} status={status_code} "
+        f"content_type={content_type} body_head={preview}"
+    )
 
 
 def _run(cmd: list[str], *, log_path: Path | None = None) -> subprocess.CompletedProcess:
@@ -71,6 +85,12 @@ def sparql_probe(endpoint: str, timeout_s: int = 5) -> tuple[bool, bool, str | N
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
+            _log_json_preview(
+                source=endpoint,
+                status_code=str(resp.status),
+                content_type=str(resp.headers.get("Content-Type", "")),
+                body=raw,
+            )
             try:
                 payload = json.loads(raw)
                 if isinstance(payload, dict) and "boolean" in payload:
@@ -216,7 +236,14 @@ def _merge_runs(output_dir: Path, combined_dir: Path) -> None:
         return
     combined_path = combined_dir / "runs.json"
     try:
-        new_runs = json.loads(runs_path.read_text(encoding="utf-8"))
+        raw = runs_path.read_text(encoding="utf-8")
+        _log_json_preview(
+            source=str(runs_path),
+            status_code="file",
+            content_type="application/json",
+            body=raw,
+        )
+        new_runs = json.loads(raw)
     except Exception:
         return
     if not isinstance(new_runs, list):
@@ -224,7 +251,14 @@ def _merge_runs(output_dir: Path, combined_dir: Path) -> None:
     existing: list[dict[str, object]] = []
     if combined_path.exists():
         try:
-            existing = json.loads(combined_path.read_text(encoding="utf-8"))
+            raw_existing = combined_path.read_text(encoding="utf-8")
+            _log_json_preview(
+                source=str(combined_path),
+                status_code="file",
+                content_type="application/json",
+                body=raw_existing,
+            )
+            existing = json.loads(raw_existing)
         except Exception:
             existing = []
     if not isinstance(existing, list):
@@ -241,8 +275,22 @@ def _merge_metrics(output_dir: Path, combined_dir: Path) -> None:
     if not metric_path.exists() or not runs_path.exists():
         return
     try:
-        metric_data = json.loads(metric_path.read_text(encoding="utf-8"))
-        runs_data = json.loads(runs_path.read_text(encoding="utf-8"))
+        raw_metric = metric_path.read_text(encoding="utf-8")
+        _log_json_preview(
+            source=str(metric_path),
+            status_code="file",
+            content_type="application/json",
+            body=raw_metric,
+        )
+        metric_data = json.loads(raw_metric)
+        raw_runs = runs_path.read_text(encoding="utf-8")
+        _log_json_preview(
+            source=str(runs_path),
+            status_code="file",
+            content_type="application/json",
+            body=raw_runs,
+        )
+        runs_data = json.loads(raw_runs)
     except Exception:
         return
     task_name = None
@@ -254,7 +302,14 @@ def _merge_metrics(output_dir: Path, combined_dir: Path) -> None:
     combined_metric = {}
     if combined_path.exists():
         try:
-            combined_metric = json.loads(combined_path.read_text(encoding="utf-8"))
+            raw_combined = combined_path.read_text(encoding="utf-8")
+            _log_json_preview(
+                source=str(combined_path),
+                status_code="file",
+                content_type="application/json",
+                body=raw_combined,
+            )
+            combined_metric = json.loads(raw_combined)
         except Exception:
             combined_metric = {}
     if not isinstance(combined_metric, dict):

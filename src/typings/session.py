@@ -1,5 +1,5 @@
 from typing import Optional, Any, Mapping, Generator
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from enum import StrEnum
 
 from .general import SampleIndex, ChatHistoryItem, TaskName, Role
@@ -160,6 +160,8 @@ class Session(BaseModel):
     task_output: Optional[dict[str, Optional[str]]] = None  # Answer to user intent
     evaluation_record: SessionEvaluationRecord = SessionEvaluationRecord()
     expected_answer: Optional[dict[str, Any]] = None
+    tool_invoked: list[bool] = Field(default_factory=list)
+    tool_invoked_any: bool = False
 
 
 class SessionMetricCalculationPartial(BaseModel):
