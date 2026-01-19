@@ -75,7 +75,7 @@ class OpenaiLanguageModel(LanguageModel):
     """
 
     # Always-long default timeout (seconds). 30 minutes.
-    DEFAULT_TIMEOUT_S: float = 1200.0
+    DEFAULT_TIMEOUT_S: float = 2400.0
 
     def __init__(
         self,
@@ -577,6 +577,7 @@ class OpenaiLanguageModel(LanguageModel):
         sanitized_config.pop("allow_internal_tool_protocol", None)
         sanitized_config.pop("toolgen_extract_tool_calls", None)
         sanitized_config.pop("ollama_force_tool_calls", None)
+        timeout_override_s = sanitized_config.pop("request_timeout_s", None)
 
         # print(f"[LM] messages | base_len={len(base_messages)} request_len={len(request_messages)}")
         # if request_messages:
@@ -591,6 +592,15 @@ class OpenaiLanguageModel(LanguageModel):
 
         # Execute request
         client = self.client.with_options(max_retries=0) if is_ollama else self.client
+        if timeout_override_s is not None:
+            try:
+                timeout_s = float(timeout_override_s)
+                timeout = httpx.Timeout(
+                    timeout_s, read=timeout_s, write=timeout_s, connect=30.0
+                )
+                client = client.with_options(timeout=timeout)
+            except Exception:
+                pass
 
         def _request_completion(
             messages: Sequence[ChatCompletionMessageParam],
