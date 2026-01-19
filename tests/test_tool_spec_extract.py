@@ -104,3 +104,31 @@ def test_extract_tool_spec_tool_calls_args():
     parsed = ctrl.extract_tool_spec("", response_obj)
     assert all(k in parsed for k in ctrl._required_tool_spec_keys())
     assert isinstance(parsed["code_lines"], list)
+
+
+def test_extract_tool_spec_invalid_escape():
+    ctrl_mod = _load_controller_module()
+    ctrl = object.__new__(ctrl_mod.SelfEvolvingController)
+    raw = (
+        '{"name":"sql_escape","description":"Test","signature":"run(payload: dict) -> dict",'
+        '"tool_type":"utility","tool_category":"validator","input_schema":{"type":"object","required":["payload"],'
+        '"properties":{"payload":{"type":"object","required":[],"properties":{}}}},'
+        '"capabilities":["ok"],"code_lines":["pattern = \\"\\w+\\"","return {}"]}'
+    )
+    parsed = ctrl.extract_tool_spec(raw, None)
+    assert all(k in parsed for k in ctrl._required_tool_spec_keys())
+
+
+def test_extract_tool_spec_unescaped_newline():
+    ctrl_mod = _load_controller_module()
+    ctrl = object.__new__(ctrl_mod.SelfEvolvingController)
+    raw = (
+        '{'
+        '"name":"sql_newline","description":"Test","signature":"run(payload: dict) -> dict",'
+        '"tool_type":"utility","tool_category":"validator","input_schema":{"type":"object","required":["payload"],'
+        '"properties":{"payload":{"type":"object","required":[],"properties":{}}}},'
+        '"capabilities":["ok"],"code_lines":["line1\nline2","return {}"]'
+        '}'
+    )
+    parsed = ctrl.extract_tool_spec(raw, None)
+    assert all(k in parsed for k in ctrl._required_tool_spec_keys())

@@ -561,6 +561,9 @@ class OpenaiLanguageModel(LanguageModel):
         toolgen_extract_tool_calls = bool(
             inference_config_dict.get("toolgen_extract_tool_calls")
         )
+        force_ollama_tool_calls = inference_config_dict.get(
+            "ollama_force_tool_calls", True
+        )
 
         # Hard-disable API tool usage; we only allow plain-text <internal_tool> blocks.
         allow_tools = False
@@ -573,6 +576,7 @@ class OpenaiLanguageModel(LanguageModel):
         sanitized_config.pop("stop", None)
         sanitized_config.pop("allow_internal_tool_protocol", None)
         sanitized_config.pop("toolgen_extract_tool_calls", None)
+        sanitized_config.pop("ollama_force_tool_calls", None)
 
         # print(f"[LM] messages | base_len={len(base_messages)} request_len={len(request_messages)}")
         # if request_messages:
@@ -595,11 +599,13 @@ class OpenaiLanguageModel(LanguageModel):
             request_config = dict(config)
             forced_tool_call = False
 
-            if is_ollama:
+            if is_ollama and force_ollama_tool_calls:
                 # Force Ollama to always return a tool call with JSON args.
                 request_config["tools"] = OLLAMA_RESPOND_TOOL
                 request_config["tool_choice"] = {"type": "function", "function": {"name": "respond"}}
                 forced_tool_call = True
+            elif is_ollama:
+                request_config = self._strip_tool_request_fields(request_config)
 
             # Still strip any stray tool fields for non-ollama
             if not is_ollama:

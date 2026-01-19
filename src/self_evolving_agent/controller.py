@@ -63,8 +63,14 @@ HARD CONSTRAINTS
 - run() MUST NEVER raise. Wrap logic in try/except and on exception return a dict with errors=[...]. Validate types BEFORE calling methods (e.g., .lower()).
 - If returning valid=True then errors MUST be [] and every fixed_* field MUST exist and be a non-empty string (never None).
 - capabilities MUST be a JSON array of strings (list[str]), NOT a single string.
-- In code_lines, write normal Python quotes (' or "). JSON escaping is fine.
+- code_lines are RAW Python source lines. Do NOT manually escape quotes for JSON. Never include backslashes before quotes (no \" or \\"). Any JSON escaping will be handled by the JSON serializer, not by you.
 - signature MUST be exactly "run(payload: dict) -> dict" (no other parameters allowed).
+
+ESCAPING RULES (HARD)
+- In code_lines, DO NOT output any of these substrings anywhere: \" or \\"
+- Use SINGLE QUOTES for all Python strings and dict keys, except the required 3-line module docstring.
+- Do not use backslashes for quoting. If you need quotes inside text, switch quote type (use ' outside, " inside) or build strings without escapes.
+- Every code_lines entry must be directly pasteable into a .py file as-is.
 
 
 PURPOSE / ROI
@@ -118,7 +124,17 @@ QUALITY REQUIREMENTS (HARD)
 - Include self_test() with 2 tests (good + bad), BUT self_test() must use only normal quotes (' or ") and NEVER triple quotes.
 - Do NOT write any string literal that starts with """ except the 3-line module docstring at the very top.
 
+SELF_TEST QUOTE RULE (HARD)
+- In self_test(), do not use f-strings that contain nested quotes like result["x"] inside the f-string.
+- Use intermediate variables + repr() for error messages.
 
+                                        
+FINAL SELF-CHECK (REQUIRED)
+- Before outputting JSON, scan your own code_lines mentally:
+  - If any line contains a backslash followed by a quote (\" or \\") you MUST rewrite it using single quotes and remove the backslashes.
+  - Ensure dict returns look like: {'valid': False, 'errors': ['...'], 'warnings': []}
+
+                                        
 ''').strip()
 
 
@@ -192,7 +208,7 @@ def build_solver_tool_rules() -> str:
         }
       },
       "capabilities": ["capability_a", "capability_b"],
-      "code_lines": ["line 1", "line 2", "..."]
+      "code_lines": ["line 1", "line 2", "line 3"]
     }</internal_tool>
 
     PREFLIGHT (CONDITIONAL):
@@ -303,6 +319,8 @@ class SelfEvolvingController(Agent):
 
         # Strongly prefer pure JSON output (supported by OpenAI-compatible backends; safe to ignore if unsupported)
         base_cfg["response_format"] = {"type": "json_object"}
+        base_cfg["toolgen_extract_tool_calls"] = True
+        base_cfg["ollama_force_tool_calls"] = False
 
 
         self._toolgen_agent = LanguageModelAgent(
@@ -448,6 +466,21 @@ class SelfEvolvingController(Agent):
         s = (s or "")
         return s if len(s) <= n else (s[:n] + "...[truncated]")
 
+    def _normalize_toolgen_content(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                elif isinstance(part, str):
+                    parts.append(part)
+            return "".join(parts)
+        return ""
+
     def _extract_first_json_object(self, text: str) -> Optional[str]:
         """
         Return the first top-level JSON object substring from text.
@@ -494,6 +527,127 @@ class SelfEvolvingController(Agent):
 
         return None
 
+    def _escape_invalid_json_backslashes(self, text: str) -> str:
+        if not text:
+            return text
+        out: list[str] = []
+        in_str = False
+        esc = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if not in_str:
+                if ch == '"':
+                    in_str = True
+                out.append(ch)
+                i += 1
+                continue
+
+            if esc:
+                out.append(ch)
+                esc = False
+                i += 1
+                continue
+
+            if ch == "\\":
+                nxt = text[i + 1] if i + 1 < len(text) else ""
+                if nxt in ('"', "\\", "/", "b", "f", "n", "r", "t", "u"):
+                    out.append(ch)
+                    esc = True
+                else:
+                    out.append("\\\\")
+                i += 1
+                continue
+
+            if ch == '"':
+                in_str = False
+            out.append(ch)
+            i += 1
+
+        return "".join(out)
+
+    def _escape_control_chars_in_json_strings(self, text: str) -> str:
+        if not text:
+            return text
+        out: list[str] = []
+        in_str = False
+        esc = False
+        for ch in text:
+            if not in_str:
+                if ch == '"':
+                    in_str = True
+                out.append(ch)
+                continue
+
+            if esc:
+                out.append(ch)
+                esc = False
+                continue
+
+            if ch == "\\":
+                out.append(ch)
+                esc = True
+                continue
+
+            if ch == '"':
+                in_str = False
+                out.append(ch)
+                continue
+
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            if ord(ch) < 0x20:
+                out.append(f"\\u{ord(ch):04x}")
+                continue
+
+            out.append(ch)
+
+        return "".join(out)
+
+    def _close_truncated_json(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        s = text.strip()
+        if not s.startswith("{"):
+            return None
+        stack: list[str] = []
+        in_str = False
+        esc = False
+        out: list[str] = []
+        for ch in s:
+            out.append(ch)
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                stack.append("}")
+            elif ch == "[":
+                stack.append("]")
+            elif ch in ("}", "]"):
+                if stack and ch == stack[-1]:
+                    stack.pop()
+        if esc:
+            out.append("\\")
+        if in_str:
+            out.append('"')
+        while stack:
+            out.append(stack.pop())
+        return "".join(out)
 
     def _build_payload_from_payload_schema(
         self,
@@ -1753,8 +1907,9 @@ class SelfEvolvingController(Agent):
                 continue
 
             try:
+                raw_lines = self._explode_code_lines(list(spec.code_lines or []))
                 enforced_lines = self._normalize_module_docstring_lines(
-                    list(spec.code_lines or []),
+                    raw_lines,
                     description=spec.description,
                 )
             except Exception as exc:
@@ -1781,8 +1936,8 @@ class SelfEvolvingController(Agent):
             line_count = 0
             for line in spec.code_lines or []:
                 text = str(line)
-                if "\\n" in text:
-                    text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+                if "\r\n" in text:
+                    text = text.replace("\r\n", "\n")
                 if "\n" in text:
                     line_count += len(text.splitlines())
                 else:
@@ -1812,11 +1967,7 @@ class SelfEvolvingController(Agent):
                 line
                 for line in (spec.code_lines or [])
                 if isinstance(line, str)
-                and (
-                    "<generated>" in line
-                    or "..." in line
-                    or "[truncated]" in line
-                )
+                and self._is_placeholder_line(line)
             ]
             if placeholder_lines:
                 last_error = "placeholder tokens in code_lines"
@@ -2040,11 +2191,26 @@ class SelfEvolvingController(Agent):
             output_len=len(response.content or ""),
             finish_reason=getattr(response, "finish_reason", None),
         )
-        raw_text_full = response.content or ""
+        raw_text_full = self._normalize_toolgen_content(response.content)
+        if response.content and not raw_text_full.strip():
+            raise RuntimeError(
+                "BUG: toolgen repair content empty after normalization (parsing wrong source)"
+            )
+        if "[truncated]" in raw_text_full:
+            raise RuntimeError("BUG: truncation marker found in toolgen repair raw_text")
         self._last_toolgen_parse_source = None
         fallback_info = self._toolgen_fallback_info()
+        self._toolgen_debug_event(
+            "toolgen_repair_parse_input",
+            content_type=type(response.content).__name__,
+            raw_text_len=len(raw_text_full),
+            raw_text_head=raw_text_full[:120],
+            raw_text_tail=raw_text_full[-120:] if len(raw_text_full) > 120 else raw_text_full,
+        )
         try:
-            payload = self.extract_tool_spec(raw_text_full, fallback_info or response)
+            if not raw_text_full.strip() and fallback_info and fallback_info.get("raw_output"):
+                raw_text_full = str(fallback_info["raw_output"])
+            payload = self.extract_tool_spec(raw_text_full, response)
         except Exception as exc:
             self._toolgen_debug_event(
                 "toolgen_repair_parse_failed",
@@ -2286,6 +2452,34 @@ class SelfEvolvingController(Agent):
         required = self._required_tool_spec_keys()
         return all(key in obj for key in required)
 
+    def _repair_misnested_tool_spec(self, obj: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not isinstance(obj, Mapping):
+            return obj
+        input_schema = obj.get("input_schema")
+        if not isinstance(input_schema, Mapping):
+            return obj
+        required = self._required_tool_spec_keys()
+        moved: dict[str, Any] = {}
+        for key in required:
+            if key == "input_schema" or key in obj:
+                continue
+            if key in input_schema:
+                moved[key] = input_schema[key]
+        if not moved:
+            return obj
+        updated = dict(obj)
+        updated_schema = dict(input_schema)
+        for key in moved:
+            updated_schema.pop(key, None)
+        updated.update(moved)
+        updated["input_schema"] = updated_schema
+        self._toolgen_debug_event(
+            "toolgen_parse_repaired",
+            reason="hoist_keys_from_input_schema",
+            moved_keys=list(moved.keys()),
+        )
+        return updated
+
     def _extract_tool_call_arguments(self, response_obj: Any) -> Optional[str]:
         if response_obj is None:
             return None
@@ -2345,10 +2539,21 @@ class SelfEvolvingController(Agent):
             try:
                 obj = json.loads(text)
             except Exception:
-                return None
+                sanitized = self._escape_invalid_json_backslashes(text)
+                sanitized = self._escape_control_chars_in_json_strings(sanitized)
+                if sanitized != text:
+                    try:
+                        obj = json.loads(sanitized)
+                        parsed_from = source_label + "_sanitized"
+                    except Exception:
+                        return None
+                else:
+                    return None
             if isinstance(obj, Mapping):
+                obj = self._repair_misnested_tool_spec(obj)
                 if self._tool_spec_has_required_keys(obj):
-                    parsed_from = source_label
+                    if parsed_from is None:
+                        parsed_from = source_label
                     return obj
                 wrapped = obj.get("content")
                 if isinstance(wrapped, str) and wrapped.strip():
@@ -2364,11 +2569,21 @@ class SelfEvolvingController(Agent):
             self._last_toolgen_parse_source = parsed_from
             return dict(obj)
 
-        obj_text = self._extract_first_json_object(raw_text_full)
+        sanitized_full = self._escape_invalid_json_backslashes(raw_text_full)
+        sanitized_full = self._escape_control_chars_in_json_strings(sanitized_full)
+
+        obj_text = self._extract_first_json_object(sanitized_full)
         if obj_text:
             obj = _parse_json_text(obj_text, "balanced_json_extraction")
             if obj is not None:
                 self._last_toolgen_parse_source = parsed_from or "balanced_json_extraction"
+                return dict(obj)
+
+        repaired = self._close_truncated_json(sanitized_full)
+        if repaired:
+            obj = _parse_json_text(repaired, "closed_truncated_json")
+            if obj is not None:
+                self._last_toolgen_parse_source = parsed_from or "closed_truncated_json"
                 return dict(obj)
 
         tool_args = self._extract_tool_call_arguments(response_obj)
@@ -2528,8 +2743,8 @@ class SelfEvolvingController(Agent):
         normalized_lines: list[str] = []
         for line in code_lines:
             text = str(line)
-            if "\\n" in text:
-                text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+            if "\r\n" in text:
+                text = text.replace("\r\n", "\n")
             if "\n" in text:
                 normalized_lines.extend(text.splitlines())
             else:
@@ -2538,6 +2753,26 @@ class SelfEvolvingController(Agent):
         if not normalized_lines:
             return None
         return "\n".join(normalized_lines).rstrip() + "\n"
+
+    def _explode_code_lines(self, code_lines: Sequence[Any]) -> list[str]:
+        exploded: list[str] = []
+        for line in code_lines or []:
+            text = str(line)
+            if "\r\n" in text:
+                text = text.replace("\r\n", "\n")
+            if "\n" in text:
+                exploded.extend(text.splitlines())
+            else:
+                exploded.append(text)
+        return exploded
+
+    def _is_placeholder_line(self, line: str) -> bool:
+        text = (line or "").strip()
+        if not text:
+            return False
+        if "<generated>" in text or "[truncated]" in text:
+            return True
+        return text in {"...", "…"}
 
     def _normalize_module_docstring_lines(
         self, lines: Sequence[str], description: Optional[str] = None
@@ -2828,7 +3063,7 @@ class SelfEvolvingController(Agent):
             line
             for line in code_lines
             if isinstance(line, str)
-            and ("<generated>" in line or "..." in line or "[truncated]" in line)
+            and self._is_placeholder_line(line)
         ]
         if placeholder_lines:
             self._toolgen_debug_event(
@@ -3392,12 +3627,25 @@ class SelfEvolvingController(Agent):
             output_len=len(response.content or ""),
             finish_reason=getattr(response, "finish_reason", None),
         )
-        raw_text_full = response.content or ""
+        raw_text_full = self._normalize_toolgen_content(response.content)
+        if response.content and not raw_text_full.strip():
+            raise RuntimeError(
+                "BUG: toolgen content empty after normalization (parsing wrong source)"
+            )
+        if "[truncated]" in raw_text_full:
+            raise RuntimeError("BUG: truncation marker found in toolgen raw_text")
+        self._toolgen_debug_event(
+            "toolgen_parse_input",
+            content_type=type(response.content).__name__,
+            raw_text_len=len(raw_text_full),
+            raw_text_head=raw_text_full[:120],
+            raw_text_tail=raw_text_full[-120:] if len(raw_text_full) > 120 else raw_text_full,
+        )
         self._last_toolgen_parse_source = None
         try:
-            creation_request = self.extract_tool_spec(
-                raw_text_full, fallback_info or response
-            )
+            if not raw_text_full.strip() and fallback_info and fallback_info.get("raw_output"):
+                raw_text_full = str(fallback_info["raw_output"])
+            creation_request = self.extract_tool_spec(raw_text_full, response)
         except Exception as exc:
             preview = (response.content or "")[:800]
             self._trace("tool_generation_debug", f"parse_failed content_preview={preview!r}")
