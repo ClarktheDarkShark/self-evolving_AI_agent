@@ -336,6 +336,7 @@ class ControllerToolgenMixin:
         if getattr(self, "_toolgen_agent", None) is None:
             return None
 
+        self._toolgen_last_query = query
         prompt = self._toolgen_request_prompt(query, chat_history)
         self._trace("tool_agent_input", prompt)
         tool_history = ChatHistory()
