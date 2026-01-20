@@ -47,8 +47,6 @@ class ControllerOrchestratorMixin:
             "environment": self._resolved_environment_label(),
             "task_text": cleaned_query,
             "history": history_text,
-            "last_observation": self._get_last_env_observation(chat_history),
-            "candidate_output": self._get_candidate_output(chat_history, cleaned_query),
             "existing_tools": existing,
             "output_schema": {
                 "action": "use_tool|create_tool|no_tool",

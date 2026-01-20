@@ -73,17 +73,6 @@ class ControllerToolgenMixin:
                     return text[start : i + 1]
         return None
 
-    def _default_tool_name(self, query: Optional[str]) -> str:
-        words = re.findall(r"[a-zA-Z0-9]+", (query or "").lower())
-        words = [w for w in words if w not in {"the", "a", "an", "to", "of", "and", "or"}]
-        base = "_".join(words[:4]) if words else "generated"
-        env = getattr(self, "_resolved_environment_label", lambda: "")()
-        prefix = "validator" if env in {"db_bench", "mysql"} else "tool"
-        name = f"{prefix}_{base}".strip("_")
-        if not name[0].isalpha():
-            name = f"tool_{name}"
-        return name[:48]
-
     def _parse_creation_payload(self, payload: str) -> Optional[Mapping[str, Any]]:
         try:
             obj = json.loads(payload)
@@ -181,22 +170,13 @@ class ControllerToolgenMixin:
             "task": self._truncate((query or "").strip(), 800),
             "history": "\n".join(history_lines),
             "existing_tools": existing,
-            "design_goal": (
-                "Build a reusable tool that solves the task and nearby tasks. "
-                "Prefer a slightly richer tool over a narrow single-case tool."
-            ),
-            "environment_hint": (
-                "If this is a db_bench/mysql task, build a validator tool that checks "
-                "the final answer format and SQL action format before submission."
-            ),
             "output_mode": self._toolgen_output_mode(),
             "output_instructions": (
                 "Output ONLY:\n###TOOL_START\n<python>\n###TOOL_END"
                 if self._toolgen_output_mode() == "markers"
                 else "Output a single JSON object ToolSpec."
             ),
-            "requested_tool_name": getattr(self, "_toolgen_requested_tool_name", None)
-            or self._default_tool_name(query),
+            "requested_tool_name": getattr(self, "_toolgen_requested_tool_name", None),
             "requested_tool_category": getattr(self, "_toolgen_requested_tool_category", None),
         }
         return json.dumps(payload, ensure_ascii=True, default=str)
@@ -219,10 +199,7 @@ class ControllerToolgenMixin:
         return "\n".join(normalized_lines).rstrip() + "\n"
 
     def _wrap_marker_tool_spec(self, python_code: str) -> dict[str, Any]:
-        name = (
-            getattr(self, "_toolgen_requested_tool_name", None)
-            or self._default_tool_name(getattr(self, "_toolgen_last_query", None))
-        )
+        name = getattr(self, "_toolgen_requested_tool_name", None) or "generated_tool"
         description = getattr(self, "_toolgen_requested_description", None) or "Generated tool."
         signature = getattr(self, "_toolgen_requested_signature", None) or "run(payload: dict) -> dict"
         tool_type = getattr(self, "_toolgen_requested_tool_type", None) or "utility"
@@ -248,9 +225,7 @@ class ControllerToolgenMixin:
 
     def _normalize_tool_spec(self, spec: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(spec)
-        normalized.setdefault(
-            "name", self._default_tool_name(getattr(self, "_toolgen_last_query", None))
-        )
+        normalized.setdefault("name", "generated_tool")
         normalized.setdefault("description", "Generated tool.")
         normalized.setdefault("signature", "run(payload: dict) -> dict")
         normalized.setdefault("tool_type", "utility")
