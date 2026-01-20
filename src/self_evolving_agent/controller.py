@@ -351,21 +351,8 @@ class SelfEvolvingController(
             if tb:
                 self._trace("tool_pipeline_traceback", tb)
 
-        def _requires_action_format() -> bool:
-            return self._is_db_bench_env()
-
         def _fallback_response() -> str:
-            if _requires_action_format():
-                return "Action: Answer\nFinal Answer: []"
             return "OK."
-
-        def _ensure_solver_output(content: str) -> str:
-            text = (content or "").strip()
-            if not text:
-                return _fallback_response()
-            if _requires_action_format() and not re.match(r"^Action:\s*(Operation|Answer)\b", text):
-                return _fallback_response()
-            return content
 
         tool_traces: list[dict[str, Any]] = []
         tool_error: Optional[str] = None
@@ -492,11 +479,6 @@ class SelfEvolvingController(
                     tool_error = f"tool generation exception: {type(exc).__name__}: {exc}"
                     self._trace("tool_agent_result", "ERROR tool generation failed")
                     _record_tool_error("create_tool", tool_error, traceback.format_exc())
-                    self._toolgen_debug_event(
-                        "INVARIANT_BROKEN",
-                        reason="create_tool_exception",
-                        tool_error=tool_error,
-                    )
                     tool_result = ToolResult.failure(tool_error)
                     working_history = self._inject_tool_result_message(
                         working_history, "create_tool", tool_result
@@ -507,11 +489,6 @@ class SelfEvolvingController(
                     tool_error = "tool generation failed"
                     self._trace("tool_agent_result", "ERROR tool generation failed")
                     _record_tool_error("create_tool", tool_error)
-                    self._toolgen_debug_event(
-                        "INVARIANT_BROKEN",
-                        reason="create_tool_no_result",
-                        tool_error=tool_error,
-                    )
                     tool_result = ToolResult.failure(tool_error)
                     working_history = self._inject_tool_result_message(
                         working_history, "create_tool", tool_result
@@ -621,7 +598,6 @@ class SelfEvolvingController(
                     ),
                 )
                 continue
-            content = _ensure_solver_output(content)
             context_key = self._solver_context_key(working_history)
             if content == self._last_solver_output and context_key == self._last_solver_context_key:
                 self._solver_repeat_count += 1
