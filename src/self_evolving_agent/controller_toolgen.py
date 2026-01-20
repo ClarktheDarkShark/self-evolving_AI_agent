@@ -148,9 +148,34 @@ class ControllerToolgenMixin:
                 "tool_type": tool.tool_type,
                 "tool_category": getattr(tool, "tool_category", None),
                 "signature": tool.signature,
+                "description": tool.description,
+                "input_schema": getattr(tool, "input_schema", None),
+                "capabilities": getattr(tool, "capabilities", None),
             }
             for tool in tools[-50:]
         ]
+
+    def _toolgen_default_name(self) -> str:
+        requested = getattr(self, "_toolgen_requested_tool_name", None)
+        if isinstance(requested, str) and requested.strip():
+            return requested.strip()
+        query = getattr(self, "_toolgen_last_query", "") or ""
+        cleaned = re.sub(r"[^0-9a-zA-Z]+", " ", query).strip().lower()
+        tokens = [token for token in cleaned.split() if token]
+        slug = "_".join(tokens[:5]).strip("_")
+        if len(slug) > 48:
+            slug = slug[:48].rstrip("_")
+        return f"{slug}_tool" if slug else "task_tool"
+
+    def _toolgen_default_description(self) -> str:
+        requested = getattr(self, "_toolgen_requested_description", None)
+        if isinstance(requested, str) and requested.strip():
+            return requested.strip()
+        query = getattr(self, "_toolgen_last_query", "") or ""
+        summary = query.strip()
+        if summary:
+            return f"Utility tool for: {summary[:120]}"
+        return "Utility tool for the current task."
 
     def _toolgen_request_prompt(self, query: str, chat_history: ChatHistory) -> str:
         existing = []
@@ -176,6 +201,10 @@ class ControllerToolgenMixin:
                 if self._toolgen_output_mode() == "markers"
                 else "Output a single JSON object ToolSpec."
             ),
+            "tool_expectations": (
+                "Pick a clear, specific name. Provide complete, reusable logic "
+                "with docstrings and edge-case handling; avoid toy or trivial implementations."
+            ),
             "requested_tool_name": getattr(self, "_toolgen_requested_tool_name", None),
             "requested_tool_category": getattr(self, "_toolgen_requested_tool_category", None),
         }
@@ -199,8 +228,8 @@ class ControllerToolgenMixin:
         return "\n".join(normalized_lines).rstrip() + "\n"
 
     def _wrap_marker_tool_spec(self, python_code: str) -> dict[str, Any]:
-        name = getattr(self, "_toolgen_requested_tool_name", None) or "generated_tool"
-        description = getattr(self, "_toolgen_requested_description", None) or "Generated tool."
+        name = self._toolgen_default_name()
+        description = self._toolgen_default_description()
         signature = getattr(self, "_toolgen_requested_signature", None) or "run(payload: dict) -> dict"
         tool_type = getattr(self, "_toolgen_requested_tool_type", None) or "utility"
         tool_category = getattr(self, "_toolgen_requested_tool_category", None) or "utility"
@@ -225,8 +254,8 @@ class ControllerToolgenMixin:
 
     def _normalize_tool_spec(self, spec: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(spec)
-        normalized.setdefault("name", "generated_tool")
-        normalized.setdefault("description", "Generated tool.")
+        normalized.setdefault("name", self._toolgen_default_name())
+        normalized.setdefault("description", self._toolgen_default_description())
         normalized.setdefault("signature", "run(payload: dict) -> dict")
         normalized.setdefault("tool_type", "utility")
         normalized.setdefault("tool_category", "utility")
