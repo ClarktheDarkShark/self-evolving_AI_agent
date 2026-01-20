@@ -29,7 +29,11 @@ from src.typings.config import get_predefined_timestamp_structure
 from .controller_history import ControllerHistoryMixin
 from .controller_logging import ControllerLoggingMixin
 from .controller_orchestrator import ControllerOrchestratorMixin
-from .controller_prompts import ORCHESTRATOR_SYSTEM_PROMPT, TOOLGEN_SYSTEM_PROMPT
+from .controller_prompts import (
+    ORCHESTRATOR_SYSTEM_PROMPT,
+    TOOLGEN_SYSTEM_PROMPT,
+    TOOLGEN_SYSTEM_PROMPT_MARKERS,
+)
 from .controller_toolgen import ControllerToolgenMixin
 from .controller_tools import ControllerToolsMixin
 from .tool_registry import ToolMetadata, ToolResult, get_registry
@@ -120,19 +124,17 @@ class SelfEvolvingController(
             base_cfg.pop(k, None)
 
         base_cfg["tool_choice"] = "none"
-        base_cfg["response_format"] = {"type": "json_object"}
+        toolgen_output_mode = os.environ.get("TOOLGEN_OUTPUT_MODE", "markers").strip().lower()
+        if toolgen_output_mode == "json":
+            base_cfg["response_format"] = {"type": "json_object"}
+            toolgen_system_prompt = TOOLGEN_SYSTEM_PROMPT
+        else:
+            toolgen_system_prompt = TOOLGEN_SYSTEM_PROMPT_MARKERS
         base_cfg["toolgen_extract_tool_calls"] = True
         base_cfg["ollama_force_tool_calls"] = False
-        toolgen_timeout_raw = os.environ.get("TOOLGEN_REQUEST_TIMEOUT_S")
-        if toolgen_timeout_raw:
-            try:
-                base_cfg["request_timeout_s"] = float(toolgen_timeout_raw.strip())
-            except Exception:
-                pass
-
         self._toolgen_agent = LanguageModelAgent(
             language_model=language_model,
-            system_prompt=TOOLGEN_SYSTEM_PROMPT,
+            system_prompt=toolgen_system_prompt,
             inference_config_dict={
                 **base_cfg,
                 "temperature": 0.0,
@@ -235,6 +237,10 @@ class SelfEvolvingController(
         self._toolgen_requested_tool_name: Optional[str] = None
         self._toolgen_requested_tool_category: Optional[str] = None
         self._toolgen_requested_capabilities: Optional[list[str]] = None
+        self._toolgen_requested_signature: Optional[str] = None
+        self._toolgen_requested_input_schema: Optional[dict[str, Any]] = None
+        self._toolgen_requested_tool_type: Optional[str] = None
+        self._toolgen_requested_description: Optional[str] = None
         self._run_task_metadata: Optional[dict[str, Any]] = None
         self._last_solver_output: Optional[str] = None
         self._last_solver_context_key: Optional[str] = None
@@ -327,6 +333,10 @@ class SelfEvolvingController(
         self._toolgen_requested_tool_name = None
         self._toolgen_requested_tool_category = None
         self._toolgen_requested_capabilities = None
+        self._toolgen_requested_signature = None
+        self._toolgen_requested_input_schema = None
+        self._toolgen_requested_tool_type = None
+        self._toolgen_requested_description = None
 
         user_items = [item for item in self._history_items(working_history) if item.role == Role.USER]
         if len(user_items) >= 2:
@@ -453,6 +463,27 @@ class SelfEvolvingController(
                     "check_tables",
                     "check_limit",
                 ]
+                self._toolgen_requested_signature = "run(payload: dict) -> dict"
+                self._toolgen_requested_tool_type = "utility"
+                self._toolgen_requested_description = (
+                    "Validates SQL SELECT queries for table/column/limit constraints."
+                )
+                self._toolgen_requested_input_schema = {
+                    "type": "object",
+                    "required": ["payload"],
+                    "properties": {
+                        "payload": {
+                            "type": "object",
+                            "required": ["query"],
+                            "properties": {
+                                "query": {"type": "string"},
+                                "table_name": {"type": "string"},
+                                "columns": {"type": "array", "items": {"type": "string"}},
+                                "schema": {"type": "object"},
+                            },
+                        }
+                    },
+                }
                 try:
                     selected_tool = self._maybe_generate_tool_for_query(
                         task_query, working_history, allow_reuse=False, force=True

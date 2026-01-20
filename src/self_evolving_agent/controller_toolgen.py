@@ -4,6 +4,8 @@ import json
 import os
 import re
 import traceback
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 try:
@@ -20,8 +22,13 @@ from .tool_retrieval import retrieve_tools
 
 
 class ControllerToolgenMixin:
+    def _toolgen_output_mode(self) -> str:
+        value = os.environ.get("TOOLGEN_OUTPUT_MODE", "markers")
+        mode = value.strip().lower()
+        return "json" if mode == "json" else "markers"
+
     def _toolgen_test_mode(self) -> bool:
-        value = os.environ.get("TEST", "")
+        value = os.environ.get("TOOLGEN_TEST_MODE") or os.environ.get("TEST", "")
         return value.strip().lower() in {"1", "true", "yes", "on"}
 
     def _toolgen_env_int(self, key: str, default: int) -> int:
@@ -32,6 +39,146 @@ class ControllerToolgenMixin:
             return int(raw)
         except Exception:
             return default
+
+    def _broken_tools_dir(self) -> Path:
+        base = None
+        if getattr(self, "_generated_tools_log_path", None) is not None:
+            base = Path(self._generated_tools_log_path).parent
+        elif getattr(self, "_tool_invocation_log_path", None) is not None:
+            base = Path(self._tool_invocation_log_path).parent
+        else:
+            base = Path("outputs")
+        return base / "broken_tools"
+
+    def _toolgen_failure_dir(self, tool_name: Optional[str]) -> Path:
+        out_dir = self._broken_tools_dir()
+        safe_name = self._sanitize_tool_filename(tool_name or "toolgen")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        path = out_dir / f"{ts}_{safe_name}"
+        counter = 1
+        while path.exists():
+            path = out_dir / f"{ts}_{safe_name}_{counter}"
+            counter += 1
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _sanitize_tool_filename(self, name: str) -> str:
+        text = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name or "tool")
+        return text[:80] if len(text) > 80 else text
+
+    def _persist_broken_tool(
+        self,
+        *,
+        stage: str,
+        error: str,
+        spec: ToolSpec,
+        raw_spec: Optional[Mapping[str, Any]],
+        code: str,
+    ) -> None:
+        if not code:
+            return
+        try:
+            out_dir = self._broken_tools_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = self._sanitize_tool_filename(spec.name or "tool")
+            safe_stage = self._sanitize_tool_filename(stage or "unknown")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            filename = f"{safe_name}__{safe_stage}__{ts}.py"
+            path = out_dir / filename
+            counter = 1
+            while path.exists():
+                path = out_dir / f"{safe_name}__{safe_stage}__{ts}_{counter}.py"
+                counter += 1
+            raw_dump = json.dumps(
+                raw_spec if raw_spec is not None else spec.__dict__,
+                ensure_ascii=True,
+                default=str,
+            )
+            header = (
+                "# BROKEN TOOL\n"
+                f"# stage: {stage}\n"
+                f"# error: {error}\n"
+                f"# name: {spec.name}\n"
+                f"# signature: {spec.signature}\n"
+                f"# raw_spec: {raw_dump}\n\n"
+            )
+            path.write_text(header + code, encoding="utf-8")
+        except Exception:
+            return
+
+    def _persist_broken_tool_output(
+        self,
+        *,
+        stage: str,
+        error: str,
+        raw_output: str,
+        tool_name: Optional[str] = None,
+    ) -> None:
+        try:
+            out_dir = self._broken_tools_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = self._sanitize_tool_filename(tool_name or "toolgen")
+            safe_stage = self._sanitize_tool_filename(stage or "unknown")
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            filename = f"{safe_name}__{safe_stage}__{ts}.txt"
+            path = out_dir / filename
+            counter = 1
+            while path.exists():
+                path = out_dir / f"{safe_name}__{safe_stage}__{ts}_{counter}.txt"
+                counter += 1
+            header = (
+                "# BROKEN TOOL OUTPUT\n"
+                f"# stage: {stage}\n"
+                f"# error: {error}\n"
+                f"# tool_name: {tool_name}\n\n"
+            )
+            body = raw_output or "<empty>"
+            path.write_text(header + body, encoding="utf-8")
+        except Exception:
+            return
+
+    def _persist_toolgen_failure_artifacts(
+        self,
+        *,
+        stage: str,
+        error: str,
+        tool_name: Optional[str] = None,
+        prompt: Optional[str] = None,
+        raw_output: Optional[str] = None,
+        extracted_python: Optional[str] = None,
+    ) -> None:
+        try:
+            tool_name = tool_name or getattr(self, "_toolgen_requested_tool_name", None)
+            prompt = prompt if prompt is not None else getattr(self, "_toolgen_last_prompt", "")
+            raw_output = raw_output if raw_output is not None else getattr(self, "_toolgen_last_raw_output", "")
+            extracted_python = (
+                extracted_python
+                if extracted_python is not None
+                else getattr(self, "_toolgen_last_extracted_python", "")
+            )
+            out_dir = self._toolgen_failure_dir(tool_name)
+            (out_dir / "error.txt").write_text(
+                f"stage: {stage}\nerror: {error}\n", encoding="utf-8"
+            )
+            (out_dir / "prompt.txt").write_text(prompt or "<empty>", encoding="utf-8")
+            (out_dir / "raw_output.txt").write_text(raw_output or "<empty>", encoding="utf-8")
+            if extracted_python:
+                (out_dir / "extracted.py").write_text(extracted_python, encoding="utf-8")
+        except Exception:
+            return
+
+    def _extract_marked_python(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        start = text.find("###TOOL_START")
+        if start < 0:
+            return None
+        end = text.find("###TOOL_END", start + len("###TOOL_START"))
+        if end < 0:
+            return None
+        body = text[start + len("###TOOL_START"):end]
+        body = body.strip()
+        return body or None
 
     def _normalize_toolgen_content(self, content: Any) -> str:
         if isinstance(content, str):
@@ -447,6 +594,7 @@ class ControllerToolgenMixin:
             existing = []
 
         compact_query = self._toolgen_compact_query(query)
+        output_mode = self._toolgen_output_mode()
 
         test_mode = self._toolgen_test_mode()
         history_k = self._toolgen_env_int("TOOLGEN_HISTORY_K", 4 if test_mode else 8)
@@ -476,6 +624,11 @@ class ControllerToolgenMixin:
                 design_goal += " Output a SELECT VALIDATOR; do not output a builder/parser."
             else:
                 design_goal += " Output a VALIDATOR; do not output a builder/parser."
+        if output_mode == "markers":
+            design_goal += (
+                " OUTPUT FORMAT: first line ###TOOL_START, then raw Python source, "
+                "then last line ###TOOL_END. Output ONLY those lines."
+            )
 
         history_items = self._history_items(chat_history)[-history_k:]
         mini_lines = []
@@ -490,6 +643,12 @@ class ControllerToolgenMixin:
             "user_task": self._truncate(compact_query, task_chars),
             "history_hint": mini_history,
             "design_goal": design_goal,
+            "output_mode": output_mode,
+            "output_instructions": (
+                "Output ONLY:\n###TOOL_START\n<python>\n###TOOL_END\nNo JSON."
+                if output_mode == "markers"
+                else "Output a single JSON object ToolSpec."
+            ),
             "requested_tool_name": requested_tool_name_for_prompt,
             "requested_tool_category": requested_tool_category,
             "requested_capabilities": requested_capabilities,
@@ -498,12 +657,13 @@ class ControllerToolgenMixin:
                 "max_lines": max_lines,
                 "deterministic": True,
                 "self_test_required": False if test_mode else True,
-                "output_keys": [
-                    "name","description","signature","tool_type","tool_category",
-                    "input_schema","capabilities","code_lines"
-                ],
             },
         }
+        if output_mode == "json":
+            payload["hard_constraints"]["output_keys"] = [
+                "name","description","signature","tool_type","tool_category",
+                "input_schema","capabilities","code_lines"
+            ]
         return json.dumps(payload, ensure_ascii=True, default=str)
 
     def _normalize_retrieval_query(self, query: str) -> str:
@@ -739,6 +899,46 @@ class ControllerToolgenMixin:
                 )
         return spec
 
+    def _wrap_marker_tool_spec(self, python_code: str) -> dict[str, Any]:
+        name = getattr(self, "_toolgen_requested_tool_name", None) or "generated_tool"
+        description = (
+            getattr(self, "_toolgen_requested_description", None)
+            or "Generated tool."
+        )
+        signature = (
+            getattr(self, "_toolgen_requested_signature", None)
+            or "run(payload: dict) -> dict"
+        )
+        tool_type = (
+            getattr(self, "_toolgen_requested_tool_type", None)
+            or "utility"
+        )
+        tool_category = (
+            getattr(self, "_toolgen_requested_tool_category", None)
+            or "utility"
+        )
+        input_schema = getattr(self, "_toolgen_requested_input_schema", None)
+        if not isinstance(input_schema, Mapping):
+            input_schema = {
+                "type": "object",
+                "required": ["payload"],
+                "properties": {
+                    "payload": {"type": "object", "required": [], "properties": {}}
+                },
+            }
+        capabilities = getattr(self, "_toolgen_requested_capabilities", None) or []
+        code_lines = python_code.splitlines()
+        return {
+            "name": name,
+            "description": description,
+            "signature": signature,
+            "tool_type": tool_type,
+            "tool_category": tool_category,
+            "input_schema": input_schema,
+            "capabilities": capabilities,
+            "code_lines": code_lines,
+        }
+
     def _ensure_tool_imports(self, lines: list[str]) -> list[str]:
         needs_re = any("re." in line for line in lines)
         has_re = any(
@@ -839,7 +1039,7 @@ class ControllerToolgenMixin:
         raw_spec: Optional[Mapping[str, Any]] = None,
     ) -> Optional[ToolMetadata]:
         test_mode = self._toolgen_test_mode()
-        max_attempts = 1 if test_mode else 3
+        max_attempts = 3
         max_lines = self._toolgen_env_int(
             "TOOLGEN_MAX_LINES", 60 if test_mode else 90
         )
@@ -860,8 +1060,22 @@ class ControllerToolgenMixin:
                     signature=spec.signature,
                     error=last_error,
                 )
+                raw_code = self._join_code_lines(spec.code_lines or [])
+                if raw_code:
+                    self._persist_broken_tool(
+                        stage="spec_alignment",
+                        error=last_error,
+                        spec=spec,
+                        raw_spec=current_raw_spec,
+                        code=raw_code,
+                    )
+                self._persist_toolgen_failure_artifacts(
+                    stage="spec_alignment",
+                    error=last_error,
+                    tool_name=spec.name,
+                )
 
-                if attempt == max_attempts or test_mode:
+                if attempt == max_attempts:
                     break
 
                 repair_spec = self._repair_tool_spec(
@@ -889,7 +1103,21 @@ class ControllerToolgenMixin:
                     signature=spec.signature,
                     error=last_error,
                 )
-                if attempt == max_attempts or test_mode:
+                raw_code = self._join_code_lines(spec.code_lines or [])
+                if raw_code:
+                    self._persist_broken_tool(
+                        stage="docstring_invariant",
+                        error=last_error,
+                        spec=spec,
+                        raw_spec=current_raw_spec,
+                        code=raw_code,
+                    )
+                self._persist_toolgen_failure_artifacts(
+                    stage="docstring_invariant",
+                    error=last_error,
+                    tool_name=spec.name,
+                )
+                if attempt == max_attempts:
                     break
                 repair_spec = self._repair_tool_spec(
                     spec, last_error, chat_history, raw_spec=current_raw_spec
@@ -909,26 +1137,35 @@ class ControllerToolgenMixin:
                     line_count += len(text.splitlines())
                 else:
                     line_count += 1
-            if line_count > max_lines:
-                last_error = f"line_limit_exceeded: code_lines > {max_lines}"
-                self._trace("tool_generation_error", f"stage=line_limit error={last_error}")
-                self._toolgen_debug_event(
-                    "toolgen_validate_failed",
-                    stage="line_limit",
-                    tool_name=spec.name,
-                    signature=spec.signature,
-                    error=last_error,
-                )
-                if attempt == max_attempts or test_mode:
-                    break
-                repair_spec = self._repair_tool_spec(
-                    spec, last_error, chat_history, raw_spec=current_raw_spec
-                )
-                if repair_spec is None:
-                    break
-                spec = repair_spec
-                current_raw_spec = spec.__dict__
-                continue
+            # if line_count > max_lines:
+            #     last_error = f"line_limit_exceeded: code_lines > {max_lines}"
+            #     self._trace("tool_generation_error", f"stage=line_limit error={last_error}")
+            #     self._toolgen_debug_event(
+            #         "toolgen_validate_failed",
+            #         stage="line_limit",
+            #         tool_name=spec.name,
+            #         signature=spec.signature,
+            #         error=last_error,
+            #     )
+            #     raw_code = self._join_code_lines(spec.code_lines or [])
+            #     if raw_code:
+            #         self._persist_broken_tool(
+            #             stage="line_limit",
+            #             error=last_error,
+            #             spec=spec,
+            #             raw_spec=current_raw_spec,
+            #             code=raw_code,
+            #         )
+            #     if attempt == max_attempts:
+            #         break
+            #     repair_spec = self._repair_tool_spec(
+            #         spec, last_error, chat_history, raw_spec=current_raw_spec
+            #     )
+            #     if repair_spec is None:
+            #         break
+            #     spec = repair_spec
+            #     current_raw_spec = spec.__dict__
+            #     continue
 
             placeholder_lines = [
                 line
@@ -946,7 +1183,21 @@ class ControllerToolgenMixin:
                     signature=spec.signature,
                     error=last_error,
                 )
-                if attempt == max_attempts or test_mode:
+                raw_code = self._join_code_lines(spec.code_lines or [])
+                if raw_code:
+                    self._persist_broken_tool(
+                        stage="placeholder_tokens",
+                        error=last_error,
+                        spec=spec,
+                        raw_spec=current_raw_spec,
+                        code=raw_code,
+                    )
+                self._persist_toolgen_failure_artifacts(
+                    stage="placeholder_tokens",
+                    error=last_error,
+                    tool_name=spec.name,
+                )
+                if attempt == max_attempts:
                     break
                 repair_spec = self._repair_tool_spec(
                     spec, last_error, chat_history, raw_spec=current_raw_spec
@@ -968,8 +1219,13 @@ class ControllerToolgenMixin:
                     signature=spec.signature,
                     error=last_error,
                 )
+                self._persist_toolgen_failure_artifacts(
+                    stage="code_join",
+                    error=last_error,
+                    tool_name=spec.name,
+                )
 
-                if attempt == max_attempts or test_mode:
+                if attempt == max_attempts:
                     break
 
                 repair_spec = self._repair_tool_spec(
@@ -1071,6 +1327,18 @@ class ControllerToolgenMixin:
                     signature=spec.signature,
                     error=last_error,
                 )
+                self._persist_broken_tool(
+                    stage="register",
+                    error=last_error,
+                    spec=spec,
+                    raw_spec=current_raw_spec,
+                    code=code,
+                )
+                self._persist_toolgen_failure_artifacts(
+                    stage="register",
+                    error=last_error,
+                    tool_name=spec.name,
+                )
 
             else:
                 last_error = getattr(result, "error", None) or last_error or "unknown validate failure"
@@ -1102,8 +1370,20 @@ class ControllerToolgenMixin:
                     error=last_error,
                     code_preview=code_preview,
                 )
+                self._persist_broken_tool(
+                    stage=stage,
+                    error=last_error,
+                    spec=spec,
+                    raw_spec=current_raw_spec,
+                    code=code,
+                )
+                self._persist_toolgen_failure_artifacts(
+                    stage=stage,
+                    error=last_error,
+                    tool_name=spec.name,
+                )
 
-            if attempt == max_attempts or test_mode:
+            if attempt == max_attempts:
                 break
 
             repair_spec = self._repair_tool_spec(spec, last_error or "", chat_history)
@@ -1212,9 +1492,13 @@ class ControllerToolgenMixin:
                 reason="invalid_creation_request_type",
                 request_type=type(creation_request).__name__,
             )
+            self._persist_toolgen_failure_artifacts(
+                stage="invalid_creation_request_type",
+                error="creation_request not mapping",
+                tool_name=getattr(self, "_toolgen_requested_tool_name", None),
+            )
             return None
 
-        test_mode = self._toolgen_test_mode()
         tool_spec = dict(creation_request)
         before_lines = list(tool_spec.get("code_lines") or [])
         try:
@@ -1228,6 +1512,11 @@ class ControllerToolgenMixin:
                 "toolgen_register_failed",
                 reason="normalization_failed",
                 error=str(exc),
+            )
+            self._persist_toolgen_failure_artifacts(
+                stage="normalization_failed",
+                error=str(exc),
+                tool_name=tool_spec.get("name"),
             )
             return None
         self._toolgen_debug_event(
@@ -1243,8 +1532,11 @@ class ControllerToolgenMixin:
                 tool_category=tool_spec.get("tool_category"),
                 expected=requested_tool_category,
             )
-            if test_mode:
-                return None
+            self._persist_toolgen_failure_artifacts(
+                stage="tool_category_mismatch",
+                error="tool_category_mismatch",
+                tool_name=tool_spec.get("name"),
+            )
             repair_spec = self._repair_tool_spec(
                 ToolSpec.from_payload(tool_spec),
                 "tool_category_mismatch",
@@ -1273,8 +1565,11 @@ class ControllerToolgenMixin:
                     tool_name=tool_spec.get("name"),
                     expected_prefix=expected_prefix,
                 )
-                if test_mode:
-                    return None
+                self._persist_toolgen_failure_artifacts(
+                    stage="tool_name_mismatch",
+                    error="tool_name_mismatch",
+                    tool_name=tool_spec.get("name"),
+                )
                 repair_spec = self._repair_tool_spec(
                     ToolSpec.from_payload(tool_spec),
                     "tool_name_mismatch",
@@ -1320,6 +1615,11 @@ class ControllerToolgenMixin:
                 reason="parsed_missing_required_fields",
                 payload_keys=list(tool_spec.keys()),
             )
+            self._persist_toolgen_failure_artifacts(
+                stage="missing_required_fields",
+                error=f"missing required fields: {', '.join(missing)}",
+                tool_name=tool_spec.get("name"),
+            )
             return None
 
         preflight_error = None
@@ -1337,8 +1637,11 @@ class ControllerToolgenMixin:
                 reason=preflight_error,
                 tool_name=tool_spec.get("name"),
             )
-            if test_mode:
-                return None
+            self._persist_toolgen_failure_artifacts(
+                stage=preflight_error,
+                error=preflight_error,
+                tool_name=tool_spec.get("name"),
+            )
             repair_spec = self._repair_tool_spec(
                 ToolSpec.from_payload(tool_spec),
                 preflight_error,
@@ -1360,8 +1663,11 @@ class ControllerToolgenMixin:
                     reason="missing_self_test",
                     tool_name=tool_spec.get("name"),
                 )
-                if test_mode:
-                    return None
+                self._persist_toolgen_failure_artifacts(
+                    stage="missing_self_test",
+                    error="missing self_test",
+                    tool_name=tool_spec.get("name"),
+                )
                 repair_spec = self._repair_tool_spec(
                     ToolSpec.from_payload(tool_spec),
                     "missing self_test",
@@ -1388,8 +1694,11 @@ class ControllerToolgenMixin:
                 tool_name=tool_spec.get("name"),
                 offending_lines=placeholder_lines[:3],
             )
-            if test_mode:
-                return None
+            self._persist_toolgen_failure_artifacts(
+                stage="placeholder_tokens_in_code",
+                error="placeholder tokens in code_lines",
+                tool_name=tool_spec.get("name"),
+            )
             repair_spec = self._repair_tool_spec(
                 ToolSpec.from_payload(tool_spec),
                 "placeholder tokens in code_lines",
@@ -1416,6 +1725,11 @@ class ControllerToolgenMixin:
                 reason="code_style_inline_if",
                 offending_lines=inline_compounds[:3],
             )
+            self._persist_toolgen_failure_artifacts(
+                stage="code_style_inline_if",
+                error="inline compound statements",
+                tool_name=tool_spec.get("name"),
+            )
             return None
 
         tool_type = str(tool_spec.get("tool_type"))
@@ -1432,8 +1746,11 @@ class ControllerToolgenMixin:
                 tool_category=tool_category,
                 tool_name=tool_spec.get("name"),
             )
-            if test_mode:
-                return None
+            self._persist_toolgen_failure_artifacts(
+                stage="invalid_tool_category",
+                error=f"invalid tool_category: {tool_category}",
+                tool_name=tool_spec.get("name"),
+            )
             repair_spec = self._repair_tool_spec(
                 ToolSpec.from_payload(tool_spec),
                 f"invalid tool_category: {tool_category}",
@@ -1455,8 +1772,11 @@ class ControllerToolgenMixin:
                 tool_type=tool_type,
                 tool_name=tool_spec.get("name"),
             )
-            if test_mode:
-                return None
+            self._persist_toolgen_failure_artifacts(
+                stage="missing_input_schema",
+                error="missing input_schema",
+                tool_name=tool_spec.get("name"),
+            )
             repair_spec = self._repair_tool_spec(
                 ToolSpec.from_payload(tool_spec),
                 "missing input_schema",
@@ -1477,8 +1797,11 @@ class ControllerToolgenMixin:
                 reason="missing_capabilities",
                 tool_name=tool_spec.get("name"),
             )
-            if test_mode:
-                return None
+            self._persist_toolgen_failure_artifacts(
+                stage="missing_capabilities",
+                error="missing capabilities",
+                tool_name=tool_spec.get("name"),
+            )
             repair_spec = self._repair_tool_spec(
                 ToolSpec.from_payload(tool_spec),
                 "missing capabilities",
@@ -1589,16 +1912,7 @@ class ControllerToolgenMixin:
             prompt=prompt,
             prompt_len=len(prompt),
         )
-        timeout_raw = os.environ.get("TOOLGEN_REQUEST_TIMEOUT_S", "").strip()
-        if timeout_raw:
-            try:
-                timeout_s = float(timeout_raw)
-            except Exception:
-                timeout_s = None
-            self._toolgen_debug_event(
-                "toolgen_timeout_config",
-                timeout_s=timeout_s,
-            )
+        self._toolgen_last_prompt = prompt
         tool_history = ChatHistory()
         tool_history = self._safe_inject(tool_history, ChatHistoryItem(role=Role.USER, content=prompt))
 
@@ -1622,6 +1936,8 @@ class ControllerToolgenMixin:
             )
         if "[truncated]" in raw_text_full:
             raise RuntimeError("BUG: truncation marker found in toolgen raw_text")
+        self._toolgen_last_raw_output = raw_text_full
+        self._toolgen_last_extracted_python = ""
         self._toolgen_debug_event(
             "toolgen_parse_input",
             content_type=type(response.content).__name__,
@@ -1630,6 +1946,83 @@ class ControllerToolgenMixin:
             raw_text_tail=raw_text_full[-120:] if len(raw_text_full) > 120 else raw_text_full,
         )
         self._last_toolgen_parse_source = None
+
+        output_mode = self._toolgen_output_mode()
+        if output_mode == "markers":
+            extracted = self._extract_marked_python(raw_text_full)
+            self._toolgen_last_extracted_python = extracted or ""
+            if not extracted:
+                if raw_text_full.lstrip().startswith("{"):
+                    self._toolgen_debug_event(
+                        "toolgen_markers_missing_fallback_json",
+                        raw_output_len=len(raw_text_full),
+                    )
+                    try:
+                        creation_request = self.extract_tool_spec(raw_text_full, response)
+                        created = self._register_tool_from_payload(creation_request, chat_history)
+                        if created is None:
+                            self._persist_toolgen_failure_artifacts(
+                                stage="register_returned_none",
+                                error="register_returned_none",
+                                tool_name=getattr(self, "_toolgen_requested_tool_name", None),
+                                prompt=prompt,
+                                raw_output=raw_text_full,
+                                extracted_python=None,
+                            )
+                        return created
+                    except Exception as exc:
+                        note = "invalid_json"
+                        if '"code_lines"' in raw_text_full:
+                            note = "invalid_json_unescaped_quote_in_code_lines"
+                        error = f"markers_missing_fallback_json_failed: {note}: {exc}"
+                        self._toolgen_debug_event(
+                            "toolgen_parse_failed",
+                            raw_output=raw_text_full,
+                            fallback_source=fallback_info.get("fallback_source") if fallback_info else None,
+                            parsed_from="markers_missing_fallback_json",
+                            parsed_source_len=len(raw_text_full),
+                            error=error,
+                        )
+                        self._persist_toolgen_failure_artifacts(
+                            stage="markers_missing_fallback_json_failed",
+                            error=error,
+                            tool_name=getattr(self, "_toolgen_requested_tool_name", None),
+                            prompt=prompt,
+                            raw_output=raw_text_full,
+                            extracted_python=None,
+                        )
+                        return None
+                error = "toolgen_markers_missing"
+                self._toolgen_debug_event(
+                    "toolgen_parse_failed",
+                    raw_output=raw_text_full,
+                    fallback_source=fallback_info.get("fallback_source") if fallback_info else None,
+                    parsed_from="markers_missing",
+                    parsed_source_len=len(raw_text_full),
+                    error=error,
+                )
+                self._persist_toolgen_failure_artifacts(
+                    stage="markers_missing",
+                    error=error,
+                    tool_name=getattr(self, "_toolgen_requested_tool_name", None),
+                    prompt=prompt,
+                    raw_output=raw_text_full,
+                    extracted_python=None,
+                )
+                return None
+            tool_spec = self._wrap_marker_tool_spec(extracted)
+            created = self._register_tool_from_payload(tool_spec, chat_history)
+            if created is None:
+                self._persist_toolgen_failure_artifacts(
+                    stage="register_failed",
+                    error="register_returned_none",
+                    tool_name=getattr(self, "_toolgen_requested_tool_name", None),
+                    prompt=prompt,
+                    raw_output=raw_text_full,
+                    extracted_python=extracted,
+                )
+            return created
+
         try:
             if not raw_text_full.strip() and fallback_info and fallback_info.get("raw_output"):
                 raw_text_full = str(fallback_info["raw_output"])
@@ -1644,6 +2037,20 @@ class ControllerToolgenMixin:
                 parsed_from=getattr(self, "_last_toolgen_parse_source", None),
                 parsed_source_len=len(raw_text_full),
                 error=str(exc),
+            )
+            self._persist_broken_tool_output(
+                stage="toolgen_parse_failed",
+                error=str(exc),
+                raw_output=raw_text_full,
+                tool_name=getattr(self, "_toolgen_requested_tool_name", None),
+            )
+            self._persist_toolgen_failure_artifacts(
+                stage="toolgen_parse_failed",
+                error=str(exc),
+                tool_name=getattr(self, "_toolgen_requested_tool_name", None),
+                prompt=getattr(self, "_toolgen_last_prompt", None),
+                raw_output=raw_text_full,
+                extracted_python=getattr(self, "_toolgen_last_extracted_python", None),
             )
             self._toolgen_debug_event(
                 "INVARIANT_PARSE_FAIL",
@@ -1662,4 +2069,12 @@ class ControllerToolgenMixin:
         created = self._register_tool_from_payload(creation_request, chat_history)
         if created is None:
             self._toolgen_debug_event("toolgen_register_failed", reason="register_returned_none")
+            self._persist_toolgen_failure_artifacts(
+                stage="register_returned_none",
+                error="register_returned_none",
+                tool_name=getattr(self, "_toolgen_requested_tool_name", None),
+                prompt=prompt,
+                raw_output=raw_text_full,
+                extracted_python=getattr(self, "_toolgen_last_extracted_python", None),
+            )
         return created
