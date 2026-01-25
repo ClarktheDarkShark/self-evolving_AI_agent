@@ -30,9 +30,10 @@ from .controller_history import ControllerHistoryMixin
 from .controller_logging import ControllerLoggingMixin
 from .controller_orchestrator import ControllerOrchestratorMixin
 from .controller_prompts import (
-    ORCHESTRATOR_SYSTEM_PROMPT,
-    TOOLGEN_SYSTEM_PROMPT,
     TOOLGEN_SYSTEM_PROMPT_MARKERS,
+    TOOL_INVOKER_SYSTEM_PROMPT,
+    TOOL_ORCHESTRATOR_SYSTEM_PROMPT,
+    TOP_LEVEL_ORCHESTRATOR_SYSTEM_PROMPT,
 )
 from .controller_toolgen import ControllerToolgenMixin
 from .controller_tools import ControllerToolsMixin
@@ -121,17 +122,11 @@ class SelfEvolvingController(
             base_cfg.pop(k, None)
 
         base_cfg["tool_choice"] = "none"
-        toolgen_output_mode = os.environ.get("TOOLGEN_OUTPUT_MODE", "markers").strip().lower()
-        if toolgen_output_mode == "json":
-            base_cfg["response_format"] = {"type": "json_object"}
-            toolgen_system_prompt = TOOLGEN_SYSTEM_PROMPT
-        else:
-            toolgen_system_prompt = TOOLGEN_SYSTEM_PROMPT_MARKERS
         base_cfg["toolgen_extract_tool_calls"] = True
         base_cfg["ollama_force_tool_calls"] = False
         self._toolgen_agent = LanguageModelAgent(
             language_model=language_model,
-            system_prompt=toolgen_system_prompt,
+            system_prompt=TOOLGEN_SYSTEM_PROMPT_MARKERS,
             inference_config_dict={
                 **base_cfg,
                 "temperature": 0.3,
@@ -140,6 +135,8 @@ class SelfEvolvingController(
 
         self._use_orchestrator = use_orchestrator
         self._orchestrator_agent: Optional[LanguageModelAgent] = None
+        self._tool_orchestrator_agent: Optional[LanguageModelAgent] = None
+        self._tool_invoker_agent: Optional[LanguageModelAgent] = None
         if self._use_orchestrator:
             orchestrator_cfg = dict(inference_config_dict) if inference_config_dict else {}
             for k in ("tools", "tool_choice", "functions", "function_call"):
@@ -150,7 +147,23 @@ class SelfEvolvingController(
 
             self._orchestrator_agent = LanguageModelAgent(
                 language_model=language_model,
-                system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
+                system_prompt=TOP_LEVEL_ORCHESTRATOR_SYSTEM_PROMPT,
+                inference_config_dict={
+                    **orchestrator_cfg,
+                    "temperature": 0.0,
+                },
+            )
+            self._tool_orchestrator_agent = LanguageModelAgent(
+                language_model=language_model,
+                system_prompt=TOOL_ORCHESTRATOR_SYSTEM_PROMPT,
+                inference_config_dict={
+                    **orchestrator_cfg,
+                    "temperature": 0.0,
+                },
+            )
+            self._tool_invoker_agent = LanguageModelAgent(
+                language_model=language_model,
+                system_prompt=TOOL_INVOKER_SYSTEM_PROMPT,
                 inference_config_dict={
                     **orchestrator_cfg,
                     "temperature": 0.0,
@@ -197,7 +210,7 @@ class SelfEvolvingController(
                 self._flow_session_log_path = (
                     Path("outputs") / run_id / "flow_session.json"
                 )
-                self._flow_full_log_path = Path("outputs") / "flow_full.json"
+                self._flow_full_log_path = Path("outputs") / run_id / "flow_full.json"
                 self._agent_system_prompt_path = (
                     Path("outputs") / run_id / "agent_system_prompts.json"
                 )
@@ -229,7 +242,6 @@ class SelfEvolvingController(
             self._toolgen_debug_logger = None
         self._max_generated_tools_per_run = max_generated_tools_per_run
         self._generated_tool_counter = 0
-
         self._force_tool_generation_if_missing = force_tool_generation_if_missing
         self._tool_match_min_score = tool_match_min_score
         self._include_registry_in_prompt = include_registry_in_prompt
@@ -251,13 +263,8 @@ class SelfEvolvingController(
         self._tool_invoked_in_last_inference = False
         self._environment_label = environment_label
         self._toolgen_attempted_queries: set[str] = set()
-        self._toolgen_requested_tool_name: Optional[str] = None
-        self._toolgen_requested_tool_category: Optional[str] = None
-        self._toolgen_requested_capabilities: Optional[list[str]] = None
-        self._toolgen_requested_signature: Optional[str] = None
-        self._toolgen_requested_input_schema: Optional[dict[str, Any]] = None
-        self._toolgen_requested_tool_type: Optional[str] = None
-        self._toolgen_requested_description: Optional[str] = None
+        self._toolgen_debug_registered_tools: dict[str, int] = {}
+        self._last_toolgen_parse_source: Optional[str] = None
         self._run_task_metadata: Optional[dict[str, Any]] = None
         self._last_solver_output: Optional[str] = None
         self._last_solver_context_key: Optional[str] = None
@@ -268,92 +275,12 @@ class SelfEvolvingController(
         self._bootstrap_tools(bootstrap_tools or [])
         self._solver_system_prompt = system_prompt
 
-    def _solver_inference_with_retry(
-        self, chat_history: ChatHistory, system_prompt: Optional[str] = None
-    ) -> ChatHistoryItem:
-        return self._infer_with_system_prompt(chat_history, system_prompt)
-
-    def _infer_with_system_prompt(
-        self, chat_history: ChatHistory, system_prompt: Optional[str] = None
-    ) -> ChatHistoryItem:
-        if system_prompt is None:
-            return self._language_model_agent._inference(chat_history)
-        original_prompt = self._language_model_agent._system_prompt
-        if system_prompt == original_prompt:
-            return self._language_model_agent._inference(chat_history)
-        self._language_model_agent._system_prompt = system_prompt
-        try:
-            return self._language_model_agent._inference(chat_history)
-        finally:
-            self._language_model_agent._system_prompt = original_prompt
-
-    def plan_and_generate_tool(
-        self,
-        *,
-        tool_name: str,
-        description: str,
-        signature: str,
-        tool_type: Optional[Any] = None,
-        tool_category: Optional[Any] = None,
-        input_schema: Optional[Any] = None,
-        capabilities: Optional[Any] = None,
-        code: str,
-        chat_history: ChatHistory,
-    ) -> Optional[ToolMetadata]:
-        return self._registry.register_tool(
-            name=tool_name,
-            code=code,
-            signature=signature,
-            description=description,
-            tool_type=str(tool_type) if tool_type is not None else None,
-            tool_category=str(tool_category) if tool_category is not None else None,
-            input_schema=input_schema,
-            capabilities=capabilities,
-        )
-
-    def _bootstrap_tools(self, bootstrap_tools: Sequence[Mapping[str, Any]]) -> None:
-        if not bootstrap_tools:
-            return
-        for index, tool in enumerate(bootstrap_tools):
-            if not isinstance(tool, Mapping):
-                continue
-            name = str(tool.get("name") or f"bootstrap_tool_{index}")
-            description = str(tool.get("description") or "")
-            signature = str(tool.get("signature") or "run(task_text: str) -> str")
-            code = str(tool.get("code") or "")
-            tool_type = tool.get("tool_type")
-            tool_category = tool.get("tool_category")
-            input_schema = tool.get("input_schema")
-            capabilities = tool.get("capabilities")
-            metadata = self._registry.register_tool(
-                name=name,
-                code=code,
-                signature=signature,
-                description=description,
-                tool_type=str(tool_type) if tool_type is not None else None,
-                tool_category=str(tool_category) if tool_category is not None else None,
-                input_schema=input_schema,
-                capabilities=capabilities,
-            )
-            if metadata:
-                self._generated_tool_counter += 1
-
-    def _solver_prompt_no_tools(self) -> str:
-        return (self._solver_system_prompt or "").strip() or "You are a helpful assistant."
-
     def _orchestrated_inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
         if self._use_packaged_agent and self._packaged_shim is not None:
             return self._packaged_shim.inference(chat_history)
 
         working_history = self._clone_history(self._prune_for_current_task(chat_history))
         self._tool_invoked_in_last_inference = False
-        self._toolgen_requested_tool_name = None
-        self._toolgen_requested_tool_category = None
-        self._toolgen_requested_capabilities = None
-        self._toolgen_requested_signature = None
-        self._toolgen_requested_input_schema = None
-        self._toolgen_requested_tool_type = None
-        self._toolgen_requested_description = None
 
         user_items = [item for item in self._history_items(working_history) if item.role == Role.USER]
         if len(user_items) >= 2:
@@ -368,335 +295,127 @@ class SelfEvolvingController(
             if tb:
                 self._trace("tool_pipeline_traceback", tb)
 
+        def _requires_action_format() -> bool:
+            return self._is_db_bench_env()
+
         def _fallback_response() -> str:
+            if _requires_action_format():
+                return "Action: Answer\nFinal Answer: []"
             return "OK."
+
+        def _ensure_solver_output(content: str) -> str:
+            text = (content or "").strip()
+            if not text:
+                return _fallback_response()
+            if _requires_action_format() and not re.match(r"^Action:\s*(Operation|Answer)\b", text):
+                return _fallback_response()
+            return content
 
         tool_traces: list[dict[str, Any]] = []
         tool_error: Optional[str] = None
-        decision: dict[str, Any] = {"action": "no_tool"}
-        action = "no_tool"
-        selected_tool: Optional[ToolMetadata] = None
-        tool_agent_traced = False
         tool_result_injected = False
+        tool_agent_traced = False
 
         try:
             decision = self._orchestrate_decision(task_query, working_history)
             action = decision.get("action", "no_tool")
-            tool_name = decision.get("tool_name")
-            tool_args = decision.get("tool_args")
-            candidate_output = self._get_candidate_output(working_history, task_query)
-
             if action == "use_tool":
                 tool_agent_traced = True
-                if not isinstance(tool_name, str) or not tool_name:
-                    auto_tool = self._select_tool_for_query(
-                        task_query, candidate_output=candidate_output
+                tool_decision = self._tool_orchestrate_decision(task_query, working_history)
+                tool_action = tool_decision.get("action", "create_tool")
+                tool_suggestion = {
+                    "tool_name": tool_decision.get("tool_name"),
+                    "reason": tool_decision.get("reason"),
+                }
+
+                if tool_action == "create_tool":
+                    selected_tool = self._maybe_generate_tool_for_query(
+                        task_query, working_history, allow_reuse=False, force=True
                     )
-                    if auto_tool:
-                        tool_name = auto_tool.name
-                    else:
-                        tool_error = "missing tool_name for use_tool"
-                        self._trace("tool_agent_input", "ERROR missing tool_name for use_tool")
-                        _record_tool_error("use_tool", tool_error)
+                    if selected_tool is None:
+                        self._trace("registry_add_failed", "tool generation failed")
+                        tool_error = tool_error or "tool generation failed"
+                        _record_tool_error("create_tool", tool_error)
                         tool_result = ToolResult.failure(tool_error)
                         working_history = self._inject_tool_result_message(
-                            working_history, "use_tool", tool_result
+                            working_history, "create_tool", tool_result
                         )
                         tool_result_injected = True
-                        tool_name = None
-                if tool_name:
-                    args_auto_built = False
-                    tool_args_final = tool_args
-                    if tool_args is None or tool_args == {} or tool_args == []:
-                        resolved_name = (
-                            self._registry.resolve_name(tool_name)
-                            if hasattr(self._registry, "resolve_name")
-                            else None
-                        )
-                        resolved_name = resolved_name or tool_name
-                        tool_meta = self._get_tool_metadata(resolved_name)
-                        if tool_meta is not None:
-                            tool_args_final = self._auto_build_tool_args(
-                                tool_meta, query=task_query, chat_history=working_history
+                    else:
+                        self._trace("registry_add", selected_tool.name)
+                        tool_suggestion["tool_name"] = selected_tool.name
+
+                if not tool_result_injected:
+                    tool_invoker = self._tool_invoker_decision(
+                        task_query, working_history, suggestion=tool_suggestion
+                    )
+                    tool_name = tool_invoker.get("tool_name") or tool_suggestion.get("tool_name")
+                    tool_args = tool_invoker.get("tool_args")
+                    if tool_name:
+                        args_auto_built = False
+                        if tool_args is None or tool_args == {} or tool_args == []:
+                            resolved_name = (
+                                self._registry.resolve_name(tool_name)
+                                if hasattr(self._registry, "resolve_name")
+                                else None
                             )
-                            args_auto_built = tool_args_final is not None
-                    if tool_args_final is None or tool_args_final == {} or tool_args_final == []:
-                        resolved_name = (
-                            self._registry.resolve_name(tool_name)
-                            if hasattr(self._registry, "resolve_name")
-                            else None
-                        )
-                        resolved_name = resolved_name or tool_name
-                        tool_meta = self._get_tool_metadata(resolved_name)
-
-                        if tool_meta and self._signature_prefers_payload(tool_meta.signature):
-                            tool_args_final = {"args": [self._default_payload_dict(query=task_query, chat_history=working_history)]}
-                        else:
-                            tool_args_final = {"args": [task_query]}
-                        args_auto_built = True
-
-                    self._log_flow_event(
-                        "tool_agent_input",
-                        chat_history=working_history,
-                        tool_name=tool_name,
-                        tool_args=tool_args_final,
-                        reason="orchestrator_use_tool",
-                    )
-                    tool_result = self._invoke_tool_by_payload(
-                        tool_name,
-                        tool_args_final,
-                        reason="orchestrator_use_tool",
-                        args_auto_built=args_auto_built,
-                        decision_action=action,
-                    )
-                    self._log_flow_event(
-                        "tool_agent_output",
-                        chat_history=working_history,
-                        tool_name=tool_name,
-                        success=tool_result.success,
-                        error=tool_result.error,
-                        output=tool_result.output,
-                    )
-                    tool_traces.append(
-                        self._build_tool_trace(
-                            summary="Orchestrator invoked a tool.",
+                            resolved_name = resolved_name or tool_name
+                            tool_meta = self._get_tool_metadata(resolved_name)
+                            if tool_meta is not None:
+                                tool_args = self._auto_build_tool_args(
+                                    tool_meta, query=task_query, chat_history=working_history
+                                )
+                                args_auto_built = tool_args is not None
+                        if tool_args is None or tool_args == {} or tool_args == []:
+                            tool_args = {"args": [task_query]}
+                            args_auto_built = True
+                        self._log_flow_event(
+                            "tool_agent_input",
+                            chat_history=working_history,
                             tool_name=tool_name,
-                            args=[],
-                            kwargs={"tool_args": tool_args_final},
-                            result=tool_result,
+                            tool_args=tool_args,
+                            reason="tool_invoker",
                         )
-                    )
-                    working_history = self._inject_tool_result_message(
-                        working_history, tool_name, tool_result
-                    )
-                    tool_result_injected = True
-            elif action == "create_tool":
-                tool_agent_traced = True
-
-                # NEW: read orchestrator tool request (if provided)
-                tool_request = None
-                if isinstance(tool_args, dict):
-                    tool_request = tool_args.get("tool_request")
-
-                if isinstance(tool_request, dict):
-                    # Populate toolgen request fields from orchestrator intent
-                    name_from_req = tool_request.get("name")
-                    self._toolgen_requested_tool_name = (
-                        str(name_from_req).strip()
-                        if isinstance(name_from_req, str) and name_from_req.strip()
-                        else (str(tool_name).strip() if tool_name else None)
-                    )
-
-                    # Accept alias: "category" -> "tool_category"
-                    cat = tool_request.get("tool_category")
-                    if (cat is None) and ("category" in tool_request):
-                        cat = tool_request.get("category")
-
-                    default_cat = "planner"
-
-                    self._toolgen_requested_tool_category = (
-                        str(cat).strip() if isinstance(cat, str) and cat.strip() else default_cat
-                    )
-
-
-                    desc = tool_request.get("description")
-                    self._toolgen_requested_description = (
-                        str(desc).strip() if isinstance(desc, str) and desc.strip() else None
-                    )
-
-                    caps = tool_request.get("capabilities")
-                    self._toolgen_requested_capabilities = caps if isinstance(caps, list) else None
-
-                    schema = tool_request.get("input_schema")
-                    if (schema is None) and ("inputSchema" in tool_request):
-                        schema = tool_request.get("inputSchema")
-                    if (schema is None) and ("schema" in tool_request):
-                        schema = tool_request.get("schema")
-
-                    self._toolgen_requested_input_schema = schema if isinstance(schema, dict) else None
-
-                    # Keep these invariant
-                    self._toolgen_requested_signature = "run(payload: dict) -> dict"
-                    self._toolgen_requested_tool_type = "utility"
-
-                else:
-                    # Fallback: do NOT hardcode SQL. Keep generic.
-                    self._toolgen_requested_tool_name = str(tool_name).strip() if tool_name else None
-                    default_cat = "planner"
-                    self._toolgen_requested_tool_category = default_cat
-                    self._toolgen_requested_signature = "run(payload: dict) -> dict"
-                    self._toolgen_requested_tool_type = "utility"
-                    self._toolgen_requested_description = None
-                    self._toolgen_requested_capabilities = None
-                    self._toolgen_requested_input_schema = None
-
-                self._toolgen_debug_event(
-                    "toolgen_request_resolved",
-                    tool_name=self._toolgen_requested_tool_name,
-                    tool_category=self._toolgen_requested_tool_category,
-                    capabilities=self._toolgen_requested_capabilities,
-                    signature=self._toolgen_requested_signature,
-                    has_input_schema=bool(self._toolgen_requested_input_schema),
-                )
-
-                # (Optional but recommended) allow reuse here
-                selected_tool = self._maybe_generate_tool_for_query(
-                    task_query, working_history, allow_reuse=True, force=True
-                )
-
-                if selected_tool is not None:
-                    self._trace("registry_add", selected_tool.name)
-                else:
-                    self._trace("registry_add_failed", "tool generation failed")
-                    tool_error = tool_error or "tool generation failed"
-                    _record_tool_error("create_tool", tool_error)
-                    tool_result = ToolResult.failure(tool_error)
-                    working_history = self._inject_tool_result_message(
-                        working_history, "create_tool", tool_result
-                    )
-                    tool_result_injected = True
-
+                        tool_result = self._invoke_tool_by_payload(
+                            tool_name,
+                            tool_args,
+                            reason="tool_invoker",
+                            args_auto_built=args_auto_built,
+                            decision_action=tool_action,
+                        )
+                        self._log_flow_event(
+                            "tool_agent_output",
+                            chat_history=working_history,
+                            tool_name=tool_name,
+                            success=tool_result.success,
+                            error=tool_result.error,
+                            output=tool_result.output,
+                        )
+                        tool_traces.append(
+                            self._build_tool_trace(
+                                summary="Tool invoker executed a tool.",
+                                tool_name=tool_name,
+                                args=[],
+                                kwargs={"tool_args": tool_args},
+                                result=tool_result,
+                            )
+                        )
+                        working_history = self._inject_tool_result_message(
+                            working_history, tool_name, tool_result
+                        )
+                        tool_result_injected = True
+                    else:
+                        tool_error = "tool_invoker_missing_tool_name"
+                        _record_tool_error("tool_invoker", tool_error)
+                        tool_result = ToolResult.failure(tool_error)
+                        working_history = self._inject_tool_result_message(
+                            working_history, "tool_invoker", tool_result
+                        )
+                        tool_result_injected = True
         except Exception as exc:
             tool_error = f"{type(exc).__name__}: {exc}"
             _record_tool_error("tool_pipeline", tool_error, traceback.format_exc())
 
-        candidate_output = self._get_candidate_output(working_history, task_query)
-
-        if selected_tool is not None:
-            if action == "create_tool":
-                new_tool_args = None
-                if isinstance(tool_args, dict):
-                    if "tool_args" in tool_args:
-                        new_tool_args = tool_args.get("tool_args")
-                    tool_request = tool_args.get("tool_request")
-                    if new_tool_args is None and isinstance(tool_request, dict):
-                        new_tool_args = tool_request.get("example_payload") or tool_request.get("example_args")
-
-                if new_tool_args is not None:
-                    self._log_flow_event(
-                        "tool_agent_input",
-                        chat_history=working_history,
-                        tool_name=selected_tool.name,
-                        tool_args=new_tool_args,
-                        reason="orchestrator_create_tool",
-                    )
-                    tool_result = self._invoke_tool_by_payload(
-                        selected_tool.name,
-                        new_tool_args,
-                        reason="orchestrator_create_tool",
-                        args_auto_built=False,
-                        decision_action=action,
-                    )
-                    self._log_flow_event(
-                        "tool_agent_output",
-                        chat_history=working_history,
-                        tool_name=selected_tool.name,
-                        success=tool_result.success,
-                        error=tool_result.error,
-                        output=tool_result.output,
-                    )
-                    tool_traces.append(
-                        self._build_tool_trace(
-                            summary="Orchestrator invoked a tool.",
-                            tool_name=selected_tool.name,
-                            args=[],
-                            kwargs={"tool_args": new_tool_args},
-                            result=tool_result,
-                        )
-                    )
-                    working_history = self._inject_tool_result_message(
-                        working_history, selected_tool.name, tool_result
-                    )
-                    tool_result_injected = True
-                else:
-                    tool_meta = self._get_tool_metadata(selected_tool.name)
-                    schema = tool_meta.input_schema if tool_meta else None
-                    payload_schema = (schema or {}).get("properties", {}).get("payload") if isinstance(schema, dict) else None
-                    required_keys = payload_schema.get("required") if isinstance(payload_schema, dict) else None
-                    if required_keys is None or all(k in {"task_text", "candidate_output"} for k in required_keys):
-                        self._log_flow_event(
-                            "tool_agent_input",
-                            chat_history=working_history,
-                            tool_name=selected_tool.name,
-                            reason=f"orchestrator_{action}",
-                            tool_args={"task_text": task_query, "candidate_output": candidate_output},
-                        )
-                        payload = self._invoke_tool_for_query(
-                            selected_tool,
-                            task_query,
-                            candidate_output=candidate_output,
-                            reason=f"orchestrator_{action}",
-                            decision_action=action,
-                        )
-                        if payload is not None:
-                            tool_result, tool_args, tool_kwargs = payload
-                            self._log_flow_event(
-                                "tool_agent_output",
-                                chat_history=working_history,
-                                tool_name=selected_tool.name,
-                                success=tool_result.success,
-                                error=tool_result.error,
-                                output=tool_result.output,
-                            )
-                            tool_traces.append(
-                                self._build_tool_trace(
-                                    summary="Orchestrator invoked a tool.",
-                                    tool_name=selected_tool.name,
-                                    args=tool_args,
-                                    kwargs=tool_kwargs,
-                                    result=tool_result,
-                                )
-                            )
-                            working_history = self._inject_tool_result_message(
-                                working_history, selected_tool.name, tool_result
-                            )
-                            tool_result_injected = True
-                    else:
-                        tool_result = ToolResult.success_result(
-                            {"ok": False, "error": "missing_required_args_for_new_tool"}
-                        )
-                        working_history = self._inject_tool_result_message(
-                            working_history, selected_tool.name, tool_result
-                        )
-                        tool_result_injected = True
-            else:
-                self._log_flow_event(
-                    "tool_agent_input",
-                    chat_history=working_history,
-                    tool_name=selected_tool.name,
-                    reason=f"orchestrator_{action}",
-                    tool_args={"task_text": task_query, "candidate_output": candidate_output},
-                )
-                payload = self._invoke_tool_for_query(
-                    selected_tool,
-                    task_query,
-                    candidate_output=candidate_output,
-                    reason=f"orchestrator_{action}",
-                    decision_action=action,
-                )
-                if payload is not None:
-                    tool_result, tool_args, tool_kwargs = payload
-                    self._log_flow_event(
-                        "tool_agent_output",
-                        chat_history=working_history,
-                        tool_name=selected_tool.name,
-                        success=tool_result.success,
-                        error=tool_result.error,
-                        output=tool_result.output,
-                    )
-                    tool_traces.append(
-                        self._build_tool_trace(
-                            summary="Orchestrator invoked a tool.",
-                            tool_name=selected_tool.name,
-                            args=tool_args,
-                            kwargs=tool_kwargs,
-                            result=tool_result,
-                        )
-                    )
-                    working_history = self._inject_tool_result_message(
-                        working_history, selected_tool.name, tool_result
-                    )
-                    tool_result_injected = True
         if not tool_agent_traced:
             self._trace("tool_agent_input", "none")
             self._trace("tool_agent_result", "none")
@@ -750,6 +469,7 @@ class SelfEvolvingController(
                     ),
                 )
                 continue
+            content = _ensure_solver_output(content)
             context_key = self._solver_context_key(working_history)
             if content == self._last_solver_output and context_key == self._last_solver_context_key:
                 self._solver_repeat_count += 1
@@ -950,6 +670,28 @@ class SelfEvolvingController(
         raise AgentUnknownException(
             "Exceeded internal tool steps without producing a non-internal output."
         )
+
+    def _solver_prompt_no_tools(self) -> str:
+        return (self._solver_system_prompt or "").strip() or "You are a helpful assistant."
+
+    def _solver_inference_with_retry(
+        self, chat_history: ChatHistory, system_prompt: Optional[str] = None
+    ) -> ChatHistoryItem:
+        return self._infer_with_system_prompt(chat_history, system_prompt)
+
+    def _infer_with_system_prompt(
+        self, chat_history: ChatHistory, system_prompt: Optional[str] = None
+    ) -> ChatHistoryItem:
+        if system_prompt is None:
+            return self._language_model_agent._inference(chat_history)
+        original_prompt = self._language_model_agent._system_prompt
+        if system_prompt == original_prompt:
+            return self._language_model_agent._inference(chat_history)
+        self._language_model_agent._system_prompt = system_prompt
+        try:
+            return self._language_model_agent._inference(chat_history)
+        finally:
+            self._language_model_agent._system_prompt = original_prompt
 
     @override
     def get_role_dict(self) -> Mapping[Role, str]:

@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from src.typings import ChatHistory, ChatHistoryItem
 
@@ -9,6 +9,33 @@ from .tool_retrieval import retrieve_tools
 
 
 class ControllerToolsMixin:
+    def _bootstrap_tools(self, bootstrap_tools: Sequence[Mapping[str, Any]]) -> None:
+        if not bootstrap_tools:
+            return
+        for index, tool in enumerate(bootstrap_tools):
+            if not isinstance(tool, Mapping):
+                continue
+            name = str(tool.get("name") or f"bootstrap_tool_{index}")
+            description = str(tool.get("description") or "")
+            signature = str(tool.get("signature") or "run(task_text: str) -> str")
+            code = str(tool.get("code") or "")
+            tool_type = tool.get("tool_type")
+            tool_category = tool.get("tool_category")
+            input_schema = tool.get("input_schema")
+            capabilities = tool.get("capabilities")
+            metadata = self._registry.register_tool(
+                name=name,
+                code=code,
+                signature=signature,
+                description=description,
+                tool_type=str(tool_type) if tool_type is not None else None,
+                tool_category=str(tool_category) if tool_category is not None else None,
+                input_schema=input_schema,
+                capabilities=capabilities,
+            )
+            if metadata:
+                self._generated_tool_counter += 1
+
     def _get_tool_metadata(self, name: str) -> Optional[ToolMetadata]:
         for tool in self._registry.list_tools():
             if tool.name == name:

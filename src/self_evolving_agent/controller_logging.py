@@ -564,6 +564,9 @@ class ControllerLoggingMixin:
             return "db_bench"
         return self._environment_label
 
+    def _is_db_bench_env(self) -> bool:
+        return self._resolved_environment_label() in {"db_bench", "mysql"}
+
     def _is_structured_task(self, query: str) -> bool:
         q = (query or "").lower()
         if not q:

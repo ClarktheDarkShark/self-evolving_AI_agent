@@ -1,7 +1,6 @@
 #controller_toolgen.py
 
 import json
-import os
 import re
 from typing import Any, Mapping, Optional, Sequence
 
@@ -15,9 +14,7 @@ from .tool_retrieval import retrieve_tools
 
 class ControllerToolgenMixin:
     def _toolgen_output_mode(self) -> str:
-        value = os.environ.get("TOOLGEN_OUTPUT_MODE", "markers")
-        mode = value.strip().lower()
-        return "json" if mode == "json" else "markers"
+        return "markers"
 
     def _normalize_toolgen_content(self, content: Any) -> str:
         if isinstance(content, str):
@@ -147,17 +144,13 @@ class ControllerToolgenMixin:
         return [
             {
                 "name": tool.name,
-                "tool_type": tool.tool_type,
-                "tool_category": getattr(tool, "tool_category", None),
                 "signature": tool.signature,
+                "docstring": tool.docstring,
             }
             for tool in tools[-50:]
         ]
 
     def _toolgen_default_name(self) -> str:
-        requested = getattr(self, "_toolgen_requested_tool_name", None)
-        if isinstance(requested, str) and requested.strip():
-            return requested.strip()
         query = getattr(self, "_toolgen_last_query", "") or ""
         slug = re.sub(r"[^0-9a-zA-Z]+", "_", query).strip("_").lower()
         if len(slug) > 48:
@@ -165,9 +158,6 @@ class ControllerToolgenMixin:
         return f"{slug}_tool" if slug else "task_tool"
 
     def _toolgen_default_description(self) -> str:
-        requested = getattr(self, "_toolgen_requested_description", None)
-        if isinstance(requested, str) and requested.strip():
-            return requested.strip()
         query = getattr(self, "_toolgen_last_query", "") or ""
         summary = query.strip()
         return f"Utility tool for: {summary[:120]}" if summary else "Utility tool for the current task."
@@ -180,33 +170,15 @@ class ControllerToolgenMixin:
             existing = []
 
         history_items = self._history_items(chat_history)
-        # history_items = self._history_items(chat_history)[-6:]
         history_lines = []
         for i, it in enumerate(history_items):
-            content = (it.content or "").strip().replace("\n", " ")
-            content = self._truncate(content, 240)
+            content = (it.content or "").strip()
             history_lines.append("{}:{}:{}".format(i, it.role.value, content))
 
         payload = {
-            # "task": self._truncate((query or "").strip(), 800),
-            "task": query,
+            "task": (query or "").strip(),
             "history": "\n".join(history_lines),
             "existing_tools": existing,
-            "output_mode": self._toolgen_output_mode(),
-            "output_instructions": (
-                "Output ONLY:\n###TOOL_START\n<python>\n###TOOL_END"
-                if self._toolgen_output_mode() == "markers"
-                else "Output a single JSON object ToolSpec."
-            ),
-            "requested_tool_name": getattr(self, "_toolgen_requested_tool_name", None),
-            "requested_tool_category": getattr(self, "_toolgen_requested_tool_category", None),
-
-            # ✅ ADD THESE (so ToolGen can actually obey orchestrator intent)
-            "requested_tool_description": getattr(self, "_toolgen_requested_description", None),
-            "requested_tool_capabilities": getattr(self, "_toolgen_requested_capabilities", None),
-            "requested_tool_input_schema": getattr(self, "_toolgen_requested_input_schema", None),
-            "requested_tool_signature": getattr(self, "_toolgen_requested_signature", None),
-            "requested_tool_type": getattr(self, "_toolgen_requested_tool_type", None),
         }
 
         return json.dumps(payload, ensure_ascii=True, default=str)
@@ -231,17 +203,15 @@ class ControllerToolgenMixin:
     def _wrap_marker_tool_spec(self, python_code: str) -> dict[str, Any]:
         name = self._toolgen_default_name()
         description = self._toolgen_default_description()
-        signature = getattr(self, "_toolgen_requested_signature", None) or "run(payload: dict) -> dict"
-        tool_type = getattr(self, "_toolgen_requested_tool_type", None) or "utility"
-        tool_category = getattr(self, "_toolgen_requested_tool_category", None) or "utility"
-        input_schema = getattr(self, "_toolgen_requested_input_schema", None)
-        if not isinstance(input_schema, Mapping):
-            input_schema = {
-                "type": "object",
-                "required": ["payload"],
-                "properties": {"payload": {"type": "object", "required": [], "properties": {}}},
-            }
-        capabilities = getattr(self, "_toolgen_requested_capabilities", None) or []
+        signature = "run(payload: dict) -> dict"
+        tool_type = "utility"
+        tool_category = "utility"
+        input_schema = {
+            "type": "object",
+            "required": ["payload"],
+            "properties": {"payload": {"type": "object", "required": [], "properties": {}}},
+        }
+        capabilities = []
         return {
             "name": name,
             "description": description,
@@ -381,35 +351,11 @@ class ControllerToolgenMixin:
         self._trace("tool_agent_result", response.content)
         raw_text_full = self._normalize_toolgen_content(response.content)
 
-        if self._toolgen_output_mode() == "markers":
-            extracted = self._extract_marked_python(raw_text_full)
-            if not extracted:
-                return None
-            tool_spec = self._wrap_marker_tool_spec(extracted)
-            return self._register_tool_from_payload(tool_spec, chat_history)
-
-        creation_request = self.extract_tool_spec(raw_text_full, response)
-        return self._register_tool_from_payload(creation_request, chat_history)
+        extracted = self._extract_marked_python(raw_text_full)
+        if not extracted:
+            return None
+        tool_spec = self._wrap_marker_tool_spec(extracted)
+        return self._register_tool_from_payload(tool_spec, chat_history)
 
     def _reuse_matches_request(self, tool: ToolMetadata) -> bool:
-        requested_category = getattr(self, "_toolgen_requested_tool_category", None)
-        requested_caps = getattr(self, "_toolgen_requested_capabilities", None)
-        requested_signature = getattr(self, "_toolgen_requested_signature", None)
-
-        if requested_category:
-            pass
-            # if (tool.tool_category or "") != requested_category:
-            #     return False
-            # if requested_category in {"validator", "linter"} and (tool.tool_category or "") not in {"validator", "linter"}:
-            #     return False
-
-        if requested_caps:
-            pass
-            # tool_caps = set(tool.capabilities or [])
-            # if not tool_caps.intersection(set(requested_caps)):
-            #     return False
-
-        if requested_signature and tool.signature != requested_signature:
-            return False
-
         return True
