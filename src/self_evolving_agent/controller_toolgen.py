@@ -1,3 +1,5 @@
+#controller_toolgen.py
+
 import json
 import os
 import re
@@ -148,9 +150,6 @@ class ControllerToolgenMixin:
                 "tool_type": tool.tool_type,
                 "tool_category": getattr(tool, "tool_category", None),
                 "signature": tool.signature,
-                "description": tool.description,
-                "input_schema": getattr(tool, "input_schema", None),
-                "capabilities": getattr(tool, "capabilities", None),
             }
             for tool in tools[-50:]
         ]
@@ -160,9 +159,7 @@ class ControllerToolgenMixin:
         if isinstance(requested, str) and requested.strip():
             return requested.strip()
         query = getattr(self, "_toolgen_last_query", "") or ""
-        cleaned = re.sub(r"[^0-9a-zA-Z]+", " ", query).strip().lower()
-        tokens = [token for token in cleaned.split() if token]
-        slug = "_".join(tokens[:5]).strip("_")
+        slug = re.sub(r"[^0-9a-zA-Z]+", "_", query).strip("_").lower()
         if len(slug) > 48:
             slug = slug[:48].rstrip("_")
         return f"{slug}_tool" if slug else "task_tool"
@@ -173,9 +170,7 @@ class ControllerToolgenMixin:
             return requested.strip()
         query = getattr(self, "_toolgen_last_query", "") or ""
         summary = query.strip()
-        if summary:
-            return f"Utility tool for: {summary[:120]}"
-        return "Utility tool for the current task."
+        return f"Utility tool for: {summary[:120]}" if summary else "Utility tool for the current task."
 
     def _toolgen_request_prompt(self, query: str, chat_history: ChatHistory) -> str:
         existing = []
@@ -184,7 +179,8 @@ class ControllerToolgenMixin:
         except Exception:
             existing = []
 
-        history_items = self._history_items(chat_history)[-6:]
+        history_items = self._history_items(chat_history)
+        # history_items = self._history_items(chat_history)[-6:]
         history_lines = []
         for i, it in enumerate(history_items):
             content = (it.content or "").strip().replace("\n", " ")
@@ -192,7 +188,8 @@ class ControllerToolgenMixin:
             history_lines.append("{}:{}:{}".format(i, it.role.value, content))
 
         payload = {
-            "task": self._truncate((query or "").strip(), 800),
+            # "task": self._truncate((query or "").strip(), 800),
+            "task": query,
             "history": "\n".join(history_lines),
             "existing_tools": existing,
             "output_mode": self._toolgen_output_mode(),
@@ -201,13 +198,17 @@ class ControllerToolgenMixin:
                 if self._toolgen_output_mode() == "markers"
                 else "Output a single JSON object ToolSpec."
             ),
-            "tool_expectations": (
-                "Pick a clear, specific name. Provide complete, reusable logic "
-                "with docstrings and edge-case handling; avoid toy or trivial implementations."
-            ),
             "requested_tool_name": getattr(self, "_toolgen_requested_tool_name", None),
             "requested_tool_category": getattr(self, "_toolgen_requested_tool_category", None),
+
+            # ✅ ADD THESE (so ToolGen can actually obey orchestrator intent)
+            "requested_tool_description": getattr(self, "_toolgen_requested_description", None),
+            "requested_tool_capabilities": getattr(self, "_toolgen_requested_capabilities", None),
+            "requested_tool_input_schema": getattr(self, "_toolgen_requested_input_schema", None),
+            "requested_tool_signature": getattr(self, "_toolgen_requested_signature", None),
+            "requested_tool_type": getattr(self, "_toolgen_requested_tool_type", None),
         }
+
         return json.dumps(payload, ensure_ascii=True, default=str)
 
     def _normalize_retrieval_query(self, query: str) -> str:
@@ -355,7 +356,7 @@ class ControllerToolgenMixin:
             reuse = self._reuse_existing_tool(
                 reuse_query, candidate_output=candidate_output, needed_archetype=None
             )
-            if reuse is not None:
+            if reuse is not None and self._reuse_matches_request(reuse):
                 return reuse
 
         if not self._force_tool_generation_if_missing and not force:
@@ -367,6 +368,10 @@ class ControllerToolgenMixin:
 
         self._toolgen_last_query = query
         prompt = self._toolgen_request_prompt(query, chat_history)
+        self._write_agent_system_prompt(
+            "toolgen",
+            getattr(self._toolgen_agent, "_system_prompt", "") or "",
+        )
         self._trace("tool_agent_input", prompt)
         tool_history = ChatHistory()
         tool_history = self._safe_inject(
@@ -385,3 +390,26 @@ class ControllerToolgenMixin:
 
         creation_request = self.extract_tool_spec(raw_text_full, response)
         return self._register_tool_from_payload(creation_request, chat_history)
+
+    def _reuse_matches_request(self, tool: ToolMetadata) -> bool:
+        requested_category = getattr(self, "_toolgen_requested_tool_category", None)
+        requested_caps = getattr(self, "_toolgen_requested_capabilities", None)
+        requested_signature = getattr(self, "_toolgen_requested_signature", None)
+
+        if requested_category:
+            pass
+            # if (tool.tool_category or "") != requested_category:
+            #     return False
+            # if requested_category in {"validator", "linter"} and (tool.tool_category or "") not in {"validator", "linter"}:
+            #     return False
+
+        if requested_caps:
+            pass
+            # tool_caps = set(tool.capabilities or [])
+            # if not tool_caps.intersection(set(requested_caps)):
+            #     return False
+
+        if requested_signature and tool.signature != requested_signature:
+            return False
+
+        return True

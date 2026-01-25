@@ -52,6 +52,14 @@ class ControllerOrchestratorMixin:
                 "action": "use_tool|create_tool|no_tool",
                 "tool_name": "required if use_tool",
                 "tool_args": "optional",
+                "tool_request": {
+                    "tool_category": "validator|linter|formatter|parser|normalizer|planner|utility",
+                    "capabilities": "list[str]",
+                    "signature": "run(payload: dict) -> dict",
+                    "input_schema": "payload-style schema object",
+                    "description": "short description",
+                    "example_payload": "optional payload dict for auto-invoke",
+                },
                 "reason": "short reason",
             },
         }
@@ -80,13 +88,27 @@ class ControllerOrchestratorMixin:
         if not self._orchestrator_agent:
             return {"action": "no_tool"}
         prompt = self._orchestrator_request_prompt(query, chat_history)
+        self._write_agent_system_prompt(
+            "orchestrator",
+            getattr(self._orchestrator_agent, "_system_prompt", "") or "",
+        )
         self._trace("orchestrator_input", prompt)
+        self._log_flow_event(
+            "orchestrator_input",
+            chat_history=chat_history,
+            prompt=prompt,
+        )
         orchestration_history = ChatHistory()
         orchestration_history = self._safe_inject(
             orchestration_history, ChatHistoryItem(role=Role.USER, content=prompt)
         )
         response = self._orchestrator_agent._inference(orchestration_history)
         self._trace("orchestrator_result", response.content)
+        self._log_flow_event(
+            "orchestrator_output",
+            chat_history=chat_history,
+            output=response.content or "",
+        )
         payload = self._parse_orchestrator_payload(response.content)
         if not isinstance(payload, Mapping):
             return {"action": "no_tool"}

@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional
 
 from src.typings import ChatHistory, ChatHistoryItem
 
@@ -55,6 +55,13 @@ class ControllerToolsMixin:
                 default=str,
             ),
         )
+        self._log_flow_event(
+            "tool_agent_input",
+            tool_name=resolved_name,
+            args=args,
+            kwargs=kwargs,
+            reason=reason,
+        )
         self._toolgen_debug_event(
             "tool_invoke_start",
             tool_name=resolved_name,
@@ -91,6 +98,13 @@ class ControllerToolsMixin:
             args_auto_built=args_auto_built,
             decision_action=decision_action,
         )
+        self._log_flow_event(
+            "tool_agent_output",
+            tool_name=resolved_name,
+            success=result.success,
+            error=result.error,
+            output=result.output,
+        )
         self._trace("tool_agent_result", self._format_tool_result(resolved_name, result))
         return result
 
@@ -125,6 +139,13 @@ class ControllerToolsMixin:
             )
         except Exception:
             self._trace("tool_agent_input", f"{tool.name}({args}, {kwargs})")
+        self._log_flow_event(
+            "tool_agent_input",
+            tool_name=tool.name,
+            args=args,
+            kwargs=kwargs,
+            reason=reason,
+        )
         self._toolgen_debug_event(
             "tool_invoke_start",
             tool_name=tool.name,
@@ -161,6 +182,13 @@ class ControllerToolsMixin:
             reason=reason,
             decision_action=decision_action,
         )
+        self._log_flow_event(
+            "tool_agent_output",
+            tool_name=tool.name,
+            success=result.success,
+            error=result.error,
+            output=result.output,
+        )
         self._trace("tool_agent_result", self._format_tool_result(tool.name, result))
         return result, args, kwargs
 
@@ -190,17 +218,6 @@ class ControllerToolsMixin:
             return [payload], {}
         return [query or candidate_output or ""], {}
 
-    @staticmethod
-    def _pack_tool_args(
-        args: Sequence[Any], kwargs: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        packed: dict[str, Any] = {}
-        if args:
-            packed["args"] = list(args)
-        if kwargs:
-            packed["kwargs"] = dict(kwargs)
-        return packed
-
     def _auto_build_tool_args(
         self,
         tool: ToolMetadata,
@@ -212,7 +229,11 @@ class ControllerToolsMixin:
         payload = self._build_tool_invocation(tool, query=query, candidate_output=candidate_output)
         if payload:
             args, kwargs = payload
-            packed = self._pack_tool_args(args, kwargs)
+            packed: dict[str, Any] = {}
+            if args:
+                packed["args"] = list(args)
+            if kwargs:
+                packed["kwargs"] = dict(kwargs)
             if packed:
                 return packed
         if query:
@@ -243,14 +264,6 @@ class ControllerToolsMixin:
         if best.score < self._reuse_similarity_threshold:
             return None
         return best.tool
-
-    @staticmethod
-    def _capability_overlap(target: Iterable[str], candidate: Iterable[str]) -> float:
-        target_set = {str(x) for x in (target or []) if x}
-        candidate_set = {str(x) for x in (candidate or []) if x}
-        if not target_set or not candidate_set:
-            return 0.0
-        return len(target_set & candidate_set) / max(len(target_set), len(candidate_set))
 
     def _select_tool_for_query(
         self,
