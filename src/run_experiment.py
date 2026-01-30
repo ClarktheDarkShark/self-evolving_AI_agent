@@ -190,7 +190,19 @@ class ConfigUtility:
             language_model_name := assignment_agent.parameters.get("language_model")
         ) is not None:
             # Do not replace the language_model in the parameters with the GeneralInstanceFactory instance.
-            assert language_model_name in assignment_language_model_dict
+            if language_model_name not in assignment_language_model_dict:
+                default_language_model_info_dict = raw_config["language_model_dict"].get(
+                    language_model_name
+                )
+                if default_language_model_info_dict is None:
+                    raise ValueError(
+                        f"Unknown language_model {language_model_name!r} in assignment agent config"
+                    )
+                assignment_language_model_dict[language_model_name] = (
+                    ConfigUtility._get_custom_instance_info_dict(
+                        default_language_model_info_dict, {"name": language_model_name}
+                    )
+                )
         # endregion
         # region Construct assignment_callback_dict
         assignment_callback_dict: dict[str, Any] = raw_config["assignment_config"][

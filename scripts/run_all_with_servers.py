@@ -18,8 +18,8 @@ from pathlib import Path
 import kg_sparql_server
 
 CONFIG_PATHS = [
-    "configs/assignments/experiments/llama_31_8b_instruct/instance/db_bench/instance/standard.yaml",
     "configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/standard.yaml",
+    "configs/assignments/experiments/llama_31_8b_instruct/instance/db_bench/instance/standard.yaml",
     "configs/assignments/experiments/llama_31_8b_instruct/instance/os_interaction/instance/standard.yaml",
     
 ]
@@ -389,19 +389,19 @@ def _start_fuseki_serve_only(repo_root: Path, fuseki_log_path: Path) -> bool:
 
     res = _run(run_cmd, log_path=fuseki_log_path)
     if res.returncode != 0:
-        # print("[run_all_with_servers] docker run failed starting Fuseki.")
+        print("[run_all_with_servers] docker run failed starting Fuseki.")
 
         # # Print the REAL docker error immediately
         # if res.stderr:
-        #     print("[run_all_with_servers] docker stderr:")
-        #     print(res.stderr.strip())
+        print("[run_all_with_servers] docker stderr:")
+        print(res.stderr.strip())
 
         # if res.stdout:
-        #     print("[run_all_with_servers] docker stdout:")
-        #     print(res.stdout.strip())
+        print("[run_all_with_servers] docker stdout:")
+        print(res.stdout.strip())
 
-        # print(f"[run_all_with_servers] Fuseki log: {fuseki_log_path}")
-        # print(_tail_file(fuseki_log_path))
+        print(f"[run_all_with_servers] Fuseki log: {fuseki_log_path}")
+        print(_tail_file(fuseki_log_path))
         return False
 
     # Show log tail right after start (helps immediately)
@@ -431,6 +431,7 @@ def _ensure_fuseki_ready(repo_root: Path, fuseki_log_path: Path) -> tuple[bool, 
     print(f"[KG preflight] reachable={reachable}, has_data={has_data}")
     if err:
         print(f"[KG preflight] error={err}")
+        pass
 
     if reachable and has_data:
         return False, True
@@ -450,12 +451,14 @@ def _ensure_fuseki_ready(repo_root: Path, fuseki_log_path: Path) -> tuple[bool, 
         print(f"[run_all_with_servers] KB loaded: {health.has_data}")
         if health.error:
             print(f"[run_all_with_servers] Error: {health.error}")
+            pass
 
         # surface container status/logs to console
         ps = subprocess.run(["docker", "ps", "-a", "--filter", f"name={FUSEKI_CONTAINER}"],
                             capture_output=True, text=True, check=False)
         if ps.stdout:
             print(ps.stdout.strip())
+            pass
         logs = subprocess.run(["docker", "logs", "--tail", "80", FUSEKI_CONTAINER],
                               capture_output=True, text=True, check=False)
         if logs.stdout:

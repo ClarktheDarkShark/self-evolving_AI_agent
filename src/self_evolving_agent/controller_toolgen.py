@@ -1,8 +1,11 @@
 #controller_toolgen.py
 
+import datetime
 import json
 import re
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
+import ast
 
 from src.typings import ChatHistory, ChatHistoryItem, Role
 
@@ -151,16 +154,29 @@ class ControllerToolgenMixin:
         ]
 
     def _toolgen_default_name(self) -> str:
-        query = getattr(self, "_toolgen_last_query", "") or ""
-        slug = re.sub(r"[^0-9a-zA-Z]+", "_", query).strip("_").lower()
-        if len(slug) > 48:
-            slug = slug[:48].rstrip("_")
-        return f"{slug}_tool" if slug else "task_tool"
+        return "generated_tool"
 
     def _toolgen_default_description(self) -> str:
         query = getattr(self, "_toolgen_last_query", "") or ""
         summary = query.strip()
         return f"Utility tool for: {summary[:120]}" if summary else "Utility tool for the current task."
+
+    def _extract_tool_name_from_code(self, python_code: str) -> Optional[str]:
+        if not python_code:
+            return None
+        for raw_line in python_code.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("#"):
+                continue
+            match = re.match(r"^#\s*tool_name\s*:\s*([a-zA-Z0-9_]+)\s*$", line)
+            if not match:
+                continue
+            name = match.group(1).strip().lower()
+            if name:
+                if not name.endswith("_generated_tool"):
+                    return f"{name}_generated_tool"
+                return name
+        return None
 
     def _toolgen_request_prompt(self, query: str, chat_history: ChatHistory) -> str:
         existing = []
@@ -169,17 +185,46 @@ class ControllerToolgenMixin:
         except Exception:
             existing = []
 
-        history_items = self._history_items(chat_history)
+        def _shorten_history_line(text: str) -> str:
+            if not text:
+                return ""
+            if "Observation:" in text or "executes successfully" in text:
+                head, sep, tail = text.partition("Observation:")
+                if sep:
+                    trimmed_tail = tail.strip()
+                    if len(trimmed_tail) > 300:
+                        trimmed_tail = trimmed_tail[:300] + "...[truncated_observation]"
+                    return (head.strip() + " Observation: " + trimmed_tail).strip()
+            if len(text) > 1000:
+                return text[:1000] + "...[truncated]"
+            return text
+
+        history_items = self._history_items(chat_history)[-8:]
         history_lines = []
         for i, it in enumerate(history_items):
             content = (it.content or "").strip()
+            content = _shorten_history_line(content)
             history_lines.append("{}:{}:{}".format(i, it.role.value, content))
 
         payload = {
             "task": (query or "").strip(),
+            "task_requirement": (
+                "Tool must directly help solve the current task; generic tools are invalid."
+            ),
             "history": "\n".join(history_lines),
             "existing_tools": existing,
         }
+        solver_recommendation = (
+            getattr(self, "_toolgen_last_recommendation", "") or ""
+        ).strip()
+        if solver_recommendation:
+            # if len(solver_recommendation) > 1200:
+            #     solver_recommendation = solver_recommendation[:1200] + "...[truncated]"
+            payload["solver_recommendation"] = solver_recommendation
+            payload["recommendation_note"] = (
+                "Solver provided a draft response. Use it to design a tool that "
+                "validates or strengthens the draft for this task."
+            )
 
         return json.dumps(payload, ensure_ascii=True, default=str)
 
@@ -201,7 +246,7 @@ class ControllerToolgenMixin:
         return "\n".join(normalized_lines).rstrip() + "\n"
 
     def _wrap_marker_tool_spec(self, python_code: str) -> dict[str, Any]:
-        name = self._toolgen_default_name()
+        name = self._extract_tool_name_from_code(python_code) or self._toolgen_default_name()
         description = self._toolgen_default_description()
         signature = "run(payload: dict) -> dict"
         tool_type = "utility"
@@ -209,8 +254,25 @@ class ControllerToolgenMixin:
         input_schema = {
             "type": "object",
             "required": ["payload"],
-            "properties": {"payload": {"type": "object", "required": [], "properties": {}}},
+            "properties": {
+                "payload": {
+                "type": "object",
+                "required": ["task_text", "asked_for", "trace", "actions_spec"],
+                "properties": {
+                    "task_text": {"type": "string"},
+                    "asked_for": {"type": "string"},
+                    "trace": {"type": "array"},
+                    "actions_spec": {"type": "object"},
+                    "constraints": {"type": "array"},
+                    "output_contract": {"type": "object"},
+                    "draft_response": {"type": ["string","null"]},
+                    "candidate_output": {},
+                    "env_observation": {},},
+                }
+            }
         }
+
+
         capabilities = []
         return {
             "name": name,
@@ -226,6 +288,9 @@ class ControllerToolgenMixin:
     def _normalize_tool_spec(self, spec: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(spec)
         normalized.setdefault("name", self._toolgen_default_name())
+        name = str(normalized.get("name") or "").strip().lower()
+        if name and not name.endswith("_generated_tool"):
+            normalized["name"] = f"{name}_generated_tool"
         normalized.setdefault("description", self._toolgen_default_description())
         normalized.setdefault("signature", "run(payload: dict) -> dict")
         normalized.setdefault("tool_type", "utility")
@@ -235,11 +300,140 @@ class ControllerToolgenMixin:
             {
                 "type": "object",
                 "required": ["payload"],
-                "properties": {"payload": {"type": "object", "required": [], "properties": {}}},
+                "properties": {
+                    "payload": {
+                    "type": "object",
+                    "required": ["task_text", "asked_for", "trace", "actions_spec"],
+                    "properties": {
+                        "task_text": {"type": "string"},
+                        "asked_for": {"type": "string"},
+                        "trace": {"type": "array"},
+                        "actions_spec": {"type": "object"},
+                        "constraints": {"type": "array"},
+                        "output_contract": {"type": "object"},
+                        "draft_response": {"type": ["string","null"]},
+                        "candidate_output": {},
+                        "env_observation": {},}
+                    },
+                }
             },
         )
         normalized.setdefault("capabilities", [])
+        schema = normalized.get("input_schema")
+        if isinstance(schema, Mapping):
+            props = schema.get("properties") or {}
+            payload_schema = props.get("payload")
+            if isinstance(payload_schema, Mapping):
+                required = payload_schema.get("required") or []
+                if not isinstance(required, list):
+                    required = []
+                required_keys = ["task_text", "asked_for", "trace", "actions_spec"]
+                for key in required_keys:
+                    if key not in required:
+                        required.append(key)
+                payload_schema["required"] = required
+                properties = payload_schema.get("properties") or {}
+                if "task_text" not in properties:
+                    properties["task_text"] = {"type": "string"}
+                if "asked_for" not in properties:
+                    properties["asked_for"] = {"type": "string"}
+                if "trace" not in properties:
+                    properties["trace"] = {"type": "array"}
+                if "actions_spec" not in properties:
+                    properties["actions_spec"] = {"type": "object"}
+                payload_schema["properties"] = properties
+                props["payload"] = payload_schema
+                schema["properties"] = props
+                normalized["input_schema"] = schema
         return normalized
+
+    def _validate_spec_alignment(self, spec: ToolSpec) -> Optional[str]:
+        if spec.signature.strip() != "run(payload: dict) -> dict":
+            return "signature_mismatch"
+        schema = spec.input_schema
+        if not isinstance(schema, Mapping):
+            return "missing_input_schema"
+        if schema.get("type") != "object":
+            return "input_schema_type_mismatch"
+        required = schema.get("required") or []
+        if required != ["payload"]:
+            return "input_schema_required_mismatch"
+        payload_schema = (schema.get("properties") or {}).get("payload")
+        if not isinstance(payload_schema, Mapping):
+            return "payload_schema_missing"
+        if payload_schema.get("type") != "object":
+            return "payload_schema_type_mismatch"
+        if "required" not in payload_schema:
+            return "payload_required_missing"
+        return None
+
+    def _validate_run_ast(self, code: str) -> Optional[str]:
+        try:
+            tree = ast.parse(code)
+        except Exception as exc:
+            return f"ast_parse_failed: {exc}"
+        run_fn = None
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "run":
+                run_fn = node
+                break
+        if run_fn is None:
+            return "run_not_found"
+        args = run_fn.args
+        total_args = list(args.posonlyargs) + list(args.args)
+        if len(total_args) != 1 or total_args[0].arg != "payload":
+            return "run_signature_mismatch"
+        if args.vararg or args.kwarg or args.kwonlyargs:
+            return "run_signature_mismatch"
+        return None
+
+    def _failed_tool_log_dir(self) -> Path:
+        base_path = None
+        log_path = getattr(self, "_generated_tools_log_path", None)
+        if log_path is not None:
+            base_path = Path(log_path).parent
+        if base_path is None:
+            base_path = Path("outputs")
+        return base_path / "callback_state" / "callback_generated_tool_logging"
+
+    def _write_failed_tool_artifact(
+        self,
+        *,
+        stage: str,
+        error: str,
+        spec: Optional[ToolSpec] = None,
+        code: Optional[str] = None,
+        raw_spec: Optional[Mapping[str, Any]] = None,
+        raw_output: Optional[str] = None,
+    ) -> None:
+        try:
+            tool_name = (spec.name if spec else None) or "unknown_tool"
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+            suffix = "py" if code else "txt"
+            filename = f"{tool_name}__{stage}__{ts}.{suffix}"
+            out_dir = self._failed_tool_log_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            header = (
+                f"# stage: {stage}\n"
+                f"# tool_name: {tool_name}\n"
+                f"# signature: {(spec.signature if spec else '')}\n"
+                f"# error: {error}\n"
+            )
+            if code:
+                content = header + "\n" + code
+            else:
+                meta = {
+                    "stage": stage,
+                    "tool_name": tool_name,
+                    "signature": spec.signature if spec else None,
+                    "error": error,
+                    "raw_spec": raw_spec,
+                    "raw_output": raw_output,
+                }
+                content = header + "\n" + json.dumps(meta, ensure_ascii=True, default=str, indent=2)
+            (out_dir / filename).write_text(content, encoding="utf-8")
+        except Exception:
+            return
 
     def _validate_and_register_tool(
         self,
@@ -248,18 +442,59 @@ class ControllerToolgenMixin:
         *,
         raw_spec: Optional[Mapping[str, Any]] = None,
     ) -> Optional[ToolMetadata]:
+        alignment_error = self._validate_spec_alignment(spec)
+        if alignment_error:
+            self._trace("tool_generation_error", f"stage=spec_alignment error={alignment_error}")
+            self._write_failed_tool_artifact(
+                stage="spec_alignment",
+                error=alignment_error,
+                spec=spec,
+                raw_spec=raw_spec,
+            )
+            return None
         code = self._join_code_lines(spec.code_lines or [])
         if not code:
             self._trace("tool_generation_error", "stage=code_join error=empty_code")
+            self._write_failed_tool_artifact(
+                stage="code_join",
+                error="empty_code",
+                spec=spec,
+                raw_spec=raw_spec,
+            )
+            return None
+        ast_error = self._validate_run_ast(code)
+        if ast_error:
+            self._trace("tool_generation_error", f"stage=run_signature error={ast_error}")
+            self._write_failed_tool_artifact(
+                stage="run_signature",
+                error=ast_error,
+                spec=spec,
+                code=code,
+                raw_spec=raw_spec,
+            )
             return None
         try:
             result = validate_tool_code(code)
         except Exception as exc:
             self._trace("tool_generation_error", f"stage=validate_exception error={exc}")
+            self._write_failed_tool_artifact(
+                stage="validate_exception",
+                error=str(exc),
+                spec=spec,
+                code=code,
+                raw_spec=raw_spec,
+            )
             return None
         if not result or not result.success:
             error = getattr(result, "error", None) or "validate failed"
             self._trace("tool_generation_error", f"stage=validate error={error}")
+            self._write_failed_tool_artifact(
+                stage="validate",
+                error=error,
+                spec=spec,
+                code=code,
+                raw_spec=raw_spec,
+            )
             return None
         try:
             metadata = self._registry.register_tool(
@@ -274,9 +509,33 @@ class ControllerToolgenMixin:
             )
         except Exception as exc:
             self._trace("tool_generation_error", f"stage=register_exception error={exc}")
+            self._write_failed_tool_artifact(
+                stage="register_exception",
+                error=str(exc),
+                spec=spec,
+                code=code,
+                raw_spec=raw_spec,
+            )
             return None
         if metadata:
             self._tool_creation_successes += 1
+            try:
+                payload = {
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "event": "create",
+                    "tool_name": metadata.name,
+                    "signature": metadata.signature,
+                    "description": metadata.description,
+                    "tool_type": metadata.tool_type,
+                    "tool_category": metadata.tool_category,
+                    "input_schema": metadata.input_schema,
+                    "capabilities": metadata.capabilities,
+                    "path": getattr(self._registry, "_get_tool_path", lambda n: None)(metadata.name),
+                }
+                payload.update(self._get_run_task_metadata())
+                self._append_generated_tools_log(payload)
+            except Exception:
+                pass
         return metadata
 
     def _register_tool_from_payload(
@@ -347,12 +606,24 @@ class ControllerToolgenMixin:
         tool_history = self._safe_inject(
             tool_history, ChatHistoryItem(role=Role.USER, content=prompt)
         )
+
         response = self._toolgen_agent._inference(tool_history)
+
         self._trace("tool_agent_result", response.content)
+        # print()
+        # print("*************************************************************")
+        # print('Tool agent response', response.content)
+        # print("*************************************************************")
+        # print()
         raw_text_full = self._normalize_toolgen_content(response.content)
 
         extracted = self._extract_marked_python(raw_text_full)
         if not extracted:
+            self._write_failed_tool_artifact(
+                stage="toolgen_markers_missing",
+                error="marker_block_not_found",
+                raw_output=raw_text_full,
+            )
             return None
         tool_spec = self._wrap_marker_tool_spec(extracted)
         return self._register_tool_from_payload(tool_spec, chat_history)

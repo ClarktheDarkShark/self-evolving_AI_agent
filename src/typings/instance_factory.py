@@ -87,7 +87,7 @@ class GeneralInstanceFactory(BaseModel, InstanceFactoryInterface):
         return v
 
     def create(self) -> Any:
-        # print('>>>>>>>> ', self.module, self.parameters)
+        print('>>>>>>>> ', self.module, self.parameters)
         splits = self.module.split(".")
         if len(splits) == 0:
             raise Exception("Invalid module name: {}".format(self.module))

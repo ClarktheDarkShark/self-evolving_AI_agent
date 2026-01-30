@@ -50,6 +50,11 @@ class ControllerOrchestratorMixin:
             "task_text": cleaned_query,
             "history": history_text,
             "existing_tools": existing,
+            # "decision_policy": (
+            #     "Choose use_tool whenever a tool could help validate, format, or prevent missed constraints. "
+            #     "Do NOT choose no_tool just because no existing tool fits; use_tool routes to a tool pipeline "
+            #     "that can create a new tool."
+            # ),
             "output_schema": {
                 "action": "use_tool|no_tool",
                 "reason": "short reason",
@@ -57,12 +62,13 @@ class ControllerOrchestratorMixin:
         }
         return json.dumps(payload, ensure_ascii=True, default=str)
 
-    def _tool_orchestrator_request_prompt(self, query: str, chat_history: ChatHistory) -> str:
-        try:
-            existing = self._orchestrator_compact_existing_tools()
-        except Exception:
-            existing = []
-
+    def _tool_orchestrator_request_prompt(
+        self,
+        query: str,
+        chat_history: ChatHistory,
+        *,
+        solver_recommendation: Optional[str] = None,
+    ) -> str:
         recent = self._history_items(chat_history)
         history_lines = []
         for i, it in enumerate(recent):
@@ -75,13 +81,18 @@ class ControllerOrchestratorMixin:
             "environment": self._resolved_environment_label(),
             "task_text": cleaned_query,
             "history": history_text,
-            "existing_tools": existing,
             "output_schema": {
                 "action": "use_tool|create_tool",
                 "tool_name": "only if use_tool",
                 "reason": "short reason",
             },
         }
+        if solver_recommendation:
+            payload["solver_recommendation"] = solver_recommendation
+            payload["recommendation_note"] = (
+                "Solver provided a draft response. Use it to decide whether a tool "
+                "can validate or strengthen the draft before returning it."
+            )
         return json.dumps(payload, ensure_ascii=True, default=str)
 
     def _tool_invoker_request_prompt(
@@ -91,11 +102,6 @@ class ControllerOrchestratorMixin:
         *,
         suggestion: Optional[Mapping[str, Any]] = None,
     ) -> str:
-        try:
-            existing = self._orchestrator_compact_existing_tools()
-        except Exception:
-            existing = []
-
         recent = self._history_items(chat_history)
         history_lines = []
         for i, it in enumerate(recent):
@@ -108,7 +114,6 @@ class ControllerOrchestratorMixin:
             "environment": self._resolved_environment_label(),
             "task_text": cleaned_query,
             "history": history_text,
-            "existing_tools": existing,
             "suggestion": suggestion or {},
             "output_schema": {
                 "tool_name": "required",
@@ -174,16 +179,30 @@ class ControllerOrchestratorMixin:
         }
 
     def _tool_orchestrate_decision(
-        self, query: str, chat_history: ChatHistory
+        self,
+        query: str,
+        chat_history: ChatHistory,
+        *,
+        solver_recommendation: Optional[str] = None,
     ) -> dict[str, Any]:
         agent = getattr(self, "_tool_orchestrator_agent", None)
         if agent is None:
             return {"action": "create_tool", "reason": "missing_tool_orchestrator"}
-        prompt = self._tool_orchestrator_request_prompt(query, chat_history)
-        self._write_agent_system_prompt(
-            "tool_orchestrator",
-            getattr(agent, "_system_prompt", "") or "",
+        prompt = self._tool_orchestrator_request_prompt(
+            query, chat_history, solver_recommendation=solver_recommendation
         )
+        try:
+            tools = self._orchestrator_compact_existing_tools()
+        except Exception:
+            tools = []
+        tool_list_text = json.dumps(tools, ensure_ascii=True, default=str)
+        original_prompt = getattr(agent, "_system_prompt", "") or ""
+        agent._system_prompt = (
+            original_prompt
+            + "\n\nThere are environment tools that you must NOT consider. Only use tools in the following list to make your decision. if the list is empty, you must generate a tool:\n"
+            + tool_list_text
+        ).strip()
+        self._write_agent_system_prompt("tool_orchestrator", agent._system_prompt)
         self._trace("tool_orchestrator_input", prompt)
         self._log_flow_event(
             "tool_orchestrator_input",
@@ -194,7 +213,10 @@ class ControllerOrchestratorMixin:
         tool_history = self._safe_inject(
             tool_history, ChatHistoryItem(role=Role.USER, content=prompt)
         )
-        response = agent._inference(tool_history)
+        try:
+            response = agent._inference(tool_history)
+        finally:
+            agent._system_prompt = original_prompt
         self._trace("tool_orchestrator_result", response.content)
         self._log_flow_event(
             "tool_orchestrator_output",
@@ -208,6 +230,9 @@ class ControllerOrchestratorMixin:
         if action not in {"use_tool", "create_tool"}:
             action = "create_tool"
         tool_name = payload.get("tool_name")
+        if tool_name and not str(tool_name).endswith("_generated_tool"):
+            tool_name = None
+            action = "create_tool"
         return {
             "action": action,
             "tool_name": str(tool_name).strip() if tool_name else None,
@@ -225,10 +250,18 @@ class ControllerOrchestratorMixin:
         if agent is None:
             return {"tool_name": None, "tool_args": None, "reason": "missing_tool_invoker"}
         prompt = self._tool_invoker_request_prompt(query, chat_history, suggestion=suggestion)
-        self._write_agent_system_prompt(
-            "tool_invoker",
-            getattr(agent, "_system_prompt", "") or "",
-        )
+        try:
+            tools = self._orchestrator_compact_existing_tools()
+        except Exception:
+            tools = []
+        tool_list_text = json.dumps(tools, ensure_ascii=True, default=str)
+        original_prompt = getattr(agent, "_system_prompt", "") or ""
+        agent._system_prompt = (
+            original_prompt
+            + "\n\nYou must ONLY select tools from the following list:\n"
+            + tool_list_text
+        ).strip()
+        self._write_agent_system_prompt("tool_invoker", agent._system_prompt)
         self._trace("tool_invoker_input", prompt)
         self._log_flow_event(
             "tool_invoker_input",
@@ -239,7 +272,10 @@ class ControllerOrchestratorMixin:
         tool_history = self._safe_inject(
             tool_history, ChatHistoryItem(role=Role.USER, content=prompt)
         )
-        response = agent._inference(tool_history)
+        try:
+            response = agent._inference(tool_history)
+        finally:
+            agent._system_prompt = original_prompt
         self._trace("tool_invoker_result", response.content)
         self._log_flow_event(
             "tool_invoker_output",
@@ -251,6 +287,8 @@ class ControllerOrchestratorMixin:
             return {"tool_name": None, "tool_args": None, "reason": "parse_failed"}
         tool_name = payload.get("tool_name")
         tool_args = payload.get("tool_args")
+        if tool_name and not str(tool_name).endswith("_generated_tool"):
+            return {"tool_name": None, "tool_args": None, "reason": "invalid_tool_name"}
         return {
             "tool_name": str(tool_name).strip() if tool_name else None,
             "tool_args": tool_args,

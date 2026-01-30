@@ -19,7 +19,8 @@ class ControllerLoggingMixin:
 
     def _trace(self, label: str, content: Any) -> None:
         text = "" if content is None else str(content)
-        print(f"[TRACE] {label}:\n{text}")
+        # print(f"[TRACE] {label}:\n{text}")
+        pass
 
     def _preview_for_log(self, obj: Any, max_len: int = 300) -> str:
         try:
@@ -533,19 +534,18 @@ class ControllerLoggingMixin:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def _get_run_task_metadata(self) -> dict[str, Any]:
-        if self._run_task_metadata is not None:
-            return dict(self._run_task_metadata)
+        cached = dict(self._run_task_metadata) if self._run_task_metadata else {}
         if not self._generated_tools_log_path:
-            return {}
+            return cached
         session_path = self._generated_tools_log_path.parent / prefix_filename(
             "current_session.json"
         )
         if not session_path.exists():
-            return {}
+            return cached
         try:
             payload = json.loads(session_path.read_text(encoding="utf-8"))
         except Exception:
-            return {}
+            return cached
         task_name = payload.get("task_name")
         sample_index = payload.get("sample_index")
         meta: dict[str, Any] = {}
@@ -562,6 +562,8 @@ class ControllerLoggingMixin:
         task_name = meta.get("task_name")
         if task_name in {"db_bench", "mysql"}:
             return "db_bench"
+        if task_name:
+            return str(task_name)
         return self._environment_label
 
     def _is_db_bench_env(self) -> bool:

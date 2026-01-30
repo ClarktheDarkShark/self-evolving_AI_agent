@@ -41,7 +41,7 @@ class GeneratedToolLoggingCallback(Callback):
         timestamp = datetime.datetime.now(datetime.UTC).isoformat()
         payload_with_time = {"timestamp": timestamp, **payload}
         self._append_log(payload_with_time)
-        print(f"[GeneratedToolLogging] {json.dumps(payload_with_time)}")
+        # print(f"[GeneratedToolLogging] {json.dumps(payload_with_time)}")
 
     def _ensure_subscription(self) -> None:
         if self._subscribed:

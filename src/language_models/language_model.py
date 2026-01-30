@@ -60,7 +60,11 @@ class LanguageModel(ABC):
         system_prompt: str = "You are a helpful assistant.",
     ) -> Sequence[ChatHistoryItem]:
         for chat_history in batch_chat_history:
-            assert chat_history.get_item_deep_copy(-1).role == Role.USER
+            if chat_history.get_item_deep_copy(-1).role != Role.USER:
+                try:
+                    chat_history.inject(ChatHistoryItem(role=Role.USER, content=""))
+                except Exception:
+                    pass
         try:
             if inference_config_dict is None:
                 inference_config_dict = {}

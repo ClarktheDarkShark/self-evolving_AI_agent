@@ -267,7 +267,7 @@ class SelfEvolvingController:
         if isinstance(v, list):
             return list(v)
 
-        print("[SelfEvolvingController] Unable to read ChatHistory via supported methods; skipping.")
+        # print("[SelfEvolvingController] Unable to read ChatHistory via supported methods; skipping.")
         return []
 
 
@@ -599,7 +599,7 @@ class SelfEvolvingController:
         if not normalized_lines:
             return None
         if len(normalized_lines) > 150:
-            print("[SelfEvolvingController] Tool code exceeds 150 lines; skipping.")
+            # print("[SelfEvolvingController] Tool code exceeds 150 lines; skipping.")
             return None
         return "\n".join(normalized_lines).rstrip() + "\n"
 
@@ -708,14 +708,14 @@ class SelfEvolvingController:
         self, creation_request: Mapping[str, Any], chat_history: ChatHistory
     ) -> Optional[ToolMetadata]:
         if self._generated_tool_counter >= self._max_generated_tools_per_run:
-            print("[SelfEvolvingController] Reached generated tool limit; skipping.")
+            # print("[SelfEvolvingController] Reached generated tool limit; skipping.")
             return None
 
         # Enforce schema-bearing tools for reliability
         tool_type = creation_request.get("tool_type")
         input_schema = creation_request.get("input_schema")
         if tool_type in {"validator", "linter", "formatter"} and input_schema is None:
-            print("[SelfEvolvingController] Missing input_schema for typed tool; skipping.")
+            # print("[SelfEvolvingController] Missing input_schema for typed tool; skipping.")
             return None
 
         spec = ToolSpec.from_payload(dict(creation_request))
@@ -741,21 +741,21 @@ class SelfEvolvingController:
             return None
         best = retrieved[0]
         if best.score < self._reuse_similarity_threshold:
-            print(
-                "[SelfEvolvingController] Reuse gate skipped: "
-                f"best_score={best.score:.3f} < threshold={self._reuse_similarity_threshold:.3f}"
-            )
+            # print(
+            #     "[SelfEvolvingController] Reuse gate skipped: "
+            #     f"best_score={best.score:.3f} < threshold={self._reuse_similarity_threshold:.3f}"
+            # )
             return None
         if "run(" not in (best.tool.signature or ""):
-            print(
-                "[SelfEvolvingController] Reuse gate skipped: "
-                f"tool '{best.tool.name}' missing run() signature."
-            )
+            # print(
+            #     "[SelfEvolvingController] Reuse gate skipped: "
+            #     f"tool '{best.tool.name}' missing run() signature."
+            # )
             return None
-        print(
-            "[SelfEvolvingController] Reuse gate selected "
-            f"tool='{best.tool.name}' score={best.score:.3f}."
-        )
+        # print(
+        #     "[SelfEvolvingController] Reuse gate selected "
+        #     f"tool='{best.tool.name}' score={best.score:.3f}."
+        # )
         return best.tool
 
 
@@ -898,7 +898,7 @@ class SelfEvolvingController:
     def _bootstrap_tools(self, bootstrap_tools: Sequence[Mapping[str, Any]]) -> None:
         if not bootstrap_tools:
             return
-        print(f"[SelfEvolvingController] Bootstrapping {len(bootstrap_tools)} tool(s).")
+        # print(f"[SelfEvolvingController] Bootstrapping {len(bootstrap_tools)} tool(s).")
         for index, tool in enumerate(bootstrap_tools):
             if not isinstance(tool, Mapping):
                 continue
@@ -920,7 +920,7 @@ class SelfEvolvingController:
             )
             if metadata:
                 self._generated_tool_counter += 1
-                print(f"[SelfEvolvingController] Bootstrapped '{metadata.name}'.")
+                # print(f"[SelfEvolvingController] Bootstrapped '{metadata.name}'.")
 
     def _safe_inject(self, h: ChatHistory, item: ChatHistoryItem) -> ChatHistory:
         """Injects item while respecting ChatHistory rule: roles must alternate."""

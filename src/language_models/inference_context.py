@@ -10,6 +10,7 @@ class InferenceContext:
     task_name: Optional[str] = None
     sample_index: Optional[str] = None
     chat_history_len: Optional[int] = None
+    agent_name: Optional[str] = None
 
 
 _context_state = local()
@@ -20,11 +21,13 @@ def set_inference_context(
     task_name: Optional[str],
     sample_index: Optional[str],
     chat_history_len: Optional[int],
+    agent_name: Optional[str] = None,
 ) -> None:
     _context_state.value = InferenceContext(
         task_name=task_name,
         sample_index=sample_index,
         chat_history_len=chat_history_len,
+        agent_name=agent_name,
     )
 
 

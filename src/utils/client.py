@@ -1,6 +1,7 @@
 from typing import Any, Optional, Type, TypeVar, overload, reveal_type
 from datetime import datetime, timezone
 import json
+import os
 import time
 import requests
 from pydantic import BaseModel
@@ -28,6 +29,12 @@ class Client(BaseModel):
 
     def __init__(self, **data: Any):
         super().__init__(**data)
+        override_timeout = os.getenv("TOOLGEN_REQUEST_TIMEOUT_S", "").strip()
+        if override_timeout:
+            try:
+                self.request_timeout = int(float(override_timeout))
+            except Exception:
+                pass
 
     def model_post_init(self, __context: Any) -> None:
         """
@@ -109,18 +116,25 @@ class Client(BaseModel):
         # endregion
         # region Send request
         start_ts = datetime.now(timezone.utc).isoformat()
+        request_timeout = self.request_timeout
+        override_timeout = os.getenv("TOOLGEN_REQUEST_TIMEOUT_S", "").strip()
+        if override_timeout:
+            try:
+                request_timeout = int(float(override_timeout))
+            except Exception:
+                pass
         start_time = time.monotonic()
         SafeLogger.info(
             "HTTP request start api=%s address=%s timeout_s=%s payload_bytes=%d start_ts=%s",
             api,
             address,
-            self.request_timeout,
+            request_timeout,
             payload_bytes,
             start_ts,
         )
         try:
             response = requests.post(
-                address, json=data_dict, timeout=self.request_timeout
+                address, json=data_dict, timeout=request_timeout
             )
         except requests.exceptions.Timeout as e:
             elapsed_ms = (time.monotonic() - start_time) * 1000.0

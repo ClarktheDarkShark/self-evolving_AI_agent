@@ -75,7 +75,7 @@ class ToolRegistry:
         self.snapshots_dir = os.path.join(self.base_path, "run_snapshots")
         os.makedirs(self.tools_dir, exist_ok=True)
         os.makedirs(self.snapshots_dir, exist_ok=True)
-        print(f"[ToolRegistry] Initialized registry at '{self.base_path}'")
+        # print(f"[ToolRegistry] Initialized registry at '{self.base_path}'")
         self._metadata: Dict[str, ToolMetadata] = {}
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._lock = threading.Lock()
@@ -244,9 +244,7 @@ class ToolRegistry:
         return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     def _canonical_name(self, base_name: str, fingerprint: str) -> str:
-        base = re.sub(r"__[0-9a-fA-F]{6,}$", "", base_name)
-        short = fingerprint[:10]
-        return f"{base}__{short}"
+        return re.sub(r"__[0-9a-fA-F]{6,}$", "", base_name)
 
     def _find_by_hash(self, code_hash: str) -> Optional[ToolMetadata]:
         for meta in self._metadata.values():
@@ -416,10 +414,10 @@ class ToolRegistry:
         # Enforce docstring + run() presence (new format). If invalid, replace with safe stub.
         issues = self._validate_tool_source(normalized_code)
         if issues:
-            print(
-                f"[ToolRegistry] Tool '{base_name}' failed validation; skipping. "
-                f"Issues: {issues}"
-            )
+            # print(
+            #     f"[ToolRegistry] Tool '{base_name}' failed validation; skipping. "
+            #     f"Issues: {issues}"
+            # )
             self._notify(
                 {
                     "event": "register_skipped",
@@ -442,10 +440,10 @@ class ToolRegistry:
             if existing_name:
                 existing_meta = self._metadata.get(existing_name)
                 if existing_meta:
-                    print(
-                        "[ToolRegistry] Deduped tool generation: "
-                        f"fingerprint={fingerprint[:10]} name={existing_name}"
-                    )
+                    # print(
+                    #     "[ToolRegistry] Deduped tool generation: "
+                    #     f"fingerprint={fingerprint[:10]} name={existing_name}"
+                    # )
                     self._notify(
                         {
                             "event": "register_deduped",
@@ -462,10 +460,10 @@ class ToolRegistry:
             if fingerprint and fingerprint not in self._fingerprint_map:
                 self._fingerprint_map[fingerprint] = existing.name
                 self._save_fingerprint_map()
-            print(
-                f"[ToolRegistry] Skipping duplicate tool '{base_name}'; "
-                f"matches existing '{existing.name}'."
-            )
+            # print(
+            #     f"[ToolRegistry] Skipping duplicate tool '{base_name}'; "
+            #     f"matches existing '{existing.name}'."
+            # )
             return existing
 
         version = 1
@@ -474,10 +472,11 @@ class ToolRegistry:
             fingerprint_short = fingerprint or code_hash[:10]
             tool_name = self._canonical_name(base_name, fingerprint_short)
             if tool_name != base_name:
-                print(
-                    "[ToolRegistry] Canonicalized tool name "
-                    f"'{base_name}' -> '{tool_name}'."
-                )
+                # print(
+                #     "[ToolRegistry] Canonicalized tool name "
+                #     f"'{base_name}' -> '{tool_name}'."
+                # )
+                pass
         else:
             version = self._next_version(base_name)
             tool_name = f"{base_name}__v{version}"
@@ -486,10 +485,10 @@ class ToolRegistry:
             if fingerprint and fingerprint not in self._fingerprint_map:
                 self._fingerprint_map[fingerprint] = tool_name
                 self._save_fingerprint_map()
-            print(
-                "[ToolRegistry] Tool already registered; reusing "
-                f"'{tool_name}'."
-            )
+            # print(
+            #     "[ToolRegistry] Tool already registered; reusing "
+            #     f"'{tool_name}'."
+            # )
             return existing_meta
         tool_path = self._get_tool_path(tool_name)
         module_doc, run_doc = self._extract_docstrings(normalized_code)
@@ -795,11 +794,11 @@ class ToolRegistry:
             outcome = ToolResult.success_result(result)
 
         except Exception as e:
-            print(
-                f"[ToolRegistry] invoke_tool failure name={resolved_name} "
-                f"error_type={type(e).__name__} error={e}"
-            )
-            print(traceback.format_exc())
+            # print(
+            #     f"[ToolRegistry] invoke_tool failure name={resolved_name} "
+            #     f"error_type={type(e).__name__} error={e}"
+            # )
+            # print(traceback.format_exc())
             outcome = ToolResult.failure(str(e))
             error_type = type(e).__name__
             error_traceback = traceback.format_exc()
@@ -873,10 +872,10 @@ def get_registry(
     with _REGISTRY_LOCK:
         if force_reset or _REGISTRY_INSTANCE is None:
             base_path = _resolve_registry_path(tool_registry_path or os.getcwd())
-            print(f"[ToolRegistry] Creating new registry at '{base_path}'")
+            # print(f"[ToolRegistry] Creating new registry at '{base_path}'")
             _REGISTRY_INSTANCE = ToolRegistry(base_path)
         elif tool_registry_path and os.path.abspath(_resolve_registry_path(tool_registry_path)) != _REGISTRY_INSTANCE.base_path:
             resolved_path = _resolve_registry_path(tool_registry_path)
-            print(f"[ToolRegistry] Switching registry base path to '{resolved_path}'")
+            # print(f"[ToolRegistry] Switching registry base path to '{resolved_path}'")
             _REGISTRY_INSTANCE = ToolRegistry(resolved_path)
     return _REGISTRY_INSTANCE

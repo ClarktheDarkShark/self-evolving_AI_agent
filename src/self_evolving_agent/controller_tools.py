@@ -9,6 +9,45 @@ from .tool_retrieval import retrieve_tools
 
 
 class ControllerToolsMixin:
+    def _normalize_trace(self, trace: Any) -> list[dict[str, Any]]:
+        if not isinstance(trace, list):
+            return []
+        if not trace:
+            return []
+        if all(isinstance(item, dict) for item in trace):
+            return list(trace)
+
+        def _parse_action_name(text: str) -> str:
+            if not text:
+                return ""
+            raw = text.strip()
+            if raw.lower().startswith("action:"):
+                raw = raw.split(":", 1)[1].strip()
+            if "(" in raw:
+                return raw.split("(", 1)[0].strip()
+            return raw.split()[0].strip() if raw.split() else ""
+
+        normalized: list[dict[str, Any]] = []
+        for item in trace:
+            if isinstance(item, str):
+                action = _parse_action_name(item)
+                normalized.append({"action": action, "raw": item, "args": {}})
+        return normalized
+
+    def _normalize_analyzer_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        trace = payload.get("trace")
+        normalized_trace = self._normalize_trace(trace)
+        if normalized_trace:
+            payload["trace"] = normalized_trace
+        actions_spec = payload.get("actions_spec")
+        if not actions_spec:
+            actions_spec = {}
+            for step in normalized_trace:
+                action = step.get("action")
+                if isinstance(action, str) and action:
+                    actions_spec[action] = {}
+            payload["actions_spec"] = actions_spec
+        return payload
     def _bootstrap_tools(self, bootstrap_tools: Sequence[Mapping[str, Any]]) -> None:
         if not bootstrap_tools:
             return
@@ -57,18 +96,110 @@ class ControllerToolsMixin:
             else None
         )
         resolved_name = resolved_name or tool_name
+
+        # Look up signature so we can enforce "payload tools always get 1 dict arg"
+        tool_meta = self._get_tool_metadata(resolved_name)
+
         args: list[Any] = []
         kwargs: dict[str, Any] = {}
+
+        # ---- Normalize tool_args into args/kwargs ----
         if isinstance(tool_args, Mapping):
+            # If caller used the packed form: {"args":[...], "kwargs":{...}}
             if "args" in tool_args or "kwargs" in tool_args:
                 args = list(tool_args.get("args") or [])
                 kwargs = dict(tool_args.get("kwargs") or {})
             else:
-                kwargs = dict(tool_args)
+                # IMPORTANT: if this is a payload tool, treat the mapping as THE payload positional arg
+                if tool_meta and self._signature_prefers_payload(tool_meta.signature):
+                    if "payload" in tool_args and len(tool_args) == 1:
+                        inner = tool_args.get("payload")
+                        if isinstance(inner, Mapping) and "payload" in inner:
+                            args = [{"payload": inner.get("payload")}]
+                        else:
+                            args = [dict(tool_args)]
+                    else:
+                        args = [{"payload": dict(tool_args)}]
+                    kwargs = {}
+                else:
+                    # otherwise treat mapping as kwargs
+                    args = []
+                    kwargs = dict(tool_args)
         elif isinstance(tool_args, (list, tuple)):
             args = list(tool_args)
         else:
             args = [tool_args] if tool_args is not None else []
+
+        # ---- Hard guard: never invoke a payload tool with no positional dict ----
+        if tool_meta and self._signature_prefers_payload(tool_meta.signature):
+            # If args is empty OR args is present but not exactly one dict, fix it.
+            # (Your registry wrapper seems to enforce "single dict argument" for payload tools.)
+            if not args:
+                args = [{"payload": self._default_payload_dict(task_text="", candidate_output=None, chat_history=None)}]
+                kwargs = {}
+                args_auto_built = True
+            else:
+                first = args[0]
+                if isinstance(first, Mapping):
+                    if "payload" in first and isinstance(first.get("payload"), Mapping):
+                        inner = first.get("payload")
+                        if isinstance(inner, Mapping) and "payload" in inner:
+                            first = dict(first)
+                            first["payload"] = inner.get("payload")
+                    if "payload" in first:
+                        inner = first.get("payload")
+                        if isinstance(inner, Mapping) and "payload" in inner:
+                            first = dict(first)
+                            first["payload"] = inner.get("payload")
+                        args = [dict(first)]
+                        kwargs = {}
+                    else:
+                        base = self._default_payload_dict(task_text="", candidate_output=None, chat_history=None)
+                        base.update(dict(first))  # caller wins, but required keys now exist
+                        args = [{"payload": base}]
+                        kwargs = {}
+                        args_auto_built = True
+
+                else:
+                    args = [{"payload": self._default_payload_dict(task_text=str(first), candidate_output=None, chat_history=None)}]
+                kwargs = {}
+                args_auto_built = True
+
+            # Also: if caller tried to pass keyword args into payload tool, fold them into payload dict
+            if kwargs:
+                merged = dict(args[0])
+                if isinstance(merged.get("payload"), Mapping):
+                    payload_inner = dict(merged.get("payload"))
+                    payload_inner.update(kwargs)
+                    merged["payload"] = payload_inner
+                else:
+                    merged.update(kwargs)
+                args = [merged]
+                kwargs = {}
+
+        if tool_meta and self._signature_prefers_payload(tool_meta.signature):
+            if args and isinstance(args[0], Mapping):
+                wrapped = dict(args[0])
+                inner = wrapped.get("payload")
+                if isinstance(inner, Mapping):
+                    wrapped["payload"] = self._normalize_analyzer_payload(dict(inner))
+                    args = [wrapped]
+
+        if tool_meta and tool_meta.environment_usage:
+            current_env = self._resolved_environment_label()
+            if current_env not in tool_meta.environment_usage:
+                error = f"tool_environment_mismatch: {current_env}"
+                self._trace("tool_generation_error", error)
+                self._log_flow_event(
+                    "tool_agent_output",
+                    tool_name=resolved_name,
+                    success=False,
+                    error=error,
+                    output=None,
+                )
+                return ToolResult.failure(error)
+
+        # ---- Logging / tracing ----
         self._trace(
             "tool_agent_input",
             json.dumps(
@@ -96,8 +227,10 @@ class ControllerToolsMixin:
             kwargs_preview=self._preview_for_log(kwargs),
             reason=reason,
         )
+
         self._mark_tool_invoked()
         self._tool_invocation_attempts += 1
+
         result = self._registry.invoke_tool(
             resolved_name,
             *args,
@@ -108,8 +241,10 @@ class ControllerToolsMixin:
             },
             **kwargs,
         )
+
         if result.success:
             self._tool_invocation_successes += 1
+
         self._toolgen_debug_event(
             "tool_invoke_result",
             tool_name=resolved_name,
@@ -134,6 +269,7 @@ class ControllerToolsMixin:
         )
         self._trace("tool_agent_result", self._format_tool_result(resolved_name, result))
         return result
+
 
     def _invoke_tool_for_query(
         self,
@@ -241,8 +377,22 @@ class ControllerToolsMixin:
         if not query and candidate_output is None:
             return None
         if self._signature_prefers_payload(tool.signature) or isinstance(tool.input_schema, Mapping):
-            payload = {"task_text": query, "candidate_output": candidate_output}
-            return [payload], {}
+            payload = self._default_payload_dict(
+                task_text=query or "",
+                candidate_output=candidate_output,
+                chat_history=None,  # keep None if you don't want to expose it
+            )
+            required = []
+            schema = tool.input_schema if isinstance(tool.input_schema, Mapping) else None
+            if schema:
+                payload_schema = (schema.get("properties") or {}).get("payload")
+                if isinstance(payload_schema, Mapping):
+                    req = payload_schema.get("required") or []
+                    if isinstance(req, list):
+                        required = [str(x) for x in req if x]
+            if required and any(key not in payload for key in required):
+                return None
+            return [{"payload": payload}], {}
         return [query or candidate_output or ""], {}
 
     def _auto_build_tool_args(
@@ -265,7 +415,7 @@ class ControllerToolsMixin:
                 return packed
         if query:
             return {"args": [query]}
-        return {"args": [{"task_text": query, "candidate_output": candidate_output}]}
+        return {"args": [{"payload": {"task_text": query, "candidate_output": candidate_output}}]}
 
     def _reuse_existing_tool(
         self,
@@ -394,7 +544,13 @@ class ControllerToolsMixin:
             last_user = self._get_last_user_item(chat_history)
             query = (last_user.content or "").strip() if last_user else ""
             if tool_meta and self._signature_prefers_payload(tool_meta.signature):
-                tool_args = [self._default_payload_dict(query=query, chat_history=chat_history)]
+                tool_args = [self._default_payload_dict(
+                    task_text=query,
+                    candidate_output=self._get_candidate_output(chat_history, query),
+                    chat_history=chat_history,  # or None if you don't want it
+                )]
+                tool_args = [{"payload": tool_args[0]}]
+
             elif query:
                 tool_args = [query]
             else:

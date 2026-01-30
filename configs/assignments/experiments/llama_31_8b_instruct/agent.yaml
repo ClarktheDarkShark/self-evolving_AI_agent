@@ -19,8 +19,7 @@ assignment_config:
       max_generated_tools_per_run: 30
       environment_label: os_interaction
       system_prompt: |
-        You are a helpful assistant. You can generate a new tool that will to assist with your task or call an internal tools using <internal_tool> blocks when helpful.
-        Always respect the environment's required output format.
+        You are a helpful assistant.
       force_tool_generation_if_missing: true
       tool_match_min_score: 0.20
       include_registry_in_prompt: true
@@ -44,8 +43,7 @@ agent_dict:
       tool_registry_path: "outputs/tool_library"
       max_generated_tools_per_run: 3
       system_prompt: |
-        You are a helpful assistant. You may generate a new tool to assist with your task or call an internal tools using <internal_tool> blocks when helpful.
-        Always respect the environment's required output format.
+        You are a helpful assistant.
       inference_config_dict: {}
 
       # ADD THESE (so custom_parameters can override them)

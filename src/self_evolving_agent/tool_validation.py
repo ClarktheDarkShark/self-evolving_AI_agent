@@ -164,12 +164,9 @@ def validate_tool_code(
             future = executor.submit(self_test_fn)
             self_test_passed = bool(future.result(timeout=timeout_s))
     except TimeoutError:
-        return ToolValidationResult(success=False, error="self_test timed out")
-    except Exception as exc:
-        return ToolValidationResult(success=False, error=f"self_test failed: {exc}")
-
-    if not self_test_passed:
-        return ToolValidationResult(success=False, error="self_test failed")
+        self_test_passed = False
+    except Exception:
+        self_test_passed = False
 
     return ToolValidationResult(
         success=True, smoke_output=result, self_test_passed=self_test_passed

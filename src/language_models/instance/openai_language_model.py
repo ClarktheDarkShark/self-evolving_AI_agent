@@ -106,8 +106,9 @@ class OpenaiLanguageModel(LanguageModel):
         http_client = self._build_httpx_client()
 
         if http_client is None:
-            # if os.getenv("LIFELONG_HTTPX_LOG", "").strip():
+            if os.getenv("LIFELONG_HTTPX_LOG", "").strip():
                 # print("[LM] WARNING: httpx logging requested but client not available.")
+                pass
             self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         else:
             try:
@@ -242,6 +243,7 @@ class OpenaiLanguageModel(LanguageModel):
                 "task_name": context.task_name,
                 "sample_index": context.sample_index,
                 "chat_history_len": context.chat_history_len,
+                "agent_name": context.agent_name,
             },
             "request": {
                 "messages": list(messages),
@@ -552,7 +554,7 @@ class OpenaiLanguageModel(LanguageModel):
         # )
         # print(
         #     "[LM] incoming cfg keys:",
-        #     sorted(list(inference_config_dict.keys()))
+        #     sorted(list(inference_config_dict.keys())),
         # )
 
         allow_internal_tool_protocol = bool(
@@ -580,9 +582,16 @@ class OpenaiLanguageModel(LanguageModel):
         timeout_override_s = sanitized_config.pop("request_timeout_s", None)
 
         # print(f"[LM] messages | base_len={len(base_messages)} request_len={len(request_messages)}")
-        # if request_messages:
-            # print(f"[LM] first msg role={request_messages[0].get('role')} head={_dbg_preview(request_messages[0].get('content'))}")
-            # print(f"[LM] last  msg role={request_messages[-1].get('role')} head={_dbg_preview(request_messages[-1].get('content'))}")
+        if request_messages:
+            # print(
+            #     f"[LM] first msg role={request_messages[0].get('role')} "
+            #     f"head={_dbg_preview(request_messages[0].get('content'))}"
+            # )
+            # print(
+            #     f"[LM] last  msg role={request_messages[-1].get('role')} "
+            #     f"head={_dbg_preview(request_messages[-1].get('content'))}"
+            # )
+            pass
         # print("[LM] sanitized_config:", {k: sanitized_config.get(k) for k in sorted(sanitized_config.keys())})
 
         if is_ollama:
@@ -813,6 +822,15 @@ class OpenaiLanguageModel(LanguageModel):
 
         output_str_list: list[str] = []
         for message_list in batch_message_list:
+            # right before calling _get_completion_content(...)
+            print("\n=== inference_config_dict ===")
+            print(inference_config_dict)
+
+            print("\n=== message_list (FULL) ===")
+            for i, m in enumerate(message_list):
+                print(f"\n--- msg[{i}] role={m.get('role')} ---")
+                print(m.get("content"))
+
             output_str_list.extend(
                 self._get_completion_content(
                     message_list=message_list,

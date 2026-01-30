@@ -36,7 +36,7 @@ class SkillEvaluator:
                     skill_set.add(command)
                     command_node_list.append(node)
                 else:
-                    # print(command)
+                    print(command)
                     pass
             elif node.kind in [
                 "operator",

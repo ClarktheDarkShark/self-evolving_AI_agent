@@ -216,15 +216,10 @@ class ControllerHistoryMixin:
     def _inject_tool_result_message(
         self, chat_history: ChatHistory, tool_name: str, result: ToolResult
     ) -> ChatHistory:
-        appended = self._append_tool_result_to_last_task(
-            chat_history, tool_name, result
-        )
-        if appended:
-            return chat_history
         payload = self._format_tool_result_payload(tool_name, result)
         content = "TOOL_RESULT " + json.dumps(payload, ensure_ascii=True, default=str)
         return self._safe_inject(
-            chat_history, ChatHistoryItem(role=Role.USER, content=content)
+            chat_history, ChatHistoryItem(role=Role.AGENT, content=content)
         )
 
     def _infer_task_intent(self, task_query: str) -> dict[str, str]:
@@ -368,7 +363,7 @@ class ControllerHistoryMixin:
             lines.append(f"Last observation: {repeat_info.get('observation', '')}")
         if tool_result_injected:
             lines.append(
-                "NOTE: TOOL RESULTS appended in the last task entry are supplemental evidence, not new tasks."
+                "NOTE: TOOL_RESULT messages are supplemental evidence, not new tasks."
             )
         if last_action_info:
             action = last_action_info.get("action")
@@ -423,24 +418,12 @@ class ControllerHistoryMixin:
         if not context_msg:
             return chat_history
         items = self._history_items(chat_history)
-        for idx in range(len(items) - 1, -1, -1):
-            if items[idx].role != Role.USER:
-                continue
-            current = items[idx].content or ""
-            if "CONTEXT:" in current:
+        for msg in reversed(items):
+            if msg.role == Role.AGENT and "CONTEXT:" in (msg.content or ""):
                 return chat_history
-            updated = current + "\n\nCONTEXT:\n" + context_msg
-            try:
-                if hasattr(chat_history, "set"):
-                    chat_history.set(
-                        idx, ChatHistoryItem(role=Role.USER, content=updated)
-                    )
-                else:
-                    items[idx] = ChatHistoryItem(role=Role.USER, content=updated)
-            except Exception:
-                return chat_history
-            return chat_history
-        return chat_history
+        return self._safe_inject(
+            chat_history, ChatHistoryItem(role=Role.AGENT, content="CONTEXT:\n" + context_msg)
+        )
 
     def _extract_internal_tool_calls(self, content: str) -> list[tuple[str, Mapping[str, Any]]]:
         """

@@ -88,6 +88,17 @@ class ToolRegistry:
         self._load_metadata()
         self._load_fingerprint_map()
 
+    def _fn_prefers_payload(self, run_fn: Callable[..., Any]) -> bool:
+        try:
+            sig = inspect.signature(run_fn)
+        except Exception:
+            return False
+        params = list(sig.parameters.values())
+        if len(params) != 1:
+            return False
+        p = params[0]
+        return p.name.lower() == "payload"
+
     # ---------------------------
     # Metadata persistence
     # ---------------------------
@@ -252,9 +263,7 @@ class ToolRegistry:
         return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     def _canonical_name(self, base_name: str, fingerprint: str) -> str:
-        base = re.sub(r"__[0-9a-fA-F]{6,}$", "", base_name)
-        short = fingerprint[:10]
-        return f"{base}__{short}"
+        return re.sub(r"__[0-9a-fA-F]{6,}$", "", base_name)
 
     def _find_by_hash(self, code_hash: str) -> Optional[ToolMetadata]:
         for meta in self._metadata.values():
@@ -422,10 +431,10 @@ class ToolRegistry:
         # Enforce docstring + run() presence (new format). If invalid, replace with safe stub.
         issues = self._validate_tool_source(normalized_code)
         if issues:
-            print(
-                f"[ToolRegistry] Tool '{base_name}' failed validation; skipping. "
-                f"Issues: {issues}"
-            )
+            # print(
+            #     f"[ToolRegistry] Tool '{base_name}' failed validation; skipping. "
+            #     f"Issues: {issues}"
+            # )
             self._notify(
                 {
                     "event": "register_skipped",
@@ -448,10 +457,10 @@ class ToolRegistry:
             if existing_name:
                 existing_meta = self._metadata.get(existing_name)
                 if existing_meta:
-                    print(
-                        "[ToolRegistry] Deduped tool generation: "
-                        f"fingerprint={fingerprint[:10]} name={existing_name}"
-                    )
+                    # print(
+                    #     "[ToolRegistry] Deduped tool generation: "
+                    #     f"fingerprint={fingerprint[:10]} name={existing_name}"
+                    # )
                     self._notify(
                         {
                             "event": "register_deduped",
@@ -468,10 +477,10 @@ class ToolRegistry:
             if fingerprint and fingerprint not in self._fingerprint_map:
                 self._fingerprint_map[fingerprint] = existing.name
                 self._save_fingerprint_map()
-            print(
-                f"[ToolRegistry] Skipping duplicate tool '{base_name}'; "
-                f"matches existing '{existing.name}'."
-            )
+            # print(
+            #     f"[ToolRegistry] Skipping duplicate tool '{base_name}'; "
+            #     f"matches existing '{existing.name}'."
+            # )
             return existing
 
         version = 1
@@ -480,10 +489,11 @@ class ToolRegistry:
             fingerprint_short = fingerprint or code_hash[:10]
             tool_name = self._canonical_name(base_name, fingerprint_short)
             if tool_name != base_name:
-                print(
-                    "[ToolRegistry] Canonicalized tool name "
-                    f"'{base_name}' -> '{tool_name}'."
-                )
+                # print(
+                #     "[ToolRegistry] Canonicalized tool name "
+                #     f"'{base_name}' -> '{tool_name}'."
+                # )
+                pass
         else:
             version = self._next_version(base_name)
             tool_name = f"{base_name}__v{version}"
@@ -492,10 +502,10 @@ class ToolRegistry:
             if fingerprint and fingerprint not in self._fingerprint_map:
                 self._fingerprint_map[fingerprint] = tool_name
                 self._save_fingerprint_map()
-            print(
-                "[ToolRegistry] Tool already registered; reusing "
-                f"'{tool_name}'."
-            )
+            # print(
+            #     "[ToolRegistry] Tool already registered; reusing "
+            #     f"'{tool_name}'."
+            # )
             return existing_meta
         tool_path = self._get_tool_path(tool_name)
         module_doc, run_doc = self._extract_docstrings(normalized_code)
@@ -506,11 +516,11 @@ class ToolRegistry:
                 with open(tool_path, "w", encoding="utf-8") as f:
                     f.write(normalized_code)
             except Exception as exc:
-                print(
-                    f"[ToolRegistry] persist failure name={tool_name} "
-                    f"error_type={type(exc).__name__} error={exc}"
-                )
-                print(traceback.format_exc())
+                # print(
+                #     f"[ToolRegistry] persist failure name={tool_name} "
+                #     f"error_type={type(exc).__name__} error={exc}"
+                # )
+                # print(traceback.format_exc())
                 return None
 
             metadata = self._metadata.get(
@@ -664,7 +674,23 @@ class ToolRegistry:
         params = list(sig.parameters.values())
 
         # Common payload used for dict-style tools or **kwargs tools
-        payload = {"task_text": query, "query": query, "text": query, "input": query}
+        payload = {
+            "task_text": query,
+            "asked_for": query,      # safest default
+            "trace": [],
+            "actions_spec": {},
+            "constraints": [],
+            "output_contract": {},
+            "draft_response": None,
+            "candidate_output": None,
+            "env_observation": None,
+
+            # optional aliases (fine to keep)
+            "query": query,
+            "text": query,
+            "input": query,
+        }
+
 
         # If run() takes no parameters (or only optional), try no-arg call.
         required = [
@@ -832,7 +858,52 @@ class ToolRegistry:
                 )
             run_fn = getattr(module, "run")
             if not callable(run_fn):
-                raise TypeError(f"Tool '{name}'.run exists but is not callable.")
+                raise TypeError(...)
+
+            # Normalize args/kwargs for payload-style tools (authoritative check)
+            if self._fn_prefers_payload(run_fn):
+                payload_arg = None
+
+                # kwargs form
+                if kwargs:
+                    if "payload" in kwargs and not args:
+                        # If kwargs includes payload plus extras, merge extras into payload
+                        base = kwargs.get("payload")
+                        if isinstance(base, dict):
+                            merged = dict(base)
+                            for k, v in kwargs.items():
+                                if k != "payload":
+                                    merged[k] = v
+                            payload_arg = merged
+                        else:
+                            payload_arg = base
+                        kwargs = {}
+                    elif not args:
+                        payload_arg = dict(kwargs)
+                        kwargs = {}
+
+                # args form
+                if args:
+                    if len(args) == 1 and isinstance(args[0], dict) and "payload" in args[0]:
+                        inner = args[0].get("payload")
+                        if isinstance(inner, dict):
+                            merged = dict(inner)
+                            for k, v in args[0].items():
+                                if k != "payload":
+                                    merged[k] = v
+                            payload_arg = merged
+                        else:
+                            payload_arg = inner
+                    elif len(args) == 1:
+                        payload_arg = args[0]
+
+                if payload_arg is None:
+                    return ToolResult.failure("payload tool requires a single dict argument")
+                if not isinstance(payload_arg, dict):
+                    return ToolResult.failure("payload must be a dict")
+
+                args = (payload_arg,)
+                kwargs = {}
 
             result = run_fn(*args, **kwargs)
 
@@ -843,11 +914,11 @@ class ToolRegistry:
             outcome = ToolResult.success_result(result)
 
         except Exception as e:
-            print(
-                f"[ToolRegistry] invoke_tool failure stage={stage} name={resolved_name} "
-                f"error_type={type(e).__name__} error={e}"
-            )
-            print(traceback.format_exc())
+            # print(
+            #     f"[ToolRegistry] invoke_tool failure stage={stage} name={resolved_name} "
+            #     f"error_type={type(e).__name__} error={e}"
+            # )
+            # print(traceback.format_exc())
             outcome = ToolResult.failure(str(e))
             error_type = type(e).__name__
             error_traceback = traceback.format_exc()

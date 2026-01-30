@@ -913,7 +913,7 @@ def validate() -> None:
             continue
         print("=" * 20)
         print(f"Skill: {skill}")
-        # print(f"Explanation: {info_dict['explanation']}")
+        print(f"Explanation: {info_dict['explanation']}")
         for sql_info in info_dict["demonstration"]:
             assert isinstance(sql_info, Mapping)
             sql = sql_info["sql"]
