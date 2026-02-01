@@ -301,11 +301,26 @@ class SelfEvolvingController(
         candidate_output: Optional[str] = None,
         chat_history: Optional[ChatHistory] = None,
     ) -> dict[str, Any]:
+        task_text_full = task_text or ""
+        if chat_history is not None:
+            user_items = [
+                item
+                for item in self._history_items(chat_history)
+                if item.role == Role.USER and (item.content or "").strip()
+            ]
+            if user_items:
+                first_user = (user_items[0].content or "").strip()
+                last_user = (user_items[-1].content or "").strip()
+                if first_user and last_user and last_user not in first_user:
+                    task_text_full = f"{first_user}\n\n{last_user}"
+                else:
+                    task_text_full = first_user or last_user or task_text_full
+        actions_spec = self._extract_actions_spec_from_text(task_text_full)
         payload: dict[str, Any] = {
-            "task_text": task_text or "",
+            "task_text": task_text_full,
             "asked_for": "",          # safe default
             "trace": [],              # safe default
-            "actions_spec": {},       # safe default
+            "actions_spec": actions_spec,
             "constraints": [],
             "output_contract": {},
             "draft_response": None,
@@ -359,6 +374,7 @@ class SelfEvolvingController(
         tool_agent_traced = False
         solver_sidecar: list[str] = []
         solver_recommendation: Optional[str] = None
+        tool_followup: Optional[dict[str, Any]] = None
 
         initial_solver_prompt = self._solver_prompt_no_tools()
         self._write_agent_system_prompt("solver", initial_solver_prompt)
@@ -461,6 +477,7 @@ class SelfEvolvingController(
                             tool_name,
                             tool_args,
                             reason="tool_invoker",
+                            chat_history=working_history,
                             args_auto_built=args_auto_built,
                             decision_action=tool_action,
                         )
@@ -484,14 +501,30 @@ class SelfEvolvingController(
                         solver_sidecar.append(
                             self._format_tool_result(tool_name, tool_result)
                         )
+                        tool_followup = self._extract_tool_followup(tool_result)
+                        if tool_followup:
+                            solver_sidecar.append(
+                                "TOOL_NEXT_ACTION:\n"
+                                + json.dumps(tool_followup, ensure_ascii=True, default=str)
+                            )
                         tool_result_injected = True
                     else:
                         tool_error = "tool_invoker_missing_tool_name"
+                        self._log_failed_invoke_event(
+                            tool_name=None,
+                            reason=tool_error,
+                        )
                         _record_tool_error("tool_invoker", tool_error)
                         tool_result = ToolResult.failure(tool_error)
                         solver_sidecar.append(
                             self._format_tool_result("tool_invoker", tool_result)
                         )
+                        tool_followup = self._extract_tool_followup(tool_result)
+                        if tool_followup:
+                            solver_sidecar.append(
+                                "TOOL_NEXT_ACTION:\n"
+                                + json.dumps(tool_followup, ensure_ascii=True, default=str)
+                            )
                         tool_result_injected = True
         except Exception as exc:
             tool_error = f"{type(exc).__name__}: {exc}"
@@ -526,6 +559,13 @@ class SelfEvolvingController(
                     + "\n\nINTERNAL TOOL CONTEXT:\n"
                     + "\n\n".join(solver_sidecar)
                 )
+            if tool_followup:
+                solver_prompt = (
+                    solver_prompt
+                    + "\n\nTOOL FOLLOWUP REQUIRED:\n"
+                    + "A tool indicates additional steps are required. Do NOT return a Final Answer. "
+                    + "Use TOOL_NEXT_ACTION if provided, otherwise request the missing step."
+                )
             solver_payload = {
                 "system_prompt": solver_prompt,
                 "history": self._toolgen_render_history(
@@ -548,6 +588,20 @@ class SelfEvolvingController(
                 working_history, system_prompt=solver_prompt
             )
             content = getattr(solver_response, "content", "") or ""
+            if tool_followup and "final answer" in content.lower():
+                self._trace("solver_result", content)
+                working_history = self._safe_inject(working_history, solver_response)
+                working_history = self._safe_inject(
+                    working_history,
+                    ChatHistoryItem(
+                        role=Role.USER,
+                        content=(
+                            "A tool requires another step. Do NOT return Final Answer. "
+                            "Use the TOOL_NEXT_ACTION from the tool result."
+                        ),
+                    ),
+                )
+                continue
             if self._contains_internal_tool(content):
                 self._trace("solver_result", content)
                 working_history = self._safe_inject(working_history, solver_response)
@@ -651,7 +705,10 @@ class SelfEvolvingController(
                 )
                 if preprocess_tool and preprocess_tool.name not in auto_invoked_tools:
                     preprocess_payload = self._invoke_tool_for_query(
-                        preprocess_tool, task_query, reason="auto_preprocess"
+                        preprocess_tool,
+                        task_query,
+                        chat_history=working_history,
+                        reason="auto_preprocess",
                     )
                     if preprocess_payload is not None:
                         preprocess_result, tool_args, tool_kwargs = preprocess_payload
@@ -764,6 +821,26 @@ class SelfEvolvingController(
 
     def _solver_prompt_no_tools(self) -> str:
         return (self._solver_system_prompt or "").strip() or "You are a helpful assistant."
+
+    def _extract_tool_followup(self, result: ToolResult) -> Optional[dict[str, Any]]:
+        output = result.output
+        parsed: Optional[Mapping[str, Any]] = None
+        if isinstance(output, Mapping):
+            parsed = output
+        elif isinstance(output, str) and output.strip():
+            text = output.strip()
+            parsed = self._parse_creation_payload(text)
+            if not parsed:
+                obj_text = self._extract_first_json_object(text)
+                if obj_text:
+                    parsed = self._parse_creation_payload(obj_text)
+        if not parsed:
+            return None
+        status = str(parsed.get("status") or "").strip().lower()
+        next_action = parsed.get("next_action")
+        if status in {"need_step", "blocked", "error"} or next_action:
+            return {"status": status or None, "next_action": next_action}
+        return None
 
     def _solver_inference_with_retry(
         self, chat_history: ChatHistory, system_prompt: Optional[str] = None

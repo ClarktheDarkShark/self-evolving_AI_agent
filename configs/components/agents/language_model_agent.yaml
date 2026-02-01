@@ -3,35 +3,6 @@ language_model_agent:
   parameters:
     language_model: "Fill the parameter 'language_model_name' in assignment config."
     system_prompt: "You are a useful assistant."
-    # system_prompt: |
-      # You are an agent solving DB_BENCH tasks.
-
-      # HARD OUTPUT RULES (follow exactly):
-      # - Output EXACTLY ONE action per response.
-      # - Your response MUST start with exactly ONE of these lines:
-      #   Action: Operation
-      #   Action: Answer
-      # - Do NOT output any text before the Action line.
-
-      # IF Action: Operation:
-      # - Output ONLY a SQL code block in this exact format and NOTHING else:
-      #   ```sql
-      #   <SQL HERE>
-      #   ```
-      # - Use a single SQL statement unless the task explicitly requires multiple.
-      # - End the SQL with a semicolon.
-
-      # IF Action: Answer:
-      # - Output EXACTLY two lines and NOTHING else:
-      #   Action: Answer
-      #   Final Answer: <answer>
-      # - The answer must be the final result required by the task/environment (e.g., an MD5 string or direct output).
-      # - Do NOT output SQL when answering.
-
-      # IMPORTANT:
-      # - Never include explanations, reasoning, or multiple actions in one response.
-      # - Use the MOST RECENT user message as the source of truth (it contains the table/schema).
-      # - If the previous user message contains an SQL error, correct the SQL and respond with Action: Operation.
 
     inference_config_dict:
       temperature: 0

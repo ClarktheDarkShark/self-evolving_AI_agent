@@ -37,10 +37,25 @@ class GeneratedToolLoggingCallback(Callback):
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, default=str) + "\n")
 
+    def _truncate_text(self, text: str, max_len: int) -> str:
+        if text is None:
+            return ""
+        text = str(text)
+        return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+    def _truncate_payload(self, obj: Any, max_len: int) -> Any:
+        if isinstance(obj, str):
+            return self._truncate_text(obj, max_len)
+        if isinstance(obj, list):
+            return [self._truncate_payload(item, max_len) for item in obj]
+        if isinstance(obj, dict):
+            return {k: self._truncate_payload(v, max_len) for k, v in obj.items()}
+        return obj
+
     def _listener(self, payload: dict[str, Any]) -> None:
         timestamp = datetime.datetime.now(datetime.UTC).isoformat()
         payload_with_time = {"timestamp": timestamp, **payload}
-        self._append_log(payload_with_time)
+        self._append_log(self._truncate_payload(payload_with_time, 500))
         # print(f"[GeneratedToolLogging] {json.dumps(payload_with_time)}")
 
     def _ensure_subscription(self) -> None:

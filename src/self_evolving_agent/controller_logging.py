@@ -626,6 +626,23 @@ class ControllerLoggingMixin:
         payload.update(self._get_run_task_metadata())
         self._append_generated_tools_log(payload)
 
+    def _log_failed_invoke_event(
+        self,
+        *,
+        tool_name: Optional[str],
+        reason: str,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "event": "failed_invoke",
+            "tool_name": tool_name,
+            "reason": reason,
+            "environment_label": self._resolved_environment_label(),
+            "source": "controller",
+        }
+        payload.update(self._get_run_task_metadata())
+        self._append_generated_tools_log(payload)
+
     def _mark_tool_invoked(self) -> None:
         self._tool_invoked_in_last_inference = True
 

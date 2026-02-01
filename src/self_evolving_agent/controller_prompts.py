@@ -15,6 +15,7 @@ DECISION RULES (GENERAL)
 - Even if a task looks simple, choose use_tool when a tool could prevent subtle errors or missed constraints.
 - If no suitable tool exists, still choose use_tool so the tool pipeline can create one.
 - Choose no_tool ONLY if the task is truly trivial, single-step, and low-risk. This must consider the full history of user and agent actions.
+- ALWAYS return use_tool when the solver recommendation is to provide the final answer for a task.
 """).strip()
 
 
@@ -48,7 +49,7 @@ C) a validator/repair output that deterministically transforms the solver's draf
 If the tool output is merely a guess, label, or non-executable summary, it is NOT suitable -> create_tool.
 
 DECISION RULES (GENERAL)
-- Prefer create_tool when uncertain about suitability or when the task has strict format/constraints and no suitable catalog tool clearly satisfies the gate.
+- When there is no suitable tool to use, return create_tool
 - Reasons must be specific (e.g., "not_in_catalog", "fails_gate_no_plan", "fails_gate_guess_only", "meets_gate_plan", "meets_gate_validator").
 - If the solver_recommendation is a final answer, always return use_tool | create_tool
 """).strip()
@@ -355,273 +356,359 @@ OUTPUT (HARD)
 
 
 
+# TOOLGEN_USER_APPENDIX = textwrap.dedent('''
+# Reasoning: low
+# You are ToolGen. Generate ONE reusable, domain-agnostic analysis tool for multi-step agent loops.
+
+# ========================
+# OUTPUT FORMAT (HARD #1)
+# ========================
+# - Output MUST be ONLY this, with NOTHING before/after:
+# Line 1: ###TOOL_START
+# Then: raw Python source (no markdown, no prose, no JSON)
+# Last line: ###TOOL_END
+# - If you cannot comply, still output the markers + best-effort Python. Never omit markers.
+# - Include a short tool name in the code as a single comment line:
+#   # tool_name: <short_snake_case>_generated_tool
+#   Keep it under ~3 words; do NOT copy the full task text.
+# - The Python source MUST include a comment line: # tool_name: <short_snake_case_name>
+
+# ========================
+# NON-NEGOTIABLE RULES
+# ========================
+# - Python standard library ONLY.
+# - Deterministic: no randomness.
+# - Implement ONLY: def run(payload: dict) -> dict  (exact signature)
+# - run() MUST NEVER raise: wrap everything in try/except.
+#   On exception, return a dict with keys:
+#   status='error', errors(list[str]), warnings(list[str]),
+#   next_action, answer_recommendation, plan, validation, rationale.
+# - Basic type guards before calling methods (e.g., guard .lower()).
+
+# CRITICAL TOKEN RULE (HARD)
+# - The substring "set" must NOT appear anywhere in the generated Python source
+#   (code, comments, strings, variable names). Do NOT use set() or the type name.
+#   Use dict membership for uniqueness instead.
+
+# SAFETY (HARD)
+# - ABSOLUTELY FORBIDDEN anywhere in code/comments/strings:
+#   'sudo', 'useradd', 'usermod', 'groupadd', 'chmod', 'chgrp'
+
+# ========================
+# TOOL PURPOSE
+# ========================
+# This tool analyzes: task_text + asked_for + trace + actions_spec (+ optional constraints/contract)
+# and returns:
+# - whether the solver can answer now,
+# - what action to do next (ONLY from actions_spec),
+# - validation signals (prereq gaps, contract guard, derivations),
+# - short rationale strings that help the orchestrator and solver.
+
+# It MUST NOT execute external actions. It MUST NOT assume any domain ontology.
+
+# SOLVER RECOMMENDATION (CONTEXT)
+# - The user message may include solver_recommendation, which is a draft response from the solver.
+# - Use it to shape a tool that validates or strengthens that draft for the current task.
+
+# ========================
+# ORCHESTRATOR GUIDANCE (DOCSTRING MUST INCLUDE THIS)  (HARD)
+# ========================
+# The ONE module docstring (the first 3 lines) MUST include, verbatim, an "INPUT_SCHEMA:" clause that lists required/optional keys.
+
+# Format requirements (HARD):
+# - The docstring single-line description MUST contain this exact substring: "INPUT_SCHEMA:"
+# - Immediately after "INPUT_SCHEMA:" include:
+#   "required=task_text,asked_for,trace,actions_spec; optional=constraints,output_contract,draft_response,candidate_output,env_observation"
+# - Also include, in the same single line, these concepts: contract guard, prereqs, next-action suggestion, limitations (no persistence; only analyzes payload; does not call tools).
+
+# Example (must be one single line inside the docstring):
+# INPUT_SCHEMA: required=task_text:str,asked_for:str,trace:list[dict]|list[str],actions_spec:dict; optional=constraints:list[str],output_contract:dict,draft_response:str,candidate_output:str,env_observation:any
+
+
+# ========================
+# INVOCATION CONTRACT (HARD)
+# ========================
+# The tool MUST document BOTH:
+# (A) the controller wrapper shape (how to call the tool), and
+# (B) the run() payload shape (what run(payload) receives).
+
+# Near run(), include this EXACT 3-line comment block (verbatim keys + formatting):
+# # INVOKE_WITH: {"args":[{"payload": <RUN_PAYLOAD> }], "kwargs":{}}
+# # RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec"]
+# # RUN_PAYLOAD_OPTIONAL: ["constraints","output_contract","draft_response","candidate_output","env_observation"]
+
+# Also include ONE example in a single comment line:
+# # INVOKE_EXAMPLE: {"args":[{"payload":{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{}}}],"kwargs":{}}
+
+
+# ========================
+# SCHEMA ECHO (HARD)
+# ========================
+# In addition to the docstring, include a short comment block near run() that repeats the contract so it can be extracted if needed:
+# # input_schema_required: task_text, asked_for, trace, actions_spec
+# # input_schema_optional: constraints, output_contract, draft_response, candidate_output, env_observation
+
+                                        
+# ========================
+# INPUTS (HARD)
+# ========================
+# payload required keys:
+# - task_text: str
+# - asked_for: str
+# - trace: list[dict] | list[str]
+# - actions_spec: dict
+# Optional:
+# - constraints: list[str]
+# - output_contract: dict (...)
+# - draft_response: str (...)
+# - candidate_output: str (latest proposed action/step or partial answer)
+# - env_observation: any (...)
+
+
+# Trace steps (best effort; tolerate extras):
+# - action, args, ok, output, error
+
+# trace accepted forms (HARD):
+# - trace may be list[dict] OR list[str]
+# - If list[str], run() MUST normalize into list[dict] with at least:
+#   {'action': <parsed_action_string>, 'ok': None, 'output': None}
+# - After normalization, ALL internal logic must treat trace as list[dict]
+
+# actions_spec:
+# - { action_name: { 'prerequisites': list[dict]|None } }
+# HARD: If actions_spec is missing OR empty dict:
+# - status MUST be 'blocked'
+# - errors MUST include "missing_actions_spec"
+# - next_action MUST be None
+
+
+# ========================
+# OUTPUTS (HARD)
+# ========================
+# run() MUST ALWAYS return a dict with these keys:
+# - status: 'need_step'|'can_answer'|'blocked'|'error'
+# - next_action: {'action': str, 'args': any} | None
+# - answer_recommendation: any | None
+# - plan: list[dict]   (exactly 5)
+# - validation: dict   (must include: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations)
+# - rationale: list[str]  (must include at least 2 short strings)
+# - errors: list[str]
+# - warnings: list[str]
+
+# Rules:
+# - If missing required payload keys => status='blocked' and errors include "missing_payload_key:<k>".
+# - If status == 'can_answer' => answer_recommendation MUST be non-None.
+# - Else => answer_recommendation MUST be None.
+# - next_action MUST reference ONLY an action present in actions_spec (never invent).
+
+# ========================
+# MINIMAL LOGIC (BUT MUST BE CORRECT)
+# ========================
+# A) Infer desired_kind from asked_for (lowercased):
+# - numeric if contains 'count' or 'number' or 'how many'
+# - boolean if starts with 'is'/'are'/'does'/'can' OR contains 'true'/'false'/'yes'/'no'
+# - id_like if contains 'id' or 'identifier' OR contains '#'
+# - else: string
+
+# B) last_ok_output:
+# - most recent trace step with ok==True => its output (else None)
+
+# C) Candidate value selection (IMPORTANT):
+# - First, if last_ok_output itself already matches desired_kind (per completion rules), accept it as candidate_value.
+# - Only if no candidate_value, attempt derivation.
+
+# D) Derivations (use regex for numeric strings):
+# - numeric + last_ok_output is list/tuple/dict => derived=len(output), add 'from_len'
+# - numeric + last_ok_output is str => if exactly one integer substring via regex \\d+, parse it, add 'from_str_int'
+# - boolean + last_ok_output is str => exact 'yes'/'true'->True, 'no'/'false'->False, add 'from_str_bool'
+# - Put derivations into validation['derivations'] as a list of short strings AND keep derived value separately.
+
+# E) Completion check (candidate_value only):
+# - numeric: int/float (not bool)
+# - boolean: bool
+# - id_like: str len 2..128, only alnum plus '_' '-' '#'
+# - string: not None
+# complete = True iff candidate_value passes
+
+# F) Sanity checks (HARD REQUIREMENTS):
+# 1) Hallucinated actions:
+# - For each trace step:
+#   - If action is missing/empty/non-str => append error "hallucinated_action:null"
+#   - Else if action not in actions_spec => append error "hallucinated_action:<action>"
+# - If any hallucinated_action errors exist => status MUST be 'error'.
+# - IMPORTANT: these hallucination strings MUST appear in the returned errors list (not just internal vars).
+
+# 2) Prerequisites:
+# - For each trace step action that has prerequisites:
+#   - require a prior ok step with prereq action
+#   - if prereq has 'contains': require that substring in str(prior.output) (case-sensitive OK)
+# - Missing prereq => record in validation['prereq_violations'] as "prereq_violation:<act>:<missing_action>"
+# - Prereq violations MUST NOT be placed into errors (they are handled via need_step logic).
+
+# G) Constraints (warnings only):
+# - If constraints list provided:
+#   - Build safe_text = (task_text + " " + asked_for + " " + str(trace)).lower()
+#   - Any constraint whose lowercase is not a substring of safe_text => warning "uncovered_constraint:<c>"
+
+# H) Contract guard (validation only; deterministic):
+# - If draft_response is a non-empty str and output_contract is a dict:
+#   - Produce solver_suggestion by applying these edits in order:
+#     1) strip whitespace (record 'trimmed' if changed)
+#     2) if one_line: replace line breaks with spaces (record 'one_line' if changed)
+#     3) if allow_prefixes list: ensure startswith one of them; if not, prepend first prefix + space (record 'prefix_added')
+#     4) forbid_substrings: if any present (case-insensitive) record "forbid_substring:<x>"
+#     5) require_substrings: if missing (case-insensitive) record "require_substring:<x>"
+#     6) max_chars int: if exceeded, truncate and record "max_chars:<n>"
+# - CONTRACT SEMANTICS (HARD):
+#   contract_ok MUST be True IFF there are NO contract_violations at all.
+#   (This means trimmed/one_line/prefix_added/max_chars also make contract_ok False.)
+# - Always store: contract_ok (bool), contract_violations (list), solver_suggestion (str|None)
+
+# I) Choose status/next_action deterministically:
+# - If actions_spec missing OR empty => status='blocked', errors include "missing_actions_spec", next_action=None
+# - missing required keys => blocked
+# - else if hallucinated_action errors exist => status='error', next_action=None
+# - else if prereq_violations exist => status='need_step' and next_action is the missing prereq action (args={}) IF it exists in actions_spec, else None
+# - else if complete => status='can_answer'
+# - else => status='need_step' and next_action chosen as:
+#   pick lexicographically smallest action_name in actions_spec that contains one of:
+#   'inspect','list','show','get','query','check','validate','derive','transform','compute','open','read','view','load','parse','fetch'
+#   (case-insensitive). If none, next_action=None.
+
+# J) Rationale (MUST NOT BE EMPTY):
+# Return at least 2 short items, e.g.:
+# - "kind=<desired_kind>"
+# - "complete=<true/false>"
+# Optionally add: "next=<action_or_none>", "contract_ok=<true/false>", "prereq_missing=<n>"
+
+# K) Plan:
+# - Always return exactly 5 plan steps with ids '1'..'5'
+#   goals: inspect, apply_constraints, derive_or_transform, validate, answer
+#   depends_on: previous id (None for first)
+#   done: simple booleans:
+#     - inspect done if any ok trace action name contains inspect-ish keywords (same list as in next_action selection)
+#     - validate done if complete OR any ok trace action contains 'validate' or 'check'
+#     - others False
+
+# ========================
+# DOCSTRING + SELF_TEST (HARD, MINIMAL)
+# ========================
+# - Begin file with EXACTLY ONE module docstring as first three lines:
+#   """
+#   <single-line detailed description about what the tool does, must include: contract guard, prereqs, next-action suggestion, limitations>
+#   """
+# - No other triple-quoted strings anywhere.
+# - Add one comment near run(): # Example: run({'task_text':'...','asked_for':'...','trace':[],'actions_spec':{}})
+
+# SELF_TEST:
+# - Include def self_test() -> bool with exactly 2 tests (good + bad).
+# - self_test() MUST NEVER raise; return False on exception.
+# - Good test must verify ALL of:
+#   - status is 'can_answer'
+#   - answer_recommendation equals 3 (derive from len([1,2,3]) OR accept last_ok_output=3)
+#   - hallucinated actions do not exist
+#   - contract_ok is False when trim/prefix edits are applied AND solver_suggestion begins with required prefix
+# - Bad test: prereq missing case:
+#   - trace contains action B ok==True
+#   - actions_spec has B with prereq action A
+#   - expect status == 'need_step' and next_action.action == 'A'
+
+# FINAL CHECK (REQUIRED)
+# - Output markers present, exact signature, forbidden substrings absent, and "set" substring absent.
+                                        
+# Generate a tool based on these instructions and the provided user message:
+# ''').strip()
+
+
 TOOLGEN_USER_APPENDIX = textwrap.dedent('''
 Reasoning: low
 You are ToolGen. Generate ONE reusable, domain-agnostic analysis tool for multi-step agent loops.
 
-========================
-OUTPUT FORMAT (HARD #1)
-========================
-- Output MUST be ONLY this, with NOTHING before/after:
-Line 1: ###TOOL_START
-Then: raw Python source (no markdown, no prose, no JSON)
-Last line: ###TOOL_END
-- If you cannot comply, still output the markers + best-effort Python. Never omit markers.
-- Include a short tool name in the code as a single comment line:
-  # tool_name: <short_snake_case>_generated_tool
-  Keep it under ~3 words; do NOT copy the full task text.
-- The Python source MUST include a comment line: # tool_name: <short_snake_case_name>
+HARD OUTPUT
+- Output ONLY:
+  ###TOOL_START
+  (raw Python source only)
+  ###TOOL_END
+- Always include markers.
+- Include ONE short name comment: # tool_name: <short_snake_case>_generated_tool  (<= ~3 words)
 
-========================
-NON-NEGOTIABLE RULES
-========================
-- Python standard library ONLY.
-- Deterministic: no randomness.
-- Implement ONLY: def run(payload: dict) -> dict  (exact signature)
-- run() MUST NEVER raise: wrap everything in try/except.
-  On exception, return a dict with keys:
-  status='error', errors(list[str]), warnings(list[str]),
-  next_action, answer_recommendation, plan, validation, rationale.
-- Basic type guards before calling methods (e.g., guard .lower()).
+HARD RULES
+- stdlib only; deterministic.
+- Implement ONLY: def run(payload: dict) -> dict
+- run() never raises (wrap all).
+- FORBIDDEN anywhere (code/comments/strings): sudo,useradd,usermod,groupadd,chmod,chgrp
+- CRITICAL: substring "set" must NOT appear anywhere in the Python source (any case, any context).
 
-CRITICAL TOKEN RULE (HARD)
-- The substring "set" must NOT appear anywhere in the generated Python source
-  (code, comments, strings, variable names). Do NOT use set() or the type name.
-  Use dict membership for uniqueness instead.
+DOCSTRING (HARD)
+File MUST start with EXACTLY ONE 3-line module docstring:
+"""
+<single-line detailed description about what the tool does, must include: contract guard, prereqs, next-action suggestion, limitations> INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec; optional=constraints,output_contract,draft_response,candidate_output,env_observation
+"""
+No other triple quotes anywhere.
 
-SAFETY (HARD)
-- ABSOLUTELY FORBIDDEN anywhere in code/comments/strings:
-  'sudo', 'useradd', 'usermod', 'groupadd', 'chmod', 'chgrp'
-
-========================
-TOOL PURPOSE
-========================
-This tool analyzes: task_text + asked_for + trace + actions_spec (+ optional constraints/contract)
-and returns:
-- whether the solver can answer now,
-- what action to do next (ONLY from actions_spec),
-- validation signals (prereq gaps, contract guard, derivations),
-- short rationale strings that help the orchestrator and solver.
-
-It MUST NOT execute external actions. It MUST NOT assume any domain ontology.
-
-SOLVER RECOMMENDATION (CONTEXT)
-- The user message may include solver_recommendation, which is a draft response from the solver.
-- Use it to shape a tool that validates or strengthens that draft for the current task.
-
-========================
-ORCHESTRATOR GUIDANCE (DOCSTRING MUST INCLUDE THIS)  (HARD)
-========================
-The ONE module docstring (the first 3 lines) MUST include, verbatim, an "INPUT_SCHEMA:" clause that lists required/optional keys.
-
-Format requirements (HARD):
-- The docstring single-line description MUST contain this exact substring: "INPUT_SCHEMA:"
-- Immediately after "INPUT_SCHEMA:" include:
-  "required=task_text,asked_for,trace,actions_spec; optional=constraints,output_contract,draft_response,candidate_output,env_observation"
-- Also include, in the same single line, these concepts: contract guard, prereqs, next-action suggestion, limitations (no persistence; only analyzes payload; does not call tools).
-
-Example (must be one single line inside the docstring):
-INPUT_SCHEMA: required=task_text:str,asked_for:str,trace:list[dict]|list[str],actions_spec:dict; optional=constraints:list[str],output_contract:dict,draft_response:str,candidate_output:str,env_observation:any
-
-
-========================
-INVOCATION CONTRACT (HARD)
-========================
-The tool MUST document BOTH:
-(A) the controller wrapper shape (how to call the tool), and
-(B) the run() payload shape (what run(payload) receives).
-
-Near run(), include this EXACT 3-line comment block (verbatim keys + formatting):
+CONTRACT (HARD)
+Near run(), include EXACT lines:
 # INVOKE_WITH: {"args":[{"payload": <RUN_PAYLOAD> }], "kwargs":{}}
 # RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec"]
 # RUN_PAYLOAD_OPTIONAL: ["constraints","output_contract","draft_response","candidate_output","env_observation"]
-
-Also include ONE example in a single comment line:
 # INVOKE_EXAMPLE: {"args":[{"payload":{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{}}}],"kwargs":{}}
-
-
-========================
-SCHEMA ECHO (HARD)
-========================
-In addition to the docstring, include a short comment block near run() that repeats the contract so it can be extracted if needed:
 # input_schema_required: task_text, asked_for, trace, actions_spec
 # input_schema_optional: constraints, output_contract, draft_response, candidate_output, env_observation
 
-                                        
-========================
-INPUTS (HARD)
-========================
-payload required keys:
-- task_text: str
-- asked_for: str
-- trace: list[dict] | list[str]
-- actions_spec: dict
-Optional:
-- constraints: list[str]
-- output_contract: dict (...)
-- draft_response: str (...)
-- candidate_output: str (latest proposed action/step or partial answer)
-- env_observation: any (...)
+INPUTS
+Required: task_text(str), asked_for(str), trace(list[dict]|list[str]), actions_spec(dict)
+Optional: constraints(list[str]), output_contract(dict), draft_response(str), candidate_output(str), env_observation(any)
+- If trace is list[str], normalize to list[dict] with {'action':<str>,'ok':None,'output':None}
+- If actions_spec missing/{} => status='blocked', errors include "missing_actions_spec", next_action=None
 
+OUTPUT (HARD)
+Always return dict keys:
+status, next_action, answer_recommendation, plan, validation, rationale, errors, warnings
+- status in {'need_step','can_answer','blocked','error'}
+- plan is EXACTLY 5 steps (ids '1'..'5')
+- validation includes keys: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations
+- rationale has >=2 short strings
+- Missing required payload key => blocked + "missing_payload_key:<k>"
+- If can_answer => answer_recommendation non-None else None
+- next_action ONLY from actions_spec
 
-Trace steps (best effort; tolerate extras):
-- action, args, ok, output, error
+MINIMAL LOGIC (REQUIRED)
+- desired_kind from asked_for.lower(): numeric/boolean/id_like/string (as in prior prompt)
+- last_ok_output = most recent trace ok==True output
+- candidate_value: accept last_ok_output if matches kind else derive:
+  numeric: len(list/tuple/dict) or single int from str via regex \\d+
+  boolean: yes/true/no/false from str
+  Record derivations in validation['derivations']
+- completion rules: numeric=int/float(not bool), boolean=bool, id_like=str(2..128,[A-Za-z0-9_\\-#]), string=not None
+- Hallucinated actions: if action missing/non-str => errors add "hallucinated_action:null"; if not in actions_spec => "hallucinated_action:<a>"
+  If any => status='error', next_action=None (errors MUST include those strings)
+- Prereqs: actions_spec[action].prerequisites; require prior ok prereq action; optional 'contains' substring in str(prior.output)
+  Record ONLY in validation['prereq_violations'] as "prereq_violation:<act>:<missing_action>"
+- constraints => warnings "uncovered_constraint:<c>" when c not found in (task_text+asked_for+trace).lower()
+- Contract guard if draft_response str and output_contract dict:
+  apply edits: trim, one_line, allow_prefixes (prepend), forbid_substrings, require_substrings, max_chars (truncate)
+  contract_ok True IFF contract_violations empty (edits count as violations)
+- Status/next_action:
+  blocked on missing keys / missing actions_spec;
+  error on hallucinated_action;
+  need_step on prereq violations (next_action=missing prereq action if present);
+  can_answer if complete else need_step with lexicographically smallest action in actions_spec containing any keyword:
+  inspect,list,show,get,query,check,validate,derive,transform,compute,open,read,view,load,parse,fetch
 
-trace accepted forms (HARD):
-- trace may be list[dict] OR list[str]
-- If list[str], run() MUST normalize into list[dict] with at least:
-  {'action': <parsed_action_string>, 'ok': None, 'output': None}
-- After normalization, ALL internal logic must treat trace as list[dict]
+SELF_TEST (HARD)
+Include def self_test() -> bool with exactly 2 tests (never raise):
+- Good: can_answer and answer_recommendation==3 (len([1,2,3]) or last_ok_output=3), no hallucinated_action, contract_ok False when trim/prefix applied and solver_suggestion startswith required prefix
+- Bad: prereq missing (B ok==True, B requires A) => need_step and next_action.action=='A'
 
-actions_spec:
-- { action_name: { 'prerequisites': list[dict]|None } }
-HARD: If actions_spec is missing OR empty dict:
-- status MUST be 'blocked'
-- errors MUST include "missing_actions_spec"
-- next_action MUST be None
-
-
-========================
-OUTPUTS (HARD)
-========================
-run() MUST ALWAYS return a dict with these keys:
-- status: 'need_step'|'can_answer'|'blocked'|'error'
-- next_action: {'action': str, 'args': any} | None
-- answer_recommendation: any | None
-- plan: list[dict]   (exactly 5)
-- validation: dict   (must include: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations)
-- rationale: list[str]  (must include at least 2 short strings)
-- errors: list[str]
-- warnings: list[str]
-
-Rules:
-- If missing required payload keys => status='blocked' and errors include "missing_payload_key:<k>".
-- If status == 'can_answer' => answer_recommendation MUST be non-None.
-- Else => answer_recommendation MUST be None.
-- next_action MUST reference ONLY an action present in actions_spec (never invent).
-
-========================
-MINIMAL LOGIC (BUT MUST BE CORRECT)
-========================
-A) Infer desired_kind from asked_for (lowercased):
-- numeric if contains 'count' or 'number' or 'how many'
-- boolean if starts with 'is'/'are'/'does'/'can' OR contains 'true'/'false'/'yes'/'no'
-- id_like if contains 'id' or 'identifier' OR contains '#'
-- else: string
-
-B) last_ok_output:
-- most recent trace step with ok==True => its output (else None)
-
-C) Candidate value selection (IMPORTANT):
-- First, if last_ok_output itself already matches desired_kind (per completion rules), accept it as candidate_value.
-- Only if no candidate_value, attempt derivation.
-
-D) Derivations (use regex for numeric strings):
-- numeric + last_ok_output is list/tuple/dict => derived=len(output), add 'from_len'
-- numeric + last_ok_output is str => if exactly one integer substring via regex \\d+, parse it, add 'from_str_int'
-- boolean + last_ok_output is str => exact 'yes'/'true'->True, 'no'/'false'->False, add 'from_str_bool'
-- Put derivations into validation['derivations'] as a list of short strings AND keep derived value separately.
-
-E) Completion check (candidate_value only):
-- numeric: int/float (not bool)
-- boolean: bool
-- id_like: str len 2..128, only alnum plus '_' '-' '#'
-- string: not None
-complete = True iff candidate_value passes
-
-F) Sanity checks (HARD REQUIREMENTS):
-1) Hallucinated actions:
-- For each trace step:
-  - If action is missing/empty/non-str => append error "hallucinated_action:null"
-  - Else if action not in actions_spec => append error "hallucinated_action:<action>"
-- If any hallucinated_action errors exist => status MUST be 'error'.
-- IMPORTANT: these hallucination strings MUST appear in the returned errors list (not just internal vars).
-
-2) Prerequisites:
-- For each trace step action that has prerequisites:
-  - require a prior ok step with prereq action
-  - if prereq has 'contains': require that substring in str(prior.output) (case-sensitive OK)
-- Missing prereq => record in validation['prereq_violations'] as "prereq_violation:<act>:<missing_action>"
-- Prereq violations MUST NOT be placed into errors (they are handled via need_step logic).
-
-G) Constraints (warnings only):
-- If constraints list provided:
-  - Build safe_text = (task_text + " " + asked_for + " " + str(trace)).lower()
-  - Any constraint whose lowercase is not a substring of safe_text => warning "uncovered_constraint:<c>"
-
-H) Contract guard (validation only; deterministic):
-- If draft_response is a non-empty str and output_contract is a dict:
-  - Produce solver_suggestion by applying these edits in order:
-    1) strip whitespace (record 'trimmed' if changed)
-    2) if one_line: replace line breaks with spaces (record 'one_line' if changed)
-    3) if allow_prefixes list: ensure startswith one of them; if not, prepend first prefix + space (record 'prefix_added')
-    4) forbid_substrings: if any present (case-insensitive) record "forbid_substring:<x>"
-    5) require_substrings: if missing (case-insensitive) record "require_substring:<x>"
-    6) max_chars int: if exceeded, truncate and record "max_chars:<n>"
-- CONTRACT SEMANTICS (HARD):
-  contract_ok MUST be True IFF there are NO contract_violations at all.
-  (This means trimmed/one_line/prefix_added/max_chars also make contract_ok False.)
-- Always store: contract_ok (bool), contract_violations (list), solver_suggestion (str|None)
-
-I) Choose status/next_action deterministically:
-- If actions_spec missing OR empty => status='blocked', errors include "missing_actions_spec", next_action=None
-- missing required keys => blocked
-- else if hallucinated_action errors exist => status='error', next_action=None
-- else if prereq_violations exist => status='need_step' and next_action is the missing prereq action (args={}) IF it exists in actions_spec, else None
-- else if complete => status='can_answer'
-- else => status='need_step' and next_action chosen as:
-  pick lexicographically smallest action_name in actions_spec that contains one of:
-  'inspect','list','show','get','query','check','validate','derive','transform','compute','open','read','view','load','parse','fetch'
-  (case-insensitive). If none, next_action=None.
-
-J) Rationale (MUST NOT BE EMPTY):
-Return at least 2 short items, e.g.:
-- "kind=<desired_kind>"
-- "complete=<true/false>"
-Optionally add: "next=<action_or_none>", "contract_ok=<true/false>", "prereq_missing=<n>"
-
-K) Plan:
-- Always return exactly 5 plan steps with ids '1'..'5'
-  goals: inspect, apply_constraints, derive_or_transform, validate, answer
-  depends_on: previous id (None for first)
-  done: simple booleans:
-    - inspect done if any ok trace action name contains inspect-ish keywords (same list as in next_action selection)
-    - validate done if complete OR any ok trace action contains 'validate' or 'check'
-    - others False
-
-========================
-DOCSTRING + SELF_TEST (HARD, MINIMAL)
-========================
-- Begin file with EXACTLY ONE module docstring as first three lines:
-  """
-  <single-line description, must include: contract guard, prereqs, next-action suggestion, limitations>
-  """
-- No other triple-quoted strings anywhere.
-- Add one comment near run(): # Example: run({'task_text':'...','asked_for':'...','trace':[],'actions_spec':{}})
-
-SELF_TEST:
-- Include def self_test() -> bool with exactly 2 tests (good + bad).
-- self_test() MUST NEVER raise; return False on exception.
-- Good test must verify ALL of:
-  - status is 'can_answer'
-  - answer_recommendation equals 3 (derive from len([1,2,3]) OR accept last_ok_output=3)
-  - hallucinated actions do not exist
-  - contract_ok is False when trim/prefix edits are applied AND solver_suggestion begins with required prefix
-- Bad test: prereq missing case:
-  - trace contains action B ok==True
-  - actions_spec has B with prereq action A
-  - expect status == 'need_step' and next_action.action == 'A'
-
-FINAL CHECK (REQUIRED)
-- Output markers present, exact signature, forbidden substrings absent, and "set" substring absent.
-                                        
 Generate a tool based on these instructions and the provided user message:
 ''').strip()
 
 
+
 TOOLGEN_DEBUG_APPENDIX = textwrap.dedent('''
-DEBUG MODE OVERRIDES
-- Keep the total tool source under 100 lines.
+(CRITICAL!!!) DEBUG MODE OVERRIDES
+- When this text is present, you are in a debug override mode. The intent is to reduce inference time and simplify tools
+- Keep the total tool source more simple and under 100 lines. The max line constraint is meant to ensure tools are more simple, not simply shorter.
 - self_test() MUST simply return True (no assertions).
 ''').strip()
 

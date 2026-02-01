@@ -6,7 +6,8 @@ default:
       user: "user"
       agent: "assistant"
     api_key: ~  # Enter your API key here or set in as an environment variable (OPENAI_API_KEY). Do not commit your API key!!!
-    base_url: ~  # Will overwrite the environment variable OPENAI_BASE_URL
+    # base_url: https://api.openai.com/v1#
+    base_url: ~
     disable_api_tools: true  # Always disable API tool calling
 
 gpt-oss:20b-64k:

@@ -2,7 +2,7 @@ import json
 import re
 from typing import Any, Mapping, Optional, Sequence
 
-from src.typings import ChatHistory, ChatHistoryItem
+from src.typings import ChatHistory, ChatHistoryItem, Role
 
 from .tool_registry import ToolMetadata, ToolResult
 from .tool_retrieval import retrieve_tools
@@ -34,6 +34,72 @@ class ControllerToolsMixin:
                 normalized.append({"action": action, "raw": item, "args": {}})
         return normalized
 
+    def _extract_actions_spec_from_text(self, text: str) -> dict[str, Any]:
+        if not text:
+            return {}
+
+        heading_markers = (
+            "available actions",
+            "actions",
+            "action space",
+            "you can call",
+            "available tools",
+        )
+        end_markers = (
+            "output rules",
+            "final answer",
+            "task completion",
+            "output contract",
+            "input guidelines",
+        )
+        blacklist = {
+            "action",
+            "final",
+            "answer",
+            "example",
+            "output",
+            "input",
+            "format",
+            "return",
+            "use",
+            "call",
+        }
+
+        def _extract_from_line(line: str) -> list[str]:
+            clean = line.replace("`", "").replace("*", "").strip()
+            found: list[str] = []
+            bullet = re.match(r"^\s*(?:[-*]|\d+\.)\s*([a-zA-Z_][a-zA-Z0-9_]*)\b", clean)
+            if bullet:
+                found.append(bullet.group(1))
+            for name in re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", clean):
+                found.append(name)
+            return found
+
+        actions: set[str] = set()
+        capture = False
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                if capture:
+                    capture = False
+                continue
+            low = line.lower()
+            if any(marker in low for marker in heading_markers):
+                capture = True
+                continue
+            if capture and any(marker in low for marker in end_markers):
+                capture = False
+                continue
+
+            if capture or "action:" in low:
+                for name in _extract_from_line(line):
+                    if name and name.lower() not in blacklist:
+                        actions.add(name.lower())
+
+        if not actions:
+            return {}
+        return {name: {} for name in sorted(actions)}
+
     def _normalize_analyzer_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         trace = payload.get("trace")
         normalized_trace = self._normalize_trace(trace)
@@ -41,13 +107,34 @@ class ControllerToolsMixin:
             payload["trace"] = normalized_trace
         actions_spec = payload.get("actions_spec")
         if not actions_spec:
-            actions_spec = {}
-            for step in normalized_trace:
-                action = step.get("action")
-                if isinstance(action, str) and action:
-                    actions_spec[action] = {}
-            payload["actions_spec"] = actions_spec
+            extracted = self._extract_actions_spec_from_text(
+                str(payload.get("task_text") or "")
+            )
+            if extracted:
+                payload["actions_spec"] = extracted
+            elif normalized_trace:
+                fallback_spec: dict[str, Any] = {}
+                for step in normalized_trace:
+                    action = step.get("action")
+                    if isinstance(action, str) and action:
+                        fallback_spec[action] = {}
+                if fallback_spec:
+                    payload["actions_spec"] = fallback_spec
         return payload
+
+    def _task_text_from_history(self, chat_history: ChatHistory) -> str:
+        user_items = [
+            item
+            for item in self._history_items(chat_history)
+            if item.role == Role.USER and (item.content or "").strip()
+        ]
+        if not user_items:
+            return ""
+        first_user = (user_items[0].content or "").strip()
+        last_user = (user_items[-1].content or "").strip()
+        if first_user and last_user and last_user not in first_user:
+            return f"{first_user}\n\n{last_user}"
+        return first_user or last_user
     def _bootstrap_tools(self, bootstrap_tools: Sequence[Mapping[str, Any]]) -> None:
         if not bootstrap_tools:
             return
@@ -81,12 +168,14 @@ class ControllerToolsMixin:
                 return tool
         return None
 
+
     def _invoke_tool_by_payload(
         self,
         tool_name: str,
         tool_args: Any,
         *,
         reason: str,
+        chat_history: Optional[ChatHistory] = None,
         args_auto_built: bool = False,
         decision_action: Optional[str] = None,
     ) -> ToolResult:
@@ -154,11 +243,8 @@ class ControllerToolsMixin:
                         args = [dict(first)]
                         kwargs = {}
                     else:
-                        base = self._default_payload_dict(task_text="", candidate_output=None, chat_history=None)
-                        base.update(dict(first))  # caller wins, but required keys now exist
-                        args = [{"payload": base}]
+                        args = [{"payload": dict(first)}]
                         kwargs = {}
-                        args_auto_built = True
 
                 else:
                     args = [{"payload": self._default_payload_dict(task_text=str(first), candidate_output=None, chat_history=None)}]
@@ -182,7 +268,15 @@ class ControllerToolsMixin:
                 wrapped = dict(args[0])
                 inner = wrapped.get("payload")
                 if isinstance(inner, Mapping):
-                    wrapped["payload"] = self._normalize_analyzer_payload(dict(inner))
+                    inner_payload = dict(inner)
+                    if chat_history and not inner_payload.get("actions_spec"):
+                        full_text = self._task_text_from_history(chat_history)
+                        if full_text:
+                            inner_payload["task_text"] = full_text
+                            extracted = self._extract_actions_spec_from_text(full_text)
+                            if extracted:
+                                inner_payload["actions_spec"] = extracted
+                    wrapped["payload"] = self._normalize_analyzer_payload(inner_payload)
                     args = [wrapped]
 
         if tool_meta and tool_meta.environment_usage:
@@ -190,6 +284,10 @@ class ControllerToolsMixin:
             if current_env not in tool_meta.environment_usage:
                 error = f"tool_environment_mismatch: {current_env}"
                 self._trace("tool_generation_error", error)
+                self._log_failed_invoke_event(
+                    tool_name=resolved_name,
+                    reason=error,
+                )
                 self._log_flow_event(
                     "tool_agent_output",
                     tool_name=resolved_name,
@@ -276,12 +374,13 @@ class ControllerToolsMixin:
         tool: ToolMetadata,
         query: str,
         *,
+        chat_history: Optional[ChatHistory] = None,
         candidate_output: Optional[str] = None,
         reason: str = "auto_invoke",
         decision_action: Optional[str] = None,
     ) -> Optional[tuple[ToolResult, list[Any], dict[str, Any]]]:
         payload = self._build_tool_invocation(
-            tool, query=query, candidate_output=candidate_output
+            tool, query=query, candidate_output=candidate_output, chat_history=chat_history
         )
         if payload is None:
             return None
@@ -373,6 +472,7 @@ class ControllerToolsMixin:
         *,
         query: str,
         candidate_output: Optional[str] = None,
+        chat_history: Optional[ChatHistory] = None,
     ) -> Optional[tuple[list[Any], dict[str, Any]]]:
         if not query and candidate_output is None:
             return None
@@ -380,7 +480,7 @@ class ControllerToolsMixin:
             payload = self._default_payload_dict(
                 task_text=query or "",
                 candidate_output=candidate_output,
-                chat_history=None,  # keep None if you don't want to expose it
+                chat_history=chat_history,
             )
             required = []
             schema = tool.input_schema if isinstance(tool.input_schema, Mapping) else None
@@ -403,7 +503,12 @@ class ControllerToolsMixin:
         chat_history: ChatHistory,
     ) -> Optional[dict[str, Any]]:
         candidate_output = self._get_candidate_output(chat_history, query)
-        payload = self._build_tool_invocation(tool, query=query, candidate_output=candidate_output)
+        payload = self._build_tool_invocation(
+            tool,
+            query=query,
+            candidate_output=candidate_output,
+            chat_history=chat_history,
+        )
         if payload:
             args, kwargs = payload
             packed: dict[str, Any] = {}

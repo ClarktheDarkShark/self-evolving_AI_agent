@@ -13,6 +13,7 @@ from .tool_registry import ToolMetadata
 from .tool_spec import ToolSpec
 from .tool_validation import validate_tool_code
 from .tool_retrieval import retrieve_tools
+from .toolgen_debug_logger import toolgen_debug_enabled
 
 
 class ControllerToolgenMixin:
@@ -144,6 +145,8 @@ class ControllerToolgenMixin:
             if hasattr(self._registry, "list_latest_tools")
             else self._registry.list_tools()
         )
+        if toolgen_debug_enabled():
+            return [{"name": tool.name} for tool in tools[-5:]]
         return [
             {
                 "name": tool.name,
@@ -160,6 +163,26 @@ class ControllerToolgenMixin:
         query = getattr(self, "_toolgen_last_query", "") or ""
         summary = query.strip()
         return f"Utility tool for: {summary[:120]}" if summary else "Utility tool for the current task."
+
+    def _toolgen_tool_list_appendix(self) -> str:
+        tools = (
+            self._registry.list_latest_tools()
+            if hasattr(self._registry, "list_latest_tools")
+            else self._registry.list_tools()
+        )
+        if not tools:
+            return "CURRENT TOOLS: none"
+        lines = ["CURRENT TOOLS (name | signature):"]
+        for tool in tools:
+            name = str(getattr(tool, "name", "") or "").strip()
+            signature = str(getattr(tool, "signature", "") or "").strip()
+            if not name:
+                continue
+            if signature:
+                lines.append(f"- {name} | {signature}")
+            else:
+                lines.append(f"- {name}")
+        return "\n".join(lines)
 
     def _extract_tool_name_from_code(self, python_code: str) -> Optional[str]:
         if not python_code:
@@ -179,11 +202,15 @@ class ControllerToolgenMixin:
         return None
 
     def _toolgen_request_prompt(self, query: str, chat_history: ChatHistory) -> str:
+        debug_enabled = toolgen_debug_enabled()
         existing = []
         try:
             existing = self._toolgen_compact_existing_tools()
         except Exception:
             existing = []
+
+        max_obs_len = 120 if debug_enabled else 300
+        max_line_len = 300 if debug_enabled else 1000
 
         def _shorten_history_line(text: str) -> str:
             if not text:
@@ -192,24 +219,31 @@ class ControllerToolgenMixin:
                 head, sep, tail = text.partition("Observation:")
                 if sep:
                     trimmed_tail = tail.strip()
-                    if len(trimmed_tail) > 300:
-                        trimmed_tail = trimmed_tail[:300] + "...[truncated_observation]"
+                    if len(trimmed_tail) > max_obs_len:
+                        trimmed_tail = trimmed_tail[:max_obs_len] + "...[truncated_observation]"
                     return (head.strip() + " Observation: " + trimmed_tail).strip()
-            if len(text) > 1000:
-                return text[:1000] + "...[truncated]"
+            if len(text) > max_line_len:
+                return text[:max_line_len] + "...[truncated]"
             return text
 
         history_items = self._history_items(chat_history)[-8:]
+        if debug_enabled:
+            last_user = self._get_last_user_item(chat_history)
+            history_items = [last_user] if last_user else history_items[-2:]
         history_lines = []
         for i, it in enumerate(history_items):
+            if it is None:
+                continue
             content = (it.content or "").strip()
             content = _shorten_history_line(content)
             history_lines.append("{}:{}:{}".format(i, it.role.value, content))
 
         payload = {
-            "task": (query or "").strip(),
+            "task": self._toolgen_compact_query(query) if debug_enabled else (query or "").strip(),
             "task_requirement": (
-                "Tool must directly help solve the current task; generic tools are invalid."
+                "Task-specific tool required."
+                if debug_enabled
+                else "Tool must directly help solve the current task; generic tools are invalid."
             ),
             "history": "\n".join(history_lines),
             "existing_tools": existing,
@@ -218,15 +252,20 @@ class ControllerToolgenMixin:
             getattr(self, "_toolgen_last_recommendation", "") or ""
         ).strip()
         if solver_recommendation:
-            # if len(solver_recommendation) > 1200:
-            #     solver_recommendation = solver_recommendation[:1200] + "...[truncated]"
+            if debug_enabled and len(solver_recommendation) > 200:
+                solver_recommendation = solver_recommendation[:200] + "...[truncated]"
             payload["solver_recommendation"] = solver_recommendation
             payload["recommendation_note"] = (
-                "Solver provided a draft response. Use it to design a tool that "
+                "Use solver_recommendation if helpful."
+                if debug_enabled
+                else "Solver provided a draft response. Use it to design a tool that "
                 "validates or strengthens the draft for this task."
             )
 
-        return json.dumps(payload, ensure_ascii=True, default=str)
+        json_kwargs = {"ensure_ascii": True, "default": str}
+        if debug_enabled:
+            json_kwargs["separators"] = (",", ":")
+        return json.dumps(payload, **json_kwargs)
 
     def _normalize_retrieval_query(self, query: str) -> str:
         return (query or "").strip()[:1200]
@@ -607,7 +646,14 @@ class ControllerToolgenMixin:
             tool_history, ChatHistoryItem(role=Role.USER, content=prompt)
         )
 
-        response = self._toolgen_agent._inference(tool_history)
+        original_prompt = getattr(self._toolgen_agent, "_system_prompt", "") or ""
+        self._toolgen_agent._system_prompt = (
+            f"{original_prompt}\n\n{self._toolgen_tool_list_appendix()}".strip()
+        )
+        try:
+            response = self._toolgen_agent._inference(tool_history)
+        finally:
+            self._toolgen_agent._system_prompt = original_prompt
 
         self._trace("tool_agent_result", response.content)
         # print()

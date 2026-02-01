@@ -2,6 +2,7 @@ assignment_config:
   language_model_list:
   # - name: gpt-oss:20b-64k
   - name: gpt-oss:20b-120k
+  # - name: gpt-4o-mini
 
   # agent:
   #   name: language_model_agent
@@ -15,6 +16,7 @@ assignment_config:
     custom_parameters:
       # language_model: gpt-oss:20b-64k
       language_model: gpt-oss:20b-120k
+      # language_model: gpt-4o-mini
       tool_registry_path: outputs/tool_library
       max_generated_tools_per_run: 30
       environment_label: os_interaction
@@ -33,6 +35,7 @@ assignment_config:
         temperature: 0.0
         # max_tokens: 60000
         max_tokens: 120000
+        # max_tokens: 16300
         allow_internal_tool_protocol: true
 
 agent_dict:
