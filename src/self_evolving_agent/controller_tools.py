@@ -100,6 +100,55 @@ class ControllerToolsMixin:
             return {}
         return {name: {} for name in sorted(actions)}
 
+
+
+    def _extract_asked_for(self, task_text: str) -> str:
+        """Extract the question/asked_for from task text."""
+        if not task_text:
+            return ""
+        # Pattern: "Question: <question>, Entities: [...]"
+        match = re.match(r"Question:\s*(.+?),\s*Entities:", task_text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        # Pattern: "Question: <question>" (no entities)
+        match = re.match(r"Question:\s*(.+?)(?:\n|$)", task_text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        # Fallback: first line or first sentence
+        first_line = task_text.split("\n")[0].strip()
+        if "?" in first_line:
+            return first_line
+        return ""
+
+    def _extract_trace_from_history(self, chat_history: Optional[ChatHistory]) -> list[dict[str, Any]]:
+        """Extract action trace from chat history."""
+        if chat_history is None:
+            return []
+        trace = []
+        for item in self._history_items(chat_history):
+            content = (item.content or "").strip()
+            # Match "Action: operation(args)" pattern
+            action_match = re.search(r"Action:\s*(\w+)\s*\(([^)]*)\)", content)
+            if action_match:
+                action_name = action_match.group(1).lower()
+                trace.append({
+                    "action": action_name,
+                    "ok": None,  # We don't know success status
+                    "output": None,
+                    "args": {},
+                    "error": None
+                })
+            # Check for observation (indicates prior action succeeded)
+            if trace and "Observation:" in content:
+                trace[-1]["ok"] = True
+                # Extract observation content
+                obs_match = re.search(r"Observation:\s*(.+)", content, re.DOTALL)
+                if obs_match:
+                    trace[-1]["output"] = obs_match.group(1).strip()[:500]
+        return trace
+
+
+
     def _normalize_analyzer_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         trace = payload.get("trace")
         normalized_trace = self._normalize_trace(trace)
@@ -168,6 +217,21 @@ class ControllerToolsMixin:
                 return tool
         return None
 
+    def _fail_payload_invoke(self, tool_name: str, error: str) -> ToolResult:
+        self._trace("tool_generation_error", error)
+        self._log_failed_invoke_event(
+            tool_name=tool_name,
+            reason=error,
+        )
+        self._log_flow_event(
+            "tool_agent_output",
+            tool_name=tool_name,
+            success=False,
+            error=error,
+            output=None,
+        )
+        return ToolResult.failure(error)
+
 
     def _invoke_tool_by_payload(
         self,
@@ -194,108 +258,54 @@ class ControllerToolsMixin:
 
         # ---- Normalize tool_args into args/kwargs ----
         if isinstance(tool_args, Mapping):
-            # If caller used the packed form: {"args":[...], "kwargs":{...}}
             if "args" in tool_args or "kwargs" in tool_args:
                 args = list(tool_args.get("args") or [])
                 kwargs = dict(tool_args.get("kwargs") or {})
             else:
-                # IMPORTANT: if this is a payload tool, treat the mapping as THE payload positional arg
-                if tool_meta and self._signature_prefers_payload(tool_meta.signature):
-                    if "payload" in tool_args and len(tool_args) == 1:
-                        inner = tool_args.get("payload")
-                        if isinstance(inner, Mapping) and "payload" in inner:
-                            args = [{"payload": inner.get("payload")}]
-                        else:
-                            args = [dict(tool_args)]
-                    else:
-                        args = [{"payload": dict(tool_args)}]
-                    kwargs = {}
-                else:
-                    # otherwise treat mapping as kwargs
-                    args = []
-                    kwargs = dict(tool_args)
+                args = [tool_args]
+                kwargs = {}
         elif isinstance(tool_args, (list, tuple)):
             args = list(tool_args)
+            kwargs = {}
         else:
             args = [tool_args] if tool_args is not None else []
+            kwargs = {}
 
-        # ---- Hard guard: never invoke a payload tool with no positional dict ----
         if tool_meta and self._signature_prefers_payload(tool_meta.signature):
-            # If args is empty OR args is present but not exactly one dict, fix it.
-            # (Your registry wrapper seems to enforce "single dict argument" for payload tools.)
-            if not args:
-                args = [{"payload": self._default_payload_dict(task_text="", candidate_output=None, chat_history=None)}]
-                kwargs = {}
+            payload = None
+            if len(args) == 1 and isinstance(args[0], Mapping):
+                if "payload" in args[0]:
+                    return self._fail_payload_invoke(
+                        resolved_name, "payload_wrapper_not_allowed"
+                    )
+                payload = dict(args[0])
+            if payload is None:
+                fallback_text = str(args[0]) if args else ""
+                payload = self._default_payload_dict(
+                    task_text=fallback_text,
+                    candidate_output=None,
+                    chat_history=chat_history,
+                )
                 args_auto_built = True
-            else:
-                first = args[0]
-                if isinstance(first, Mapping):
-                    if "payload" in first and isinstance(first.get("payload"), Mapping):
-                        inner = first.get("payload")
-                        if isinstance(inner, Mapping) and "payload" in inner:
-                            first = dict(first)
-                            first["payload"] = inner.get("payload")
-                    if "payload" in first:
-                        inner = first.get("payload")
-                        if isinstance(inner, Mapping) and "payload" in inner:
-                            first = dict(first)
-                            first["payload"] = inner.get("payload")
-                        args = [dict(first)]
-                        kwargs = {}
-                    else:
-                        args = [{"payload": dict(first)}]
-                        kwargs = {}
-
-                else:
-                    args = [{"payload": self._default_payload_dict(task_text=str(first), candidate_output=None, chat_history=None)}]
-                kwargs = {}
-                args_auto_built = True
-
-            # Also: if caller tried to pass keyword args into payload tool, fold them into payload dict
             if kwargs:
-                merged = dict(args[0])
-                if isinstance(merged.get("payload"), Mapping):
-                    payload_inner = dict(merged.get("payload"))
-                    payload_inner.update(kwargs)
-                    merged["payload"] = payload_inner
-                else:
-                    merged.update(kwargs)
-                args = [merged]
+                payload.update(kwargs)
                 kwargs = {}
-
-        if tool_meta and self._signature_prefers_payload(tool_meta.signature):
-            if args and isinstance(args[0], Mapping):
-                wrapped = dict(args[0])
-                inner = wrapped.get("payload")
-                if isinstance(inner, Mapping):
-                    inner_payload = dict(inner)
-                    if chat_history and not inner_payload.get("actions_spec"):
-                        full_text = self._task_text_from_history(chat_history)
-                        if full_text:
-                            inner_payload["task_text"] = full_text
-                            extracted = self._extract_actions_spec_from_text(full_text)
-                            if extracted:
-                                inner_payload["actions_spec"] = extracted
-                    wrapped["payload"] = self._normalize_analyzer_payload(inner_payload)
-                    args = [wrapped]
+            payload = self._normalize_analyzer_payload(payload)
+            args = [payload]
+            # Inject trace if missing (LLM-provided args bypass _default_payload_dict)
+            if not args[0].get("trace"):
+                args[0]["trace"] = self._extract_trace_from_history(chat_history)
+            if len(args) != 1 or not isinstance(args[0], Mapping) or "payload" in args[0]:
+                return self._fail_payload_invoke(
+                    resolved_name, "payload_tool_requires_single_dict_arg"
+                )
 
         if tool_meta and tool_meta.environment_usage:
             current_env = self._resolved_environment_label()
             if current_env not in tool_meta.environment_usage:
-                error = f"tool_environment_mismatch: {current_env}"
-                self._trace("tool_generation_error", error)
-                self._log_failed_invoke_event(
-                    tool_name=resolved_name,
-                    reason=error,
+                return self._fail_payload_invoke(
+                    resolved_name, f"tool_environment_mismatch: {current_env}"
                 )
-                self._log_flow_event(
-                    "tool_agent_output",
-                    tool_name=resolved_name,
-                    success=False,
-                    error=error,
-                    output=None,
-                )
-                return ToolResult.failure(error)
 
         # ---- Logging / tracing ----
         self._trace(
@@ -476,7 +486,9 @@ class ControllerToolsMixin:
     ) -> Optional[tuple[list[Any], dict[str, Any]]]:
         if not query and candidate_output is None:
             return None
-        if self._signature_prefers_payload(tool.signature) or isinstance(tool.input_schema, Mapping):
+        if self._signature_prefers_payload(tool.signature):
+            if isinstance(candidate_output, str) and candidate_output.strip().lower().startswith("action:"):
+                candidate_output = None
             payload = self._default_payload_dict(
                 task_text=query or "",
                 candidate_output=candidate_output,
@@ -485,14 +497,12 @@ class ControllerToolsMixin:
             required = []
             schema = tool.input_schema if isinstance(tool.input_schema, Mapping) else None
             if schema:
-                payload_schema = (schema.get("properties") or {}).get("payload")
-                if isinstance(payload_schema, Mapping):
-                    req = payload_schema.get("required") or []
-                    if isinstance(req, list):
-                        required = [str(x) for x in req if x]
+                req = schema.get("required") or []
+                if isinstance(req, list):
+                    required = [str(x) for x in req if x]
             if required and any(key not in payload for key in required):
                 return None
-            return [{"payload": payload}], {}
+            return [payload], {}
         return [query or candidate_output or ""], {}
 
     def _auto_build_tool_args(
@@ -503,6 +513,14 @@ class ControllerToolsMixin:
         chat_history: ChatHistory,
     ) -> Optional[dict[str, Any]]:
         candidate_output = self._get_candidate_output(chat_history, query)
+        
+        # Get cached actions_spec
+        actions_spec = getattr(self, "_cached_actions_spec", None) or {}
+        if not actions_spec:
+            actions_spec = self._extract_actions_spec_from_text(
+                self._task_text_from_history(chat_history)
+            )
+        
         payload = self._build_tool_invocation(
             tool,
             query=query,
@@ -511,6 +529,10 @@ class ControllerToolsMixin:
         )
         if payload:
             args, kwargs = payload
+            # Ensure actions_spec is populated in the payload
+            if args and isinstance(args[0], dict):
+                if not args[0].get("actions_spec"):
+                    args[0]["actions_spec"] = actions_spec
             packed: dict[str, Any] = {}
             if args:
                 packed["args"] = list(args)
@@ -519,8 +541,9 @@ class ControllerToolsMixin:
             if packed:
                 return packed
         if query:
-            return {"args": [query]}
-        return {"args": [{"payload": {"task_text": query, "candidate_output": candidate_output}}]}
+            return {"args": [{"task_text": query, "actions_spec": actions_spec, "candidate_output": candidate_output}]}
+        return {"args": [{"task_text": query, "actions_spec": actions_spec, "candidate_output": candidate_output}]}
+
 
     def _reuse_existing_tool(
         self,
@@ -529,11 +552,14 @@ class ControllerToolsMixin:
         candidate_output: Optional[str] = None,
         needed_archetype: Optional[str] = None,
     ) -> Optional[ToolMetadata]:
+        # Filter tools by current environment
+        current_env = self._resolved_environment_label()
         tools = (
-            self._registry.list_latest_tools()
+            self._registry.list_latest_tools(environment=current_env)
             if hasattr(self._registry, "list_latest_tools")
-            else self._registry.list_tools()
+            else self._registry.list_tools(environment=current_env)
         )
+        print(f"[REUSE_TOOL] Found {len(tools)} tools for environment '{current_env}'")
         retrieved = retrieve_tools(
             query,
             list(tools),
@@ -555,11 +581,14 @@ class ControllerToolsMixin:
         candidate_output: Optional[str] = None,
         min_score: Optional[float] = None,
     ) -> Optional[ToolMetadata]:
+        # Filter tools by current environment
+        current_env = self._resolved_environment_label()
         tools = (
-            self._registry.list_latest_tools()
+            self._registry.list_latest_tools(environment=current_env)
             if hasattr(self._registry, "list_latest_tools")
-            else self._registry.list_tools()
+            else self._registry.list_tools(environment=current_env)
         )
+        print(f"[SELECT_TOOL] Found {len(tools)} tools for environment '{current_env}'")
         retrieved = retrieve_tools(
             query,
             list(tools),
@@ -649,18 +678,27 @@ class ControllerToolsMixin:
             last_user = self._get_last_user_item(chat_history)
             query = (last_user.content or "").strip() if last_user else ""
             if tool_meta and self._signature_prefers_payload(tool_meta.signature):
+                candidate_output = self._get_candidate_output(chat_history, query)
+                if isinstance(candidate_output, str) and candidate_output.strip().lower().startswith("action:"):
+                    candidate_output = None
                 tool_args = [self._default_payload_dict(
                     task_text=query,
-                    candidate_output=self._get_candidate_output(chat_history, query),
+                    candidate_output=candidate_output,
                     chat_history=chat_history,  # or None if you don't want it
                 )]
-                tool_args = [{"payload": tool_args[0]}]
+                # Inject trace if missing (in case payload was provided by LLM)
+                if isinstance(tool_args[0], dict) and not tool_args[0].get("trace"):
+                    tool_args[0]["trace"] = self._extract_trace_from_history(chat_history)
 
             elif query:
                 tool_args = [query]
             else:
                 tool_args = [""]
             args_auto_built = True
+
+        # Final trace injection for any remaining cases (LLM-provided args)
+        if tool_args and isinstance(tool_args[0], dict) and not tool_args[0].get("trace"):
+            tool_args[0]["trace"] = self._extract_trace_from_history(chat_history)
 
         self._tool_invocation_attempts += 1
         result = self._registry.invoke_tool(

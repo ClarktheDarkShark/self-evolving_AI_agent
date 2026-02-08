@@ -1,0 +1,37 @@
+{
+  "cursor": "X",
+  "history": [
+    "need_step",
+    "need_step",
+    "need_step",
+    "need_step",
+    "need_step",
+    "need_step",
+    "need_step",
+    "need_step:get_relations",
+    "need_step",
+    "need_step:get_neighbors",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:prereq",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:next",
+    "need_step:prereq",
+    "need_step:next",
+    "need_step:next"
+  ],
+  "notes": {
+    "dead_end": "#2"
+  }
+}

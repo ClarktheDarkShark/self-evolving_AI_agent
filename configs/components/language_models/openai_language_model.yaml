@@ -5,7 +5,7 @@ default:
       # https://platform.openai.com/docs/guides/text-generation#messages-and-roles
       user: "user"
       agent: "assistant"
-    api_key: ~  # Enter your API key here or set in as an environment variable (OPENAI_API_KEY). Do not commit your API key!!!
+    # api_key: ~  # Enter your API key here or set in as an environment variable (OPENAI_API_KEY). Do not commit your API key!!!
     # base_url: https://api.openai.com/v1#
     base_url: ~
     disable_api_tools: true  # Always disable API tool calling
@@ -25,6 +25,10 @@ gpt-oss:20b-120k:
 gpt-4o-mini:
   parameters:
     model_name: "gpt-4o-mini"
+
+gpt-5.2:
+  parameters:
+    model_name: "gpt-5.2"
 
 #completion_config_dict:
 #  max_completion_tokens: 512

@@ -18,9 +18,9 @@ from pathlib import Path
 import kg_sparql_server
 
 CONFIG_PATHS = [
+    # "configs/assignments/experiments/llama_31_8b_instruct/instance/os_interaction/instance/standard.yaml",
     "configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/standard.yaml",
-    "configs/assignments/experiments/llama_31_8b_instruct/instance/db_bench/instance/standard.yaml",
-    "configs/assignments/experiments/llama_31_8b_instruct/instance/os_interaction/instance/standard.yaml",
+    # "configs/assignments/experiments/llama_31_8b_instruct/instance/db_bench/instance/standard.yaml",
     
 ]
 

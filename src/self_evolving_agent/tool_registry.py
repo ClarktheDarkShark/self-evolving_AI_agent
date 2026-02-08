@@ -39,6 +39,7 @@ class ToolMetadata:
     failure_count: int = 0
     last_used_time: Optional[str] = None
     environment_usage: Optional[dict[str, int]] = None
+    environment: Optional[str] = None  # Environment this tool was created for
 
 
 @dataclass
@@ -155,7 +156,8 @@ class ToolRegistry:
     def _hydrate_fingerprint_map(self) -> None:
         updated = False
         for meta in self._metadata.values():
-            tool_path = self._get_tool_path(meta.name)
+            environment = getattr(meta, "environment", None)
+            tool_path = self._get_tool_path(meta.name, environment=environment)
             if not os.path.exists(tool_path):
                 continue
             try:
@@ -207,8 +209,20 @@ class ToolRegistry:
     def set_canonical_naming(self, enabled: bool) -> None:
         self._canonical_naming = bool(enabled)
 
-    def _get_tool_path(self, name: str) -> str:
+    def _get_tool_path(self, name: str, environment: Optional[str] = None) -> str:
+        """
+        Get the file path for a tool, optionally within an environment subdirectory.
+
+        If environment is provided, the tool is stored in:
+            <tools_dir>/<environment>/<name>.py
+        Otherwise:
+            <tools_dir>/<name>.py
+        """
         filename = f"{name}.py"
+        if environment:
+            env_dir = os.path.join(self.tools_dir, environment)
+            os.makedirs(env_dir, exist_ok=True)
+            return os.path.join(env_dir, filename)
         return os.path.join(self.tools_dir, filename)
 
     def _compute_code_hash(self, signature: str, code: str) -> str:
@@ -302,6 +316,7 @@ class ToolRegistry:
         if validation > 0:
             return 0.6
         return 0.0
+
 
     def record_validation_result(
         self, name: str, success: bool, *, self_test_passed: bool = False
@@ -412,6 +427,7 @@ class ToolRegistry:
         tool_category: Optional[str] = None,
         input_schema: Optional[Any] = None,
         capabilities: Optional[Any] = None,
+        environment: Optional[str] = None,
     ) -> Optional[ToolMetadata]:
         base_name = self._normalize_base_name(name)
         normalized_code = self._unwrap_code_block(code)
@@ -507,7 +523,7 @@ class ToolRegistry:
             #     f"'{tool_name}'."
             # )
             return existing_meta
-        tool_path = self._get_tool_path(tool_name)
+        tool_path = self._get_tool_path(tool_name, environment=environment)
         module_doc, run_doc = self._extract_docstrings(normalized_code)
         docstring = run_doc or module_doc or description
         with self._lock:
@@ -533,12 +549,24 @@ class ToolRegistry:
                     usage_count=0,
                 ),
             )
+            def _unwrap_payload_input_schema(signature: str, input_schema: Any) -> Any:
+                if not self._signature_is_payload(signature):
+                    return input_schema
+                if not isinstance(input_schema, dict):
+                    return input_schema
+                props = input_schema.get("properties")
+                if isinstance(props, dict) and "payload" in props:
+                    inner = props.get("payload")
+                    if isinstance(inner, dict):
+                        return inner
+                return input_schema
             # Overwrite signature/description while preserving creation_time/usage_count.
             metadata.signature = signature
             metadata.description = description
             metadata.docstring = docstring
             metadata.tool_type = tool_type
             metadata.tool_category = tool_category
+            input_schema = _unwrap_payload_input_schema(signature, input_schema)
             metadata.input_schema = input_schema
             metadata.capabilities = capabilities
             metadata.base_name = base_name
@@ -546,6 +574,7 @@ class ToolRegistry:
             metadata.code_hash = code_hash
             if metadata.environment_usage is None:
                 metadata.environment_usage = {}
+            metadata.environment = environment  # Store the environment this tool was created for
             metadata.reliability_score = self._calculate_reliability(metadata)
             self._metadata[tool_name] = metadata
             self._save_metadata()
@@ -579,9 +608,20 @@ class ToolRegistry:
     def has_tool(self, name: str) -> bool:
         return name in self._metadata
 
-    def list_latest_tools(self) -> List[ToolMetadata]:
+    def list_latest_tools(self, environment: Optional[str] = None) -> List[ToolMetadata]:
+        """
+        List the latest version of each tool.
+
+        Args:
+            environment: If provided, only return tools from this environment.
+                        If None, return all tools.
+        """
         latest: dict[str, ToolMetadata] = {}
         for meta in self._metadata.values():
+            # Filter by environment if specified
+            if environment is not None and meta.environment != environment:
+                continue
+
             base = meta.base_name or meta.name.split("__v")[0]
             if base not in latest or meta.version > latest[base].version:
                 latest[base] = meta
@@ -603,8 +643,17 @@ class ToolRegistry:
         candidates.sort(key=lambda m: m.version, reverse=True)
         return candidates[0].name
 
-    def list_tools(self) -> List[ToolMetadata]:
-        return list(self._metadata.values())
+    def list_tools(self, environment: Optional[str] = None) -> List[ToolMetadata]:
+        """
+        List all tools.
+
+        Args:
+            environment: If provided, only return tools from this environment.
+                        If None, return all tools.
+        """
+        if environment is None:
+            return list(self._metadata.values())
+        return [meta for meta in self._metadata.values() if meta.environment == environment]
 
     def get_tool_docstring(self, name: str) -> str:
         metadata = self._metadata.get(name)
@@ -754,7 +803,9 @@ class ToolRegistry:
         if not self.has_tool(name):
             return ""
 
-        tool_path = self._get_tool_path(name)
+        meta = self._metadata.get(name)
+        environment = meta.environment if meta else None
+        tool_path = self._get_tool_path(name, environment=environment)
         try:
             module = self._load_tool_module(name, tool_path)
             mod_doc = (getattr(module, "__doc__", "") or "").strip()
@@ -815,35 +866,17 @@ class ToolRegistry:
             )
             return outcome
 
-        metadata = self._metadata.get(resolved_name)
-        if metadata and self._signature_is_payload(metadata.signature):
-            payload_arg: Any = None
-            if kwargs:
-                if "payload" in kwargs and len(kwargs) == 1 and not args:
-                    payload_arg = kwargs.get("payload")
-                    kwargs = {}
-                elif not args:
-                    payload_arg = dict(kwargs)
-                    kwargs = {}
-            if args:
-                if len(args) == 1 and isinstance(args[0], dict) and "payload" in args[0]:
-                    payload_arg = args[0].get("payload")
-                elif len(args) == 1:
-                    payload_arg = args[0]
-            if payload_arg is None:
-                return ToolResult.failure("payload tool requires a single dict argument")
-            if not isinstance(payload_arg, dict):
-                return ToolResult.failure("payload must be a dict")
-            args = [payload_arg]
-            kwargs = {}
-
-        tool_path = self._get_tool_path(resolved_name)
+        # Get environment from metadata to construct the correct path
+        meta = self._metadata.get(resolved_name)
+        environment = meta.environment if meta else None
+        tool_path = self._get_tool_path(resolved_name, environment=environment)
         # print(f"[ToolRegistry] invoke_tool path name={resolved_name} path={tool_path}")
 
         error_type: str | None = None
         error_traceback: str | None = None
 
         stage = "import"
+        soft_failed = False
         try:
             module = self._load_tool_module(resolved_name, tool_path)
             stage = "run"
@@ -862,12 +895,17 @@ class ToolRegistry:
 
             # Normalize args/kwargs for payload-style tools (authoritative check)
             if self._fn_prefers_payload(run_fn):
-                payload_arg = None
+                payload_arg: Any = None
 
-                # kwargs form
-                if kwargs:
-                    if "payload" in kwargs and not args:
-                        # If kwargs includes payload plus extras, merge extras into payload
+                if args:
+                    if len(args) == 1:
+                        if isinstance(args[0], dict) and "payload" in args[0]:
+                            payload_arg = args[0].get("payload")
+                        else:
+                            payload_arg = args[0]
+
+                if payload_arg is None and kwargs:
+                    if "payload" in kwargs:
                         base = kwargs.get("payload")
                         if isinstance(base, dict):
                             merged = dict(base)
@@ -877,35 +915,24 @@ class ToolRegistry:
                             payload_arg = merged
                         else:
                             payload_arg = base
-                        kwargs = {}
-                    elif not args:
+                    else:
                         payload_arg = dict(kwargs)
-                        kwargs = {}
-
-                # args form
-                if args:
-                    if len(args) == 1 and isinstance(args[0], dict) and "payload" in args[0]:
-                        inner = args[0].get("payload")
-                        if isinstance(inner, dict):
-                            merged = dict(inner)
-                            for k, v in args[0].items():
-                                if k != "payload":
-                                    merged[k] = v
-                            payload_arg = merged
-                        else:
-                            payload_arg = inner
-                    elif len(args) == 1:
-                        payload_arg = args[0]
 
                 if payload_arg is None:
-                    return ToolResult.failure("payload tool requires a single dict argument")
+                    raise ValueError("payload tool requires a single dict argument")
                 if not isinstance(payload_arg, dict):
-                    return ToolResult.failure("payload must be a dict")
+                    raise TypeError("payload must be a dict")
 
                 args = (payload_arg,)
                 kwargs = {}
 
             result = run_fn(*args, **kwargs)
+            if isinstance(result, Mapping):
+                status = result.get("status")
+                if isinstance(status, str) and status.lower() in {"error", "blocked"}:
+                    soft_failed = True
+                if "success" in result and result.get("success") is False:
+                    soft_failed = True
 
             # print(
             #     f"[ToolRegistry] invoke_tool success name={resolved_name} "
@@ -928,7 +955,7 @@ class ToolRegistry:
             if metadata:
                 metadata.usage_count += 1
                 metadata.last_used_time = datetime.datetime.now(datetime.UTC).isoformat()
-                if outcome.success:
+                if outcome.success and not soft_failed:
                     metadata.success_count += 1
                 else:
                     metadata.failure_count += 1

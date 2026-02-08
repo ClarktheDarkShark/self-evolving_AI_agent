@@ -34,6 +34,7 @@ class ControllerHistoryMixin:
         return cloned
 
     def _prune_for_current_task(self, chat_history: ChatHistory) -> ChatHistory:
+        self._cached_actions_spec = None
         return chat_history
 
     def _get_last_env_observation(self, chat_history: ChatHistory) -> str:
@@ -53,14 +54,25 @@ class ControllerHistoryMixin:
         return ""
 
     def _toolgen_render_history(
-        self, chat_history: ChatHistory, *, max_chars_per_item: Optional[int] = 900
+        self,
+        chat_history: ChatHistory,
+        *,
+        max_chars_per_item: Optional[int] = 900,
+        preserve_first_user_n: int = 0,
     ) -> str:
         items = self._history_items(chat_history)
         rendered: list[str] = []
+        preserved_users = 0
         for idx, item in enumerate(items):
             role = item.role.value
             content = (item.content or "").strip()
-            if max_chars_per_item is not None and len(content) > max_chars_per_item:
+            if (
+                preserve_first_user_n > 0
+                and item.role == Role.USER
+                and preserved_users < preserve_first_user_n
+            ):
+                preserved_users += 1
+            elif max_chars_per_item is not None and len(content) > max_chars_per_item:
                 content = content[:max_chars_per_item] + "...[truncated]"
             rendered.append(f"{idx}:{role}: {content}")
         return "\n".join(rendered)
@@ -102,7 +114,11 @@ class ControllerHistoryMixin:
 
     def _default_payload_dict(self, *, query: str, chat_history: ChatHistory) -> dict[str, Any]:
         candidate_output = self._get_candidate_output(chat_history, query)
-        history_text = self._toolgen_render_history(chat_history, max_chars_per_item=300)
+        history_text = self._toolgen_render_history(
+            chat_history,
+            max_chars_per_item=1200,
+            preserve_first_user_n=2,
+        )
         last_user = self._get_last_user_item(chat_history)
         last_observation = (last_user.content or "").strip() if last_user else ""
         last_observation = self._strip_supplemental_sections(last_observation)

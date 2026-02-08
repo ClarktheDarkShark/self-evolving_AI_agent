@@ -1,0 +1,17 @@
+{
+  "cursor": "",
+  "history": [
+    "step_1",
+    "step_2",
+    "need_step:a",
+    "step_add_user",
+    "need_step:get_relations",
+    "completed",
+    "run:r1",
+    "run:r1",
+    "run:r1",
+    "run:r1",
+    "run:r1"
+  ],
+  "notes": {}
+}

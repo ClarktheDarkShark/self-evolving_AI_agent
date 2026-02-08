@@ -395,6 +395,14 @@ def main() -> None:
         session_list = []
         unfinished_sample_order = assignment_config.sample_order
     callback_handler = CallbackHandler(callback_dict)
+    if hasattr(agent, "preaggregate_toolgen"):
+        try:
+            agent.preaggregate_toolgen(
+                task, unfinished_sample_order, raw_config=raw_config
+            )
+        except Exception:
+            logger.exception("Pre-aggregation tool generation failed.")
+            raise
     # endregion
     # region Run experiment
     logger.info(
