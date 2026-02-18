@@ -1,0 +1,88 @@
+### PHASE 2 (Trace Normalization + Raw Parsing)
+You are ToolGen Phase 2 (Trace Normalization + Raw Parsing).
+
+Output ONLY Python code to insert at the anchor line:
+# === PHASE2_INSERT_TRACE_NORMALIZATION ===
+
+No backticks. No prose. No full file.
+Use single-line comments for helper functions, not triple-quote docstrings.
+
+HARD CONSTRAINTS
+- Python stdlib ONLY. Deterministic. No network. No randomness.
+- Forbidden anywhere: sudo,useradd,usermod,groupadd,chmod,chgrp
+- NO import statements.
+- Must NOT reference modules not imported by Phase 1 (assume os,json,re,tempfile,shutil exist).
+- Do NOT read/write files.
+- Do NOT use eval/exec.
+- _normalize_trace MUST call _safe_str() on step.output even if output is list/dict, to extract vars/relations.
+- If step.action is not in actions_spec, normalized action MUST be "" and args MUST be {} (sanitize unknowns).
+
+
+WHAT YOU MUST OUTPUT
+Provide COMPLETE definitions that will replace/define:
+- def _safe_str(value): ...
+- def _extract_vars_from_text(text): ...
+- def _extract_relations_from_text(text): ...
+- def _parse_raw_action(raw): ...
+- def _normalize_trace(trace, actions_spec): ...
+
+Core invariants (MUST ENFORCE)
+A) Canonical subject keys:
+- If token starts with "#": subject key is "var"
+- Else: subject key is "entity"
+- Never store an entity string under key "var".
+
+B) Non-string outputs:
+- Variable extraction MUST use _safe_str(step.output) and _safe_str(step.raw) even if output is list/dict.
+- Relation extraction MUST use _safe_str(step.output) and _safe_str(step.raw) even if output is list/dict.
+
+C) Sanitize hallucinated/unknown actions:
+- If a step action is not in actions_spec, set normalized["action"]="" and normalized["args"]={} (do not carry unknowns).
+- Raw parsing may only set action/args if parsed action is in actions_spec.
+
+REGEX SAFETY (HARD)
+- No regex concatenation, no f-strings for regex.
+- If quoted tokens needed, inside _parse_raw_action define exactly:
+  token = r"(?:[A-Za-z0-9_.\/:-]+|#\d+|\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*')"
+- Do NOT define regex tokens at top-level.
+
+RAW ACTION PREFIX STRIPPING (HARD)
+_parse_raw_action MUST strip optional prefix case-insensitively:
+- "Action:" or "Action <digits>:"
+Only then parse supported call forms (whitespace allowed):
+- get_relations(X)
+- get_neighbors(X, REL)
+- intersection(A, B)
+- get_attributes(X, REL)
+- count(X)
+- argmax(X, REL)
+- argmin(X, REL)
+X/A/B/REL tokens allowed: alnum underscore dot slash hyphen colon, "#<digits>", or quoted string.
+Return shape: {"action": <name>, "args": <dict>} or None. Never raise.
+
+ARGS CANONICALIZATION (HARD)
+- get_relations: {"var":X} if X startswith "#", else {"entity":X}
+- get_neighbors/get_attributes: {"var":X} or {"entity":X} plus {"relation":REL}
+- intersection: {"a":A, "b":B}
+- count: {"var":X} or {"entity":X}
+- argmax/argmin: {"var"/"entity":X, "relation":REL, "mode":"argmax"/"argmin"} (mode required)
+
+_normalize_trace(trace, actions_spec) contract (HARD)
+- If trace not list => []
+- For each step (dict or str):
+  Normalize into dict with EXACT keys:
+    action(str or ""), ok(bool or None), output(any), args(dict), error(str or None), raw(str or None)
+- If step.action contains ":" and args empty, treat as raw parse source.
+- If raw non-empty and args empty, attempt parse.
+- Adopt parsed action/args only if parsed action in actions_spec.
+- After action adoption: if action not in actions_spec, force action="" and args={}.
+
+Variable + relation hint extraction (HARD)
+- Extract var ids from _safe_str(output) and _safe_str(raw) using _extract_vars_from_text.
+- Store ordered unique list under args["vars"] if any.
+- If args lacks "var" and exactly one var id found, set args["var"]=that id.
+- Extract relation-like tokens from _safe_str(output) using _extract_relations_from_text.
+  Store ordered unique list under args["rels"] if any.
+- Never invent actions, never raise.
+
+Size target: <= 140 lines. Return ONLY code.

@@ -1,1 +1,1 @@
-{"cursor": "get_relations", "history": ["step:get_relations"], "notes": {}}
+{"cursor": "get_relations", "history": ["step:get_relations", "run t2 status need_step"], "notes": {"entities": [], "observed_vars": [], "chosen_relation": ""}}

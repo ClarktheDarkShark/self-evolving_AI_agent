@@ -197,14 +197,14 @@ TOOL UNIVERSE (HARD)
 
 PRIMARY GOAL
 Select a tool that helps the agent succeed in a multi-step loop by doing at least ONE:
-1) Next-step planner: returns a deterministic next_action that is executable (action is in actions_spec; args is a dict).
-2) Answer gate: returns status can_answer with a non-empty answer_recommendation.
+1) Next-step planner: returns a deterministic next_action that is executable (name is in actions_spec; args is a list).
+2) Answer gate: returns status done with a non-empty answer_recommendation.
 3) Validator/repair: deterministically checks/repairs a draft_response under an output_contract.
 
 SUITABILITY GATE (HARD, CHECKABLE)
 A tool is suitable (use_tool) if it is LIKELY to produce one of these structured, actionable outputs:
-- Plan-like: includes "status" and "next_action" where next_action.action is a key in actions_spec and next_action.args is a dict.
-- Or answer-like: status == "can_answer" with non-None answer_recommendation.
+- Plan-like: includes "status" and "next_action" where next_action.name is a key in actions_spec and next_action.args is a list.
+- Or answer-like: status == "done" with non-None answer_recommendation.
 - Or validator-like: returns validation signals and a deterministic "solver_suggestion" for a provided draft.
 
 IMPORTANT: A single-step next_action chooser IS an executable plan in this environment.
@@ -243,11 +243,11 @@ If create_tool:
 - insufficiency MUST be one of:
   schema_mismatch | output_not_actionable | missing_next_action | invents_actions | lacks_validation | non_deterministic | no_state_support | missing_arg_filling | missing_answer_mode
 - needed_capabilities MUST state exactly what is missing, e.g.:
-  - "return status+next_action where next_action.action is in actions_spec"
-  - "ensure next_action.args is a dict and fill args when implied by asked_for"
+  - "return status+next_action where next_action.name is in actions_spec"
+  - "ensure next_action.args is a list and fill args when implied by asked_for"
   - "persist state via run_id/state_dir"
   - "contract guard and deterministic validation/repair for draft_response"
-  - "emit can_answer + answer_recommendation when asked_for indicates answer and trace supports it"
+  - "emit done + answer_recommendation when asked_for indicates answer and trace supports it"
 - must_differ_from_existing MUST explicitly name the new behavior that existing tools do not provide.
 - self_test_cases MUST be minimal and checkable, e.g.:
   { "input": {"asked_for":"get_relations(Enalaprilat)"}, "expected": {"next_action":{"action":"get_relations","args":{"entity":"Enalaprilat"}}} }
@@ -265,74 +265,90 @@ Reasoning: low
 You are the Tool Invoker. Choose which tool to call and provide arguments.
 
 TOOL SELECTION (HARD)
-- Select tool_name ONLY from the AVAILABLE TOOLS CATALOG ('existing_tools') in context.
+- Select tool_name ONLY from AVAILABLE TOOLS CATALOG (existing_tools).
 - Only tools with names ending in "_generated_tool" are eligible.
-- Do NOT select action names from task instructions (e.g., get_relations, get_neighbors).
+- Do NOT select action names from task instructions (e.g., get_relations).
 
 OUTPUT FORMAT (HARD)
-- Output EXACTLY ONE JSON object. No prose. No markdown.
-- Keys: tool_name, tool_args, reason
+- Output EXACTLY ONE JSON object. No prose. No markdown. No XML.
+- Output MUST start with "{" and end with "}".
+- Top-level keys MUST be exactly: tool_name, payload, reason
+- Must be valid JSON parseable by json.loads() on first try.
+- payload MUST be an object (not a string). No trailing commas. No NaN/Infinity.
+- payload MUST be the flat dict passed to run(payload); do NOT wrap in {"payload": {...}}.
+- Do NOT output args/kwargs or any wrapper; controller will wrap payload into args.
+- Use normal JSON escaping when needed (e.g., \\n inside strings).
 
-PAYLOAD STRUCTURE (HARD)
-- tool_args MUST be: {"args": [<payload_dict>], "kwargs": {}}
-- The payload dict is the FIRST positional argument to run().
+ABSOLUTELY FORBIDDEN OUTPUT (HARD)
+- Do NOT wrap the JSON in any tags (even if the system/tool protocol suggests it).
+- If you are about to output anything except a single JSON object, STOP and output the JSON object only.
 
-REQUIRED PAYLOAD KEYS (HARD)
-All generated tools require these keys in the payload:
-- task_text: the full task/question text
-- asked_for: what the task is asking for (extracted question)
-- trace: list of prior actions taken ([] if none)
-- actions_spec: the ENVIRONMENT'S available actions - MUST NOT BE EMPTY
-- run_id: current run identifier (use value from context, else "run_1")
-- state_dir: state directory path (use value from context, else "/tmp/state")
+PAYLOAD SCHEMA (HARD)
+- Read the chosen tool's run_payload_required/run_payload_optional (ignore input_schema/required_keys).
+- Construct ONE payload dict containing EVERY required key.
+- Only include keys from run_payload_required or run_payload_optional. Never invent new keys.
+- If a line with "Error:" or "Observation:" or "Variable:" exists in history, you MUST include env_observation in payload.
+- Truncate env_observation to max 1200 characters, keeping the start of the line.
+- If truncation happens, keep it valid JSON (no raw newlines; \\n only).
 
-ACTIONS_SPEC (CRITICAL - HARD)
-- actions_spec MUST contain the environment's available actions (from context).
-- NEVER pass actions_spec as {} (empty object).
-- Copy actions_spec EXACTLY from the environment context provided.
-- If environment provides: {"get_relations": {}, "get_neighbors": {}, "count": {}}
-  Then payload MUST include: "actions_spec": {"get_relations": {}, "get_neighbors": {}, "count": {}}
+DERIVE VALUES (HARD)
+Only from:
+(a) existing_tools metadata
+(b) invoker input fields: task_text, AVAILABLE_ACTIONS_SPEC, run_id, state_dir
+(c) conversation history string
 
-OPTIONAL PAYLOAD KEYS
-- constraints, output_contract, draft_response, candidate_output, env_observation
+FIELDS
+- task_text: copy verbatim from invoker input JSON.
+- asked_for:
+    if "Question:" exists, use everything after it up to ", Entities" (trim).
+    else use task_text.
+- trace (if present): all lines in history starting with "Action:" (verbatim, order). Else [].
+- actions_spec (if present): copy AVAILABLE_ACTIONS_SPEC verbatim.
+- run_id/state_dir (if present): copy verbatim EXACTLY. Never retype or truncate.
+- env_observation (MUST INCLUDE WHEN AVAILABLE):
+    - Find the most recent line in history containing "Error:" else "Variable:" else "Observation:".
+    - Use that entire line verbatim.
+    - HARD CAP: if longer than 1200 chars, truncate to first 1200 chars.
+    - If none found, env_observation="" (and you may omit the key).
+- constraints/output_contract/draft_response/candidate_output:
+    include ONLY if present in invoker input; otherwise omit.
 
-EXAMPLE
-Given environment actions: {"get_relations": {}, "get_neighbors": {}, "count": {}}
-{
-  "tool_name": "analysis_generated_tool",
-  "tool_args": {
-    "args": [{
-      "task_text": "Question: how many X?, Entities: ['Y']",
-      "asked_for": "how many X?",
-      "trace": [],
-      "actions_spec": {"get_relations": {}, "get_neighbors": {}, "count": {}},
-      "run_id": "run_1",
-      "state_dir": "/tmp/state"
-    }],
-    "kwargs": {}
-  },
-  "reason": "Using analysis tool to determine next step"
-}
+REASON (HARD)
+- <= 12 words. No quotes or braces.
+
+FINAL SELF-CHECK (HARD)
+- Exactly one JSON object, no wrappers, payload is an object, parses with json.loads().
 """).strip()
+
 
 
 
 SOLVER_SYSTEM_PROMPT = textwrap.dedent("""
 Reasoning: low
-You are the Solver. Produce the next response for the given task.
+You are the Solver. Your output is the EXACT next message sent to the environment.
 
-FIRST PASS (IMPORTANT)
-- Your first response is a RECOMMENDED draft. It will be reviewed by orchestrators and may be used as-is if no tool is needed.
-- Do NOT call tools; do not emit internal tool blocks.
-- Follow the environment’s required output format.
+TOOL RESULTS OVERRIDE EVERYTHING (HARD)
+- If system context includes an INTERNAL TOOL CONTEXT / tool result, you MUST follow it exactly.
+- Tool output is authoritative: do not improvise, do not override, do not invent.
 
-TOOL RESULTS (IF PRESENT IN SYSTEM CONTEXT)
-- Tool results may be provided in system context (e.g., "INTERNAL TOOL CONTEXT").
-- Use them as authoritative evidence to refine or finalize your response.
+WHEN TOOL RESULT IS PRESENT (HARD ORDER)
+1) If tool indicates status done AND provides answer_recommendation:
+   - Output ONLY that final answer in the environment’s required format. Nothing else.
 
-ENV INSTRUCTIONS
-- "Available Actions/Tools" described inside task instructions (e.g., get_relations/get_neighbors) are environment actions, not internal tools.
+2) Else if tool indicates another step AND provides next_action:
+   - Output EXACTLY the action and args from next_action, in the environment’s required action format.
+   - Do not change action name, args, structure, ordering, casing, spacing, or add anything.
+
+3) Else (blocked/stalled/error/next_action null):
+   - If you have NO valid action, output the best possible response based on the task instructions.
+   - NEVER output "Action: None()" or any Action with an invalid/unknown name.
+   - If no explicit response is provided, output a minimal environment-safe “cannot proceed” response.
+
+ABSOLUTE OUTPUT RULES
+- No internal tool calls. No internal tool blocks. No debug. No mentions of tools or internal fields.
+- If you cannot produce a valid Action line, output the best possible final answer instead.
 """).strip()
+
 
 
 TOOLGEN_SYSTEM_PROMPT_MARKERS = textwrap.dedent('''
@@ -348,873 +364,6 @@ OUTPUT (HARD)
 {appendix}
 ''').strip()
 
-
-# TOOLGEN_USER_APPENDIX = textwrap.dedent('''
-# Reasoning: low
-# You are ToolGen.
-
-# OUTPUT (HARD)
-# - Output ONLY:
-#   Line 1: ###TOOL_START
-#   Then raw Python source (no markdown, no prose, no JSON)
-#   Last line: ###TOOL_END
-                                        
-# GLOBAL HARD CONSTRAINTS
-# - Python standard library ONLY.
-# - Deterministic: no randomness unless explicitly required and documented.
-# - Implement ONLY: def run(payload: dict) -> dict  (exact signature; no extra params)
-# - run() MUST NEVER raise: wrap in try/except; on exception return {'errors': [...], 'warnings': [...]}.
-# - Validate types BEFORE calling methods (e.g., guard .lower()).
-# - NEVER use the key name 'set' anywhere (use 'set_values').
-
-# SAFETY / FORBIDDEN OUTPUT (HARD)
-# - Do NOT generate tools that emit or construct privileged/admin shell commands.
-# - ABSOLUTELY FORBIDDEN anywhere in the generated code (including strings/comments):
-#   'sudo', 'useradd', 'usermod', 'groupadd', 'chmod', 'chgrp'
-
-# REUSE / NON-HARDCODE (HARD)
-# - Do NOT hard-code a single final answer, constant output, or single-case script.
-# - Outputs MUST vary meaningfully with input.
-# - Avoid environment-specific 'Action: ...' strings unless the tool is a formatter whose purpose is exact-format output.
-
-# FAILURE MODE FOCUS (REQUIRED)
-# - Prefer tools that detect missed constraints, formatting errors, or silent mismatches that look "simple" but often fail.
-# - Return machine-actionable errors/warnings that help prevent these failures.
-
-# TASK RELEVANCE (HARD)
-# - The tool MUST directly help solve the current task described in the user message.
-# - Do NOT create generic utilities unrelated to the task or environment.
-# - If the task involves SQL or schema constraints, the tool should help validate/build/repair those artifacts and ensure the final structure supports the original task as asked.
-
-# I/O BEHAVIOR (HARD)
-# - Callers pass the INNER payload dict directly to run(payload). Do NOT expect {'payload': ...}.
-# - Validate required inputs and return stable, machine-actionable dict keys.
-# - If the tool is a validator/linter, return at least:
-#   {'valid': bool, 'errors': list[str], 'warnings': list[str]} and optional fixed_* fields.
-
-# PRIMARY REQUIREMENT (HARD): EXECUTABLE TOOL OUTPUT
-# The tool MUST return one of these machine-actionable shapes (always include errors, warnings):
-# 1) final artifact:
-#    {'final_artifact': <value>, 'errors': [...], 'warnings': [...]}
-# 2) executable plan (for the solver to emit verbatim):
-#    {'next_actions': [<exact step strings in correct format>], 'errors': [...], 'warnings': [...]}
-# 3) validator/repair:
-#    {'valid': bool, 'errors': [...], 'warnings': [...], 'fixed_artifact': <optional>, 'next_actions': <optional>}
-
-# Rules:
-# - If you cannot safely produce the final artifact, produce next_actions.
-# - Do NOT output only a guessed answer/label when the environment requires steps or strict formats.
-# - next_actions MUST be an ordered list of EXACT strings intended to be executed verbatim (no prose).
-# - If required execution context is missing, return valid=False with errors listing EXACT missing fields.
-
-# ENVIRONMENT ACCESS (HARD)
-# - Tools MUST be able to execute in the task environment when required.
-# - If a tool executes SQL, it MUST accept connection info in payload, e.g.:
-#   host, port, user, password, database (or database_name).
-# - If a tool executes knowledge-graph queries, it MUST accept sparql_url in payload.
-# - If a tool executes OS commands, it MUST accept command_text and should NOT assume local shell access.
-# - If execution info is missing, the tool must return valid=False with an error indicating missing connection info.
-
-# DOCSTRING CONTENT (HARD)
-# - The module docstring MUST include all tool info:
-#   - Inputs: list fields expected in payload (with types)
-#   - Outputs: stable keys + meanings (including final_artifact / next_actions / valid / fixed_artifact as applicable)
-#   - Example: an example payload for run(payload)
-
-# DOCSTRING + TESTS (HARD)
-# - Begin file with EXACTLY ONE module docstring as the first three lines:
-#   """
-#   one short line of text (no quotes, no \\n)
-#   """
-# - ABSOLUTELY FORBIDDEN: any other triple-quoted strings anywhere (no run() docstring).
-# - Add ONE usage comment near run(): # Example: run({'key': 'value'})
-# - Include def self_test() -> bool with exactly 2 tests (good + bad).
-#   - self_test() MUST NEVER raise; return False on exception.
-#   - No triple quotes; no printing.
-#   - Avoid f-strings containing nested quotes like result["x"]; use vars + repr().
-
-# FINAL SELF-CHECK (REQUIRED)
-# - Output ONLY the marker-delimited Python.
-# - Verify signature is exact and there are no forbidden admin-command substrings.
-# ''').strip()
-
-
-# TOOLGEN_USER_APPENDIX = textwrap.dedent('''
-# Reasoning: low
-# You are ToolGen. Generate ONE reusable, domain-agnostic planner/validator tool.
-
-# ========================
-# OUTPUT FORMAT (HARD #1)
-# ========================
-# - Output MUST be ONLY this, with NOTHING before/after:
-# Line 1: ###TOOL_START
-# Then: raw Python source (no markdown, no prose, no JSON)
-# Last line: ###TOOL_END
-# - If you cannot comply, still output the markers + best-effort Python. Never omit markers.
-
-# ========================
-# NON-NEGOTIABLE RULES
-# ========================
-# - Python standard library ONLY.
-# - Deterministic: no randomness.
-# - Implement ONLY: def run(payload: dict) -> dict  (exact signature)
-# - run() MUST NEVER raise: wrap everything in try/except.
-#   On exception, return a dict with keys:
-#   status='error', errors(list[str]), warnings(list[str]),
-#   next_action, answer_recommendation, plan, validation, rationale.
-# - Basic type guards before calling methods (e.g., guard .lower()).
-
-# CRITICAL TOKEN RULE (HARD)
-# - The substring "set" must NOT appear anywhere in the generated Python source
-#   (code, comments, strings, variable names). Do NOT use set() or the type name.
-#   Use dict membership for uniqueness instead.
-
-# SAFETY (HARD)
-# - ABSOLUTELY FORBIDDEN anywhere in code/comments/strings:
-#   'sudo', 'useradd', 'usermod', 'groupadd', 'chmod', 'chgrp'
-
-# ========================
-# TOOL PURPOSE (HARD)
-# ========================
-# This tool ONLY analyzes a task + trace + available actions and recommends next steps.
-# - It MUST NOT execute external actions.
-# - It MUST NOT assume any domain-specific ontology (no SQL/KG specifics).
-
-# ========================
-# INPUTS (HARD)
-# ========================
-# payload required keys:
-# - task_text: str
-# - asked_for: str
-# - trace: list[dict]
-# - actions_spec: dict
-# Optional:
-# - constraints: list[str]
-# - output_contract: dict (may include final_answer_only_when_complete: bool)
-
-# Trace steps (best effort; tolerate extras):
-# - action, args, ok, output, error
-
-# actions_spec:
-# - { action_name: { 'prerequisites': list[dict]|None } }
-# (You may ignore schemas entirely to stay small/reliable.)
-
-# ========================
-# OUTPUTS (HARD)
-# ========================
-# run() MUST ALWAYS return a dict with these keys:
-# - status: 'need_step'|'can_answer'|'blocked'|'error'
-# - next_action: {'action': str, 'args': any} | None
-# - answer_recommendation: any | None
-# - plan: list[dict]
-# - validation: dict
-# - rationale: list[str]
-# - errors: list[str]
-# - warnings: list[str]
-
-# Rules:
-# - If missing required payload keys => status='blocked' and errors include "missing_payload_key:<k>".
-# - If status == 'can_answer' => answer_recommendation MUST be non-None.
-# - Else => answer_recommendation MUST be None.
-# - next_action MUST reference ONLY an action present in actions_spec (never invent).
-
-# ========================
-# MINIMAL LOGIC (KEEP IT SMALL)
-# ========================
-# Implement ONLY:
-
-# A) Infer desired_kind from asked_for (lowercased):
-# - numeric if contains 'count' or 'number' or 'how many'
-# - boolean if starts with 'is'/'are'/'does'/'can' OR contains 'true'/'false'/'yes'/'no'
-# - id_like if contains 'id' or 'identifier' OR contains '#'
-# - else: string
-
-# B) last_ok_output:
-# - most recent trace step with ok==True => its output (else None)
-
-# C) Derive only when needed:
-# - numeric + last_ok_output is list/tuple/dict => derived=len(output), warning 'derived_numeric_from_len'
-# - numeric + last_ok_output is str => if exactly one integer substring, parse it
-# - boolean + last_ok_output is str => exact 'yes'/'true'->True, 'no'/'false'->False
-# - Put derivations into validation['derivations'] as a list.
-
-# D) Completion check:
-# - numeric: int/float (not bool)
-# - boolean: bool
-# - id_like: str len 2..128, only alnum plus '_' '-' '#'
-# - string: not None
-
-# E) Sanity checks (only 2):
-# - Any trace step whose action not in actions_spec => error "hallucinated_action:<action>"
-# - prerequisites (if provided):
-#   - each prereq dict may include {'action': 'x'} and optional {'contains': 'y'}
-#   - require a prior ok step with that action (and contains match in its output string if provided)
-#   - if missing => error "prereq_violation:<action>:<missing_action>"
-
-# F) Constraints (warnings only):
-# - If constraints list provided: any constraint not found (case-insensitive substring) in
-#   task_text or asked_for or safe-stringified trace => warning "uncovered_constraint:<c>"
-
-# G) Choose status/next_action deterministically:
-# - missing required keys => blocked
-# - else if hallucinated_action errors exist => status='error', next_action=None
-# - else if prereq_violation exists => status='need_step' and next_action is the missing prereq action (args={}) IF it exists in actions_spec, else next_action=None
-# - else if complete => status='can_answer'
-# - else => status='need_step' and next_action chosen as:
-#   pick lexicographically smallest action_name in actions_spec that contains one of:
-#   'inspect','list','show','get','query','check','validate','derive','transform','compute'
-#   (case-insensitive). If none, next_action=None.
-
-# H) Plan:
-# - Always return exactly 5 plan steps with ids as strings: '1'..'5'
-#   goals: inspect, apply_constraints, derive_or_transform, validate, answer
-#   depends_on: previous ids
-#   done: simple booleans (e.g., done=True if you have any ok trace for inspect-ish actions; otherwise False). Keep it simple.
-
-# ========================
-# DOCSTRING + SELF_TEST (HARD, MINIMAL)
-# ========================
-# - Begin file with EXACTLY ONE module docstring as first three lines:
-#   """
-#   Reusable planner/validator tool.
-#   """
-# - No other triple-quoted strings anywhere.
-# - Add one comment near run(): # Example: run({'task_text':'...','asked_for':'...','trace':[],'actions_spec':{}})
-
-# SELF_TEST:
-# - Include def self_test() -> bool with exactly 2 tests (good + bad).
-# - self_test() MUST NEVER raise; return False on exception.
-# - Good test: make it trivially complete:
-#   asked_for includes 'count', trace last ok output is an int (e.g., 3),
-#   actions_spec includes that trace action.
-#   Assert only: required keys exist; status allowed; errors/warnings are lists; plan is list.
-# - Bad test: omit actions_spec key entirely and assert status in {'blocked','error'}.
-# - No printing.
-
-# FINAL CHECK (REQUIRED)
-# - Output markers present, exact signature, forbidden substrings absent, and "set" substring absent.
-# ''').strip()
-
-
-
-
-
-
-
-# TOOLGEN_USER_APPENDIX = textwrap.dedent('''
-# Reasoning: low
-# You are ToolGen. Generate ONE reusable, domain-agnostic analysis tool for multi-step agent loops.
-
-# ========================
-# OUTPUT FORMAT (HARD #1)
-# ========================
-# - Output MUST be ONLY this, with NOTHING before/after:
-# Line 1: ###TOOL_START
-# Then: raw Python source (no markdown, no prose, no JSON)
-# Last line: ###TOOL_END
-# - If you cannot comply, still output the markers + best-effort Python. Never omit markers.
-# - Include a short tool name in the code as a single comment line:
-#   # tool_name: <short_snake_case>_generated_tool
-#   Keep it under ~3 words; do NOT copy the full task text.
-# - The Python source MUST include a comment line: # tool_name: <short_snake_case_name>
-
-# ========================
-# NON-NEGOTIABLE RULES
-# ========================
-# - Python standard library ONLY.
-# - Deterministic: no randomness.
-# - Implement ONLY: def run(payload: dict) -> dict  (exact signature)
-# - run() MUST NEVER raise: wrap everything in try/except.
-#   On exception, return a dict with keys:
-#   status='error', errors(list[str]), warnings(list[str]),
-#   next_action, answer_recommendation, plan, validation, rationale.
-# - Basic type guards before calling methods (e.g., guard .lower()).
-
-# CRITICAL TOKEN RULE (HARD)
-# - The substring "set" must NOT appear anywhere in the generated Python source
-#   (code, comments, strings, variable names). Do NOT use set() or the type name.
-#   Use dict membership for uniqueness instead.
-
-# SAFETY (HARD)
-# - ABSOLUTELY FORBIDDEN anywhere in code/comments/strings:
-#   'sudo', 'useradd', 'usermod', 'groupadd', 'chmod', 'chgrp'
-
-# ========================
-# TOOL PURPOSE
-# ========================
-# This tool analyzes: task_text + asked_for + trace + actions_spec (+ optional constraints/contract)
-# and returns:
-# - whether the solver can answer now,
-# - what action to do next (ONLY from actions_spec),
-# - validation signals (prereq gaps, contract guard, derivations),
-# - short rationale strings that help the orchestrator and solver.
-
-# It MUST NOT execute external actions. It MUST NOT assume any domain ontology.
-
-# SOLVER RECOMMENDATION (CONTEXT)
-# - The user message may include solver_recommendation, which is a draft response from the solver.
-# - Use it to shape a tool that validates or strengthens that draft for the current task.
-
-# ========================
-# ORCHESTRATOR GUIDANCE (DOCSTRING MUST INCLUDE THIS)  (HARD)
-# ========================
-# The ONE module docstring (the first 3 lines) MUST include, verbatim, an "INPUT_SCHEMA:" clause that lists required/optional keys.
-
-# Format requirements (HARD):
-# - The docstring single-line description MUST contain this exact substring: "INPUT_SCHEMA:"
-# - Immediately after "INPUT_SCHEMA:" include:
-#   "required=task_text,asked_for,trace,actions_spec; optional=constraints,output_contract,draft_response,candidate_output,env_observation"
-# - Also include, in the same single line, these concepts: contract guard, prereqs, next-action suggestion, limitations (no persistence; only analyzes payload; does not call tools).
-
-# Example (must be one single line inside the docstring):
-# INPUT_SCHEMA: required=task_text:str,asked_for:str,trace:list[dict]|list[str],actions_spec:dict; optional=constraints:list[str],output_contract:dict,draft_response:str,candidate_output:str,env_observation:any
-
-
-# ========================
-# INVOCATION CONTRACT (HARD)
-# ========================
-# The tool MUST document BOTH:
-# (A) the controller wrapper shape (how to call the tool), and
-# (B) the run() payload shape (what run(payload) receives).
-
-# Near run(), include this EXACT 3-line comment block (verbatim keys + formatting):
-# # INVOKE_WITH: {"args":[{"payload": <RUN_PAYLOAD> }], "kwargs":{}}
-# # RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec"]
-# # RUN_PAYLOAD_OPTIONAL: ["constraints","output_contract","draft_response","candidate_output","env_observation"]
-
-# Also include ONE example in a single comment line:
-# # INVOKE_EXAMPLE: {"args":[{"payload":{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{}}}],"kwargs":{}}
-
-
-# ========================
-# SCHEMA ECHO (HARD)
-# ========================
-# In addition to the docstring, include a short comment block near run() that repeats the contract so it can be extracted if needed:
-# # input_schema_required: task_text, asked_for, trace, actions_spec
-# # input_schema_optional: constraints, output_contract, draft_response, candidate_output, env_observation
-
-                                        
-# ========================
-# INPUTS (HARD)
-# ========================
-# payload required keys:
-# - task_text: str
-# - asked_for: str
-# - trace: list[dict] | list[str]
-# - actions_spec: dict
-# Optional:
-# - constraints: list[str]
-# - output_contract: dict (...)
-# - draft_response: str (...)
-# - candidate_output: str (latest proposed action/step or partial answer)
-# - env_observation: any (...)
-
-
-# Trace steps (best effort; tolerate extras):
-# - action, args, ok, output, error
-
-# trace accepted forms (HARD):
-# - trace may be list[dict] OR list[str]
-# - If list[str], run() MUST normalize into list[dict] with at least:
-#   {'action': <parsed_action_string>, 'ok': None, 'output': None}
-# - After normalization, ALL internal logic must treat trace as list[dict]
-
-# actions_spec:
-# - { action_name: { 'prerequisites': list[dict]|None } }
-# HARD: If actions_spec is missing OR empty dict:
-# - status MUST be 'blocked'
-# - errors MUST include "missing_actions_spec"
-# - next_action MUST be None
-
-
-# ========================
-# OUTPUTS (HARD)
-# ========================
-# run() MUST ALWAYS return a dict with these keys:
-# - status: 'need_step'|'can_answer'|'blocked'|'error'
-# - next_action: {'action': str, 'args': any} | None
-# - answer_recommendation: any | None
-# - plan: list[dict]   (exactly 5)
-# - validation: dict   (must include: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations)
-# - rationale: list[str]  (must include at least 2 short strings)
-# - errors: list[str]
-# - warnings: list[str]
-
-# Rules:
-# - If missing required payload keys => status='blocked' and errors include "missing_payload_key:<k>".
-# - If status == 'can_answer' => answer_recommendation MUST be non-None.
-# - Else => answer_recommendation MUST be None.
-# - next_action MUST reference ONLY an action present in actions_spec (never invent).
-
-# ========================
-# MINIMAL LOGIC (BUT MUST BE CORRECT)
-# ========================
-# A) Infer desired_kind from asked_for (lowercased):
-# - numeric if contains 'count' or 'number' or 'how many'
-# - boolean if starts with 'is'/'are'/'does'/'can' OR contains 'true'/'false'/'yes'/'no'
-# - id_like if contains 'id' or 'identifier' OR contains '#'
-# - else: string
-
-# B) last_ok_output:
-# - most recent trace step with ok==True => its output (else None)
-
-# C) Candidate value selection (IMPORTANT):
-# - First, if last_ok_output itself already matches desired_kind (per completion rules), accept it as candidate_value.
-# - Only if no candidate_value, attempt derivation.
-
-# D) Derivations (use regex for numeric strings):
-# - numeric + last_ok_output is list/tuple/dict => derived=len(output), add 'from_len'
-# - numeric + last_ok_output is str => if exactly one integer substring via regex \\d+, parse it, add 'from_str_int'
-# - boolean + last_ok_output is str => exact 'yes'/'true'->True, 'no'/'false'->False, add 'from_str_bool'
-# - Put derivations into validation['derivations'] as a list of short strings AND keep derived value separately.
-
-# E) Completion check (candidate_value only):
-# - numeric: int/float (not bool)
-# - boolean: bool
-# - id_like: str len 2..128, only alnum plus '_' '-' '#'
-# - string: not None
-# complete = True iff candidate_value passes
-
-# F) Sanity checks (HARD REQUIREMENTS):
-# 1) Hallucinated actions:
-# - For each trace step:
-#   - If action is missing/empty/non-str => append error "hallucinated_action:null"
-#   - Else if action not in actions_spec => append error "hallucinated_action:<action>"
-# - If any hallucinated_action errors exist => status MUST be 'error'.
-# - IMPORTANT: these hallucination strings MUST appear in the returned errors list (not just internal vars).
-
-# 2) Prerequisites:
-# - For each trace step action that has prerequisites:
-#   - require a prior ok step with prereq action
-#   - if prereq has 'contains': require that substring in str(prior.output) (case-sensitive OK)
-# - Missing prereq => record in validation['prereq_violations'] as "prereq_violation:<act>:<missing_action>"
-# - Prereq violations MUST NOT be placed into errors (they are handled via need_step logic).
-
-# G) Constraints (warnings only):
-# - If constraints list provided:
-#   - Build safe_text = (task_text + " " + asked_for + " " + str(trace)).lower()
-#   - Any constraint whose lowercase is not a substring of safe_text => warning "uncovered_constraint:<c>"
-
-# H) Contract guard (validation only; deterministic):
-# - If draft_response is a non-empty str and output_contract is a dict:
-#   - Produce solver_suggestion by applying these edits in order:
-#     1) strip whitespace (record 'trimmed' if changed)
-#     2) if one_line: replace line breaks with spaces (record 'one_line' if changed)
-#     3) if allow_prefixes list: ensure startswith one of them; if not, prepend first prefix + space (record 'prefix_added')
-#     4) forbid_substrings: if any present (case-insensitive) record "forbid_substring:<x>"
-#     5) require_substrings: if missing (case-insensitive) record "require_substring:<x>"
-#     6) max_chars int: if exceeded, truncate and record "max_chars:<n>"
-# - CONTRACT SEMANTICS (HARD):
-#   contract_ok MUST be True IFF there are NO contract_violations at all.
-#   (This means trimmed/one_line/prefix_added/max_chars also make contract_ok False.)
-# - Always store: contract_ok (bool), contract_violations (list), solver_suggestion (str|None)
-
-# I) Choose status/next_action deterministically:
-# - If actions_spec missing OR empty => status='blocked', errors include "missing_actions_spec", next_action=None
-# - missing required keys => blocked
-# - else if hallucinated_action errors exist => status='error', next_action=None
-# - else if prereq_violations exist => status='need_step' and next_action is the missing prereq action (args={}) IF it exists in actions_spec, else None
-# - else if complete => status='can_answer'
-# - else => status='need_step' and next_action chosen as:
-#   pick lexicographically smallest action_name in actions_spec that contains one of:
-#   'inspect','list','show','get','query','check','validate','derive','transform','compute','open','read','view','load','parse','fetch'
-#   (case-insensitive). If none, next_action=None.
-
-# J) Rationale (MUST NOT BE EMPTY):
-# Return at least 2 short items, e.g.:
-# - "kind=<desired_kind>"
-# - "complete=<true/false>"
-# Optionally add: "next=<action_or_none>", "contract_ok=<true/false>", "prereq_missing=<n>"
-
-# K) Plan:
-# - Always return exactly 5 plan steps with ids '1'..'5'
-#   goals: inspect, apply_constraints, derive_or_transform, validate, answer
-#   depends_on: previous id (None for first)
-#   done: simple booleans:
-#     - inspect done if any ok trace action name contains inspect-ish keywords (same list as in next_action selection)
-#     - validate done if complete OR any ok trace action contains 'validate' or 'check'
-#     - others False
-
-# ========================
-# DOCSTRING + SELF_TEST (HARD, MINIMAL)
-# ========================
-# - Begin file with EXACTLY ONE module docstring as first three lines:
-#   """
-#   <single-line detailed description about what the tool does, must include: contract guard, prereqs, next-action suggestion, limitations>
-#   """
-# - No other triple-quoted strings anywhere.
-# - Add one comment near run(): # Example: run({'task_text':'...','asked_for':'...','trace':[],'actions_spec':{}})
-
-# SELF_TEST:
-# - Include def self_test() -> bool with exactly 2 tests (good + bad).
-# - self_test() MUST NEVER raise; return False on exception.
-# - Good test must verify ALL of:
-#   - status is 'can_answer'
-#   - answer_recommendation equals 3 (derive from len([1,2,3]) OR accept last_ok_output=3)
-#   - hallucinated actions do not exist
-#   - contract_ok is False when trim/prefix edits are applied AND solver_suggestion begins with required prefix
-# - Bad test: prereq missing case:
-#   - trace contains action B ok==True
-#   - actions_spec has B with prereq action A
-#   - expect status == 'need_step' and next_action.action == 'A'
-
-# FINAL CHECK (REQUIRED)
-# - Output markers present, exact signature, forbidden substrings absent, and "set" substring absent.
-                                        
-# Generate a tool based on these instructions and the provided user message:
-# ''').strip()
-
-
-
-
-
-
-# TOOLGEN_USER_APPENDIX = textwrap.dedent('''
-# Reasoning: low
-# You are ToolGen. Generate ONE reusable, domain-agnostic analysis tool for multi-step agent loops.
-
-# HARD OUTPUT
-# - Output ONLY:
-#   ###TOOL_START
-#   (raw Python source only)
-#   ###TOOL_END
-# - Always include markers.
-# - Include ONE short name comment: # tool_name: <short_snake_case>_generated_tool  (<= ~3 words)
-
-# HARD RULES
-# - stdlib only; deterministic.
-# - Implement ONLY: def run(payload: dict) -> dict
-# - run() never raises (wrap all).
-# - FORBIDDEN anywhere (code/comments/strings): sudo,useradd,usermod,groupadd,chmod,chgrp
-# - CRITICAL: substring "set" must NOT appear anywhere in the Python source (any case, any context).
-
-# DOCSTRING (HARD)
-# File MUST start with EXACTLY ONE 3-line module docstring:
-# """
-# <single-line detailed description about what the tool does, must include: contract guard, prereqs, next-action suggestion, limitations> INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec; optional=constraints,output_contract,draft_response,candidate_output,env_observation
-# """
-# No other triple quotes anywhere.
-
-# CONTRACT (HARD)
-# Near run(), include EXACT lines:
-# # INVOKE_WITH: {"args":[{"payload": <RUN_PAYLOAD> }], "kwargs":{}}
-# # RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec"]
-# # RUN_PAYLOAD_OPTIONAL: ["constraints","output_contract","draft_response","candidate_output","env_observation"]
-# # INVOKE_EXAMPLE: {"args":[{"payload":{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{}}}],"kwargs":{}}
-# # input_schema_required: task_text, asked_for, trace, actions_spec
-# # input_schema_optional: constraints, output_contract, draft_response, candidate_output, env_observation
-
-# INPUTS
-# Required: task_text(str), asked_for(str), trace(list[dict]|list[str]), actions_spec(dict)
-# Optional: constraints(list[str]), output_contract(dict), draft_response(str), candidate_output(str), env_observation(any)
-# - If trace is list[str], normalize to list[dict] with {'action':<str>,'ok':None,'output':None}
-# - If actions_spec missing/{} => status='blocked', errors include "missing_actions_spec", next_action=None
-
-# OUTPUT (HARD)
-# Always return dict keys:
-# status, next_action, answer_recommendation, plan, validation, rationale, errors, warnings
-# - status in {'need_step','can_answer','blocked','error'}
-# - plan is EXACTLY 5 steps (ids '1'..'5')
-# - validation includes keys: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations
-# - rationale has >=2 short strings
-# - Missing required payload key => blocked + "missing_payload_key:<k>"
-# - If can_answer => answer_recommendation non-None else None
-# - next_action ONLY from actions_spec
-
-# MINIMAL LOGIC (REQUIRED)
-# - desired_kind from asked_for.lower(): numeric/boolean/id_like/string (as in prior prompt)
-# - last_ok_output = most recent trace ok==True output
-# - candidate_value: accept last_ok_output if matches kind else derive:
-#   numeric: len(list/tuple/dict) or single int from str via regex \\d+
-#   boolean: yes/true/no/false from str
-#   Record derivations in validation['derivations']
-# - completion rules: numeric=int/float(not bool), boolean=bool, id_like=str(2..128,[A-Za-z0-9_\\-#]), string=not None
-# - Hallucinated actions: if action missing/non-str => errors add "hallucinated_action:null"; if not in actions_spec => "hallucinated_action:<a>"
-#   If any => status='error', next_action=None (errors MUST include those strings)
-# - Prereqs: actions_spec[action].prerequisites; require prior ok prereq action; optional 'contains' substring in str(prior.output)
-#   Record ONLY in validation['prereq_violations'] as "prereq_violation:<act>:<missing_action>"
-# - constraints => warnings "uncovered_constraint:<c>" when c not found in (task_text+asked_for+trace).lower()
-# - Contract guard if draft_response str and output_contract dict:
-#   apply edits: trim, one_line, allow_prefixes (prepend), forbid_substrings, require_substrings, max_chars (truncate)
-#   contract_ok True IFF contract_violations empty (edits count as violations)
-# - Status/next_action:
-#   blocked on missing keys / missing actions_spec;
-#   error on hallucinated_action;
-#   need_step on prereq violations (next_action=missing prereq action if present);
-#   can_answer if complete else need_step with lexicographically smallest action in actions_spec containing any keyword:
-#   inspect,list,show,get,query,check,validate,derive,transform,compute,open,read,view,load,parse,fetch
-
-# SELF_TEST (HARD)
-# Include def self_test() -> bool with exactly 2 tests (never raise):
-# - Good: can_answer and answer_recommendation==3 (len([1,2,3]) or last_ok_output=3), no hallucinated_action, contract_ok False when trim/prefix applied and solver_suggestion startswith required prefix
-# - Bad: prereq missing (B ok==True, B requires A) => need_step and next_action.action=='A'
-
-# Generate a tool based on these instructions and the provided user message:
-# ''').strip()
-
-
-# TOOLGEN_USER_APPENDIX = textwrap.dedent('''
-# Reasoning: low
-# You are ToolGen. Generate ONE reusable, domain-agnostic analysis tool for multi-step agent loops.
-
-# ========================
-# OUTPUT FORMAT (HARD #1)
-# ========================
-# - Output MUST be ONLY this, with NOTHING before/after:
-# Line 1: ###TOOL_START
-# Then: raw Python source (no markdown, no prose, no JSON)
-# Last line: ###TOOL_END
-# - If you cannot comply, still output the markers + best-effort Python. Never omit markers.
-# - Include a short tool name in the code as a single comment line:
-#   # tool_name: <short_snake_case>_generated_tool
-#   Keep it under ~3 words; do NOT copy the full task text.
-
-# ========================
-# NON-NEGOTIABLE RULES
-# ========================
-# - Python standard library ONLY.
-# - Deterministic: no randomness.
-# - Implement ONLY: def run(payload: dict) -> dict  (exact signature)
-# - run() MUST NEVER raise: wrap everything in try/except.
-#   On exception, return a dict with keys:
-#   status='error', errors(list[str]), warnings(list[str]),
-#   next_action, answer_recommendation, plan, validation, rationale.
-# - Basic type guards before calling methods (e.g., guard .lower()).
-
-# SAFETY (HARD)
-# - ABSOLUTELY FORBIDDEN anywhere in code/comments/strings:
-#   'sudo', 'useradd', 'usermod', 'groupadd', 'chmod', 'chgrp'
-
-# NOTE ON UNIQUENESS (SOFT)
-# - Avoid using Python's set() type. Prefer dict membership for uniqueness.
-
-# ========================
-# TOOL PURPOSE
-# ========================
-# This tool analyzes: task_text + asked_for + trace + actions_spec (+ optional constraints/contract)
-# and returns:
-# - whether the solver can answer now,
-# - what action to do next (ONLY from actions_spec),
-# - validation signals (prereq gaps, contract guard, derivations),
-# - short rationale strings that help the orchestrator and solver.
-
-# It MUST NOT execute external actions. It MUST NOT assume any domain ontology.
-
-# SOLVER RECOMMENDATION (CONTEXT)
-# - The user message may include draft_response, which is a draft output from the solver.
-# - Use it to validate or strengthen that draft for the current task.
-
-# ========================
-# ORCHESTRATOR GUIDANCE (DOCSTRING MUST INCLUDE THIS)  (HARD)
-# ========================
-# The ONE module docstring (the first 3 lines) MUST include, verbatim, an "INPUT_SCHEMA:" clause that lists required/optional keys.
-
-# Format requirements (HARD):
-# - The docstring single-line description MUST contain this exact substring: "INPUT_SCHEMA:"
-# - Immediately after "INPUT_SCHEMA:" include:
-#   "required=task_text,asked_for,trace,actions_spec; optional=constraints,output_contract,draft_response,candidate_output,env_observation"
-# - Also include, in the same single line, these concepts: contract guard, prereqs, next-action suggestion, limitations (no persistence; only analyzes payload; does not call tools).
-
-# Example (must be one single line inside the docstring):
-# INPUT_SCHEMA: required=task_text:str,asked_for:str,trace:list[dict]|list[str],actions_spec:dict; optional=constraints:list[str],output_contract:dict,draft_response:str,candidate_output:str,env_observation:any
-
-# ========================
-# INVOCATION CONTRACT (HARD)
-# ========================
-# The tool MUST document BOTH:
-# (A) the controller wrapper shape (how to call the tool), and
-# (B) the run() payload shape (what run(payload) receives).
-
-# Near run(), include this EXACT 3-line comment block (verbatim keys + formatting):
-# # INVOKE_WITH: {"args":[{"payload": <RUN_PAYLOAD> }], "kwargs":{}}
-# # RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec"]
-# # RUN_PAYLOAD_OPTIONAL: ["constraints","output_contract","draft_response","candidate_output","env_observation"]
-
-# Also include ONE example in a single comment line:
-# # INVOKE_EXAMPLE: {"args":[{"payload":{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{}}}],"kwargs":{}}
-
-# ========================
-# SCHEMA ECHO (HARD)
-# ========================
-# In addition to the docstring, include a short comment block near run() that repeats the contract so it can be extracted if needed:
-# # input_schema_required: task_text, asked_for, trace, actions_spec
-# # input_schema_optional: constraints, output_contract, draft_response, candidate_output, env_observation
-
-# ========================
-# INPUTS (HARD)
-# ========================
-# payload required keys:
-# - task_text: str
-# - asked_for: str
-# - trace: list[dict] | list[str]
-# - actions_spec: dict
-# Optional:
-# - constraints: list[str]
-# - output_contract: dict
-# - draft_response: str
-# - candidate_output: str (latest proposed action/step or partial answer)
-# - env_observation: any
-
-# Trace steps (best effort; tolerate extras):
-# - action, args, ok, output, error
-
-# trace accepted forms (HARD):
-# - trace may be list[dict] OR list[str]
-# - If list[str], run() MUST normalize into list[dict] with at least:
-#   {'action': <parsed_action_string>, 'ok': None, 'output': None, 'args': None, 'error': None}
-# - After normalization, ALL internal logic must treat trace as list[dict]
-
-# actions_spec:
-# - { action_name: { 'prerequisites': list[dict]|None } }
-# HARD: If actions_spec is missing OR empty dict:
-# - status MUST be 'blocked'
-# - errors MUST include "missing_actions_spec"
-# - next_action MUST be None
-
-# ========================
-# OUTPUTS (HARD)
-# ========================
-# run() MUST ALWAYS return a dict with these keys:
-# - status: 'need_step'|'can_answer'|'blocked'|'error'
-# - next_action: {'action': str, 'args': any} | None
-# - answer_recommendation: any | None
-# - plan: list[dict]   (may be empty; keep simple)
-# - validation: dict   (must include: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations, constraints_ok, uncovered_constraints)
-# - rationale: list[str]  (must include at least 2 short strings)
-# - errors: list[str]
-# - warnings: list[str]
-
-# Rules:
-# - If missing required payload keys => status='blocked' and errors include "missing_payload_key:<k>".
-# - If status == 'can_answer' => answer_recommendation MUST be non-None.
-# - Else => answer_recommendation MUST be None.
-# - next_action MUST reference ONLY an action present in actions_spec (never invent).
-
-# ========================
-# MINIMAL LOGIC (MUST BE CORRECT)
-# ========================
-# A) Infer desired_kind from asked_for (lowercased):
-# - numeric if contains 'count' or 'number' or 'how many'
-# - boolean if starts with 'is'/'are'/'does'/'can' OR contains 'true'/'false'/'yes'/'no'
-# - id_like if contains 'id' or 'identifier' OR contains '#'
-# - else: string
-
-# B) last_ok_output:
-# - most recent trace step with ok==True => its output (else None)
-
-# C) Candidate value selection:
-# - If candidate_output is provided and non-empty, prefer it as candidate_value (but still validate kind).
-# - Else if last_ok_output matches desired_kind (per completion rules), candidate_value = last_ok_output
-# - Else attempt derivation from last_ok_output.
-
-# D) Derivations:
-# - numeric + last_ok_output is list/tuple/dict => derived=len(output), add 'from_len'
-# - numeric + last_ok_output is str => if exactly one integer substring via regex \\d+, parse it, add 'from_str_int'
-# - boolean + last_ok_output is str => exact 'yes'/'true'->True, 'no'/'false'->False, add 'from_str_bool'
-# - Store derivations list in validation['derivations'] and keep derived_value separately.
-
-# E) Completion check (candidate_value only):
-# - numeric: int/float (not bool)
-# - boolean: bool
-# - id_like: str len 2..128, only alnum plus '_' '-' '#'
-# - string: candidate_value is not None
-# complete = True iff candidate_value passes
-
-# F) Hallucinated actions (HARD REQUIREMENT):
-# - For each trace step:
-#   - If action is missing/empty/non-str => append error "hallucinated_action:null"
-#   - Else if action not in actions_spec => append error "hallucinated_action:<action>"
-# - If any hallucinated_action errors exist => status MUST be 'error' and next_action=None.
-
-# G) Prerequisites:
-# - For each trace step action that has prerequisites:
-#   - require a prior ok step with prereq action
-#   - if prereq has 'contains': require that substring in str(prior.output)
-# - Missing prereq => record in validation['prereq_violations'] as "prereq_violation:<act>:<missing_action>"
-# - Prereq violations MUST NOT be placed into errors.
-
-# H) Constraints (HIGH-IMPACT CHANGE: constraints gate completion):
-# - If constraints is a list of strings:
-#   - For each constraint c:
-#     - Consider it "covered" only if c appears (case-insensitive) in EITHER:
-#       (1) any trace step 'action' string, OR
-#       (2) str(trace step 'args'), OR
-#       (3) str(trace step 'output'), OR
-#       (4) str(env_observation) if provided
-#   - Any not covered => add to uncovered_constraints and add warning "uncovered_constraint:<c>"
-# - validation must include:
-#   - uncovered_constraints: list[str]
-#   - constraints_ok: bool (True iff uncovered_constraints is empty)
-# - IMPORTANT: If constraints_ok is False, you MUST NOT return status='can_answer' even if complete==True.
-
-# I) Contract guard (validation only; deterministic):
-# - If draft_response is a non-empty str and output_contract is a dict:
-#   - Produce solver_suggestion by applying these edits in order:
-#     1) strip whitespace (record 'trimmed' if changed)
-#     2) one_line: replace line breaks with spaces (record 'one_line' if changed)
-#     3) allow_prefixes list: ensure startswith one of them; if not, prepend first prefix + space (record 'prefix_added')
-#     4) forbid_substrings: if any present (case-insensitive) record "forbid_substring:<x>"
-#     5) require_substrings: if missing (case-insensitive) record "require_substring:<x>"
-#     6) max_chars int: if exceeded, truncate and record "max_chars:<n>"
-# - contract_ok MUST be True IFF there are NO contract_violations at all.
-# - Always store: contract_ok (bool), contract_violations (list), solver_suggestion (str|None)
-
-# J) Choose status/next_action deterministically:
-# Order:
-# 1) If actions_spec missing/empty => status='blocked', errors include "missing_actions_spec", next_action=None
-# 2) If missing required payload keys => status='blocked'
-# 3) Else if hallucinated_action errors => status='error', next_action=None
-# 4) Else if prereq_violations exist:
-#    - status='need_step'
-#    - next_action = {'action': <missing_prereq_action>, 'args': {}} IF it exists in actions_spec else None
-# 5) Else if complete AND constraints_ok:
-#    - status='can_answer'
-#    - answer_recommendation = candidate_value
-# 6) Else:
-#    - status='need_step'
-#    - next_action selection:
-#      - Prefer an action whose name contains (case-insensitive) one of: 'relations','inspect','list','show','get','query','check','validate','derive','parse'
-#      - Choose the lexicographically smallest among matches.
-#      - If none, next_action=None
-
-# K) Rationale (MUST NOT BE EMPTY):
-# Return at least 2 short items, e.g.:
-# - "kind=<desired_kind>"
-# - "complete=<true/false>"
-# Optionally add: "constraints_ok=<true/false>", "uncovered=<n>", "contract_ok=<true/false>", "prereq_missing=<n>", "next=<action_or_none>"
-
-# L) Plan:
-# - Keep simple: return [] OR a few short dict items. No fixed length requirement.
-
-# ========================
-# DOCSTRING + SELF_TEST (HARD, MINIMAL)
-# ========================
-# - Begin file with EXACTLY ONE module docstring as first three lines:
-#   """
-#   <single-line detailed description about what the tool does, must include: contract guard, prereqs, next-action suggestion, limitations>
-#   """
-# - No other triple-quoted strings anywhere.
-# - Add one comment near run(): # Example: run({'task_text':'...','asked_for':'...','trace':[],'actions_spec':{}})
-
-# SELF_TEST:
-# - Include def self_test() -> bool with exactly 2 tests (good + bad).
-# - self_test() MUST NEVER raise; return False on exception.
-# - Good test must verify ALL of:
-#   - status is 'can_answer'
-#   - answer_recommendation equals 3 (derive from len([1,2,3]) OR accept last_ok_output=3)
-#   - no hallucinated_action errors
-#   - constraints_ok is True when constraints are covered
-#   - contract_ok is False when trim/prefix edits are applied AND solver_suggestion begins with required prefix
-# - Bad test: prereq missing case:
-#   - trace contains action B ok==True
-#   - actions_spec has B with prereq action A
-#   - expect status == 'need_step' and next_action.action == 'A'
-
-# FINAL CHECK (REQUIRED)
-# - Output markers present, exact signature, forbidden substrings absent, and next_action never invents actions.
-
-# Generate a tool based on these instructions and the provided user message:
-# ''').strip()
 
 
 
@@ -1304,7 +453,7 @@ STATE (HARD)
 OUTPUTS (HARD)
 ========================
 run() MUST ALWAYS return dict with ONLY these keys:
-- status: 'need_step'|'can_answer'|'blocked'|'error'
+- status: 'need_step'|'done'|'blocked'|'error'
 - next_action: {'action': str, 'args': dict} | None
 - answer_recommendation: any | None
 - state: dict  (updated state schema)
@@ -1314,15 +463,15 @@ run() MUST ALWAYS return dict with ONLY these keys:
 
 Rules:
 - Missing required key => status='blocked' and errors include "missing_payload_key:<k>"
-- next_action.action MUST be in actions_spec (never invent)
-- If status=='can_answer' => answer_recommendation non-None
+- next_action.name MUST be in actions_spec (never invent)
+- If status=='done' => answer_recommendation non-None
 - Else => answer_recommendation None
 - If status=='need_step' and next_action is None:
   errors MUST include "no_valid_next_action" and rationale MUST explain why
 
 NEXT_ACTION ARGS (HARD):
 - If next_action present => {"action":"<name>","args":{...}}
-- next_action.args MUST ALWAYS be a dict (use {})
+- next_action.args MUST ALWAYS be a list (use [])
 
 ========================
 MINIMAL BEHAVIOR (HARD)
@@ -1345,7 +494,7 @@ MINIMAL BEHAVIOR (HARD)
      - candidate_output may be used ONLY if it matches desired_kind; otherwise ignore it
      - For numeric: accept int/float (not bool) OR derive len(list/dict) OR parse first \\d+ from a string
      - For string: accept any non-None last_ok_output
-     - If usable value found => status='can_answer' and answer_recommendation set; next_action=None
+     - If usable value found => status='done' and answer_recommendation set; next_action=None
 4) State cursor/history:
    - cursor is a short phase string like 'start','after_step','answered'
    - append one short history string each call
@@ -1356,7 +505,7 @@ FINAL CHECK (HARD)
 ========================
 - Markers present; stdlib only; forbidden substrings absent
 - Signature exact; file <= 90 lines
-- next_action never invents; next_action.args is dict (never None)
+- next_action never invents; next_action.args is list (never None)
 - state cursor string; history list[str]; atomic write used
 
 Generate the tool based on these instructions and the provided user message:
@@ -1365,188 +514,302 @@ Generate the tool based on these instructions and the provided user message:
 
 AGG_TOOLGEN_USER_KG = textwrap.dedent('''
 Reasoning: low
-You are ToolGen. Generate ONE reusable, domain-agnostic analysis + state-tracking Python tool for multi-step agent loops.
+You are ToolGen. Generate ONE minimal, robust Python-stdlib tool for the Knowledge-Graph environment.
+Goal: GENERIC across KG tasks (not domain-specific), helps multi-step progress by suggesting the best next KG action.
 
 ========================
-OUTPUT (HARD)
+OUTPUT (ABSOLUTE HARD)
 ========================
-Output ONLY:
+Output ONLY (no prose/markdown/JSON wrapper):
 ###TOOL_START
 <raw python source>
 ###TOOL_END
-Always include markers even on failure.
-Include near top: # tool_name: <short_snake_case>_generated_tool (<= ~4 words; function not task)
+- Markers exactly once each, first/last lines.
+- If about to output anything else: STOP -> output markers + best-effort Python.
+- Near top comment: # tool_name: kg_min_generated_tool
 
 ========================
-CORE RULES (HARD)
+CODE / SAFETY (HARD)
 ========================
-- Python stdlib ONLY. Deterministic.
-- Implement: def run(payload: dict) -> dict ; def self_test() -> bool (required)
-- run() MUST NEVER raise; wrap in try/except; on exception return:
-  status='error', errors[], warnings[], next_action=None, answer_recommendation=None, plan=[], validation={}, rationale=[...]
-- Type-guard before methods. Never rely on dict insertion order: keys = sorted(actions_spec.keys()).
-SAFETY (HARD): forbidden anywhere in code/comments/strings: 'sudo','useradd','usermod','groupadd','chmod','chgrp'
+- Python stdlib only. Deterministic. No network. No randomness. No eval/exec.
+- Forbidden anywhere: sudo,useradd,usermod,groupadd,chmod,chgrp
+- Top-level imports only. Python 3.8+; NO walrus (:=), NO match/case.
+- Implement EXACTLY:
+  def run(payload: dict) -> dict
+  def self_test() -> bool
+- run() MUST NEVER raise: wrap whole body in try/except Exception.
+  On exception: return JSON-safe dict with ALL required output keys AND validation.contract_ok=False.
 
 ========================
-DOCSTRING SCHEMA (HARD)
+JSON-SAFE ONLY (HARD)
 ========================
-File MUST begin with EXACTLY ONE 3-line module docstring (no other triple quotes):
+- Output and persisted state MUST be JSON-serializable.
+- Forbidden types: set, tuple, bytes, pathlib.Path, re.Match
+- Any internal set => sorted(list(...)) before storing/returning.
+
+========================
+MODULE DOCSTRING (HARD)
+========================
+File MUST start with EXACTLY ONE 3-line module docstring; no other triple quotes anywhere:
 """
-<ONE LINE that includes: contract guard, prereqs, next-action suggestion, limitations
-AND includes EXACTLY this schema clause:
-INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation
->
+contract guard + prereqs + next-action suggestion + limitations. INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation >
 """
 
 ========================
-INVOCATION + SCHEMA ECHO (HARD)
+CONTRACT BLOCK (HARD)
 ========================
-Near run(), include EXACT comment block:
+Include this exact block verbatim TWICE:
+(1) immediately after the module docstring
+(2) immediately above def run(payload: dict) -> dict:
+
 # INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
 # RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec","run_id","state_dir"]
 # RUN_PAYLOAD_OPTIONAL: ["constraints","output_contract","draft_response","candidate_output","env_observation"]
 # INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state"}], "kwargs":{}}
-# Example: run({'task_text':'...','asked_for':'...','trace':[],'actions_spec':{},'run_id':'r1','state_dir':'./state'})
-# input_schema_required: task_text, asked_for, trace, actions_spec, run_id, state_dir
-# input_schema_optional: constraints, output_contract, draft_response, candidate_output, env_observation
 
 ========================
-STATE (HARD)
+REQUIRED PAYLOAD / OUTPUT
 ========================
-- Persist local JSON only: <state_dir>/<run_id>.json ; MUST os.makedirs(state_dir, exist_ok=True) before any I/O.
-- Load existing or init; update deterministically; atomic write (tmp then os.replace).
-- Required state schema: {"cursor":"<string>","history":["<step>"],"notes":{}}
-  cursor ALWAYS string ("" if unknown). history ONLY strings; append exactly one short string per run().
+Required payload keys: task_text, asked_for, trace, actions_spec, run_id, state_dir
+Output keys ALWAYS (exactly): status, next_action, answer_recommendation, errors, warnings, validation
 
 ========================
-INPUTS + NORMALIZATION (HARD)
+VALIDATION (HARD)
 ========================
-Required: task_text, asked_for, trace, actions_spec, run_id, state_dir
-Optional: constraints, output_contract, draft_response, candidate_output, env_observation
-- If trace is list[str] => list[dict]: {'action':<str>, 'ok':None, 'output':None, 'args':{}, 'error':None, 'raw':None}
-- If trace is list[dict], normalize each: ensure keys action/ok/output/args/error/raw exist; if args missing/None/non-dict => {}
-- IMPORTANT: if step has non-empty raw and args is {} or missing required fields, parse raw into fields best-effort:
-  patterns: get_relations(X), get_neighbors(X, REL), intersection(A,B), get_attributes(X, REL), count(X), argmax(X, REL), argmin(X, REL)
-  also parse outputs: "-> #k", "Variable #k", "ERROR ..." into output/error/ok hints.
-If actions_spec missing/empty => status='blocked', errors include "missing_actions_spec", next_action=None
+validation MUST be JSON object with exactly:
+- contract_ok: bool
+- violations: list[str]
+
+Meaning of contract_ok = "output complies with contract", NOT "task solved".
+contract_ok MUST be True whenever:
+- output has all required output keys
+- values are JSON-safe
+- next_action is None OR {"name":str,"args":list}
+- missing required payload keys handled via status="blocked" (still contract_ok=True)
+
+contract_ok MUST be False ONLY when:
+- tool failed to comply (exception, malformed output, non-JSON-safe, invalid next_action shape)
+violations: short machine-readable strings when contract_ok=False else [].
 
 ========================
-OUTPUTS (HARD)
+MINIMUM BEHAVIOR (HARD)
 ========================
-run() MUST ALWAYS return dict with keys:
-status('need_step'|'can_answer'|'blocked'|'error'),
-next_action({'action':str,'args':dict}|None),
-answer_recommendation(any|None),
-plan(list[dict]),
-validation(dict keys: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations, constraints_ok, uncovered_constraints),
-rationale(list[str] >=2), errors(list[str]), warnings(list[str])
-Rules:
-- Missing required payload key => blocked + "missing_payload_key:<k>"
-- status=='can_answer' => answer_recommendation non-None; else MUST be None
-- next_action.action MUST be key in actions_spec; next_action.args MUST be dict
-- If status=='need_step' and next_action is None => errors include "no_valid_next_action" + rationale why
+1) Missing required payload keys:
+   - status="blocked"
+   - errors includes "missing_payload_key:<k>" for each missing key (sorted)
+   - next_action=None, warnings=[], answer_recommendation=None
+   - validation={"contract_ok": True, "violations": []}
+
+2) actions_spec sanitize (never block):
+   - allowed={"get_relations","get_neighbors","intersection","get_attributes","count","argmax","argmin"}
+   - usable_actions = sorted(keys ∩ allowed) if actions_spec is dict else []
+   - if actions_spec has other keys => warning "actions_spec_sanitized"
+
+3) State persistence (JSON only):
+   - file: <state_dir>/<run_id>.json ; mkdirs + atomic write (tmp then os.replace)
+   - if missing/corrupt: reset {"history":[], "notes":{}}
+   - append exactly ONE short history string per run() (<=120 chars)
+   - persist only JSON-safe primitives
+
+4) Normalize defensively:
+   - any text field: value if str else ""
+   - trace: list[str] OR list[dict] -> normalize to list[str]
+   - trace_action_lines = [line for line in normalized trace if line startswith "Action:"]
+   - never regex on None; optional keys may be absent.
 
 ========================
-MINIMAL LOGIC (MUST BE CORRECT)
+ROBUST EXTRACTION (GENERIC)
 ========================
-A) desired_kind from asked_for.lower():
-numeric if 'count'/'number'/'how many'; boolean if startswith 'is'/'are'/'does'/'can' or contains 'true'/'false'/'yes'/'no';
-id_like if contains 'id'/'identifier' or '#'; else string
-B) last_ok_step = most recent trace step with ok==True else None; last_ok_output = last_ok_step.output else None
-C) candidate_value preference:
-1) If candidate_output non-empty AND matches desired_kind => use
-2) Else if last_ok_output matches desired_kind => use
-3) Else derive:
-   numeric + (list/tuple/dict) => len ('from_len')
-   numeric + str => exactly one integer via regex \\b\\d+\\b AND MUST NOT contain 'Variable #' or '#<digits>' => int ('from_str_int')
-   boolean + str => yes/true=>True, no/false=>False ('from_str_bool')
-Store derivations in validation['derivations'].
-D) completion:
-- numeric: int/float (not bool) AND NOT small int extracted from 'Variable #k' style strings
-- boolean: bool
-- id_like: str 2..128 only [A-Za-z0-9_\\-#] AND MUST NOT startwith 'Variable #'
-- string: complete ONLY if candidate_value is str and passes FINAL-ANSWER GATE
-D2) FINAL-ANSWER GATE FOR STRING (HARD): _looks_final_answer(s)->bool False if any:
-startswith "Variable #"; startswith "["/"{"/"("; contains "base."/"rdf.freebase.com"/"http://"/"https://";
->8 commas OR >3 newlines OR len(strip)>256. True only if non-empty, has >=1 letter, and no violations.
-D3) ANTI-FALSE-CAN_ANSWER (HARD): MUST NOT can_answer if env_observation (or any step.output/error) contains
-"need " or "not " or "wrong" or "type mismatch" or "error" or "must " (case-insensitive). Add rationale "blocked_by_observation".
+Store in state notes (JSON-safe):
+- entities: parse from FIRST bracketed list after substring "Entities" in task_text; else from asked_for; else from "\\n".join(trace_action_lines).
+  Tolerate Entities:[A, B] and Entities: ['A','B'].
+  Split commas; strip whitespace; strip surrounding quotes; defensively strip stray brackets; drop empty.
+  notes["entities"]=list[str]
 
-E) hallucinated actions (HARD):
-For each trace step: missing/empty/non-str => "hallucinated_action:null"; action not in actions_spec => "hallucinated_action:<action>"
-If any => status='error', next_action=None
-F) prerequisites (validation only):
-actions_spec[action] may include prerequisites list[dict] {'action':str,'contains':str|None}
-Satisfied ONLY by PRIOR step with ok==True and matching action; if contains set, require substring in str(prior.output) (case-insensitive).
-Record missing as "prereq_violation:<act>:<missing_action>" in validation['prereq_violations'] (not errors). Once satisfied, never revert.
-G) constraints gate (HARD):
-If constraints is list[str], each must appear (case-insensitive) in any: step.action OR str(step.args) OR str(step.output) OR str(env_observation)
-Uncovered => uncovered_constraints + warnings "uncovered_constraint:<c>"
-constraints_ok True iff uncovered empty. If constraints_ok False => MUST NOT can_answer.
-H) contract guard (validation only):
-If draft_response non-empty str and output_contract dict: apply edits in order:
-trimmed, one_line, allow_prefixes, forbid_substrings, require_substrings, max_chars.
-contract_ok iff no contract_violations.
+- env_observation: payload["env_observation"] if str else ""
+  May contain "Error:" / "Observation:" / "Variable #N" lines.
 
-========================
-FAILURE RECOVERY (HARD; common KG/tool ops)
-========================
-Compute from latest trace + env_observation (stringified, case-insensitive):
-- dead_end_relations: ok get_relations with output [] or startswith "[]"
-- invalid_relation_error: step.error contains "is not a relation" OR "has the following relations: []"
-- opaque_variable: output contains "Variable #k" and later get_relations(#k) is [] (or dead_end_relations on #k)
-- task_limit_pressure: len(trace) >= 10
-Rules:
-1) If invalid_relation_error and 'get_relations' available: next_action MUST be get_relations on SAME var if recoverable (else normal chooser).
-2) If dead_end_relations/opaque_variable: warn; state.notes['dead_end']=<var_or_empty>; MUST NOT target that var on next step.
-3) Anti-loop: do not suggest same next_action.action >2 times within last 5 steps (unless only option).
-4) If task_limit_pressure and complete False: prefer finishers (neighbors after relations; else relations; else intersection; else count only if numeric).
+- observed_vars: collect all "#<digits>" from env_observation AND trace_action_lines
+  notes["observed_vars"]=sorted unique list[str]
+
+- last_action parsing (simple string ops; no complex parsing):
+  from last element of trace_action_lines (if any). Tolerate malformed "Action: get_relations(['X')" etc.
+  Extract action name and up to 2 args; clean args by stripping whitespace then repeatedly stripping
+  leading/trailing brackets+quotes (up to 3 passes).
+
+- prereq error recovery:
+  if env_observation contains "Execute get_relations for X before executing get_neighbors"
+  extract X between "for " and " before" (best effort) and clean with same routine.
+
+- relations list parsing from Observation:
+  if env_observation has "Observation:" followed by a bracket list "[...]", parse tokens inside FIRST such brackets.
+  relation-like token contains "." OR "/".
+  Maintain notes["relations_by_subject"] as dict[str, list[str]] (default {}).
+  If last action is get_relations(X) and Observation list exists:
+    notes["relations_by_subject"][X] = parsed_relations_sorted_deduped
+  Do NOT invent relations. notes["last_relations"] optional for backward compatibility only; must NOT drive get_neighbors.
+
+- relation choice (generic, question-driven):
+  Maintain notes["chosen_relation_by_subject"] as dict[str,str] (default {}).
+  For subject X: rels = notes["relations_by_subject"].get(X, []); chosen = notes["chosen_relation_by_subject"].get(X,"")
+  If chosen empty and rels non-empty: pick one (deterministic) and store to chosen_relation_by_subject[X].
+  Optional legacy fallback:
+    if notes["chosen_relation"] empty and notes["last_relations"] non-empty:
+      keyword-score using asked_for (case-insensitive):
+        +2 if any asked_for word len>=4 is substring of relation
+        +1 if relation contains any of:
+           name,type,label,description,alias,profession,country,date,time,year,location,ingredient,species,texture,source
+      pick highest; tie -> lexicographic; store notes["chosen_relation"].
+  Never block if cannot choose.
 
 ========================
-STATUS + NEXT_ACTION (deterministic + args-aware)
+INVALID RELATION RECOVERY (CORE FIX)
 ========================
-Order:
-1) missing required keys => blocked
-2) actions_spec missing/empty => blocked + "missing_actions_spec"
-3) hallucinated_action => error
-4) prereq_violations exist => need_step; choose first missing prereq action present (sorted) else None
-5) if complete AND constraints_ok AND not blocked_by_observation => can_answer; answer_recommendation=candidate_value; next_action=None
-6) else need_step; choose next_action:
-   keys=sorted(actions_spec.keys()); last_action = most recent normalized step.action; asked=asked_for.lower()
-   Prefer: (a) last_action=='get_relations' and 'get_neighbors' => get_neighbors
-           (b) last_action=='get_neighbors' and 'intersection' => intersection
-   Then first available from: get_relations, get_neighbors, intersection, get_attributes, count
-   Then keyword match: first key where key.lower() in asked
-   Fallback: first key in keys, BUT never choose argmax/argmin unless asked contains 'max'/'min'
-ARGS-AWARE (HARD): if chosen action typically requires args and you cannot construct them from parsed trace/raw/state:
-- do NOT return empty args; instead choose an action that can get needed info (prefer get_relations on last var/entity).
-- For intersection, require two vars of same type if known; if last two vars differ (e.g., setting vs character), avoid intersection.
-
-Apply FAILURE RECOVERY vetoes (dead var, anti-loop, invalid_relation_error rule).
-
-Rationale MUST include: "kind=<...>", "complete=<...>", and one of:
-"nonfinal:string_dump" | "constraints_blocked" | "blocked_by_observation" | "prereq_missing=<n>" | "next=<action_or_none>" | "dead_end" | "task_limit_pressure"
+If env_observation contains "is not a relation of the":
+- Best-effort extract relation R and subject X from a substring like:
+  "get_neighbors: <R> is not a relation of the <X>."
+- Clean X and R with same clean-arg routine.
+- Maintain notes["invalid_pairs"] as list[str] (default []).
+  Append "X|R" then dedup+sort.
+- If env_observation also contains "has the following relations:" followed by FIRST bracket list:
+  parse relation-like tokens and store as canonical:
+    notes["relations_by_subject"][X] = parsed_relations_sorted_deduped
+Do NOT invent relations.
 
 ========================
-SELF_TEST (HARD; MUST INCLUDE)
+STRICT PREREQS (HARD)
 ========================
-Deterministic self_test returns True only if ALL pass:
-- relations dump string like "[base.foo, http://...]" does NOT yield can_answer
-- candidate_output "Variable #0, ..." does NOT yield can_answer (numeric/id_like/string)
-- from_str_int must NOT extract from "Variable #k" or "#k" contexts
-- If env_observation contains "need" or "wrong" tool must NOT can_answer even if candidate looks complete
-- Prevent argmax-first when get_relations pending
-- Prereq requires ok==True
-- NEW: if get_relations(#2) ok==True output==[] then tool must NOT suggest get_neighbors targeting #2 next
-- NEW: if last_action get_relations then suggested get_neighbors must NOT have empty args (either construct args or choose get_relations instead)
+Before suggesting get_neighbors(X,R), ensure trace_action_lines contains string EXACTLY:
+"Action: get_relations(X)" for that X.
+If not, suggest get_relations(X) first.
+
+Also before suggesting get_neighbors(X,R):
+- require R in notes["relations_by_subject"].get(X, [])
+- require (X+"|"+R) NOT in notes.get("invalid_pairs", [])
 
 ========================
+NEXT_ACTION SHAPE + NEVER-REPEAT (HARD)
+========================
+- next_action is None OR {"name":<str>, "args":<list>}
+- NEVER return next_action as a string.
+- If status=="need_step" and usable_actions not empty => next_action MUST be non-null (best effort).
+
+Never-repeat:
+- last_action_line = last of trace_action_lines (or "")
+- proposed_action_line = "Action: <name>(<comma+space args>)"
+- if proposed_action_line == last_action_line => do NOT propose it; fall back.
+
+Also: if proposing get_neighbors(X,R) and "X|R" in notes["invalid_pairs"] => do NOT propose; fall back.
+
+========================
+GENERIC NEXT_ACTION LOGIC (ORDERED; TASK-AGNOSTIC)
+========================
+Drive decisions ONLY by: entities, observed_vars, env_observation (errors + Observation), asked_for keywords.
+Do NOT hardcode domain terms.
+
+Definitions (use notes):
+- entities = notes.get("entities", [])
+- vars = notes.get("observed_vars", [])
+- asked_l = asked_for.lower()
+- is_count_q = ("how many" in asked_l) or ("number of" in asked_l) or ("count" in asked_l)
+- want_attributes = any(w in asked_l for w in ["highest","lowest","maximum","minimum","largest","smallest","earliest","latest","most","least"])
+
+Maintain note slots (strings only):
+notes["var_e0"], notes["var_e1"], notes["var_join"], notes["last_var_created"]
+
+Update from env_observation:
+- If contains "Variable #<n>":
+  notes["last_var_created"]="#<n>"
+  If notes["var_e0"] empty and last action was get_neighbors(entity0, ...) => set var_e0
+  Else if notes["var_e1"] empty and last action was get_neighbors(entity1, ...) => set var_e1
+  Else if last action was intersection(var_e0,var_e1) => set var_join
+
+Priority actions:
+A) Error recovery:
+   - If prereq error extracted X and "get_relations" usable => propose get_relations(X)
+   - Else if invalid relation error extracted subject X:
+       if "get_relations" usable and Action: get_relations(X) not already in trace_action_lines => propose get_relations(X)
+       else continue (do NOT repeat invalid get_neighbors)
+
+B) If we just called get_relations(Xr) and we have a chosen relation and get_neighbors usable:
+   - Detect most recent get_relations argument Xr from trace_action_lines (best-effort)
+   - Let R = chosen_relation_by_subject.get(Xr,"") or notes.get("chosen_relation","")
+   - Propose get_neighbors(Xr,R) ONLY if prereqs satisfied AND R in notes["relations_by_subject"].get(Xr, []) AND (Xr+"|"+R) not invalid.
+
+C) Bootstrap up to two entities:
+   - e0 = entities[0] if any else ""
+   - e1 = entities[1] if len>1 else ""
+   - If var_e0 empty:
+       if "get_relations" usable and Action: get_relations(e0) not in trace => propose get_relations(e0)
+       else if "get_neighbors" usable and have valid subject-scoped R and prereqs satisfied => propose get_neighbors(e0,R)
+     (subject-scoped R must be in relations_by_subject[e0] and not invalid; else fall back to get_relations(e0) if usable)
+   - Else if e1 and var_e1 empty:
+       similarly for e1
+
+D) Join / constrain:
+   - If var_e0 and var_e1 and var_join empty and "intersection" usable => propose intersection(var_e0,var_e1)
+
+E) Question-driven finishing moves:
+   - If is_count_q and vars and "count" usable => propose count(vars[0])
+   - Else if want_attributes and vars and "get_attributes" usable => propose get_attributes(vars[0])
+
+F) Exploration when stuck:
+   - If vars and "get_relations" usable and Action: get_relations(vars[0]) not in trace => propose get_relations(vars[0])
+   - Else if entities and "get_relations" usable => pick first entity not yet used in get_relations(...) and propose it
+   - Else next_action=None
+
+========================
+STATUS / ANSWER
+========================
+- status="blocked" only for missing required payload keys.
+- done only if candidate_output is a string "#<digits>" AND that var is in notes["observed_vars"].
+  If done: status="done", answer_recommendation="Final Answer: <var>", next_action=None.
+- otherwise status="need_step", answer_recommendation=None.
+
+========================
+FINAL SANITIZE (HARD)
+========================
+Before returning:
+- output dict must have exactly: status,next_action,answer_recommendation,errors,warnings,validation
+- ensure JSON-safe values
+- if next_action not None:
+  - dict with keys "name"(str) and "args"(list)
+  - args elements must be strings (coerce)
+  - if invalid shape => next_action=None and warning "invalid_next_action_shape"
+- If status=="need_step" and usable_actions not empty and next_action is None => warning "no_viable_next_action"
+- If tool reached end without exception => validation={"contract_ok": True, "violations": []}
+- If any internal exception => validation={"contract_ok": False, "violations": ["exception"]}
+
+========================
+SELF_TEST (HARD)
+========================
+self_test() must:
+- return False if it finds ':=' in module source (inspect.getsource best-effort).
+- call run() with synthetic payloads; return True only if ALL pass:
+  1) missing key => blocked + missing_payload_key AND validation.contract_ok==True
+  2) polluted actions_spec => not blocked + warning actions_spec_sanitized AND validation.contract_ok==True
+  3) entity parsing works for both: "Entities:[A, B]" and "Entities: ['A','B']"
+  4) prereq error recovery proposes get_relations("cows") from:
+     "Execute get_relations for cows before executing get_neighbors"
+  5) after get_relations + Observation list => proposes dict-shaped get_neighbors
+  6) next_action never a string
+  7) JSON-safe output/state (no set/tuple/bytes/path/re.Match)
+  8) validation always present with keys contract_ok(bool), violations(list[str])
+  9) invalid relation recovery:
+     env_observation with
+     "get_neighbors: food.cheese.aging_time is not a relation of the cows"
+     and "has the following relations: [food.cheese_milk_source.cheeses, common.topic.image]"
+     => notes["invalid_pairs"] contains "cows|food.cheese.aging_time"
+     AND subsequent call does NOT propose that invalid pair.
+
+self_test must not write outside a temp directory under provided state_dir.
+
 FINAL CHECK (HARD)
-========================
-- Markers present; stdlib only; forbidden substrings absent
-- run() signature exact; next_action never invents; next_action.args is dict
-- cursor string; history list[str]; atomic write used
+Markers present; stdlib only; forbidden substrings absent; exact signatures; no extra triple quotes;
+never outputs Action lines; never uses ':='.
 ''').strip()
+
+
 
 
 
@@ -1639,17 +902,17 @@ Compute policy_required ONLY from user_intent.
 OUTPUTS (HARD)
 ========================
 run() MUST ALWAYS return dict with keys:
-status('need_step'|'can_answer'|'blocked'|'error'),
-next_action({'action':str,'args':dict}|None),
-answer_recommendation(any|None),
+status('need_step'|'done'|'blocked'|'error'),
+next_action({'name':str,'args':list}|None),
+answer_recommendation(str|None),
 plan(list[dict]),
 validation(dict keys: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations, constraints_ok, uncovered_constraints),
 rationale(list[str] >=2), errors(list[str]), warnings(list[str])
 
 Rules:
 - Missing required payload key => blocked + "missing_payload_key:<k>"
-- status=='can_answer' => answer_recommendation non-None; else MUST be None
-- next_action.action MUST be key in actions_spec; next_action.args MUST be dict
+- status=='done' => answer_recommendation non-None; else MUST be None
+- next_action.name MUST be key in actions_spec; next_action.args MUST be list
 - If status=='need_step' and next_action is None => errors include "no_valid_next_action" + rationale why
 
 NEW (HARD): SOLVER HANDOFF MUST BE USEFUL
@@ -1667,10 +930,10 @@ MINIMAL LOGIC (MUST BE CORRECT)
 A) desired_kind from asked_for.lower(): numeric/boolean/path_like/string
 B) last_ok_step/last_ok_output from trace (ok==True)
 C) candidate_value: prefer candidate_output then last_ok_output else derive (len/int/bool/path token). Store derivations.
-D) completion rules + FINAL-ANSWER GATE for string + ANTI-FALSE-CAN_ANSWER if env_observation/outputs show errors.
+D) completion rules + FINAL-ANSWER GATE for string + ANTI-FALSE-DONE if env_observation/outputs show errors.
 E) hallucinated actions: if any trace action missing/not in actions_spec => status='error'
 F) prerequisites (validation only) from actions_spec[action].prerequisites
-G) constraints gate: uncovered => warnings; constraints_ok False => MUST NOT can_answer
+G) constraints gate: uncovered => warnings; constraints_ok False => MUST NOT done
 H) contract guard (validation only) for draft_response + output_contract
 
 ========================
@@ -1684,11 +947,11 @@ Rules:
 1) If policy_required:
    - DO NOT suggest forbidden operations.
    - Prefer non-privileged alternatives (work in user-writable dirs, use temp copies, read-only inspection, report findings, propose safe commands if available in actions_spec).
-   - If a safe inspection action exists that can still answer asked_for, continue (need_step/can_answer). Block only if truly impossible.
+   - If a safe inspection action exists that can still answer asked_for, continue (need_step/done). Block only if truly impossible.
 2) missing_path_error: prefer discovery (list_dir/stat/find) on nearest parent dir; record notes['missing_path']
 3) permission_error: never suggest forbidden privilege changes; suggest user-writable workaround or read-only alternatives
 4) exists_error: idempotent checks then rename/move if available or skip if already satisfied
-5) Anti-loop: do not suggest same next_action.action >2 times in last 5 steps (unless only option)
+5) Anti-loop: do not suggest same next_action.name >2 times in last 5 steps (unless only option)
 6) task_limit_pressure: prefer finishers that yield asked_for directly
 
 ========================
@@ -1699,7 +962,7 @@ Order:
 2) actions_spec missing/empty => blocked + "missing_actions_spec"
 3) hallucinated_action => error
 4) prereq_violations exist => need_step; choose first missing prereq action present (sorted) else None
-5) if complete AND constraints_ok AND not blocked_by_observation => can_answer
+5) if complete AND constraints_ok AND not blocked_by_observation => done
 6) else need_step; choose next_action with OS-oriented ladder (list_dir/stat/find/grep/wc/read_file/etc), keyword match, fallback first key.
 ARGS-AWARE: never return empty args when chosen action requires args; pick inspection action instead.
 
@@ -1713,7 +976,7 @@ Deterministic self_test returns True only if ALL pass:
 - solver_suggestion non-empty and starts with Answer/Ask/Proceed
 - policy_required is computed from user_intent only (not from trace/draft_response/env_observation)
 - If user_intent requires forbidden ops: tool MUST NOT suggest them; MUST produce useful solver_suggestion (Proceed + Answer/Ask); MUST NOT emit refusal script
-- If env_observation has permission denied/no such file => MUST NOT can_answer even if candidate looks complete
+- If env_observation has permission denied/no such file => MUST NOT done even if candidate looks complete
 - From_str_int must NOT treat "PID 1234" as answer unless asked_for mentions pid
 - If actions_spec empty => blocked + missing_actions_spec
 - Must not return next_action with empty args when chosen action requires args AND inspection action exists
@@ -1723,7 +986,7 @@ Deterministic self_test returns True only if ALL pass:
 FINAL CHECK (HARD)
 ========================
 - Markers present; stdlib only; forbidden substrings absent in tool source
-- run() signature exact; next_action never invents; next_action.args is dict
+- run() signature exact; next_action never invents; next_action.args is list
 - cursor string; history list[str]; atomic write used
 ''').strip()
 
@@ -1732,41 +995,31 @@ FINAL CHECK (HARD)
 
 AGG_TOOLGEN_USER_DB = textwrap.dedent('''
 Reasoning: low
-You are ToolGen. Generate ONE reusable, DB-task-specific analysis + state-tracking Python tool for multi-step agent loops (SQL planning/validation for a known single-table schema).
+You are ToolGen. Generate ONE minimal, robust Python-stdlib tool for the DB environment.
+Primary goal: NEVER crash; always return the exact required output shape; be neutral if unsure.
 
-========================
 OUTPUT (HARD)
-========================
-Output ONLY:
+- Output ONLY:
 ###TOOL_START
 <raw python source>
 ###TOOL_END
-Always include markers even on failure.
-Include near top: # tool_name: <short_snake_case>_generated_tool (<= ~4 words; function not task)
+- Always include markers.
+- Near top comment: # tool_name: db_min_generated_tool
 
-========================
-CORE RULES (HARD)
-========================
-- Python stdlib ONLY. Deterministic.
-- Implement: def run(payload: dict) -> dict ; def self_test() -> bool (required)
-- run() MUST NEVER raise; wrap in try/except; on exception return:
-  status='error', errors[], warnings[], next_action=None, answer_recommendation=None, plan=[], validation={}, rationale=[...]
-- Type-guard before methods. Never rely on dict insertion order: keys = sorted(actions_spec.keys()).
+HARD RULES
+- Python stdlib ONLY. Deterministic. No network. No randomness. No eval/exec.
+- Forbidden anywhere (code/comments/strings): drop table,truncate,attach database,load_extension
+- Top-level imports only (no imports inside functions).
+- Implement EXACTLY:
+  def run(payload: dict) -> dict
+  def self_test() -> bool
+- run() MUST NEVER raise: wrap entire function body in try/except Exception.
+  On exception, return status='error' with errors=[str(e)] and all required keys present.
 
-SAFETY (HARD):
-- NEVER output destructive SQL (DROP/TRUNCATE/ALTER/CREATE) unless task_text explicitly requests it.
-- NEVER output multi-statement SQL separated by ';' (single statement only).
-- Forbidden anywhere in code/comments/strings: 'drop table','truncate','attach database','load_extension'
-
-========================
-DOCSTRING SCHEMA (HARD)
-========================
-File MUST begin with EXACTLY ONE 3-line module docstring (no other triple quotes):
+DOCSTRING (HARD)
+File MUST start with EXACTLY ONE 3-line module docstring; no other triple quotes anywhere:
 """
-<ONE LINE that includes: contract guard, prereqs, next-action suggestion, limitations
-AND includes EXACTLY this schema clause:
-INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation
->
+contract guard + prereqs + next-action suggestion + limitations. INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation >
 """
 
 ========================
@@ -1781,188 +1034,105 @@ Near run(), include EXACT comment block:
 # input_schema_required: task_text, asked_for, trace, actions_spec, run_id, state_dir
 # input_schema_optional: constraints, output_contract, draft_response, candidate_output, env_observation
 
-========================
-STATE (HARD)
-========================
-- Persist local JSON only: <state_dir>/<run_id>.json ; MUST os.makedirs(state_dir, exist_ok=True) before any I/O.
-- Load existing or init; update deterministically; atomic write (tmp then os.replace).
-- Required state schema: {"cursor":"<string>","history":["<step>"],"notes":{}}
-  cursor ALWAYS string ("" if unknown). history ONLY strings; append exactly one short string per run().
+MINIMUM BEHAVIOR (HARD)
+1) Required payload keys: task_text, asked_for, trace, actions_spec, run_id, state_dir
+   - If any missing: status='blocked' and errors include "missing_payload_key:<k>" per key (sorted).
+2) actions_spec handling:
+   - allowed = {"describe_table","inspect_schema","get_table_info","validate_sql","plan_sql","build_sql","execute_sql","run_sql","query","select","insert","update","delete"}
+   - If actions_spec is dict: usable_actions = sorted(keys ∩ allowed); else usable_actions=[]
+   - If actions_spec had any keys outside allowed: add warning "actions_spec_sanitized"
+   - Never return 'blocked' due to polluted actions_spec.
+3) State:
+   - Persist JSON at <state_dir>/<run_id>.json
+   - os.makedirs(state_dir, exist_ok=True)
+   - Atomic write (tmp then os.replace)
+   - If missing/corrupt, reset to {"cursor":"", "history":[], "notes":{}}
+   - Ensure notes has defaults:
+     table(str), columns(list[str]), intent(str),
+     last_sql(str), last_ok_action(str), last_ok_output(any),
+     must_have(dict), stalls(int), progress_sig(str)
+   - Append exactly ONE short history item per run() (<=120 chars).
+4) Normalization (crash-proof):
+   - Treat any text field as: s if isinstance(s,str) else ""
+   - For trace steps: accept list; each step -> dict with keys action(str), ok(True/False/None), output(any), args(dict), error(any), raw(any).
+   - Do NOT read payload["history"] anywhere.
+   - Never call regex on None; never assume asked_for/env_observation exist.
+5) Output contract (ALWAYS return these exact keys):
+   status, next_action, answer_recommendation, plan,
+   validation (with keys: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations, constraints_ok, uncovered_constraints),
+   rationale, errors, warnings
 
-State notes conventions (recommended, not required):
-- notes['table'] = parsed table name
-- notes['columns'] = parsed list[str] of headers
-- notes['intent'] = 'select'|'update'|'insert'|'delete'|'unknown'
-- notes['must_have'] = dict of required clauses (where, group_by, having, order_by, limit, offset)
+EXTRACTION (MINIMAL, SAFE, DETERMINISTIC)
+- Derive user_intent from task_text ONLY:
+  - If task_text contains markers like "CHAT_HISTORY","HISTORY","TRACE","MODEL","ASSISTANT","AGENT","TOOL_RESULT","INTERNAL",
+    truncate task_text at the first such marker (case-insensitive).
+  - Drop lines starting with "assistant:" or "agent:" (case-insensitive).
+  - user_intent = remaining text stripped to <= 4000 chars.
+- Parse table name (best-effort) from user_intent:
+  - "The name of this table is <t>" OR "table is <t>"
+- Parse headers (best-effort) from user_intent:
+  - "headers of this table are a, b, c" => list[str]
+- Parse intent (best-effort) from user_intent lower():
+  - insert/update/delete/select/unknown
 
-========================
-INPUTS + NORMALIZATION (HARD)
-========================
-Required: task_text, asked_for, trace, actions_spec, run_id, state_dir
-Optional: constraints, output_contract, draft_response, candidate_output, env_observation
-- If trace is list[str] => list[dict]: {'action':<str>, 'ok':None, 'output':None, 'args':{}, 'error':None, 'raw':None}
-- If trace is list[dict], normalize each: ensure keys action/ok/output/args/error/raw exist; if args missing/None/non-dict => {}
-- IMPORTANT: if step has non-empty raw and args is {} or missing required fields, parse raw into fields best-effort:
-  DB/SQL patterns:
-    - SELECT ... FROM <table> ...
-    - UPDATE <table> SET ...
-    - INSERT INTO <table> ...
-    - DELETE FROM <table> ...
-  Extract (best-effort): table, selected columns/aliases, WHERE predicates, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET.
-  Parse outputs/error hints (stringified):
-    - "no such table" / "unknown table" => missing_table_error
-    - "no such column" / "unknown column" => missing_column_error
-    - "syntax error" => syntax_error
-    - "ambiguous column" => ambiguous_column_error
-If actions_spec missing/empty => status='blocked', errors include "missing_actions_spec", next_action=None
+SQL SAFETY (HARD, MINIMAL)
+- Never recommend multi-statement SQL (any ';' => unsafe).
+- Never recommend destructive tokens unless user_intent explicitly asks for them:
+  drop table / truncate / attach database / load_extension
+- For update/delete: if SQL lacks WHERE and user_intent does not clearly request all-rows change => unsafe.
 
-========================
-OUTPUTS (HARD)
-========================
-run() MUST ALWAYS return dict with keys:
-status('need_step'|'can_answer'|'blocked'|'error'),
-next_action({'action':str,'args':dict}|None),
-answer_recommendation(any|None),
-plan(list[dict]),
-validation(dict keys: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations, constraints_ok, uncovered_constraints),
-rationale(list[str] >=2), errors(list[str]), warnings(list[str])
-Rules:
-- Missing required payload key => blocked + "missing_payload_key:<k>"
-- status=='can_answer' => answer_recommendation non-None; else MUST be None
-- next_action.action MUST be key in actions_spec; next_action.args MUST be dict
-- If status=='need_step' and next_action is None => errors include "no_valid_next_action" + rationale why
+ERROR AWARENESS (ANTI-FALSE-DONE)
+- If env_observation OR any step.error/output contains any of:
+  "error","syntax","no such table","no such column","unknown table","unknown column","ambiguous","type mismatch"
+  (case-insensitive),
+  then MUST NOT set status='done'. Add rationale token "blocked_by_observation".
 
-========================
-MINIMAL LOGIC (MUST BE CORRECT)
-========================
-A) desired_kind from asked_for.lower():
-numeric if 'count'/'number'/'how many'/'total'/'average'/'avg'/'sum'; boolean if startswith 'is'/'are'/'does'/'can';
-sql if contains 'sql' or 'query'; else table_rows
-B) last_ok_step = most recent trace step with ok==True else None; last_ok_output = last_ok_step.output else None
-C) candidate_value preference:
-1) If candidate_output non-empty AND matches desired_kind => use
-2) Else if last_ok_output matches desired_kind => use
-3) Else derive:
-   numeric + (list/tuple/dict) => len ('from_len')
-   numeric + str => exactly one integer/float via regex (\\b\\d+(?:\\.\\d+)?\\b) => number ('from_str_num')
-Store derivations in validation['derivations'].
-D) completion:
-- sql: complete ONLY if candidate_value is a single-statement SQL string and passes SQL GATE
-- table_rows: complete ONLY if candidate_value is list[dict] or list[tuple] or a string that looks like a rendered result table
-- numeric/boolean: standard
-D2) SQL GATE (HARD): _looks_safe_sql(s)->bool False if any:
-contains ';' (multi-statement), contains forbidden tokens (drop/truncate/attach/load_extension),
-lacks FROM/UPDATE/INSERT/DELETE keywords, or references tables/columns not in parsed schema (if available).
-For UPDATE/INSERT/DELETE: must have WHERE unless task_text explicitly implies all-rows update (rare); otherwise block.
-D3) ANTI-FALSE-CAN_ANSWER (HARD): MUST NOT can_answer if env_observation (or any step.output/error) contains
-"error" or "syntax" or "no such table" or "no such column" or "wrong" or "type mismatch" (case-insensitive).
-Add rationale "blocked_by_observation".
+NEXT ACTION (MINIMAL, NEUTRAL, DETERMINISTIC)
+- Only suggest an action if it is in usable_actions, otherwise next_action=None.
+- Preferred order:
+  describe_table/inspect_schema/get_table_info, plan_sql/build_sql, validate_sql, execute_sql/run_sql/query/select
+- Args:
+  - For schema actions: args=[] (no args).
+  - For plan_sql/build_sql: args=[user_intent] (only if user_intent non-empty).
+  - For validate_sql: args=[candidate_sql] only if you have a non-empty SQL candidate.
+  - For execute_sql/run_sql/query/select: args=[candidate_sql] ONLY if candidate_sql passes SQL SAFETY.
+- Never emit an action if required args would be empty/invalid.
+If would be invalid/empty, set next_action=None.
 
-E) hallucinated actions (HARD):
-For each trace step: missing/empty/non-str => "hallucinated_action:null"; action not in actions_spec => "hallucinated_action:<action>"
-If any => status='error', next_action=None
+CANDIDATE SQL / ANSWER (MINIMAL, NEVER INVENT)
+- Candidate SQL source preference:
+  1) candidate_output if it is a non-empty str
+  2) last_ok_output if it is a non-empty str
+  else ""
+- Only allow done if:
+  - asked_for indicates SQL (contains "sql" or "query") AND candidate_sql passes SQL SAFETY, OR
+  - asked_for indicates numeric/boolean AND last_ok_output is already that type (int/float/bool) AND not blocked_by_observation.
+- If done:
+  - status='done'
+  - answer_recommendation = candidate_sql (or numeric/bool value)
+  - next_action=None
+- Otherwise:
+  - status='need_step'
+  - answer_recommendation=None
 
-F) prerequisites (validation only):
-actions_spec[action] may include prerequisites list[dict] {'action':str,'contains':str|None}
-Satisfied ONLY by PRIOR step with ok==True and matching action; if contains set, require substring in str(prior.output) (case-insensitive).
-Record missing as "prereq_violation:<act>:<missing_action>" in validation['prereq_violations'] (not errors). Once satisfied, never revert.
+PREREQS + CONSTRAINTS + OUTPUT CONTRACT (MINIMAL)
+- prereq_violations: if actions_spec[action] has prerequisites, record missing ones but do not crash.
+- constraints: if constraints is list[str], mark uncovered_constraints if none of (trace/actions/outputs/env_observation) contains it (case-insensitive).
+  constraints_ok is True iff uncovered_constraints empty.
+- output_contract: if output_contract dict and draft_response is str, apply minimal checks:
+  forbid_substrings, require_substrings, max_chars. Record contract_violations and contract_ok.
 
-G) constraints gate (HARD):
-If constraints is list[str], each must appear (case-insensitive) in any: step.action OR str(step.args) OR str(step.output) OR str(env_observation)
-Uncovered => uncovered_constraints + warnings "uncovered_constraint:<c>"
-constraints_ok True iff uncovered empty. If constraints_ok False => MUST NOT can_answer.
+SELF_TEST (HARD; MUST BE REAL)
+self_test() must call run() with synthetic payloads and return True only if all pass:
+- missing key => blocked + missing_payload_key
+- polluted actions_spec => not blocked; may warn actions_spec_sanitized
+- tool never raises and always returns all required keys
+- next_action must be {"name":..., "args":[...]} when present
+- must NOT done when env_observation contains "no such column"
+- must reject multi-statement SQL containing ';' (must not mark done with it)
 
-H) contract guard (validation only):
-If draft_response non-empty str and output_contract dict: apply edits in order:
-trimmed, one_line, allow_prefixes, forbid_substrings, require_substrings, max_chars.
-contract_ok iff no contract_violations.
-
-========================
-DB INTENT + REQUIREMENTS EXTRACTION (HARD; MUST BE CORRECT)
-========================
-Parse from task_text (best-effort, deterministic):
-- table name: "The name of this table is <t>" OR "table is <t>"
-- headers: "headers of this table are a, b, c" => list[str]
-- intent:
-  UPDATE if task_text startswith/contains "update"
-  SELECT if startswith/contains "what are"/"which"/"return"
-  INSERT if startswith/contains "insert"
-  DELETE if startswith/contains "delete"
-- required clauses:
-  GROUP BY if task mentions "grouped by"
-  HAVING if task mentions "exceeding" / "more than" / aggregate filters after grouping
-  ORDER BY if task mentions "ordered by"
-  LIMIT/OFFSET if task mentions "limit" and/or "starting from the third entry" (OFFSET 2)
-Store in state.notes['must_have'].
-
-OFFSET rule (deterministic):
-- "starting from the third entry" => OFFSET 2
-- "starting from the Nth entry" => OFFSET (N-1) if N parsed int >=1
-
-========================
-DB FAILURE RECOVERY (HARD)
-========================
-Compute from latest trace + env_observation (case-insensitive):
-- missing_table_error: "no such table" / "unknown table"
-- missing_column_error: "no such column" / "unknown column"
-- syntax_error: "syntax error"
-- aggregate_misuse: "misuse of aggregate" / "aggregate functions are not allowed" / "GROUP BY" complaints
-- task_limit_pressure: len(trace) >= 10
-Rules:
-1) If missing_table_error: status='blocked' + errors include "table_not_found"
-2) If missing_column_error: status='need_step' and next_action should be a schema inspection action if available (e.g., describe_table)
-3) If syntax_error: prefer a "validate_sql" action if available; else choose a rewrite step (planner action) NOT execution
-4) If aggregate_misuse: force plan to include GROUP BY/HAVING review; do NOT can_answer until fixed
-
-========================
-STATUS + NEXT_ACTION (deterministic + args-aware)
-========================
-Order:
-1) missing required keys => blocked
-2) actions_spec missing/empty => blocked + "missing_actions_spec"
-3) hallucinated_action => error
-4) prereq_violations exist => need_step; choose first missing prereq action present (sorted) else None
-5) if complete AND constraints_ok AND not blocked_by_observation => can_answer; answer_recommendation=candidate_value; next_action=None
-6) else need_step; choose next_action:
-   keys=sorted(actions_spec.keys()); last_action = most recent normalized step.action; task=task_text.lower()
-
-   Preference ladder (DB-oriented):
-   (a) If headers/table not parsed: prefer inspect_schema / describe_table / get_table_info
-   (b) If intent is SELECT: prefer build_sql_select / plan_query then execute_sql
-   (c) If intent is UPDATE/INSERT/DELETE: prefer build_sql_write then validate_sql then execute_sql
-   (d) If env shows syntax/aggregate errors: prefer validate_sql or rewrite_sql
-   (e) If task requires GROUP BY/HAVING: prefer build_aggregate_query
-
-   Then keyword match: first key where key.lower() in task
-   Fallback: first key in keys
-
-ARGS-AWARE (HARD):
-- If chosen action requires args and you cannot construct them from parsed task_text/state/trace:
-  do NOT return empty args; instead choose a schema inspection or planning action first.
-- For execute_sql: args MUST include a 'sql' string that passes SQL GATE.
-- Never invent table/column names not present in parsed headers (if provided).
-
-Rationale MUST include: "kind=<...>", "complete=<...>", and one of:
-"missing_schema" | "aggregate_needed" | "constraints_blocked" | "blocked_by_observation" | "prereq_missing=<n>" | "next=<action_or_none>" | "task_limit_pressure"
-
-========================
-SELF_TEST (HARD; MUST INCLUDE)
-========================
-Deterministic self_test returns True only if ALL pass:
-- A SELECT requiring GROUP BY + HAVING does not yield can_answer when SQL lacks GROUP BY/HAVING
-- "starting from the third entry" produces OFFSET 2 when building/validating SQL
-- If env_observation contains "no such column" tool must NOT can_answer
-- Prevent multi-statement SQL (semicolon) from passing SQL GATE
-- For UPDATE: must require WHERE unless task clearly implies all rows
-- Must not return next_action execute_sql with empty args or missing sql
-- Must not can_answer on raw "rows affected" unless asked_for expects that
-
-========================
 FINAL CHECK (HARD)
-========================
-- Markers present; stdlib only; forbidden substrings absent
-- run() signature exact; next_action never invents; next_action.args is dict
-- cursor string; history list[str]; atomic write used
+Markers present; stdlib only; forbidden substrings absent; exact signatures; no extra triple quotes; never regex on None; always returns required keys.
 ''').strip()
 
 

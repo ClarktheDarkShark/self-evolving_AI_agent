@@ -1,8 +1,10 @@
 import datetime
+import os
 import html
 import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from src.typings import ChatHistory
@@ -34,8 +36,113 @@ class ControllerLoggingMixin:
             return
         try:
             self._generated_tools_log_path.parent.mkdir(parents=True, exist_ok=True)
+            seq = self._next_generated_tools_log_seq()
+            minimized = self._minimize_generated_tools_payload(payload, seq)
             with self._generated_tools_log_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
+                f.write(json.dumps(minimized, ensure_ascii=True, default=str) + "\n")
+        except Exception:
+            return
+
+    def _next_generated_tools_log_seq(self) -> int:
+        path = self._generated_tools_log_path
+        if not path or not path.exists():
+            return 1
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    last_t = obj.get("t")
+                    if isinstance(last_t, int):
+                        return last_t + 1
+                break
+        except Exception:
+            return 1
+        return 1
+
+    def _minimize_generated_tools_payload(
+        self, payload: Mapping[str, Any], seq: int
+    ) -> dict[str, Any]:
+        def _text_summary(text: Optional[str], max_len: int = 120) -> dict[str, Any]:
+            safe_text = "" if text is None else str(text)
+            return {
+                "len": len(safe_text),
+                "sha1": hashlib.sha1(safe_text.encode("utf-8")).hexdigest(),
+                "preview": self._truncate(safe_text, max_len),
+            }
+
+        data = dict(payload)
+        data.pop("timestamp", None)
+        data.pop("t", None)
+        event = data.get("event")
+
+        if event in {"create", "register", "register_deduped", "register_skipped"}:
+            minimized = {
+                "event": event,
+                "tool_name": data.get("tool_name"),
+                "signature": data.get("signature"),
+                "description": _text_summary(data.get("description")),
+                "tool_type": data.get("tool_type"),
+                "tool_category": data.get("tool_category"),
+                "required_keys": data.get("required_keys"),
+                "optional_keys": data.get("optional_keys"),
+                "path_basename": os.path.basename(str(data.get("path") or "")),
+                "task_name": data.get("task_name"),
+                "sample_index": data.get("sample_index"),
+            }
+            minimized["t"] = seq
+            return minimized
+
+        large_keys = {"task_text", "chat_history", "history", "actions_spec", "result_preview"}
+        minimized: dict[str, Any] = {}
+        for k, v in data.items():
+            if k in large_keys and isinstance(v, str):
+                minimized[k] = _text_summary(v)
+            else:
+                minimized[k] = v
+        minimized["t"] = seq
+        return minimized
+
+    def _solver_io_log_path(self) -> Optional[Path]:
+        if not self._generated_tools_log_path:
+            return None
+        return self._generated_tools_log_path.parent / prefix_filename("solver_io.log")
+
+    def _tool_invoker_io_log_path(self) -> Optional[Path]:
+        if not self._generated_tools_log_path:
+            return None
+        return self._generated_tools_log_path.parent / prefix_filename("tool_invoker_io.log")
+
+    def _append_solver_io_log(self, payload: Mapping[str, Any]) -> None:
+        log_path = self._solver_io_log_path()
+        if log_path is None:
+            return
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            data = dict(payload)
+            data.setdefault("timestamp", datetime.datetime.now(datetime.timezone.utc).isoformat())
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(data, ensure_ascii=True, default=str) + "\n")
+        except Exception:
+            return
+
+    def _append_tool_invoker_io_log(self, payload: Mapping[str, Any]) -> None:
+        log_path = self._tool_invoker_io_log_path()
+        if log_path is None:
+            return
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            data = dict(payload)
+            data.setdefault("timestamp", datetime.datetime.now(datetime.timezone.utc).isoformat())
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(data, ensure_ascii=True, default=str) + "\n")
         except Exception:
             return
 
@@ -290,7 +397,7 @@ class ControllerLoggingMixin:
         extracted = self._extract_solver_context(history)
         prev_extracted = self._extract_solver_context((prev_event.get("payload") or {}).get("history") if isinstance(prev_event, Mapping) else "")
         lines: list[str] = []
-        lines.extend(self._view_text_field("LAST_OBSERVATION", extracted.get("LAST_OBSERVATION"), prev_extracted.get("LAST_OBSERVATION")))
+        # lines.extend(self._view_text_field("LAST_OBSERVATION", extracted.get("LAST_OBSERVATION"), prev_extracted.get("LAST_OBSERVATION")))
         lines.extend(self._view_text_field("TASK_INTENT", extracted.get("TASK_INTENT"), prev_extracted.get("TASK_INTENT")))
         lines.extend(self._view_text_field("ORIGINAL_TASK", extracted.get("ORIGINAL_TASK"), prev_extracted.get("ORIGINAL_TASK")))
         return lines
@@ -402,7 +509,8 @@ class ControllerLoggingMixin:
         lines = history.splitlines()
         extracted: dict[str, str] = {}
         for line in reversed(lines):
-            for key in ("LAST_OBSERVATION:", "TASK_INTENT:", "ORIGINAL_TASK:"):
+            # for key in ("LAST_OBSERVATION:", "TASK_INTENT:", "ORIGINAL_TASK:"):
+            for key in ("TASK_INTENT:", "ORIGINAL_TASK:"):
                 if line.strip().startswith(key):
                     extracted[key[:-1]] = line.split(":", 1)[1].strip()
             if len(extracted) == 3:
@@ -608,6 +716,8 @@ class ControllerLoggingMixin:
         args_auto_built: bool = False,
         decision_action: Optional[str] = None,
     ) -> None:
+        if os.getenv("GENERATED_TOOLS_LOG_SOURCE", "registry") == "registry":
+            return
         payload: dict[str, Any] = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "event": "invoke",
@@ -632,6 +742,8 @@ class ControllerLoggingMixin:
         tool_name: Optional[str],
         reason: str,
     ) -> None:
+        if os.getenv("GENERATED_TOOLS_LOG_SOURCE", "registry") == "registry":
+            return
         payload: dict[str, Any] = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "event": "failed_invoke",

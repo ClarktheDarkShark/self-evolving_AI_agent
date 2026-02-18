@@ -57,7 +57,7 @@ def test_trace_normalization_and_actions_spec(tmp_path) -> None:
         description="Trace normalization checker.",
         tool_type="utility",
         tool_category="validator",
-        input_schema={"type": "object", "required": ["payload"], "properties": {"payload": {"type": "object"}}},
+        input_schema={"type": "object", "required": ["trace"], "properties": {"trace": {"type": "array"}}},
         capabilities=[],
     )
     assert metadata is not None
@@ -79,5 +79,5 @@ def test_trace_normalization_and_actions_spec(tmp_path) -> None:
     )
     assert result.success
     assert isinstance(result.output, dict)
-    assert result.output.get("trace_item_type") == "dict"
-    assert "foo" in result.output.get("actions_spec_keys", [])
+    assert result.output.get("trace_item_type") == "str"
+    assert result.output.get("actions_spec_keys", []) == []

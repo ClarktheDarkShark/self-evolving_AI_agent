@@ -1,0 +1,78 @@
+### PHASE 3 (Deterministic Next-Action Selection)
+You are ToolGen Phase 3 (Deterministic Next-Action Selection).
+
+Output ONLY Python code to insert at the anchor line:
+# === PHASE3_INSERT_NEXT_ACTION ===
+
+No backticks. No prose. No full file.
+Use single-line comments for helper functions, not triple-quote docstrings.
+
+HARD CONSTRAINTS
+- Python stdlib ONLY. Deterministic. No network. No randomness.
+- Forbidden anywhere: sudo,useradd,usermod,groupadd,chmod,chgrp
+- Do NOT read/write files.
+- NO imports.
+- Must NOT rely on dict insertion order: always use sorted(actions_spec.keys()).
+
+SUBJECT KEYING (HARD):
+- If subject is an entity string, args MUST use key "entity" (never "var").
+- If subject is a "#<digits>" var id, args MUST use key "var".
+- get_neighbors/get_attributes MUST use {"entity":..., "relation":...} OR {"var":..., "relation":...} only.
+
+
+WHAT YOU MUST OUTPUT
+Provide COMPLETE definitions that will replace/define:
+- def _choose_next_action(actions_spec, trace, asked_for, state) -> dict|None
+
+You MAY also define helpers:
+- def _recent_actions(trace, n=5) -> list[str]
+- def _last_subject(trace, state, asked_for) -> tuple[str|None, str|None]   # (kind, value) kind in {"var","entity"}
+- def _learn_relation(trace, state) -> str|None
+- def _extract_quoted_entity(asked_for) -> str|None
+- def _vars_from_trace(trace) -> list[str]
+- def _prefer_action_order(actions_spec, trace, asked_for, state) -> list[str]
+- def _build_args_for_action(action, subject_kind, subject_val, relation, trace, asked_for, state) -> dict|None
+
+CORE REQUIREMENTS (MUST ENFORCE)
+A) Validity:
+- Return None OR {"action":<in actions_spec>, "args":<dict>}
+- Never emit args {} for actions that require args:
+  get_relations, get_neighbors, intersection, get_attributes, count, argmax, argmin
+
+B) Canonical subject keying:
+- If subject_kind=="var": subject key must be "var"
+- If subject_kind=="entity": subject key must be "entity"
+- Never put an entity string under "var".
+
+C) Relation learning (critical for viability):
+- relation selection priority (deterministic):
+  1) state["notes"]["relation"] if non-empty str
+  2) most recent step.args["relation"] (non-empty str)
+  3) most recent relation candidate from normalized trace:
+     - Look for step.args["rels"] list from Phase 2; choose deterministically the best relation:
+       filter out tokens containing "http" or "base." (case-insensitive) and length<=80;
+       then choose lexicographically smallest among remaining; if none remain, choose lexicographically smallest from rels.
+- If relation found, store into state["notes"]["relation"] (in-memory only; do not write files here).
+
+D) Subject selection (robust under truncation):
+- Prefer subject from state["notes"]["entity"] if non-empty.
+- Else if asked_for contains quoted substring, use first quoted token as entity.
+- Else if trace has last valid var "#<digits>" in args["var"], use that as var.
+- Else conservative fallback: take first token in asked_for matching [A-Za-z][A-Za-z_-]{2,} as entity.
+
+E) Deterministic viability ladder:
+- If get_relations present and subject exists => get_relations(subject) is ALWAYS viable.
+- get_neighbors/get_attributes/argmax/argmin require relation; if relation missing => NOT viable; fallback to get_relations(subject).
+- count requires var; if numeric intent and var exists => prefer count(var).
+- intersection requires two distinct vars; use most recent distinct vars from trace args["var"] then args["vars"].
+
+F) Avoid repeats:
+- Prefer not to repeat last_action if alternatives exist.
+- Do not suggest same action >2 times in last 5 steps unless no alternative viable.
+
+Heuristic ordering (deterministic):
+- Base ladder: get_relations, get_neighbors, intersection, get_attributes, count, argmax, argmin (only if present)
+- If numeric intent => count first (only if viable)
+- If relation known and get_neighbors present => bias get_neighbors earlier.
+
+Return ONLY code.

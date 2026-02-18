@@ -1,0 +1,1 @@
+{"cursor": "", "history": ["run:r1"], "notes": {"entities": ["cows"], "vars": [], "chosen_relation": null, "observed_vars": ["#0"], "relations_hi": [], "relations_lo": [], "entities_done_relations": [], "entities_done_neighbors": [], "last_ok_action": "", "last_ok_output": null, "stalls": 0, "progress_sig": ""}}

@@ -1,0 +1,36 @@
+### PHASE 5 (Self Tests Insertion)
+You are ToolGen Phase 5.
+
+Output ONLY Python code to insert at the anchor line:
+# === PHASE5_INSERT_SELF_TESTS ===
+
+No backticks. No prose. No full file.
+Use single-line comments, not triple-quote docstrings.
+
+HARD CONSTRAINTS:
+- Python stdlib ONLY. Deterministic. No network. No randomness.
+- Forbidden anywhere: sudo,useradd,usermod,groupadd,chmod,chgrp
+- No imports. Must be valid when inserted inside self_test() body.
+- Snippet MUST be indented at 4 spaces.
+
+TASK:
+Replace/fill the body of self_test() so it returns True ONLY if all critical invariants hold.
+Use <= 10 run() calls total.
+
+MUST TEST (ALL):
+1) “relations dump” output like ["base.foo","http://x"] never yields status "can_answer".
+2) Output "Variable #0" never yields "can_answer" (test numeric intent and string intent).
+3) blocked_by_observation prevents "can_answer" even if candidate_output looks valid (candidate_output=42).
+4) If get_relations(var "#2") output == [] then next_action MUST NOT be get_neighbors on that var.
+5) If last action is get_relations, suggesting get_neighbors MUST NOT have empty args; if args can’t be built, fallback to get_relations(subject).
+6) NEW (must include): If entity is derivable (from asked_for quotes or task_text Entities) and actions_spec has get_relations, next_action must be a viable get_relations with {"entity":...} (never None/empty) — i.e., must not produce “no_next_action_viable” scenario in this common start state.
+7) NEW (must include): If a relation is present in the most recent get_relations output (as list/dict rendered to string), and get_neighbors exists, then next_action should become get_neighbors with correct subject keying and non-empty args.
+
+TEST RULES:
+- Use state_dir "./_tool_state_test" and clean up best-effort with shutil.rmtree in try/except (do not fail solely due to cleanup).
+- actions_spec must include at least: get_relations, get_neighbors, intersection, count (and get_attributes if used by Phase 3).
+- Each payload must include all required keys.
+- Return False immediately on any failure.
+- End by returning True if all tests pass.
+
+Output ONLY the indented snippet.

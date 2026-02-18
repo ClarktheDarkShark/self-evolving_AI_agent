@@ -54,7 +54,7 @@ def test_payload_wrapping_idempotent(tmp_path) -> None:
         description="Wrapper check tool.",
         tool_type="utility",
         tool_category="validator",
-        input_schema={"type": "object", "required": ["payload"], "properties": {"payload": {"type": "object"}}},
+        input_schema={"type": "object", "required": ["task_text"], "properties": {"task_text": {"type": "string"}}},
         capabilities=[],
     )
     assert metadata is not None

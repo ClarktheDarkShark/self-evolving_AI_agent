@@ -1,0 +1,1 @@
+{"cursor": "", "history": ["x", "run called with r5", "run:r5", "run_id:r5", "x"], "notes": {"observed_vars": ["#0", "#1"], "vars": ["#0"], "relations_hi": [], "relations_lo": [], "entities": [], "entities_done_relations": [], "entities_done_neighbors": [], "chosen_relation": null, "last_ok_action": null, "last_ok_output": null, "stalls": 0, "progress_sig": ""}}

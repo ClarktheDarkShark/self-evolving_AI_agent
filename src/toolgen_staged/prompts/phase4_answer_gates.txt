@@ -1,0 +1,64 @@
+### PHASE 4 (Answer Gates + Safety)
+You are ToolGen Phase 4 (Answer Gates + Safety).
+
+Output ONLY Python code to insert at the anchor line:
+# === PHASE4_INSERT_ANSWER_GATES ===
+
+No backticks. No prose. No full file.
+Use single-line comments for helper functions, not triple-quote docstrings.
+
+HARD CONSTRAINTS
+- Python stdlib ONLY. Deterministic. No network. No randomness.
+- Forbidden anywhere: sudo,useradd,usermod,groupadd,chmod,chgrp
+- No file I/O. No imports.
+- _answer_gate MUST NEVER return status="error" unless hallucinated_action gate triggers.
+- If actions_spec is missing/invalid, return status="need_step" with error "missing_actions_spec_for_hallucination_check".
+
+
+WHAT YOU MUST OUTPUT
+Provide COMPLETE definitions:
+
+1) def _answer_gate(asked_for, trace, constraints=None, output_contract=None, draft_response=None, candidate_output=None, env_observation=None, actions_spec=None) -> dict
+
+2) def _desired_kind(asked_for: str) -> str  # "numeric"|"boolean"|"id_like"|"string"
+3) def _blocked_by_observation(trace, env_observation) -> bool
+4) def _constraint_coverage(constraints, trace, env_observation) -> tuple[bool, list[str]]
+5) def _candidate_value(desired_kind, trace, candidate_output) -> tuple[object, list[str]]
+6) def _string_reject(s: str) -> bool
+
+MUST ENFORCE
+A) Hallucinated action gate (strict if actions_spec is dict):
+- If any trace step action is non-str or not in actions_spec => return status="error" with errors "hallucinated_action:<x>"
+- If actions_spec missing/invalid => return status="need_step" and errors include "missing_actions_spec_for_hallucination_check"
+
+B) blocked_by_observation:
+- If env_observation OR any step.output/error contains case-insensitive substring from:
+  "need ", "not ", "wrong", "type mismatch", "error", "must "
+  then blocked=True and MUST NOT can_answer.
+
+C) constraints coverage:
+- If constraints is list[str], each must appear (ci substring) in:
+  step.action OR repr(step.args) OR safe_str(step.output) OR safe_str(env_observation)
+- If uncovered exist => warnings "uncovered_constraint:<c>" and MUST NOT can_answer.
+
+D) candidate selection:
+- Prefer candidate_output if matches kind (numeric excludes bool; boolean must be bool; id_like string<=64 with digits; string passes _string_reject)
+- Else prefer last_ok output (step.ok is True and output non-None) if matches
+- Else derive:
+  - numeric: len(last_ok) if last_ok is list/tuple/dict; or int from str ONLY if exactly one standalone integer token and no "#<digits>" and no "Variable #"
+  - boolean: map true/false/yes/no strings
+
+E) string reject:
+Reject if empty, startswith "Variable #", starts with "[{(", contains "base." or "rdf.freebase.com" or "http", len>256, commas>10, newlines>5.
+
+F) Progress signals:
+When status is "need_step", validation MUST include:
+- blocked_by_observation (bool)
+- constraints_ok (bool)
+- uncovered_constraints (list)
+- derivations (list)
+- missing_signals (list[str]) that includes deterministic reasons like:
+  "missing_candidate", "missing_relation", "missing_subject", "missing_var" when applicable based on trace/asked_for/candidate_output.
+Rationale must include at least 2 items, including "kind=<...>" and "complete=<true|false>".
+
+Return ONLY code.

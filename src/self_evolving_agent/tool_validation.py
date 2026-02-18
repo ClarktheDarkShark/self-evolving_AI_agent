@@ -103,6 +103,12 @@ def _build_variation_args(
 def validate_tool_code(
     code: str, *, timeout_s: float = 2.0
 ) -> ToolValidationResult:
+    for heading in ("INVOKE_WITH:", "RUN_PAYLOAD_REQUIRED:", "RUN_PAYLOAD_OPTIONAL:"):
+        if heading not in (code or ""):
+            return ToolValidationResult(
+                success=False,
+                error=f"missing_invoke_contract:{heading}",
+            )
     try:
         compiled = compile(code, "<generated_tool>", "exec")
     except Exception as exc:

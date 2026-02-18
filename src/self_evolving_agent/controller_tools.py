@@ -1,174 +1,162 @@
 import json
+import os
 import re
 from typing import Any, Mapping, Optional, Sequence
 
-from src.typings import ChatHistory, ChatHistoryItem, Role
+from src.typings import ChatHistory, Role
 
 from .tool_registry import ToolMetadata, ToolResult
 from .tool_retrieval import retrieve_tools
 
 
 class ControllerToolsMixin:
-    def _normalize_trace(self, trace: Any) -> list[dict[str, Any]]:
-        if not isinstance(trace, list):
-            return []
-        if not trace:
-            return []
-        if all(isinstance(item, dict) for item in trace):
-            return list(trace)
-
-        def _parse_action_name(text: str) -> str:
-            if not text:
-                return ""
-            raw = text.strip()
-            if raw.lower().startswith("action:"):
-                raw = raw.split(":", 1)[1].strip()
-            if "(" in raw:
-                return raw.split("(", 1)[0].strip()
-            return raw.split()[0].strip() if raw.split() else ""
-
-        normalized: list[dict[str, Any]] = []
-        for item in trace:
-            if isinstance(item, str):
-                action = _parse_action_name(item)
-                normalized.append({"action": action, "raw": item, "args": {}})
-        return normalized
-
-    def _extract_actions_spec_from_text(self, text: str) -> dict[str, Any]:
-        if not text:
-            return {}
-
-        heading_markers = (
-            "available actions",
-            "actions",
-            "action space",
-            "you can call",
-            "available tools",
+    def _read_tool_source(self, tool_name: str) -> Optional[str]:
+        resolved_name = (
+            self._registry.resolve_name(tool_name)
+            if hasattr(self._registry, "resolve_name")
+            else None
         )
-        end_markers = (
-            "output rules",
-            "final answer",
-            "task completion",
-            "output contract",
-            "input guidelines",
-        )
-        blacklist = {
-            "action",
-            "final",
-            "answer",
-            "example",
-            "output",
-            "input",
-            "format",
-            "return",
-            "use",
-            "call",
+        resolved_name = resolved_name or tool_name
+        meta = self._get_tool_metadata(resolved_name)
+        environment = meta.environment if meta else None
+        tool_path = None
+        if hasattr(self._registry, "_get_tool_path"):
+            tool_path = self._registry._get_tool_path(resolved_name, environment=environment)
+        candidate_paths: list[str] = []
+        if tool_path:
+            candidate_paths.append(tool_path)
+        if not environment:
+            current_env = self._resolved_environment_label()
+            if hasattr(self._registry, "_get_tool_path") and current_env:
+                candidate_paths.append(
+                    self._registry._get_tool_path(resolved_name, environment=current_env)
+                )
+        if hasattr(self._registry, "_get_tool_path") and environment:
+            candidate_paths.append(self._registry._get_tool_path(resolved_name, environment=None))
+
+        seen: set[str] = set()
+        for path in candidate_paths:
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    return handle.read()
+            except Exception:
+                pass
+
+        tools_dir = getattr(self._registry, "tools_dir", None)
+        if tools_dir:
+            filename = f"{resolved_name}.py"
+            for root, _, files in os.walk(tools_dir):
+                if filename in files:
+                    try:
+                        with open(os.path.join(root, filename), "r", encoding="utf-8") as handle:
+                            return handle.read()
+                    except Exception:
+                        break
+        return None
+
+    def _parse_tool_invoke_contract(self, tool_name: str) -> Optional[dict[str, Any]]:
+        source = self._read_tool_source(tool_name)
+        if not source:
+            return None
+
+        def _find_line(label: str) -> Optional[str]:
+            match = re.search(
+                rf"{re.escape(label)}\\s*(.+)",
+                source,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                return None
+            return match.group(1).strip()
+
+        def _parse_list(raw: Optional[str]) -> list[str]:
+            if not raw:
+                return []
+            raw = raw.strip()
+            bracket = re.search(r"(\\[[^\\]]*\\])", raw)
+            candidate = bracket.group(1) if bracket else raw
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed if x]
+            except Exception:
+                pass
+            cleaned = candidate.strip().strip("[]")
+            if not cleaned:
+                return []
+            parts = []
+            for chunk in cleaned.split(","):
+                val = chunk.strip().strip("'").strip('"')
+                if val:
+                    parts.append(val)
+            return parts
+
+        invoke_with = _find_line("INVOKE_WITH:")
+        required = _parse_list(_find_line("RUN_PAYLOAD_REQUIRED:"))
+        optional = _parse_list(_find_line("RUN_PAYLOAD_OPTIONAL:"))
+        if not invoke_with:
+            req_line = _find_line("input_schema_required:")
+            opt_line = _find_line("input_schema_optional:")
+            if req_line:
+                required = [v.strip() for v in req_line.split(",") if v.strip()]
+                optional = [v.strip() for v in (opt_line or "").split(",") if v.strip()]
+            if not required:
+                doc_match = re.search(
+                    r"INPUT_SCHEMA:.*?required=([^;]+);\\s*optional=([^\\n]+)",
+                    source,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                if doc_match:
+                    required = [v.strip() for v in doc_match.group(1).split(",") if v.strip()]
+                    optional = [v.strip() for v in doc_match.group(2).split(",") if v.strip()]
+            if not required:
+                return None
+            invoke_with = '{"args":[<RUN_PAYLOAD>], "kwargs":{}}'
+        return {
+            "invoke_with": invoke_with,
+            "required": required,
+            "optional": optional,
         }
 
-        def _extract_from_line(line: str) -> list[str]:
-            clean = line.replace("`", "").replace("*", "").strip()
-            found: list[str] = []
-            bullet = re.match(r"^\s*(?:[-*]|\d+\.)\s*([a-zA-Z_][a-zA-Z0-9_]*)\b", clean)
-            if bullet:
-                found.append(bullet.group(1))
-            for name in re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", clean):
-                found.append(name)
-            return found
+    def _wrap_payload_with_contract(
+        self, invoke_with: str, payload: Mapping[str, Any]
+    ) -> Optional[tuple[list[Any], dict[str, Any]]]:
+        if not invoke_with:
+            return None
+        placeholder_pattern = re.compile(r"<RUN_PAYLOAD>|<PAYLOAD>", flags=re.IGNORECASE)
+        token = "__RUN_PAYLOAD__"
+        template = placeholder_pattern.sub(f"\"{token}\"", invoke_with)
+        try:
+            wrapper = json.loads(template)
+        except Exception:
+            return None
 
-        actions: set[str] = set()
-        capture = False
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line:
-                if capture:
-                    capture = False
-                continue
-            low = line.lower()
-            if any(marker in low for marker in heading_markers):
-                capture = True
-                continue
-            if capture and any(marker in low for marker in end_markers):
-                capture = False
-                continue
+        def _replace_token(value: Any) -> Any:
+            if value == token:
+                return dict(payload)
+            if isinstance(value, list):
+                return [_replace_token(item) for item in value]
+            if isinstance(value, dict):
+                return {k: _replace_token(v) for k, v in value.items()}
+            return value
 
-            if capture or "action:" in low:
-                for name in _extract_from_line(line):
-                    if name and name.lower() not in blacklist:
-                        actions.add(name.lower())
-
-        if not actions:
-            return {}
-        return {name: {} for name in sorted(actions)}
-
-
-
-    def _extract_asked_for(self, task_text: str) -> str:
-        """Extract the question/asked_for from task text."""
-        if not task_text:
-            return ""
-        # Pattern: "Question: <question>, Entities: [...]"
-        match = re.match(r"Question:\s*(.+?),\s*Entities:", task_text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        # Pattern: "Question: <question>" (no entities)
-        match = re.match(r"Question:\s*(.+?)(?:\n|$)", task_text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        # Fallback: first line or first sentence
-        first_line = task_text.split("\n")[0].strip()
-        if "?" in first_line:
-            return first_line
-        return ""
-
-    def _extract_trace_from_history(self, chat_history: Optional[ChatHistory]) -> list[dict[str, Any]]:
-        """Extract action trace from chat history."""
-        if chat_history is None:
-            return []
-        trace = []
-        for item in self._history_items(chat_history):
-            content = (item.content or "").strip()
-            # Match "Action: operation(args)" pattern
-            action_match = re.search(r"Action:\s*(\w+)\s*\(([^)]*)\)", content)
-            if action_match:
-                action_name = action_match.group(1).lower()
-                trace.append({
-                    "action": action_name,
-                    "ok": None,  # We don't know success status
-                    "output": None,
-                    "args": {},
-                    "error": None
-                })
-            # Check for observation (indicates prior action succeeded)
-            if trace and "Observation:" in content:
-                trace[-1]["ok"] = True
-                # Extract observation content
-                obs_match = re.search(r"Observation:\s*(.+)", content, re.DOTALL)
-                if obs_match:
-                    trace[-1]["output"] = obs_match.group(1).strip()[:500]
-        return trace
-
-
-
+        wrapper = _replace_token(wrapper)
+        if isinstance(wrapper, dict) and ("args" in wrapper or "kwargs" in wrapper):
+            args = list(wrapper.get("args") or [])
+            kwargs = dict(wrapper.get("kwargs") or {})
+            return args, kwargs
+        return [dict(payload)], {}
+    # DEPRECATED: Removed per zero-mutation policy
+    # This function violated the "no helpful mutations" requirement by:
+    # 1. Overwriting trace with normalized version
+    # 2. Injecting actions_spec from text extraction
+    # 3. Creating fallback actions_spec from trace
+    # Tools must now handle missing/invalid fields themselves.
     def _normalize_analyzer_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        trace = payload.get("trace")
-        normalized_trace = self._normalize_trace(trace)
-        if normalized_trace:
-            payload["trace"] = normalized_trace
-        actions_spec = payload.get("actions_spec")
-        if not actions_spec:
-            extracted = self._extract_actions_spec_from_text(
-                str(payload.get("task_text") or "")
-            )
-            if extracted:
-                payload["actions_spec"] = extracted
-            elif normalized_trace:
-                fallback_spec: dict[str, Any] = {}
-                for step in normalized_trace:
-                    action = step.get("action")
-                    if isinstance(action, str) and action:
-                        fallback_spec[action] = {}
-                if fallback_spec:
-                    payload["actions_spec"] = fallback_spec
+        # NO-OP: Just return payload as-is
         return payload
 
     def _task_text_from_history(self, chat_history: ChatHistory) -> str:
@@ -232,6 +220,30 @@ class ControllerToolsMixin:
         )
         return ToolResult.failure(error)
 
+    def _validate_payload_shape(
+        self, payload: Mapping[str, Any], tool_meta: Optional[ToolMetadata]
+    ) -> list[str]:
+        errors: list[str] = []
+        if tool_meta is None:
+            return errors
+        contract = self._parse_tool_invoke_contract(tool_meta.name)
+        required_keys: list[str] = []
+        if contract and contract.get("invoke_with"):
+            required_keys = list(contract.get("required") or [])
+        elif isinstance(tool_meta.required_keys, list):
+            required_keys = list(tool_meta.required_keys)
+        if required_keys == ["payload"] and isinstance(tool_meta.input_schema, Mapping):
+            props = tool_meta.input_schema.get("properties") or {}
+            payload_schema = props.get("payload") if isinstance(props, Mapping) else None
+            nested_required = []
+            if isinstance(payload_schema, Mapping):
+                nested_required = list(payload_schema.get("required") or [])
+            if nested_required:
+                required_keys = [str(k) for k in nested_required if str(k)]
+        for key in required_keys:
+            if key not in payload:
+                errors.append(f"missing:{key}")
+        return errors
 
     def _invoke_tool_by_payload(
         self,
@@ -274,31 +286,78 @@ class ControllerToolsMixin:
         if tool_meta and self._signature_prefers_payload(tool_meta.signature):
             payload = None
             if len(args) == 1 and isinstance(args[0], Mapping):
-                if "payload" in args[0]:
-                    return self._fail_payload_invoke(
-                        resolved_name, "payload_wrapper_not_allowed"
-                    )
-                payload = dict(args[0])
+                if set(args[0].keys()) == {"payload"} and isinstance(args[0].get("payload"), Mapping):
+                    payload = dict(args[0].get("payload") or {})
+                else:
+                    payload = dict(args[0])
             if payload is None:
-                fallback_text = str(args[0]) if args else ""
-                payload = self._default_payload_dict(
-                    task_text=fallback_text,
-                    candidate_output=None,
-                    chat_history=chat_history,
+                return self._fail_payload_invoke(
+                    resolved_name, "missing_payload_dict_for_payload_tool"
                 )
-                args_auto_built = True
+            payload_errors = self._validate_payload_shape(payload, tool_meta)
+            if payload_errors:
+                missing_keys = sorted(
+                    {err.split("missing:", 1)[1] for err in payload_errors if err.startswith("missing:")}
+                )
+                run_id = payload.get("run_id") if isinstance(payload, Mapping) else None
+                if missing_keys:
+                    error = (
+                        "missing_required_keys:"
+                        + ",".join(missing_keys)
+                        + f"|tool={resolved_name}|run_id={run_id or ''}"
+                    )
+                else:
+                    error = (
+                        "invalid_payload:"
+                        + ",".join(payload_errors)
+                        + f"|tool={resolved_name}|run_id={run_id or ''}"
+                    )
+                return self._fail_payload_invoke(resolved_name, error)
             if kwargs:
-                payload.update(kwargs)
-                kwargs = {}
-            payload = self._normalize_analyzer_payload(payload)
+                return self._fail_payload_invoke(
+                    resolved_name, "payload_kwargs_not_allowed"
+                )
+            if isinstance(payload, Mapping) and set(payload.keys()) == {"payload"} and isinstance(payload.get("payload"), Mapping):
+                payload = dict(payload.get("payload") or {})
+            raw_actions_spec = payload.get("actions_spec")
+            # NO MUTATIONS: Pass payload as-is, let tool handle missing fields
             args = [payload]
-            # Inject trace if missing (LLM-provided args bypass _default_payload_dict)
-            if not args[0].get("trace"):
-                args[0]["trace"] = self._extract_trace_from_history(chat_history)
+            trace_source = "payload"  # Always payload now, no injection
             if len(args) != 1 or not isinstance(args[0], Mapping) or "payload" in args[0]:
                 return self._fail_payload_invoke(
                     resolved_name, "payload_tool_requires_single_dict_arg"
                 )
+            actions_spec_source = "missing"
+            if isinstance(raw_actions_spec, Mapping):
+                actions_spec_source = "payload" if raw_actions_spec else "payload_empty"
+            actions_spec_keys = []
+            if isinstance(args[0].get("actions_spec"), Mapping):
+                actions_spec_keys = sorted(str(k) for k in args[0]["actions_spec"].keys())
+            trace_len = 0
+            last_actions: list[str] = []
+            if isinstance(args[0].get("trace"), list):
+                trace_list = args[0]["trace"]
+                trace_len = len(trace_list)
+                for step in trace_list[-3:]:
+                    if isinstance(step, Mapping):
+                        action = step.get("action")
+                        if isinstance(action, str):
+                            last_actions.append(action)
+                    else:
+                        last_actions.append(str(step))
+            self._log_flow_event(
+                "tool_trace_meta",
+                tool_name=resolved_name,
+                trace_source=trace_source,
+                trace_len=trace_len,
+                last_actions=last_actions,
+            )
+            self._log_flow_event(
+                "tool_actions_spec_meta",
+                tool_name=resolved_name,
+                actions_spec_source=actions_spec_source,
+                actions_spec_keys=actions_spec_keys,
+            )
 
         if tool_meta and tool_meta.environment_usage:
             current_env = self._resolved_environment_label()
@@ -484,26 +543,7 @@ class ControllerToolsMixin:
         candidate_output: Optional[str] = None,
         chat_history: Optional[ChatHistory] = None,
     ) -> Optional[tuple[list[Any], dict[str, Any]]]:
-        if not query and candidate_output is None:
-            return None
-        if self._signature_prefers_payload(tool.signature):
-            if isinstance(candidate_output, str) and candidate_output.strip().lower().startswith("action:"):
-                candidate_output = None
-            payload = self._default_payload_dict(
-                task_text=query or "",
-                candidate_output=candidate_output,
-                chat_history=chat_history,
-            )
-            required = []
-            schema = tool.input_schema if isinstance(tool.input_schema, Mapping) else None
-            if schema:
-                req = schema.get("required") or []
-                if isinstance(req, list):
-                    required = [str(x) for x in req if x]
-            if required and any(key not in payload for key in required):
-                return None
-            return [payload], {}
-        return [query or candidate_output or ""], {}
+        return None
 
     def _auto_build_tool_args(
         self,
@@ -512,37 +552,7 @@ class ControllerToolsMixin:
         query: str,
         chat_history: ChatHistory,
     ) -> Optional[dict[str, Any]]:
-        candidate_output = self._get_candidate_output(chat_history, query)
-        
-        # Get cached actions_spec
-        actions_spec = getattr(self, "_cached_actions_spec", None) or {}
-        if not actions_spec:
-            actions_spec = self._extract_actions_spec_from_text(
-                self._task_text_from_history(chat_history)
-            )
-        
-        payload = self._build_tool_invocation(
-            tool,
-            query=query,
-            candidate_output=candidate_output,
-            chat_history=chat_history,
-        )
-        if payload:
-            args, kwargs = payload
-            # Ensure actions_spec is populated in the payload
-            if args and isinstance(args[0], dict):
-                if not args[0].get("actions_spec"):
-                    args[0]["actions_spec"] = actions_spec
-            packed: dict[str, Any] = {}
-            if args:
-                packed["args"] = list(args)
-            if kwargs:
-                packed["kwargs"] = dict(kwargs)
-            if packed:
-                return packed
-        if query:
-            return {"args": [{"task_text": query, "actions_spec": actions_spec, "candidate_output": candidate_output}]}
-        return {"args": [{"task_text": query, "actions_spec": actions_spec, "candidate_output": candidate_output}]}
+        return None
 
 
     def _reuse_existing_tool(
@@ -675,30 +685,14 @@ class ControllerToolsMixin:
             tool_kwargs = {}
 
         if not tool_args and not tool_kwargs:
-            last_user = self._get_last_user_item(chat_history)
-            query = (last_user.content or "").strip() if last_user else ""
-            if tool_meta and self._signature_prefers_payload(tool_meta.signature):
-                candidate_output = self._get_candidate_output(chat_history, query)
-                if isinstance(candidate_output, str) and candidate_output.strip().lower().startswith("action:"):
-                    candidate_output = None
-                tool_args = [self._default_payload_dict(
-                    task_text=query,
-                    candidate_output=candidate_output,
-                    chat_history=chat_history,  # or None if you don't want it
-                )]
-                # Inject trace if missing (in case payload was provided by LLM)
-                if isinstance(tool_args[0], dict) and not tool_args[0].get("trace"):
-                    tool_args[0]["trace"] = self._extract_trace_from_history(chat_history)
+            return (
+                ToolResult.failure("missing_tool_args"),
+                [],
+                {},
+                tool_name,
+            )
 
-            elif query:
-                tool_args = [query]
-            else:
-                tool_args = [""]
-            args_auto_built = True
-
-        # Final trace injection for any remaining cases (LLM-provided args)
-        if tool_args and isinstance(tool_args[0], dict) and not tool_args[0].get("trace"):
-            tool_args[0]["trace"] = self._extract_trace_from_history(chat_history)
+        # NO MUTATION POLICY: Payload passed as-is, tool handles missing fields
 
         self._tool_invocation_attempts += 1
         result = self._registry.invoke_tool(

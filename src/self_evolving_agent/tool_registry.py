@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from src.typings.config import get_predefined_timestamp_structure
@@ -40,6 +40,9 @@ class ToolMetadata:
     last_used_time: Optional[str] = None
     environment_usage: Optional[dict[str, int]] = None
     environment: Optional[str] = None  # Environment this tool was created for
+    required_keys: list[str] = field(default_factory=list)
+    optional_keys: list[str] = field(default_factory=list)
+    property_types: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -124,6 +127,20 @@ class ToolRegistry:
                     tool_metadata.code_hash = ""
                 if tool_metadata.environment_usage is None:
                     tool_metadata.environment_usage = {}
+                if (
+                    (not tool_metadata.required_keys)
+                    or (not tool_metadata.optional_keys)
+                    or (not tool_metadata.property_types)
+                ):
+                    req_keys, opt_keys, prop_types = self._extract_schema_metadata(
+                        tool_metadata.input_schema
+                    )
+                    if not tool_metadata.required_keys:
+                        tool_metadata.required_keys = req_keys
+                    if not tool_metadata.optional_keys:
+                        tool_metadata.optional_keys = opt_keys
+                    if not tool_metadata.property_types:
+                        tool_metadata.property_types = prop_types
                 self._metadata[tool_metadata.name] = tool_metadata
         except Exception:
             # Corrupted metadata should not crash the run; start from an empty registry.
@@ -192,6 +209,35 @@ class ToolRegistry:
         if match := fenced_pattern.search(code or ""):
             return match.group("body").strip()
         return code or ""
+
+    def _extract_schema_metadata(
+        self, input_schema: Any
+    ) -> tuple[list[str], list[str], dict[str, str]]:
+        required_keys: list[str] = []
+        optional_keys: list[str] = []
+        property_types: dict[str, str] = {}
+        if not isinstance(input_schema, dict):
+            return required_keys, optional_keys, property_types
+
+        required = input_schema.get("required")
+        props = input_schema.get("properties")
+        if isinstance(required, list):
+            required_keys = [str(k) for k in required if k]
+        if isinstance(props, dict):
+            for key, spec in props.items():
+                if not isinstance(spec, dict):
+                    continue
+                raw_type = spec.get("type")
+                type_text = ""
+                if isinstance(raw_type, list):
+                    type_text = ",".join(str(t) for t in raw_type if t)
+                elif isinstance(raw_type, str):
+                    type_text = raw_type
+                if type_text:
+                    property_types[str(key)] = type_text
+            required_set = set(required_keys)
+            optional_keys = [str(k) for k in props.keys() if str(k) not in required_set]
+        return required_keys, optional_keys, property_types
 
     def _extract_docstrings(self, code: str) -> tuple[str, str]:
         try:
@@ -572,6 +618,10 @@ class ToolRegistry:
             metadata.base_name = base_name
             metadata.version = version
             metadata.code_hash = code_hash
+            req_keys, opt_keys, prop_types = self._extract_schema_metadata(input_schema)
+            metadata.required_keys = req_keys
+            metadata.optional_keys = opt_keys
+            metadata.property_types = prop_types
             if metadata.environment_usage is None:
                 metadata.environment_usage = {}
             metadata.environment = environment  # Store the environment this tool was created for
@@ -594,6 +644,9 @@ class ToolRegistry:
                 "tool_type": tool_type,
                 "tool_category": tool_category,
                 "input_schema": input_schema,
+                "required_keys": metadata.required_keys,
+                "optional_keys": metadata.optional_keys,
+                "property_types": metadata.property_types,
                 "capabilities": capabilities,
                 "path": tool_path,
                 "code_len": code_len,
@@ -670,6 +723,9 @@ class ToolRegistry:
                 "tool_type": m.tool_type,
                 "tool_category": getattr(m, "tool_category", None),
                 "input_schema": m.input_schema,
+                "required_keys": m.required_keys,
+                "optional_keys": m.optional_keys,
+                "property_types": m.property_types,
                 "capabilities": m.capabilities,
             }
             for m in self._metadata.values()
@@ -827,6 +883,20 @@ class ToolRegistry:
             return ""
 
 
+    def _payload_hash(self, payload: Any) -> str:
+        """
+        Compute canonical hash of payload for mutation detection.
+        Returns first 16 chars of SHA256 hash.
+        """
+        try:
+            if isinstance(payload, dict):
+                canonical = json.dumps(payload, sort_keys=True, default=str)
+            else:
+                canonical = str(payload)
+            return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+        except Exception:
+            return "hash_error"
+
     def invoke_tool(
         self,
         name: str,
@@ -874,6 +944,9 @@ class ToolRegistry:
 
         error_type: str | None = None
         error_traceback: str | None = None
+        payload_hash_before: str = "not_computed"
+        payload_hash_after: str = "not_computed"
+        payload_mutated: bool = False
 
         stage = "import"
         soft_failed = False
@@ -894,39 +967,64 @@ class ToolRegistry:
                 raise TypeError(...)
 
             # Normalize args/kwargs for payload-style tools (authoritative check)
+            payload_arg_for_log: dict[str, Any] | None = None
             if self._fn_prefers_payload(run_fn):
                 payload_arg: Any = None
 
                 if args:
                     if len(args) == 1:
-                        if isinstance(args[0], dict) and "payload" in args[0]:
+                        if (
+                            isinstance(args[0], dict)
+                            and set(args[0].keys()) == {"payload"}
+                            and isinstance(args[0].get("payload"), dict)
+                        ):
                             payload_arg = args[0].get("payload")
                         else:
                             payload_arg = args[0]
 
-                if payload_arg is None and kwargs:
-                    if "payload" in kwargs:
-                        base = kwargs.get("payload")
-                        if isinstance(base, dict):
-                            merged = dict(base)
-                            for k, v in kwargs.items():
-                                if k != "payload":
-                                    merged[k] = v
-                            payload_arg = merged
-                        else:
-                            payload_arg = base
-                    else:
-                        payload_arg = dict(kwargs)
-
                 if payload_arg is None:
                     raise ValueError("payload tool requires a single dict argument")
+                if kwargs:
+                    raise ValueError("payload_kwargs_not_allowed")
                 if not isinstance(payload_arg, dict):
                     raise TypeError("payload must be a dict")
 
+                required_keys: list[str] = []
+                if meta and isinstance(meta.input_schema, Mapping):
+                    req = meta.input_schema.get("required")
+                    if isinstance(req, list):
+                        required_keys = [str(k) for k in req if str(k)]
+                    if required_keys == ["payload"]:
+                        props = meta.input_schema.get("properties") or {}
+                        payload_schema = props.get("payload") if isinstance(props, Mapping) else None
+                        nested_required = []
+                        if isinstance(payload_schema, Mapping):
+                            nested_required = list(payload_schema.get("required") or [])
+                        if nested_required:
+                            required_keys = [str(k) for k in nested_required if str(k)]
+                if required_keys:
+                    missing = [k for k in required_keys if k not in payload_arg]
+                    if missing:
+                        run_id = payload_arg.get("run_id") if isinstance(payload_arg, Mapping) else None
+                        raise ValueError(
+                            "missing_required_keys:"
+                            + ",".join(sorted(missing))
+                            + f"|tool={resolved_name}|run_id={run_id or ''}"
+                        )
+
                 args = (payload_arg,)
                 kwargs = {}
+                if isinstance(payload_arg, dict):
+                    payload_arg_for_log = payload_arg
+
+            # Hash payload BEFORE tool invocation to prove no mutation
+            payload_hash_before = self._payload_hash(args[0]) if args else "no_args"
 
             result = run_fn(*args, **kwargs)
+
+            # Hash payload AFTER tool invocation to prove no mutation
+            payload_hash_after = self._payload_hash(args[0]) if args else "no_args"
+            payload_mutated = (payload_hash_before != payload_hash_after)
             if isinstance(result, Mapping):
                 status = result.get("status")
                 if isinstance(status, str) and status.lower() in {"error", "blocked"}:
@@ -950,9 +1048,11 @@ class ToolRegistry:
             error_type = type(e).__name__
             error_traceback = traceback.format_exc()
 
+        first_invoke = False
         with self._lock:
             metadata = self._metadata.get(resolved_name)
             if metadata:
+                first_invoke = metadata.usage_count == 0
                 metadata.usage_count += 1
                 metadata.last_used_time = datetime.datetime.now(datetime.UTC).isoformat()
                 if outcome.success and not soft_failed:
@@ -970,6 +1070,96 @@ class ToolRegistry:
                 self._save_metadata()
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
+        result_status = None
+        result_next_action = None
+        result_next_action_args = None
+        result_next_action_line = None
+        result_contract_ok = None
+        result_errors = None
+        result_warnings = None
+        result_rationale = None
+        result_next_action_reason = None
+        result_validation = None
+        result_answer_recommendation = None
+        result_final_answer_line = None
+        result_plan = None
+        result_output_keys = None
+        result_output_summary = None
+        if isinstance(outcome.output, Mapping):
+            status = outcome.output.get("status")
+            if isinstance(status, str):
+                result_status = status
+            next_action = outcome.output.get("next_action")
+            if isinstance(next_action, Mapping):
+                action_name = next_action.get("name")
+                if not isinstance(action_name, str):
+                    action_name = next_action.get("action")
+                if isinstance(action_name, str):
+                    result_next_action = action_name
+                args_value = next_action.get("args")
+                if isinstance(args_value, list):
+                    result_next_action_args = list(args_value)
+                elif isinstance(args_value, Mapping):
+                    result_next_action_args = dict(args_value)
+            errors = outcome.output.get("errors")
+            if isinstance(errors, list):
+                result_errors = errors
+            warnings = outcome.output.get("warnings")
+            if isinstance(warnings, list):
+                result_warnings = warnings
+            rationale = outcome.output.get("rationale")
+            if isinstance(rationale, list):
+                result_rationale = rationale
+            next_action_line = outcome.output.get("next_action_line")
+            if isinstance(next_action_line, str):
+                result_next_action_line = next_action_line
+            next_action_reason = outcome.output.get("next_action_reason")
+            if isinstance(next_action_reason, str):
+                result_next_action_reason = next_action_reason
+            answer_recommendation = outcome.output.get("answer_recommendation")
+            if answer_recommendation is not None:
+                result_answer_recommendation = answer_recommendation
+            final_answer_line = outcome.output.get("final_answer_line")
+            if isinstance(final_answer_line, str):
+                result_final_answer_line = final_answer_line
+            plan = outcome.output.get("plan")
+            if plan is not None:
+                result_plan = plan
+            validation = outcome.output.get("validation")
+            if isinstance(validation, Mapping):
+                result_validation = validation
+                contract_ok = validation.get("contract_ok")
+                if isinstance(contract_ok, bool):
+                    result_contract_ok = contract_ok
+            result_output_keys = sorted(str(k) for k in outcome.output.keys())
+        if outcome.output is not None:
+            try:
+                if isinstance(outcome.output, (dict, list)):
+                    raw = json.dumps(outcome.output, ensure_ascii=True, default=str)
+                else:
+                    raw = str(outcome.output)
+                result_output_summary = {
+                    "len": len(raw),
+                    "sha1": hashlib.sha1(raw.encode("utf-8")).hexdigest(),
+                    "preview": self._preview(raw, max_len=240),
+                }
+            except Exception:
+                result_output_summary = None
+
+        run_id = None
+        state_dir = None
+        asked_for = None
+        actions_spec_keys = None
+        trace = None
+        if isinstance(payload_arg_for_log, dict):
+            run_id = payload_arg_for_log.get("run_id")
+            state_dir = payload_arg_for_log.get("state_dir")
+            asked_for = payload_arg_for_log.get("asked_for")
+            actions_spec = payload_arg_for_log.get("actions_spec")
+            if isinstance(actions_spec, Mapping):
+                actions_spec_keys = sorted(str(k) for k in actions_spec.keys())
+            trace = payload_arg_for_log.get("trace")
+
         self._notify(
             {
                 "event": "invoke",
@@ -984,8 +1174,31 @@ class ToolRegistry:
                 "error_type": error_type,
                 "traceback": error_traceback,
                 "result_preview": self._preview(outcome.output),
+                "result_status": result_status,
+                "result_next_action": result_next_action,
+                "result_next_action_args": result_next_action_args,
+                "result_next_action_line": result_next_action_line,
+                "result_contract_ok": result_contract_ok,
+                "result_errors": result_errors,
+                "result_warnings": result_warnings,
+                "result_rationale": result_rationale,
+                "result_next_action_reason": result_next_action_reason,
+                "result_validation": result_validation,
+                "result_answer_recommendation": result_answer_recommendation,
+                "result_final_answer_line": result_final_answer_line,
+                "result_plan": result_plan,
+                "result_output_keys": result_output_keys,
+                "result_output_summary": result_output_summary,
                 "duration_ms": duration_ms,
                 "invocation_context": inv_ctx,
+                "run_id": run_id,
+                "state_dir": state_dir,
+                "asked_for": asked_for,
+                "actions_spec_keys": actions_spec_keys,
+                "trace": trace,
+                "payload_hash_before": payload_hash_before,
+                "payload_hash_after": payload_hash_after,
+                "payload_mutated": payload_mutated,
             }
         )
         self._append_snapshot(

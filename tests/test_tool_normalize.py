@@ -139,6 +139,6 @@ def test_register_and_invoke_normalized_tool(tmp_path):
         capabilities=normalized["capabilities"],
     )
     assert metadata is not None
-    result = registry.invoke_tool(metadata.name, payload={"foo": "x"})
+    result = registry.invoke_tool(metadata.name, {"foo": "x"})
     assert result.success
     assert isinstance(result.output, dict)

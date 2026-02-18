@@ -65,14 +65,8 @@ def test_tool_pipeline_end_to_end() -> None:
 
     input_schema = {
         "type": "object",
-        "required": ["payload"],
-        "properties": {
-            "payload": {
-                "type": "object",
-                "properties": {"foo": {"type": "string"}},
-                "required": [],
-            }
-        },
+        "required": ["foo"],
+        "properties": {"foo": {"type": "string"}},
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:

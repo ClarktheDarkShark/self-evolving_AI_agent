@@ -189,6 +189,7 @@ class SelfEvolvingController(
                 system_prompt=TOOL_INVOKER_SYSTEM_PROMPT,
                 inference_config_dict={
                     **orchestrator_cfg,
+                    "allow_internal_tool_protocol": False,
                     "temperature": 0.0,
                 },
                 agent_name="tool_invoker",
@@ -343,6 +344,20 @@ class SelfEvolvingController(
 
         if cache_key in cached:
             entry = cached[cache_key]
+            try:
+                task_text_hash = hashlib.sha1(task_text_full.encode("utf-8")).hexdigest()[:12]
+                self._log_flow_event(
+                    "run_scope",
+                    cached=True,
+                    task_text_hash=task_text_hash,
+                    task_sig=entry["task_sig"],
+                    run_id=entry["run_id"],
+                    state_dir=entry["state_dir"],
+                    task_name=tn,
+                    sample_index=si,
+                )
+            except Exception:
+                pass
             return entry["run_id"], entry["state_dir"], entry["task_sig"]
 
         # IMPORTANT: do NOT include asked_for (it drifts) in the signature.
@@ -355,6 +370,20 @@ class SelfEvolvingController(
         state_dir = str(base_state_dir / task_sig)
 
         cached[cache_key] = {"run_id": run_id, "state_dir": state_dir, "task_sig": task_sig}
+        try:
+            task_text_hash = hashlib.sha1(task_text_full.encode("utf-8")).hexdigest()[:12]
+            self._log_flow_event(
+                "run_scope",
+                cached=False,
+                task_text_hash=task_text_hash,
+                task_sig=task_sig,
+                run_id=run_id,
+                state_dir=state_dir,
+                task_name=tn,
+                sample_index=si,
+            )
+        except Exception:
+            pass
         return run_id, state_dir, task_sig
 
 
@@ -384,14 +413,6 @@ class SelfEvolvingController(
                 else:
                     task_text_full = first_user or last_user or task_text_full
 
-
-        asked_for = self._extract_asked_for(task_text_full)
-        trace = self._extract_trace_from_history(chat_history)
-
-        actions_spec = self._extract_actions_spec_from_text(task_text_full)
-        if not actions_spec:
-            actions_spec = getattr(self, "_cached_actions_spec", None) or {}
-
         # Prefer explicit params; fall back to metadata if not provided
         si = sample_index
         if si is None:
@@ -403,18 +424,13 @@ class SelfEvolvingController(
 
         run_id, state_dir, task_sig = self._scoped_run_id_state_dir(
             task_text_full=task_text_full,
-            asked_for=asked_for,
+            asked_for="",
             sample_index=si,
             task_name=tn,
         )
 
-
-
         payload: dict[str, Any] = {
             "task_text": task_text_full,
-            "asked_for": asked_for,      # ← NOW POPULATED
-            "trace": trace,              # ← NOW POPULATED
-            "actions_spec": actions_spec,
             "constraints": [],
             "output_contract": {},
             "draft_response": None,
@@ -443,44 +459,23 @@ class SelfEvolvingController(
             original_query = orig_last_user.content if orig_last_user else ""
         task_query = (original_query or "").strip()
 
-        if not getattr(self, "_cached_actions_spec", None):
-            first_user_items = [
-                item for item in self._history_items(working_history) 
-                if item.role == Role.USER
-            ]
-            if first_user_items:
-                first_content = (first_user_items[0].content or "").strip()
-                extracted = self._extract_actions_spec_from_text(first_content)
-                if extracted:
-                    self._cached_actions_spec = extracted
-
         def _record_tool_error(stage: str, message: str, tb: Optional[str] = None) -> None:
             self._trace("tool_pipeline_error", f"{stage}: {message}")
             if tb:
                 self._trace("tool_pipeline_traceback", tb)
-
-        def _requires_action_format() -> bool:
-            return self._is_db_bench_env()
-
-        def _fallback_response() -> str:
-            if _requires_action_format():
-                return "Action: Answer\nFinal Answer: []"
-            return "OK."
-
-        def _ensure_solver_output(content: str) -> str:
-            text = (content or "").strip()
-            if not text:
-                return _fallback_response()
-            if _requires_action_format() and not re.match(r"^Action:\s*(Operation|Answer)\b", text):
-                return _fallback_response()
-            return content
 
         tool_traces: list[dict[str, Any]] = []
         tool_error: Optional[str] = None
         tool_result_injected = False
         tool_agent_traced = False
         solver_sidecar: list[str] = []
+        last_tool_result: Optional[ToolResult] = None
+        last_tool_actions_spec: Optional[Mapping[str, Any]] = None
         solver_recommendation: Optional[str] = None
+        last_tool_next_action: Optional[str] = None
+        last_tool_run_id: Optional[str] = None
+        last_tool_state_dir: Optional[str] = None
+        last_tool_name: Optional[str] = None
 
         init_solver = os.getenv("INIT_SOLVER", "0") == "1"
         solver_recommendation = ""
@@ -502,6 +497,15 @@ class SelfEvolvingController(
                 "history_items": len(self._history_items(working_history)),
                 "sidecar_chars": 0,
             }
+            self._append_solver_io_log(
+                {
+                    "event": "solver_input",
+                    "stage": "initial_recommendation",
+                    "system_prompt": initial_solver_prompt,
+                    "history": initial_history_text,
+                    "sidecar": "",
+                }
+            )
             self._log_flow_event(
                 "solver_input",
                 chat_history=working_history,
@@ -510,6 +514,13 @@ class SelfEvolvingController(
             start_ts = time.perf_counter()
             initial_response = self._solver_inference_with_retry(
                 working_history, system_prompt=initial_solver_prompt
+            )
+            self._append_solver_io_log(
+                {
+                    "event": "solver_output",
+                    "stage": "initial_recommendation",
+                    "content": getattr(initial_response, "content", "") or "",
+                }
             )
             elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
             self._log_flow_event(
@@ -526,9 +537,9 @@ class SelfEvolvingController(
             )
             solver_recommendation = (getattr(initial_response, "content", "") or "")
             self._toolgen_last_recommendation = solver_recommendation
-            initial_solver_output = _ensure_solver_output(solver_recommendation)
+            initial_solver_output = solver_recommendation
             if self._contains_internal_tool(initial_solver_output):
-                initial_solver_output = _fallback_response()
+                initial_solver_output = ""
         else:
             self._toolgen_last_recommendation = ""
 
@@ -544,12 +555,31 @@ class SelfEvolvingController(
                 if not init_solver:
                     solver_prompt = self._solver_prompt_no_tools()
                     self._write_agent_system_prompt("solver", solver_prompt)
+                    history_text = self._toolgen_render_history(
+                        working_history,
+                        max_chars_per_item=1200,
+                        preserve_first_user_n=2,
+                    )
+                    self._append_solver_io_log(
+                        {
+                            "event": "solver_input",
+                            "stage": "no_tool",
+                            "system_prompt": solver_prompt,
+                            "history": history_text,
+                            "sidecar": "",
+                        }
+                    )
                     solver_response = self._solver_inference_with_retry(
                         working_history, system_prompt=solver_prompt
                     )
-                    content = _ensure_solver_output(
-                        getattr(solver_response, "content", "") or ""
+                    self._append_solver_io_log(
+                        {
+                            "event": "solver_output",
+                            "stage": "no_tool",
+                            "content": getattr(solver_response, "content", "") or "",
+                        }
                     )
+                    content = getattr(solver_response, "content", "") or ""
                 else:
                     content = initial_solver_output
                 self._trace("solver_result", content)
@@ -593,103 +623,154 @@ class SelfEvolvingController(
                     tool_invoker = self._tool_invoker_decision(
                         task_query, working_history, suggestion=tool_suggestion
                     )
-                    tool_name = tool_invoker.get("tool_name") or tool_suggestion.get("tool_name")
-                    tool_args = tool_invoker.get("tool_args")
+                    tool_name = tool_invoker.get("tool_name")
+                    payload = tool_invoker.get("payload")
                     if tool_name:
                         args_auto_built = False
-                        if tool_args is None or tool_args == {} or tool_args == []:
-                            resolved_name = (
-                                self._registry.resolve_name(tool_name)
-                                if hasattr(self._registry, "resolve_name")
-                                else None
-                            )
-                            resolved_name = resolved_name or tool_name
-                            tool_meta = self._get_tool_metadata(resolved_name)
-                            if tool_meta is not None:
-                                tool_args = self._auto_build_tool_args(
-                                    tool_meta, query=task_query, chat_history=working_history
+                        if not tool_result_injected:
+                            contract = self._parse_tool_invoke_contract(tool_name)
+                            invoke_with = contract.get("invoke_with") if contract else None
+                            required_keys = list(contract.get("required") or []) if contract else []
+                            optional_keys = list(contract.get("optional") or []) if contract else []
+                            if not invoke_with:
+                                tool_meta = self._get_tool_metadata(tool_name)
+                                invoke_with = '{"args":[<RUN_PAYLOAD>], "kwargs":{}}'
+                                if tool_meta:
+                                    if not required_keys:
+                                        required_keys = list(tool_meta.required_keys or [])
+                                    if not optional_keys:
+                                        optional_keys = list(tool_meta.optional_keys or [])
+                            payload_map: dict[str, Any] = dict(payload) if isinstance(payload, Mapping) else {}
+                            if isinstance(payload_map.get("actions_spec"), Mapping):
+                                last_tool_actions_spec = payload_map.get("actions_spec")
+                            payload_keys = sorted(str(k) for k in payload_map.keys())
+                            payload_for_tool: dict[str, Any] = {}
+                            missing_keys: list[str] = []
+                            for key in required_keys:
+                                if key in payload_map:
+                                    payload_for_tool[key] = payload_map[key]
+                                else:
+                                    missing_keys.append(key)
+                            for key in optional_keys:
+                                if key in payload_map:
+                                    payload_for_tool[key] = payload_map[key]
+                            try:
+                                self._append_generated_tools_log(
+                                    {
+                                        "event": "tool_invoke_contract",
+                                        "tool_name": tool_name,
+                                        "invoke_with": invoke_with,
+                                        "required_keys": required_keys,
+                                        "optional_keys": optional_keys,
+                                        "payload_keys": payload_keys,
+                                        "payload_missing": missing_keys,
+                                        "wrapper_shape": invoke_with,
+                                    }
                                 )
-                                args_auto_built = tool_args is not None
-                        if tool_args is None or tool_args == {} or tool_args == []:
-                            payload = self._default_payload_dict(
-                                task_text=task_query,
-                                candidate_output=None,
-                                chat_history=working_history,
-                                sample_index=decision.get("sample_index"),   # <-- ADD THIS
-                            )
-
-                            tool_args = {"args": [payload], "kwargs": {}}
-                            args_auto_built = True
-
-                        self._log_flow_event(
-                            "tool_agent_input",
-                            chat_history=working_history,
-                            tool_name=tool_name,
-                            tool_args=tool_args,
-                            reason="tool_invoker",
-                        )
-                        # --- FORCE SCOPED STATE FOR THIS SAMPLE (even if LLM provided tool_args) ---
-                        sample_index = decision.get("sample_index")
-                        task_name = decision.get("task_name") or self._run_task_label or self._environment_label
-
-                        if isinstance(tool_args, dict):
-                            args_list = tool_args.get("args") if isinstance(tool_args.get("args"), list) else None
-                            kwargs_dict = tool_args.get("kwargs") if isinstance(tool_args.get("kwargs"), dict) else {}
-
-                            if args_list and isinstance(args_list[0], dict):
-                                payload0 = args_list[0]
-
-                                task_text_full = (payload0.get("task_text") or task_query or "").strip() or task_query
-                                asked_for = (payload0.get("asked_for") or self._extract_asked_for(task_text_full)).strip()
-
-                                run_id, state_dir, _ = self._scoped_run_id_state_dir(
-                                    task_text_full=task_text_full,
-                                    asked_for=asked_for,
-                                    sample_index=sample_index,
-                                    task_name=task_name,
+                            except Exception:
+                                pass
+                            if missing_keys:
+                                run_id_hint = payload_map.get("run_id") if isinstance(payload_map, Mapping) else None
+                                tool_error = (
+                                    "missing_required_keys:"
+                                    + ",".join(sorted(str(k) for k in missing_keys))
+                                    + f"|tool={tool_name}|run_id={run_id_hint or ''}"
                                 )
+                                self._log_failed_invoke_event(
+                                    tool_name=tool_name,
+                                    reason=tool_error,
+                                )
+                                _record_tool_error("tool_invoker", tool_error)
+                                tool_result = ToolResult.failure(tool_error)
+                                solver_sidecar.append(
+                                    self._format_tool_result("tool_invoker", tool_result)
+                                )
+                                tool_result_injected = True
+                            else:
+                                wrapped = self._wrap_payload_with_contract(
+                                    invoke_with, payload_for_tool
+                                )
+                                if not wrapped:
+                                    tool_error = "invalid_invoke_wrapper"
+                                    self._log_failed_invoke_event(
+                                        tool_name=tool_name,
+                                        reason=tool_error,
+                                    )
+                                    _record_tool_error("tool_invoker", tool_error)
+                                    tool_result = ToolResult.failure(tool_error)
+                                    solver_sidecar.append(
+                                        self._format_tool_result("tool_invoker", tool_result)
+                                    )
+                                    tool_result_injected = True
+                                else:
+                                    args, kwargs = wrapped
+                                    if (
+                                        isinstance(args, list)
+                                        and len(args) == 1
+                                        and isinstance(args[0], Mapping)
+                                        and set(args[0].keys()) == {"payload"}
+                                        and isinstance(args[0].get("payload"), Mapping)
+                                    ):
+                                        args = [dict(args[0].get("payload") or {})]
+                                    tool_args = {"args": args, "kwargs": kwargs}
+                                    self._log_flow_event(
+                                        "tool_agent_input",
+                                        chat_history=working_history,
+                                        tool_name=tool_name,
+                                        tool_args=tool_args,
+                                        reason="tool_invoker",
+                                    )
+                                    # Now invoke
+                                    tool_result = self._invoke_tool_by_payload(
+                                        tool_name,
+                                        tool_args,
+                                        reason="tool_invoker",
+                                        chat_history=working_history,
+                                        args_auto_built=args_auto_built,
+                                        decision_action=tool_action,
+                                    )
+                                    last_tool_result = tool_result
 
-                                # Overwrite canonical fields
-                                payload0["asked_for"] = asked_for
-                                payload0["run_id"] = run_id
-                                payload0["state_dir"] = state_dir
-
-                                # Re-pack with normalized shape
-                                tool_args["args"] = [payload0]
-                                tool_args["kwargs"] = kwargs_dict
-
-
-                        # Now invoke
-                        tool_result = self._invoke_tool_by_payload(
-                            tool_name,
-                            tool_args,
-                            reason="tool_invoker",
-                            chat_history=working_history,
-                            args_auto_built=args_auto_built,
-                            decision_action=tool_action,
-                        )
-
-                        self._log_flow_event(
-                            "tool_agent_output",
-                            chat_history=working_history,
-                            tool_name=tool_name,
-                            success=tool_result.success,
-                            error=tool_result.error,
-                            output=tool_result.output,
-                        )
-                        tool_traces.append(
-                            self._build_tool_trace(
-                                summary="Tool invoker executed a tool.",
-                                tool_name=tool_name,
-                                args=[],
-                                kwargs={"tool_args": tool_args},
-                                result=tool_result,
-                            )
-                        )
-                        solver_sidecar.append(
-                            self._format_tool_result(tool_name, tool_result)
-                        )
-                        tool_result_injected = True
+                            if not tool_result_injected:
+                                self._log_flow_event(
+                                    "tool_agent_output",
+                                    chat_history=working_history,
+                                    tool_name=tool_name,
+                                    success=tool_result.success,
+                                    error=tool_result.error,
+                                    output=tool_result.output,
+                                )
+                                if isinstance(tool_result.output, Mapping):
+                                    next_action = tool_result.output.get("next_action")
+                                    if isinstance(next_action, Mapping):
+                                        action_name = next_action.get("name")
+                                        if not isinstance(action_name, str):
+                                            action_name = next_action.get("action")
+                                        if isinstance(action_name, str):
+                                            last_tool_next_action = action_name
+                                last_tool_name = tool_name
+                                if isinstance(tool_args, dict):
+                                    args_list = tool_args.get("args")
+                                    if (
+                                        isinstance(args_list, list)
+                                        and args_list
+                                        and isinstance(args_list[0], dict)
+                                    ):
+                                        last_tool_run_id = args_list[0].get("run_id")
+                                        last_tool_state_dir = args_list[0].get("state_dir")
+                                tool_traces.append(
+                                    self._build_tool_trace(
+                                        summary="Tool invoker executed a tool.",
+                                        tool_name=tool_name,
+                                        args=[],
+                                        kwargs={"tool_args": tool_args},
+                                        result=tool_result,
+                                    )
+                                )
+                                solver_sidecar.append(
+                                    self._format_tool_result(tool_name, tool_result)
+                                )
+                                tool_result_injected = True
                     else:
                         tool_error = "tool_invoker_missing_tool_name"
                         self._log_failed_invoke_event(
@@ -705,6 +786,90 @@ class SelfEvolvingController(
         except Exception as exc:
             tool_error = f"{type(exc).__name__}: {exc}"
             _record_tool_error("tool_pipeline", tool_error, traceback.format_exc())
+
+        if tool_result_injected and last_tool_result is not None:
+            if not isinstance(last_tool_result.output, Mapping):
+                err_text = last_tool_result.error or "tool_execution_failed"
+                return ChatHistoryItem(role=Role.AGENT, content=f"ERROR: {err_text}")
+
+        if (
+            tool_result_injected
+            and last_tool_result is not None
+            and isinstance(last_tool_result.output, Mapping)
+        ):
+            tool_output = last_tool_result.output
+            status = tool_output.get("status")
+            status_norm = status.lower() if isinstance(status, str) else None
+            if status_norm in {"need_step", "done", "blocked", "error"}:
+                errors = list(tool_output.get("errors") or [])
+                warnings = list(tool_output.get("warnings") or [])
+
+                if status_norm == "need_step":
+                    actions_spec = (
+                        last_tool_actions_spec
+                        if isinstance(last_tool_actions_spec, Mapping)
+                        else None
+                    )
+                    next_action = tool_output.get("next_action")
+                    action_name = None
+                    action_args = None
+                    if isinstance(next_action, Mapping):
+                        action_name = next_action.get("name")
+                        action_args = next_action.get("args")
+                    else:
+                        errors.append("invalid_next_action:missing")
+                    if action_args is None:
+                        action_args = []
+
+                    if (
+                        not isinstance(action_name, str)
+                        or not action_name.strip()
+                        or action_name.strip().lower() == "none"
+                    ):
+                        errors.append("invalid_next_action:name")
+                    if not isinstance(action_args, list):
+                        errors.append("invalid_next_action:args")
+
+                    if not isinstance(actions_spec, Mapping) or not actions_spec:
+                        errors.append("missing_actions_spec")
+                    elif isinstance(action_name, str) and action_name not in actions_spec:
+                        errors.append("invalid_next_action:not_in_actions_spec")
+
+                    if errors:
+                        err_text = ",".join(str(e) for e in errors)
+                        warn_text = ",".join(str(w) for w in warnings) if warnings else ""
+                        msg = f"ERROR: {err_text}"
+                        if warn_text:
+                            msg = msg + f" WARNINGS: {warn_text}"
+                        tool_error = err_text or "invalid_next_action"
+                        solver_sidecar.append(f"TOOL_ERROR:\n{msg}")
+                        # Fall through to solver; do not return tool error to env.
+                    else:
+                        action_args = action_args or []
+                        args_text = ", ".join(str(arg) for arg in action_args)
+                        action_line = (
+                            f"Action: {action_name}({args_text})"
+                            if args_text
+                            else f"Action: {action_name}()"
+                        )
+                        return ChatHistoryItem(role=Role.AGENT, content=action_line)
+
+                if status_norm == "done":
+                    answer = tool_output.get("answer_recommendation")
+                    if isinstance(answer, str) and answer.strip():
+                        return ChatHistoryItem(role=Role.AGENT, content=answer)
+                    errors.append("missing_answer_recommendation")
+
+                if status_norm in {"blocked", "error", "done"}:
+                    err_text = ",".join(str(e) for e in errors)
+                    warn_text = ",".join(str(w) for w in warnings) if warnings else ""
+                    msg = f"ERROR: {err_text or status_norm}"
+                    if warn_text:
+                        msg = msg + f" WARNINGS: {warn_text}"
+                    tool_error = err_text or status_norm
+                    solver_sidecar.append(f"TOOL_ERROR:\n{msg}")
+                    # Fall through to solver; do not return tool error to env.
+                    # break
 
         if not tool_agent_traced:
             self._trace("tool_agent_input", "none")
@@ -733,7 +898,7 @@ class SelfEvolvingController(
                 solver_prompt = (
                     solver_prompt
                     + "\n\nINTERNAL TOOL CONTEXT:\n"
-                    + "Tool results are strongly recommended for deciding the final response.\n"
+                    + "CRITICAL: If the tool result includes 'recommended_next_action', you MUST use that exact action as your next step. The tool has analyzed the task state and determined the optimal next action.\n\n"
                     + "\n\n".join(solver_sidecar)
                 )
             history_text = self._toolgen_render_history(
@@ -763,9 +928,27 @@ class SelfEvolvingController(
                 chat_history=working_history,
                 payload=solver_payload,
             )
+            self._append_solver_io_log(
+                {
+                    "event": "solver_input",
+                    "stage": "final_response",
+                    "attempt": attempt + 1,
+                    "system_prompt": solver_prompt,
+                    "history": history_text,
+                    "sidecar": sidecar_text,
+                }
+            )
             start_ts = time.perf_counter()
             solver_response = self._solver_inference_with_retry(
                 working_history, system_prompt=solver_prompt
+            )
+            self._append_solver_io_log(
+                {
+                    "event": "solver_output",
+                    "stage": "final_response",
+                    "attempt": attempt + 1,
+                    "content": getattr(solver_response, "content", "") or "",
+                }
             )
             elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
             self._log_flow_event(
@@ -786,20 +969,50 @@ class SelfEvolvingController(
                 self._trace("solver_result", content)
                 working_history = self._safe_inject(working_history, solver_response)
                 continue
-            content = _ensure_solver_output(content)
+            content = content
+            invalid_action = False
+            action_name = None
+            allowed_actions: set[str] = set()
+            match = re.search(r"Action:\s*([A-Za-z_][A-Za-z0-9_]*)", content)
+            if match:
+                action_name = match.group(1)
+                if action_name.strip().lower() in {"none", "null", "nil"}:
+                    invalid_action = True
+                actions_spec = (
+                    last_tool_actions_spec
+                    if isinstance(last_tool_actions_spec, Mapping)
+                    else self._available_actions_spec()
+                )
+                if isinstance(actions_spec, Mapping) and actions_spec:
+                    allowed_actions = {
+                        str(name).strip().lower()
+                        for name in actions_spec.keys()
+                        if str(name).strip()
+                    }
+                    if action_name.lower() not in allowed_actions:
+                        invalid_action = True
+            elif "Action:" in content:
+                invalid_action = True
+            if invalid_action:
+                allowed_hint = ""
+                if allowed_actions:
+                    allowed_hint = " Allowed actions: " + ", ".join(sorted(allowed_actions)) + "."
+                solver_sidecar.append(
+                    f"INVALID_ACTION: {action_name or 'missing'}.{allowed_hint}"
+                )
+                continue
             context_key = self._solver_context_key(working_history)
             if content == self._last_solver_output and context_key == self._last_solver_context_key:
                 self._solver_repeat_count += 1
                 if self._solver_repeat_count >= 2:
-                    fallback = _fallback_response()
-                    self._trace("solver_result", fallback)
+                    self._trace("solver_result", content)
                     self._log_flow_event(
                         "final_response",
                         chat_history=working_history,
-                        content=fallback,
+                        content=content,
                     )
-                    self._flush_tool_traces(tool_traces, fallback)
-                    return ChatHistoryItem(role=Role.AGENT, content=fallback)
+                    self._flush_tool_traces(tool_traces, content)
+                    return ChatHistoryItem(role=Role.AGENT, content=content)
                 working_history = self._safe_inject(working_history, solver_response)
                 working_history = self._safe_inject(
                     working_history,
@@ -815,6 +1028,20 @@ class SelfEvolvingController(
             self._last_solver_output = content
             self._last_solver_context_key = context_key
             self._trace("solver_result", content)
+            if last_tool_next_action or content:
+                executed_action = None
+                match = re.search(r"Action:\s*([A-Za-z_][A-Za-z0-9_]*)", content)
+                if match:
+                    executed_action = match.group(1)
+                if last_tool_next_action or executed_action:
+                    self._log_flow_event(
+                        "tool_action_compare",
+                        tool_name=last_tool_name,
+                        tool_next_action=last_tool_next_action,
+                        executed_action=executed_action,
+                        run_id=last_tool_run_id,
+                        state_dir=last_tool_state_dir,
+                    )
             self._log_flow_event(
                 "final_response",
                 chat_history=working_history,
@@ -828,15 +1055,15 @@ class SelfEvolvingController(
             )
             return ChatHistoryItem(role=Role.AGENT, content=content)
 
-        fallback = _fallback_response()
-        self._trace("solver_result", fallback)
+        last_output = self._last_solver_output or ""
+        self._trace("solver_result", last_output)
         self._log_flow_event(
             "final_response",
             chat_history=working_history,
-            content=fallback,
+            content=last_output,
         )
-        self._flush_tool_traces(tool_traces, fallback)
-        return ChatHistoryItem(role=Role.AGENT, content=fallback)
+        self._flush_tool_traces(tool_traces, last_output)
+        return ChatHistoryItem(role=Role.AGENT, content=last_output)
 
     def _inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
         """
@@ -913,7 +1140,7 @@ class SelfEvolvingController(
                     solver_prompt = (
                         solver_prompt
                         + "\n\nINTERNAL TOOL CONTEXT:\n"
-                        + "Tool results are strongly recommended for deciding the final response.\n"
+                        + "CRITICAL: If the tool result includes 'recommended_next_action', you MUST use that exact action as your next step. The tool has analyzed the task state and determined the optimal next action.\n\n"
                         + "\n\n".join(solver_sidecar)
                     )
                 history_text = self._toolgen_render_history(
@@ -938,9 +1165,25 @@ class SelfEvolvingController(
                         "sidecar_chars": len(sidecar_text),
                     },
                 )
+                self._append_solver_io_log(
+                    {
+                        "event": "solver_input",
+                        "stage": "non_orchestrated",
+                        "system_prompt": solver_prompt,
+                        "history": history_text,
+                        "sidecar": sidecar_text,
+                    }
+                )
                 start_ts = time.perf_counter()
                 solver_response = self._solver_inference_with_retry(
                     working_history, system_prompt=solver_prompt
+                )
+                self._append_solver_io_log(
+                    {
+                        "event": "solver_output",
+                        "stage": "non_orchestrated",
+                        "content": getattr(solver_response, "content", "") or "",
+                    }
                 )
                 elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
                 self._log_flow_event(
