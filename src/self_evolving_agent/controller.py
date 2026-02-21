@@ -38,6 +38,7 @@ from .controller_prompts import (
     TOOLGEN_SYSTEM_PROMPT_MARKERS,
     TOOL_INVOKER_SYSTEM_PROMPT,
     COMBINED_ORCHESTRATOR_SYSTEM_PROMPT,
+    TOOLGEN_VALIDATOR_SYSTEM_PROMPT,
 )
 from .controller_toolgen import ControllerToolgenMixin
 from .controller_tools import ControllerToolsMixin
@@ -126,6 +127,13 @@ class SelfEvolvingController(
             agent_name="solver",
         )
 
+        output_dir_override = get_output_dir_override()
+        if output_dir_override:
+            tool_registry_path = str(Path(output_dir_override) / "tool_library")
+        else:
+            run_stamp = get_predefined_timestamp_structure()["TIMESTAMP"]
+            tool_registry_path = str(Path("outputs") / run_stamp / "tool_library")
+
         pipeline_config = get_toolgen_pipeline_config(tool_registry_path)
         tool_registry_path = pipeline_config.registry_dir
         self._toolgen_pipeline_name = pipeline_config.pipeline
@@ -160,6 +168,17 @@ class SelfEvolvingController(
                 "temperature": 0.1,
             },
             agent_name="toolgen",
+        )
+        validator_cfg = dict(base_cfg)
+        validator_cfg["response_format"] = {"type": "json_object"}
+        self._toolgen_validator_agent = LanguageModelAgent(
+            language_model=language_model,
+            system_prompt=TOOLGEN_VALIDATOR_SYSTEM_PROMPT,
+            inference_config_dict={
+                **validator_cfg,
+                "temperature": 0.0,
+            },
+            agent_name="toolgen_validator",
         )
 
         self._use_orchestrator = use_orchestrator
@@ -301,6 +320,8 @@ class SelfEvolvingController(
         self._toolgen_debug_registered_tools: dict[str, int] = {}
         self._last_toolgen_parse_source: Optional[str] = None
         self._toolgen_last_recommendation: Optional[str] = None
+        self._tool_usage_logged: set[str] = set()
+        self._outcome_scored: set[str] = set()
         self._run_task_metadata: Optional[dict[str, Any]] = None
         self._last_solver_output: Optional[str] = None
         self._last_solver_context_key: Optional[str] = None
@@ -443,6 +464,278 @@ class SelfEvolvingController(
             payload["chat_history"] = self._toolgen_render_history(chat_history, max_chars_per_item=None)
         return payload
 
+    def _parse_action_line(self, content: str) -> Optional[tuple[str, list[str]]]:
+        text = (content or "").strip()
+        if not text:
+            return None
+        match = re.search(r"Action:\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?", text)
+        if not match:
+            return None
+        name = match.group(1).strip()
+        args_raw = (match.group(2) or "").strip()
+        if not args_raw:
+            return name, []
+        parts = [part.strip() for part in args_raw.split(",")]
+        args = [part for part in parts if part]
+        return name, args
+
+    def _parse_env_observation(self, content: str) -> tuple[Optional[str], Optional[str], bool]:
+        text = (content or "").strip()
+        if not text:
+            return None, None, False
+        error = None
+        output = None
+        if "Error:" in text:
+            error = text.split("Error:", 1)[1].strip()
+        elif "error:" in text:
+            error = text.split("error:", 1)[1].strip()
+        if "Observation:" in text:
+            output = text.split("Observation:", 1)[1].strip()
+        else:
+            output = text
+        ok = error is None
+        return output, error, ok
+
+    def _build_structured_trace(
+        self, chat_history: ChatHistory
+    ) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]]]:
+        steps: list[dict[str, Any]] = []
+        pending: Optional[dict[str, Any]] = None
+        for item in self._history_items(chat_history):
+            content = item.content or ""
+            if item.role == Role.AGENT:
+                parsed = self._parse_action_line(content)
+                if parsed:
+                    action, args = parsed
+                    pending = {"action": action, "args": args}
+            elif item.role == Role.USER and pending:
+                output, error, ok = self._parse_env_observation(content)
+                step = {
+                    "action": pending.get("action"),
+                    "args": pending.get("args") or [],
+                    "ok": ok,
+                    "output": output,
+                    "error": error,
+                }
+                steps.append(step)
+                pending = None
+
+        loop_detected = False
+        repeat_count = 1
+        if len(steps) >= 2:
+            last = steps[-1]
+            prev = steps[-2]
+            if (
+                last.get("action") == prev.get("action")
+                and last.get("args") == prev.get("args")
+                and last.get("output") == prev.get("output")
+                and last.get("error") == prev.get("error")
+            ):
+                loop_detected = True
+                repeat_count = 2
+                for idx in range(len(steps) - 3, -1, -1):
+                    cur = steps[idx]
+                    if (
+                        cur.get("action") == last.get("action")
+                        and cur.get("args") == last.get("args")
+                        and cur.get("output") == last.get("output")
+                        and cur.get("error") == last.get("error")
+                    ):
+                        repeat_count += 1
+                    else:
+                        break
+
+        last_obs = dict(steps[-1]) if steps else None
+        if last_obs is not None:
+            last_obs["loop_detected"] = loop_detected
+            last_obs["repeat_count"] = repeat_count
+        return steps, last_obs
+
+    def _truncate_for_log(
+        self, value: Any, max_chars: int = 400, max_list: int = 8
+    ) -> Any:
+        if isinstance(value, str):
+            if len(value) <= max_chars:
+                return value
+            return value[:max_chars] + f"...(+{len(value) - max_chars} chars)"
+        if isinstance(value, list):
+            if len(value) <= max_list:
+                return [self._truncate_for_log(v, max_chars, max_list) for v in value]
+            head = [self._truncate_for_log(v, max_chars, max_list) for v in value[:max_list]]
+            head.append(f"...(+{len(value) - max_list} items)")
+            return head
+        if isinstance(value, dict):
+            return {k: self._truncate_for_log(v, max_chars, max_list) for k, v in value.items()}
+        return value
+
+    def _run_dir_from_state_dir(self, state_dir: Optional[str]) -> Optional[Path]:
+        if not state_dir:
+            return None
+        try:
+            path = Path(state_dir).resolve()
+        except Exception:
+            return None
+        if path.parent is None or path.parent.parent is None:
+            return None
+        return path.parent.parent
+
+    def _get_run_dir(self) -> Optional[Path]:
+        if self._generated_tools_log_path:
+            return self._generated_tools_log_path.parent
+        return None
+
+    def _record_tool_usage(
+        self,
+        *,
+        tool_name: Optional[str],
+        run_id: Optional[str],
+        state_dir: Optional[str],
+    ) -> None:
+        if not tool_name or not run_id:
+            return
+        meta = self._get_run_task_metadata()
+        task_name = meta.get("task_name")
+        sample_index = meta.get("sample_index")
+        if task_name is None or sample_index is None:
+            return
+        key = f"{task_name}|{sample_index}|{run_id}|{tool_name}"
+        if key in self._tool_usage_logged:
+            return
+        run_dir = self._run_dir_from_state_dir(state_dir) or self._get_run_dir()
+        if run_dir is None:
+            return
+        usage_path = run_dir / "tool_usage.jsonl"
+        payload = {
+            "task_name": task_name,
+            "sample_index": sample_index,
+            "run_id": run_id,
+            "tool_name": tool_name,
+            "ts": time.time(),
+            # Advisory metadata for granular blame assignment
+            "confidence_score": getattr(self, "_last_tool_confidence", None),
+            "recommendation": getattr(self, "_last_tool_recommendation", None),
+            "solver_followed_recommendation": getattr(
+                self, "_solver_followed_recommendation", None
+            ),
+        }
+        try:
+            with open(usage_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=True, default=str) + "\n")
+            self._tool_usage_logged.add(key)
+        except Exception:
+            return
+
+    def _apply_outcome_penalties(self) -> None:
+        run_dir = self._get_run_dir()
+        if run_dir is None:
+            return
+        runs_path = run_dir / "runs.json"
+        usage_path = run_dir / "tool_usage.jsonl"
+        processed_path = run_dir / "tool_outcome_marks.jsonl"
+        if not runs_path.exists() or not usage_path.exists():
+            return
+
+        usage_map: dict[str, dict[str, Any]] = {}
+        try:
+            with open(usage_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    task_name = entry.get("task_name")
+                    sample_index = entry.get("sample_index")
+                    tool_name = entry.get("tool_name")
+                    if task_name is None or sample_index is None or not tool_name:
+                        continue
+                    key = f"{task_name}|{sample_index}"
+                    usage_map[key] = {
+                        "tool_name": tool_name,
+                        "confidence_score": entry.get("confidence_score"),
+                        "solver_followed_recommendation": entry.get(
+                            "solver_followed_recommendation"
+                        ),
+                    }
+        except Exception:
+            return
+
+        if processed_path.exists():
+            try:
+                with open(processed_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            self._outcome_scored.add(line)
+            except Exception:
+                pass
+
+        try:
+            with open(runs_path, "r", encoding="utf-8") as f:
+                runs_data = json.load(f)
+        except Exception:
+            return
+        if not isinstance(runs_data, list):
+            return
+
+        new_marks: list[str] = []
+        for entry in runs_data:
+            if not isinstance(entry, dict):
+                continue
+            task_name = entry.get("task_name")
+            sample_index = entry.get("sample_index")
+            if task_name is None or sample_index is None:
+                continue
+            outcome = None
+            eval_record = entry.get("evaluation_record")
+            if isinstance(eval_record, Mapping):
+                outcome = eval_record.get("outcome")
+            if outcome is None:
+                outcome = entry.get("outcome")
+            if outcome is None:
+                outcome = entry.get("sample_status")
+            if outcome != "incorrect":
+                continue
+            usage_entry = usage_map.get(f"{task_name}|{sample_index}")
+            if not usage_entry:
+                continue
+            tool_name = usage_entry["tool_name"]
+            key = f"{task_name}|{sample_index}|{tool_name}|{outcome}"
+            if key in self._outcome_scored:
+                continue
+
+            # Granular blame assignment based on advisory metadata
+            should_penalize = True  # default: penalize (backward compat)
+            confidence = usage_entry.get("confidence_score")
+            solver_followed = usage_entry.get("solver_followed_recommendation")
+            if confidence is not None:
+                try:
+                    confidence = float(confidence)
+                except (TypeError, ValueError):
+                    confidence = None
+            if confidence is not None:
+                if confidence >= 0.7 and solver_followed is False:
+                    # High confidence recommendation ignored by solver → solver fault
+                    should_penalize = False
+                elif confidence < 0.5:
+                    # Low confidence → ambiguous, don't penalize either party
+                    should_penalize = False
+
+            if should_penalize:
+                self._registry.record_task_outcome(tool_name, success=False)
+            self._outcome_scored.add(key)
+            new_marks.append(key)
+
+        if new_marks:
+            try:
+                with open(processed_path, "a", encoding="utf-8") as f:
+                    for key in new_marks:
+                        f.write(key + "\n")
+            except Exception:
+                pass
+
 
     def _orchestrated_inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
         if self._use_packaged_agent and self._packaged_shim is not None:
@@ -450,6 +743,7 @@ class SelfEvolvingController(
 
         working_history = self._clone_history(self._prune_for_current_task(chat_history))
         self._tool_invoked_in_last_inference = False
+        self._apply_outcome_penalties()
 
         user_items = [item for item in self._history_items(working_history) if item.role == Role.USER]
         if len(user_items) >= 2:
@@ -476,77 +770,58 @@ class SelfEvolvingController(
         last_tool_run_id: Optional[str] = None
         last_tool_state_dir: Optional[str] = None
         last_tool_name: Optional[str] = None
+        self._last_tool_confidence: Optional[float] = None
+        self._last_tool_recommendation: Optional[str] = None
+        self._solver_followed_recommendation: Optional[bool] = None
+        last_structured_trace: list[dict[str, Any]] = []
+        last_structured_obs: Optional[dict[str, Any]] = None
 
-        init_solver = os.getenv("INIT_SOLVER", "0") == "1"
+        # Sidecar paradigm: orchestrator must intercept observations before any solver pass.
+        init_solver = False
         solver_recommendation = ""
         initial_solver_output = ""
-        if init_solver:
-            initial_solver_prompt = self._solver_prompt_no_tools()
-            self._write_agent_system_prompt("solver", initial_solver_prompt)
-            initial_history_text = self._toolgen_render_history(
-                working_history,
-                max_chars_per_item=1200,
-                preserve_first_user_n=2,
-            )
-            initial_payload = {
-                "system_prompt": initial_solver_prompt,
-                "history": initial_history_text,
-                "stage": "initial_recommendation",
-                "system_prompt_chars": len(initial_solver_prompt),
-                "history_chars": len(initial_history_text),
-                "history_items": len(self._history_items(working_history)),
-                "sidecar_chars": 0,
-            }
-            self._append_solver_io_log(
-                {
-                    "event": "solver_input",
-                    "stage": "initial_recommendation",
-                    "system_prompt": initial_solver_prompt,
-                    "history": initial_history_text,
-                    "sidecar": "",
-                }
-            )
-            self._log_flow_event(
-                "solver_input",
-                chat_history=working_history,
-                payload=initial_payload,
-            )
-            start_ts = time.perf_counter()
-            initial_response = self._solver_inference_with_retry(
-                working_history, system_prompt=initial_solver_prompt
-            )
-            self._append_solver_io_log(
-                {
-                    "event": "solver_output",
-                    "stage": "initial_recommendation",
-                    "content": getattr(initial_response, "content", "") or "",
-                }
-            )
-            elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
-            self._log_flow_event(
-                "solver_metrics",
-                chat_history=working_history,
-                payload={
-                    "stage": "initial_recommendation",
-                    "solver_latency_ms": round(elapsed_ms, 2),
-                    "system_prompt_chars": len(initial_solver_prompt),
-                    "history_chars": len(initial_history_text),
-                    "history_items": len(self._history_items(working_history)),
-                    "sidecar_chars": 0,
-                },
-            )
-            solver_recommendation = (getattr(initial_response, "content", "") or "")
-            self._toolgen_last_recommendation = solver_recommendation
-            initial_solver_output = solver_recommendation
-            if self._contains_internal_tool(initial_solver_output):
-                initial_solver_output = ""
-        else:
-            self._toolgen_last_recommendation = ""
+        self._toolgen_last_recommendation = ""
+
+        # Phase 1: Extract latest observation immediately (before any solver call)
+        pre_orch_trace, pre_orch_obs = self._build_structured_trace(working_history)
+        observation_triggers: list[dict[str, Any]] = []
+        if pre_orch_obs is not None:
+            obs_output = str(pre_orch_obs.get("output") or "")
+            obs_error = pre_orch_obs.get("error")
+            if obs_output.startswith("[") or "[" in obs_output[:200]:
+                try:
+                    bracket_start = obs_output.index("[")
+                    bracket_end = obs_output.rindex("]") + 1
+                    inner = obs_output[bracket_start + 1 : bracket_end - 1]
+                    items = [x.strip() for x in inner.split(",") if x.strip()]
+                    if len(items) > 15:
+                        observation_triggers.append(
+                            {
+                                "type": "size_trigger",
+                                "item_count": len(items),
+                                "reason": f"observation has {len(items)} items (>15 threshold)",
+                            }
+                        )
+                except (ValueError, IndexError):
+                    pass
+            if obs_error or (obs_output and "Error" in obs_output[:100]):
+                observation_triggers.append(
+                    {
+                        "type": "error_trigger",
+                        "error": obs_error or obs_output[:200],
+                        "reason": "observation contains error",
+                    }
+                )
 
         try:
             self._toolgen_prebootstrap_once(task_query, working_history)
+
             decision = self._orchestrate_decision(
-                task_query, working_history, solver_recommendation=solver_recommendation
+                task_query,
+                working_history,
+                solver_recommendation=solver_recommendation,
+                observation_triggers=observation_triggers,
+                last_observation=pre_orch_obs,
             )
             action = decision.get("action", "no_tool")
             if self._toolgen_off and action == "create_tool":
@@ -641,9 +916,28 @@ class SelfEvolvingController(
                                     if not optional_keys:
                                         optional_keys = list(tool_meta.optional_keys or [])
                             payload_map: dict[str, Any] = dict(payload) if isinstance(payload, Mapping) else {}
+                            structured_trace, last_obs = self._build_structured_trace(working_history)
+                            last_structured_trace = structured_trace
+                            last_structured_obs = last_obs
+                            payload_map["trace"] = structured_trace
+                            if last_obs is not None:
+                                payload_map["env_observation"] = last_obs
                             if isinstance(payload_map.get("actions_spec"), Mapping):
                                 last_tool_actions_spec = payload_map.get("actions_spec")
                             payload_keys = sorted(str(k) for k in payload_map.keys())
+                            try:
+                                self._append_generated_tools_log(
+                                    {
+                                        "event": "tool_observation_payload",
+                                        "tool_name": tool_name,
+                                        "run_id": payload_map.get("run_id"),
+                                        "trace_len": len(structured_trace),
+                                        "trace_tail": self._truncate_for_log(structured_trace[-3:]),
+                                        "env_observation": self._truncate_for_log(last_obs),
+                                    }
+                                )
+                            except Exception:
+                                pass
                             payload_for_tool: dict[str, Any] = {}
                             missing_keys: list[str] = []
                             for key in required_keys:
@@ -741,6 +1035,24 @@ class SelfEvolvingController(
                                     output=tool_result.output,
                                 )
                                 if isinstance(tool_result.output, Mapping):
+                                    caps = getattr(self, "_tool_confidence_caps", {})
+                                    cap = caps.get(tool_name) if isinstance(caps, dict) else None
+                                    if cap is not None:
+                                        current = tool_result.output.get("confidence_score")
+                                        if isinstance(current, (int, float)):
+                                            tool_result.output["confidence_score"] = min(
+                                                float(current), float(cap)
+                                            )
+                                        else:
+                                            tool_result.output["confidence_score"] = float(cap)
+                                    # Advisory paradigm fields
+                                    self._last_tool_confidence = tool_result.output.get(
+                                        "confidence_score"
+                                    )
+                                    self._last_tool_recommendation = tool_result.output.get(
+                                        "answer_recommendation"
+                                    )
+                                    # Backward compat: legacy next_action extraction
                                     next_action = tool_result.output.get("next_action")
                                     if isinstance(next_action, Mapping):
                                         action_name = next_action.get("name")
@@ -758,6 +1070,11 @@ class SelfEvolvingController(
                                     ):
                                         last_tool_run_id = args_list[0].get("run_id")
                                         last_tool_state_dir = args_list[0].get("state_dir")
+                                self._record_tool_usage(
+                                    tool_name=last_tool_name,
+                                    run_id=last_tool_run_id,
+                                    state_dir=last_tool_state_dir,
+                                )
                                 tool_traces.append(
                                     self._build_tool_trace(
                                         summary="Tool invoker executed a tool.",
@@ -767,9 +1084,15 @@ class SelfEvolvingController(
                                         result=tool_result,
                                     )
                                 )
-                                solver_sidecar.append(
-                                    self._format_tool_result(tool_name, tool_result)
-                                )
+                                # Route to advisory formatter if tool uses advisory schema
+                                if self._is_advisory_result(tool_result):
+                                    solver_sidecar.append(
+                                        self._format_advisory_result(tool_name, tool_result)
+                                    )
+                                else:
+                                    solver_sidecar.append(
+                                        self._format_tool_result(tool_name, tool_result)
+                                    )
                                 tool_result_injected = True
                     else:
                         tool_error = "tool_invoker_missing_tool_name"
@@ -786,90 +1109,6 @@ class SelfEvolvingController(
         except Exception as exc:
             tool_error = f"{type(exc).__name__}: {exc}"
             _record_tool_error("tool_pipeline", tool_error, traceback.format_exc())
-
-        if tool_result_injected and last_tool_result is not None:
-            if not isinstance(last_tool_result.output, Mapping):
-                err_text = last_tool_result.error or "tool_execution_failed"
-                return ChatHistoryItem(role=Role.AGENT, content=f"ERROR: {err_text}")
-
-        if (
-            tool_result_injected
-            and last_tool_result is not None
-            and isinstance(last_tool_result.output, Mapping)
-        ):
-            tool_output = last_tool_result.output
-            status = tool_output.get("status")
-            status_norm = status.lower() if isinstance(status, str) else None
-            if status_norm in {"need_step", "done", "blocked", "error"}:
-                errors = list(tool_output.get("errors") or [])
-                warnings = list(tool_output.get("warnings") or [])
-
-                if status_norm == "need_step":
-                    actions_spec = (
-                        last_tool_actions_spec
-                        if isinstance(last_tool_actions_spec, Mapping)
-                        else None
-                    )
-                    next_action = tool_output.get("next_action")
-                    action_name = None
-                    action_args = None
-                    if isinstance(next_action, Mapping):
-                        action_name = next_action.get("name")
-                        action_args = next_action.get("args")
-                    else:
-                        errors.append("invalid_next_action:missing")
-                    if action_args is None:
-                        action_args = []
-
-                    if (
-                        not isinstance(action_name, str)
-                        or not action_name.strip()
-                        or action_name.strip().lower() == "none"
-                    ):
-                        errors.append("invalid_next_action:name")
-                    if not isinstance(action_args, list):
-                        errors.append("invalid_next_action:args")
-
-                    if not isinstance(actions_spec, Mapping) or not actions_spec:
-                        errors.append("missing_actions_spec")
-                    elif isinstance(action_name, str) and action_name not in actions_spec:
-                        errors.append("invalid_next_action:not_in_actions_spec")
-
-                    if errors:
-                        err_text = ",".join(str(e) for e in errors)
-                        warn_text = ",".join(str(w) for w in warnings) if warnings else ""
-                        msg = f"ERROR: {err_text}"
-                        if warn_text:
-                            msg = msg + f" WARNINGS: {warn_text}"
-                        tool_error = err_text or "invalid_next_action"
-                        solver_sidecar.append(f"TOOL_ERROR:\n{msg}")
-                        # Fall through to solver; do not return tool error to env.
-                    else:
-                        action_args = action_args or []
-                        args_text = ", ".join(str(arg) for arg in action_args)
-                        action_line = (
-                            f"Action: {action_name}({args_text})"
-                            if args_text
-                            else f"Action: {action_name}()"
-                        )
-                        return ChatHistoryItem(role=Role.AGENT, content=action_line)
-
-                if status_norm == "done":
-                    answer = tool_output.get("answer_recommendation")
-                    if isinstance(answer, str) and answer.strip():
-                        return ChatHistoryItem(role=Role.AGENT, content=answer)
-                    errors.append("missing_answer_recommendation")
-
-                if status_norm in {"blocked", "error", "done"}:
-                    err_text = ",".join(str(e) for e in errors)
-                    warn_text = ",".join(str(w) for w in warnings) if warnings else ""
-                    msg = f"ERROR: {err_text or status_norm}"
-                    if warn_text:
-                        msg = msg + f" WARNINGS: {warn_text}"
-                    tool_error = err_text or status_norm
-                    solver_sidecar.append(f"TOOL_ERROR:\n{msg}")
-                    # Fall through to solver; do not return tool error to env.
-                    # break
 
         if not tool_agent_traced:
             self._trace("tool_agent_input", "none")
@@ -891,16 +1130,41 @@ class SelfEvolvingController(
             solver_sidecar.insert(
                 0, "SOLVER_RECOMMENDATION:\n" + solver_recommendation
             )
+        if last_structured_obs is not None:
+            solver_sidecar.append(
+                "STRUCTURED_OBSERVATION:\n"
+                + json.dumps(last_structured_obs, ensure_ascii=True, default=str)
+            )
+        if last_structured_trace:
+            solver_sidecar.append(
+                "STRUCTURED_TRACE_TAIL:\n"
+                + json.dumps(last_structured_trace[-3:], ensure_ascii=True, default=str)
+            )
 
         for attempt in range(3):
             solver_prompt = self._solver_prompt_no_tools()
             if solver_sidecar:
-                solver_prompt = (
-                    solver_prompt
-                    + "\n\nINTERNAL TOOL CONTEXT:\n"
-                    + "CRITICAL: If the tool result includes 'recommended_next_action', you MUST use that exact action as your next step. The tool has analyzed the task state and determined the optimal next action.\n\n"
-                    + "\n\n".join(solver_sidecar)
+                # Detect advisory vs legacy sidecar content
+                sidecar_joined = "\n\n".join(solver_sidecar)
+                has_advisory = any(
+                    "TOOL_ADVISORY" in s or "Recommendation:" in s or "Confidence:" in s
+                    for s in solver_sidecar
                 )
+                if has_advisory:
+                    solver_prompt = (
+                        solver_prompt
+                        + "\n\n### TOOL ADVISORY (CRITICAL)\n"
+                        + "A helper tool analyzed the data and provided this recommendation.\n"
+                        + "You MUST prioritize this recommendation when choosing your next action.\n\n"
+                        + sidecar_joined
+                    )
+                else:
+                    solver_prompt = (
+                        solver_prompt
+                        + "\n\nINTERNAL TOOL CONTEXT:\n"
+                        + "Tool results may include 'recommended_next_action' with args; consider using it if it fits.\n\n"
+                        + sidecar_joined
+                    )
             history_text = self._toolgen_render_history(
                 working_history,
                 max_chars_per_item=1200,
@@ -1028,17 +1292,30 @@ class SelfEvolvingController(
             self._last_solver_output = content
             self._last_solver_context_key = context_key
             self._trace("solver_result", content)
-            if last_tool_next_action or content:
+            if last_tool_next_action or content or self._last_tool_recommendation:
                 executed_action = None
                 match = re.search(r"Action:\s*([A-Za-z_][A-Za-z0-9_]*)", content)
                 if match:
                     executed_action = match.group(1)
-                if last_tool_next_action or executed_action:
+                # Detect if solver followed the tool advisory
+                self._solver_followed_recommendation = None
+                if getattr(self, "_last_tool_recommendation", None) and content:
+                    rec_lower = self._last_tool_recommendation.lower()
+                    if "final answer" in rec_lower and "final answer" in content.lower():
+                        self._solver_followed_recommendation = True
+                    elif executed_action and executed_action.lower() in rec_lower:
+                        self._solver_followed_recommendation = True
+                    else:
+                        self._solver_followed_recommendation = False
+                if last_tool_next_action or executed_action or self._last_tool_recommendation:
                     self._log_flow_event(
-                        "tool_action_compare",
+                        "tool_advisory_compare",
                         tool_name=last_tool_name,
                         tool_next_action=last_tool_next_action,
+                        tool_recommendation=self._last_tool_recommendation,
+                        tool_confidence=self._last_tool_confidence,
                         executed_action=executed_action,
+                        solver_followed=self._solver_followed_recommendation,
                         run_id=last_tool_run_id,
                         state_dir=last_tool_state_dir,
                     )
@@ -1140,7 +1417,7 @@ class SelfEvolvingController(
                     solver_prompt = (
                         solver_prompt
                         + "\n\nINTERNAL TOOL CONTEXT:\n"
-                        + "CRITICAL: If the tool result includes 'recommended_next_action', you MUST use that exact action as your next step. The tool has analyzed the task state and determined the optimal next action.\n\n"
+                        + "Tool results may include 'recommended_next_action' with args; consider using it if it fits.\n\n"
                         + "\n\n".join(solver_sidecar)
                     )
                 history_text = self._toolgen_render_history(

@@ -163,6 +163,33 @@ def validate_tool_code(
             success=False,
             error="run() must return a dict",
         )
+    advisory_keys = {"pruned_observation", "answer_recommendation", "confidence_score"}
+    legacy_keys = {"next_action", "next_action_candidates", "why_stuck"}
+    has_advisory = any(k in result for k in advisory_keys)
+    has_legacy = any(k in result for k in legacy_keys)
+    if has_advisory:
+        missing = [k for k in advisory_keys if k not in result]
+        if missing:
+            return ToolValidationResult(
+                success=False,
+                error=f"missing_advisory_keys:{','.join(missing)}",
+            )
+        if not isinstance(result.get("answer_recommendation"), str):
+            return ToolValidationResult(
+                success=False,
+                error="answer_recommendation must be str",
+            )
+        confidence = result.get("confidence_score")
+        if not isinstance(confidence, (int, float)):
+            return ToolValidationResult(
+                success=False,
+                error="confidence_score must be float",
+            )
+    elif not has_legacy:
+        return ToolValidationResult(
+            success=False,
+            error="missing_output_schema_keys",
+        )
 
     self_test_passed = False
     try:

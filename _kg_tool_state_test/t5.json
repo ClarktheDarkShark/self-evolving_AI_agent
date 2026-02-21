@@ -1,0 +1,17 @@
+{
+  "history": [
+    "st=need_step na=get_neighbors w=anti_loop_intersection_deduped e="
+  ],
+  "notes": {
+    "entities": [
+      "A"
+    ],
+    "observed_vars": [
+      "#0",
+      "#1",
+      "#2"
+    ],
+    "relations_by_subject": {},
+    "relations_summary": {}
+  }
+}

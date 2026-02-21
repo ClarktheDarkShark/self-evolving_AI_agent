@@ -1,8 +1,8 @@
 assignment_config:
   language_model_list:
   # - name: gpt-oss:20b-64k
-  - name: gpt-oss:20b-120k
-  # - name: gpt-4o-mini
+  # - name: gpt-oss:20b-120k
+  - name: gpt-5-mini
   # - name: gpt-5.2
 
   # agent:
@@ -16,8 +16,8 @@ assignment_config:
     name: self_evolving_agent
     custom_parameters:
       # language_model: gpt-oss:20b-64k
-      language_model: gpt-oss:20b-120k
-      # language_model: gpt-4o-mini
+      # language_model: gpt-oss:20b-120k
+      language_model: gpt-5-mini
       # language_model: gpt-5.2
       tool_registry_path: outputs/tool_library
       max_generated_tools_per_run: 30
@@ -35,10 +35,10 @@ assignment_config:
       use_packaged_agent: false
       inference_config_dict:
         temperature: 0.0
-        # max_tokens: 60000
-        max_tokens: 120000
-        # max_completion_tokens: 120000
         # max_tokens: 16300
+        # max_tokens: 60000
+        # max_tokens: 120000
+        max_completion_tokens: 120000
         allow_internal_tool_protocol: true
 
 agent_dict:

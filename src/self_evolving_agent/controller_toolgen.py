@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import traceback
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 import ast
@@ -18,6 +19,7 @@ from .tool_validation import validate_tool_code
 from .tool_retrieval import retrieve_tools
 from .toolgen_debug_logger import toolgen_debug_enabled
 from .controller_prompts import TOOLGEN_DEBUG_APPENDIX
+from .toolgen_contracts import TOOL_START, TOOL_END, validate_toolgen_output
 from src.toolgen.prompts import get_toolgen_system_prompt
 from src.toolgen.prompting.build_task_pack import build_task_pack
 from src.toolgen_staged import get_toolgen_mode, run_staged_toolgen
@@ -552,6 +554,100 @@ class ControllerToolgenMixin:
             self._toolgen_agent._system_prompt = original_prompt
         return self._normalize_toolgen_content(response.content)
 
+    def _toolgen_validator_call(self, payload: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+        agent = getattr(self, "_toolgen_validator_agent", None)
+        if agent is None:
+            return None
+        try:
+            prompt = json.dumps(payload, ensure_ascii=True, default=str)
+        except Exception:
+            return None
+        tool_history = ChatHistory()
+        tool_history = self._safe_inject(
+            tool_history, ChatHistoryItem(role=Role.USER, content=prompt)
+        )
+        original_prompt = getattr(agent, "_system_prompt", "") or ""
+        try:
+            response = agent._inference(tool_history)
+        finally:
+            agent._system_prompt = original_prompt
+        content = self._normalize_toolgen_content(getattr(response, "content", "") or "")
+        parsed = None
+        parser = getattr(self, "_parse_orchestrator_payload", None)
+        if callable(parser):
+            parsed = parser(content)
+        if parsed is None:
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                return None
+        return parsed if isinstance(parsed, Mapping) else None
+
+    def _toolgen_load_tool_code(self, tool: ToolMetadata) -> Optional[str]:
+        tool_path = getattr(self._registry, "_get_tool_path", lambda n, environment=None: None)(
+            tool.name, environment=getattr(tool, "environment", None)
+        )
+        if not tool_path:
+            return None
+        try:
+            return Path(tool_path).read_text(encoding="utf-8")
+        except Exception:
+            return None
+
+    def _toolgen_validate_candidate_tool(
+        self,
+        tool_spec: Mapping[str, Any],
+        tool_code: str,
+        *,
+        task_pack: str,
+    ) -> Optional[Mapping[str, Any]]:
+        if not tool_code:
+            return None
+        payload = {
+            "task_pack": task_pack,
+            "tool": {
+                "name": tool_spec.get("name"),
+                "description": tool_spec.get("description"),
+                "signature": tool_spec.get("signature"),
+                "environment": self._resolved_environment_label(),
+            },
+            "tool_code": tool_code,
+        }
+        return self._toolgen_validator_call(payload)
+
+    def _toolgen_should_validate(self) -> bool:
+        return getattr(self, "_toolgen_validator_agent", None) is not None
+
+    def _toolgen_static_check(self, code: str) -> tuple[bool, str]:
+        if not code:
+            return False, "static_check:empty_code"
+        wrapped = f"{TOOL_START}\n{code.rstrip()}\n{TOOL_END}"
+        try:
+            result = validate_toolgen_output(wrapped)
+        except Exception:
+            return False, "static_check:exception\n" + traceback.format_exc()
+        if result.ok:
+            return True, ""
+        err = "static_check_errors:" + ",".join(result.errors)
+        if "F:syntax_error" in result.errors:
+            try:
+                ast.parse(code)
+            except Exception:
+                err += "\n" + traceback.format_exc()
+        return False, err
+
+    def _toolgen_negative_mark_triggered(self) -> bool:
+        current_env = self._resolved_environment_label()
+        tools = (
+            self._registry.list_latest_tools(environment=current_env)
+            if hasattr(self._registry, "list_latest_tools")
+            else self._registry.list_tools(environment=current_env)
+        )
+        for tool in tools:
+            if getattr(tool, "negative_marks", 0) >= 3:
+                return True
+        return False
+
     def _toolgen_generate_from_prompt(
         self,
         *,
@@ -561,24 +657,384 @@ class ControllerToolgenMixin:
         name_prefix: str,
     ) -> Optional[ToolMetadata]:
         mode = get_toolgen_mode()
-        for _ in range(3):
+        validate = self._toolgen_should_validate()
+        max_rounds = 3 if validate else 1
+        base_prompt = user_prompt
+        last_candidate: Optional[Mapping[str, Any]] = None
+        last_validation: Optional[Mapping[str, Any]] = None
+        last_grade: Optional[int] = None
+        feedback_note: Optional[str] = None
+        last_tool_code: Optional[str] = None
+        last_tool_spec: Optional[Mapping[str, Any]] = None
+        last_static_ok = False
+        last_smoke_ok = False
+        best_grade: int = -1
+        best_candidate: Optional[Mapping[str, Any]] = None
+        try:
+            self._append_generated_tools_log(
+                {
+                    "event": "toolgen_attempt",
+                    "mode": mode,
+                    "max_rounds": max_rounds,
+                    "prompt_chars": len(base_prompt or ""),
+                }
+            )
+        except Exception:
+            pass
+        for round_idx in range(1, max_rounds + 1):
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_round_start",
+                        "mode": mode,
+                        "round": round_idx,
+                    }
+                )
+            except Exception:
+                pass
+            prompt = base_prompt
+            if feedback_note:
+                code_block = ""
+                if last_tool_code:
+                    code_block = "\n\nLAST_TOOL_CODE:\n" + last_tool_code
+                prompt = (
+                    base_prompt
+                    + "\n\nVALIDATOR_FEEDBACK (apply all fixes):\n"
+                    + feedback_note
+                    + code_block
+                    + "\n\nRevise the tool accordingly."
+                )
             if mode == "legacy":
-                tool = self._toolgen_generate_from_prompt_legacy(
-                    user_prompt=user_prompt,
+                candidate = self._toolgen_generate_from_prompt_legacy(
+                    user_prompt=prompt,
                     system_prompt=system_prompt,
                     chat_history=chat_history,
                     name_prefix=name_prefix,
                 )
             else:
-                tool = self._toolgen_generate_from_prompt_staged(
-                    user_prompt=user_prompt,
+                candidate = self._toolgen_generate_from_prompt_staged(
+                    user_prompt=prompt,
                     system_prompt=system_prompt,
                     chat_history=chat_history,
                     name_prefix=name_prefix,
                 )
-            if tool:
-                return tool
-        return None
+            if not candidate:
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_round_failed",
+                            "phase": "generation",
+                            "mode": mode,
+                            "round": round_idx,
+                            "reason": "no_candidate_returned",
+                        }
+                    )
+                except Exception:
+                    pass
+                self._write_failed_tool_artifact(
+                    stage="toolgen_no_candidate",
+                    error="no_candidate_returned",
+                )
+                continue
+            if isinstance(candidate, Mapping) and candidate.get("error") and not candidate.get("tool_spec"):
+                error = str(candidate.get("error"))
+                raw_output = candidate.get("raw_output")
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_round_failed",
+                            "phase": "generation",
+                            "mode": mode,
+                            "round": round_idx,
+                            "reason": error,
+                        }
+                    )
+                except Exception:
+                    pass
+                self._write_failed_tool_artifact(
+                    stage="toolgen_generation_failed",
+                    error=error,
+                    raw_output=raw_output if isinstance(raw_output, str) else None,
+                )
+                continue
+            last_candidate = candidate
+            tool_spec = candidate.get("tool_spec")
+            tool_code = candidate.get("tool_code")
+            staged_meta = candidate.get("staged_meta")
+            if not isinstance(tool_spec, Mapping) or not isinstance(tool_code, str):
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_round_failed",
+                            "phase": "candidate_shape",
+                            "mode": mode,
+                            "round": round_idx,
+                        }
+                    )
+                except Exception:
+                    pass
+                continue
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_candidate",
+                        "mode": mode,
+                        "round": round_idx,
+                        "tool_name": tool_spec.get("name"),
+                        "code_len": len(tool_code),
+                    }
+                )
+            except Exception:
+                pass
+            last_tool_code = tool_code
+            last_tool_spec = tool_spec
+            last_static_ok = False
+            last_smoke_ok = False
+
+            static_ok, static_err = self._toolgen_static_check(tool_code)
+            if not static_ok:
+                if static_err.startswith("static_check:exception"):
+                    self._write_failed_tool_artifact(
+                        stage="static_check_exception",
+                        error=static_err,
+                        raw_output=tool_code,
+                    )
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_static_check",
+                            "mode": mode,
+                            "round": round_idx,
+                            "ok": False,
+                            "error": static_err,
+                        }
+                    )
+                except Exception:
+                    pass
+                try:
+                    spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                except Exception:
+                    spec_obj = None
+                self._write_failed_tool_artifact(
+                    stage="static_check",
+                    error=static_err,
+                    spec=spec_obj,
+                    code=tool_code,
+                    raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                )
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "tool_generation_failed",
+                            "phase": "static_check",
+                            "tool_name": tool_spec.get("name"),
+                            "error": static_err,
+                        }
+                    )
+                except Exception:
+                    pass
+                feedback_note = json.dumps(
+                    {"phase": "static_check", "error": static_err},
+                    ensure_ascii=True,
+                    default=str,
+                )
+                continue
+            last_static_ok = True
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_static_check",
+                        "mode": mode,
+                        "round": round_idx,
+                        "ok": True,
+                    }
+                )
+            except Exception:
+                pass
+
+            smoke = validate_tool_code(tool_code)
+            if not smoke.success:
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_smoke_test",
+                            "mode": mode,
+                            "round": round_idx,
+                            "ok": False,
+                            "error": smoke.error,
+                        }
+                    )
+                except Exception:
+                    pass
+                try:
+                    spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                except Exception:
+                    spec_obj = None
+                self._write_failed_tool_artifact(
+                    stage="smoke_test",
+                    error=str(smoke.error),
+                    spec=spec_obj,
+                    code=tool_code,
+                    raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                )
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "tool_generation_failed",
+                            "phase": "smoke_test",
+                            "tool_name": tool_spec.get("name"),
+                            "error": smoke.error,
+                        }
+                    )
+                except Exception:
+                    pass
+                feedback_note = json.dumps(
+                    {"phase": "smoke_test", "error": smoke.error},
+                    ensure_ascii=True,
+                    default=str,
+                )
+                continue
+            last_smoke_ok = True
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_smoke_test",
+                        "mode": mode,
+                        "round": round_idx,
+                        "ok": True,
+                    }
+                )
+            except Exception:
+                pass
+
+            if not validate:
+                metadata = self._register_tool_from_payload(tool_spec, chat_history)
+                if staged_meta:
+                    self._toolgen_log_staged_registration(staged_meta, metadata)
+                if metadata:
+                    return metadata
+                continue
+
+            validation = self._toolgen_validate_candidate_tool(
+                tool_spec, tool_code, task_pack=base_prompt
+            )
+            if not validation:
+                continue
+            last_validation = validation
+            grade_raw = validation.get("grade")
+            try:
+                grade = int(grade_raw)
+            except Exception:
+                grade = 0
+            last_grade = grade
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_validation_result",
+                        "phase": "validator",
+                        "mode": mode,
+                        "round": round_idx,
+                        "tool_name": tool_spec.get("name"),
+                        "grade": grade,
+                        "validation": validation,
+                    }
+                )
+            except Exception:
+                pass
+            if grade > best_grade:
+                best_grade = grade
+                best_candidate = candidate
+            if grade >= 8:
+                metadata = self._register_tool_from_payload(tool_spec, chat_history)
+                if staged_meta:
+                    self._toolgen_log_staged_registration(staged_meta, metadata)
+                if metadata:
+                    self._registry.record_validation_result(metadata.name, success=True)
+                    return metadata
+                continue
+            feedback_payload = {
+                "validation": validation,
+                "last_tool_name": tool_spec.get("name"),
+                "last_tool_signature": tool_spec.get("signature"),
+            }
+            try:
+                spec_obj = ToolSpec.from_payload(dict(tool_spec))
+            except Exception:
+                spec_obj = None
+            self._write_failed_tool_artifact(
+                stage="validator",
+                error=f"grade={grade}",
+                spec=spec_obj,
+                code=tool_code,
+                raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                raw_output=validation,
+            )
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "tool_generation_failed",
+                        "phase": "validator",
+                        "tool_name": tool_spec.get("name"),
+                        "grade": grade,
+                        "validation": validation,
+                    }
+                )
+            except Exception:
+                pass
+            feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
+        # Prefer the highest-graded validated candidate over the last one.
+        use_candidate = best_candidate if best_candidate is not None else last_candidate
+        if not use_candidate:
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_no_candidate",
+                        "mode": mode,
+                    }
+                )
+            except Exception:
+                pass
+            return None
+        if best_candidate is None and (not last_static_ok or not last_smoke_ok):
+            if last_tool_spec and last_tool_code:
+                try:
+                    spec_obj = ToolSpec.from_payload(dict(last_tool_spec))
+                except Exception:
+                    spec_obj = None
+                self._write_failed_tool_artifact(
+                    stage="discarded",
+                    error="static_or_smoke_failed",
+                    spec=spec_obj,
+                    code=last_tool_code,
+                    raw_spec=last_tool_spec if isinstance(last_tool_spec, Mapping) else None,
+                )
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "tool_generation_discarded",
+                        "reason": "static_or_smoke_failed",
+                        "tool_name": last_tool_spec.get("name") if isinstance(last_tool_spec, Mapping) else None,
+                        "last_static_ok": last_static_ok,
+                        "last_smoke_ok": last_smoke_ok,
+                    }
+                )
+            except Exception:
+                pass
+            return None
+        tool_spec = use_candidate.get("tool_spec")
+        if not isinstance(tool_spec, Mapping):
+            return None
+        metadata = self._register_tool_from_payload(tool_spec, chat_history)
+        if use_candidate.get("staged_meta"):
+            self._toolgen_log_staged_registration(use_candidate.get("staged_meta"), metadata)
+        if metadata and validate:
+            self._registry.record_validation_result(metadata.name, success=False)
+            caps = getattr(self, "_tool_confidence_caps", None)
+            if not isinstance(caps, dict):
+                caps = {}
+                setattr(self, "_tool_confidence_caps", caps)
+            caps[metadata.name] = 0.1
+        return metadata
 
     def _toolgen_generate_from_prompt_legacy(
         self,
@@ -587,14 +1043,22 @@ class ControllerToolgenMixin:
         system_prompt: str,
         chat_history: ChatHistory,
         name_prefix: str,
-    ) -> Optional[ToolMetadata]:
+    ) -> Optional[Mapping[str, Any]]:
         if getattr(self, "_toolgen_agent", None) is None:
             print("[TOOLGEN] ERROR: _toolgen_agent is None, cannot generate tool")
-            return None
+            self._write_failed_tool_artifact(
+                stage="toolgen_generation_failed",
+                error="missing_toolgen_agent",
+            )
+            return {"error": "missing_toolgen_agent"}
 
         if not user_prompt or not user_prompt.strip():
             print("[TOOLGEN] ERROR: user_prompt is empty, cannot generate tool")
-            return None
+            self._write_failed_tool_artifact(
+                stage="toolgen_generation_failed",
+                error="empty_user_prompt",
+            )
+            return {"error": "empty_user_prompt"}
 
         self._trace("tool_agent_input", user_prompt)
         final_system_prompt = self._toolgen_build_system_prompt(system_prompt)
@@ -630,12 +1094,12 @@ class ControllerToolgenMixin:
                 error="marker_block_not_found",
                 raw_output=raw_text_full,
             )
-            return None
+            return {"error": "toolgen_markers_missing", "raw_output": raw_text_full}
 
         tool_spec = self._wrap_marker_tool_spec(extracted)
         tool_name = str(tool_spec.get("name") or "")
         tool_spec["name"] = self._apply_tool_name_prefix(tool_name, name_prefix)
-        return self._register_tool_from_payload(tool_spec, chat_history)
+        return {"tool_spec": tool_spec, "tool_code": extracted}
 
     def _toolgen_generate_from_prompt_staged(
         self,
@@ -644,14 +1108,22 @@ class ControllerToolgenMixin:
         system_prompt: str,
         chat_history: ChatHistory,
         name_prefix: str,
-    ) -> Optional[ToolMetadata]:
+    ) -> Optional[Mapping[str, Any]]:
         if getattr(self, "_toolgen_agent", None) is None:
             print("[TOOLGEN] ERROR: _toolgen_agent is None, cannot generate tool")
-            return None
+            self._write_failed_tool_artifact(
+                stage="toolgen_generation_failed",
+                error="missing_toolgen_agent",
+            )
+            return {"error": "missing_toolgen_agent"}
 
         if not user_prompt or not user_prompt.strip():
             print("[TOOLGEN] ERROR: user_prompt is empty, cannot generate tool")
-            return None
+            self._write_failed_tool_artifact(
+                stage="toolgen_generation_failed",
+                error="empty_user_prompt",
+            )
+            return {"error": "empty_user_prompt"}
 
         final_system_prompt = self._toolgen_build_system_prompt(system_prompt)
         log_path = None
@@ -702,7 +1174,7 @@ class ControllerToolgenMixin:
                 error="marker_block_not_found",
                 raw_output=raw_text_full,
             )
-            return None
+            return {"error": "toolgen_markers_missing", "raw_output": raw_text_full}
         tool_name = self._extract_tool_name_from_code(extracted) or "unknown_generated_tool"
         final_sha256 = hashlib.sha256(extracted.encode("utf-8")).hexdigest()
         line_count = len(extracted.splitlines())
@@ -802,13 +1274,36 @@ class ControllerToolgenMixin:
 
         tool_spec = self._wrap_marker_tool_spec(extracted)
         tool_spec["name"] = self._apply_tool_name_prefix(tool_name, name_prefix)
-        metadata = self._register_tool_from_payload(tool_spec, chat_history)
+        return {
+            "tool_spec": tool_spec,
+            "tool_code": extracted,
+            "staged_meta": {
+                "tool_build_span_id": tool_build_span_id,
+                "tool_name": tool_spec.get("name"),
+                "final_sha256": final_sha256,
+                "line_count": line_count,
+                "triple_quote_count": triple_quote_count,
+                "forbidden_hits": forbidden_hits,
+            },
+        }
+
+    def _toolgen_log_staged_registration(
+        self, staged_meta: Any, metadata: Optional[ToolMetadata]
+    ) -> None:
+        if not isinstance(staged_meta, Mapping):
+            return
+        tool_build_span_id = staged_meta.get("tool_build_span_id")
+        final_sha256 = staged_meta.get("final_sha256")
+        line_count = staged_meta.get("line_count")
+        triple_quote_count = staged_meta.get("triple_quote_count")
+        forbidden_hits = staged_meta.get("forbidden_hits")
+        tool_name = staged_meta.get("tool_name")
         if not metadata:
             self._toolgen_staged_log_event(
                 {
                     "event": "tool_register_failed",
                     "tool_build_span_id": tool_build_span_id,
-                    "tool_name": tool_spec.get("name"),
+                    "tool_name": tool_name,
                     "final_sha256": final_sha256,
                     "line_count": line_count,
                     "triple_quote_count": triple_quote_count,
@@ -816,7 +1311,7 @@ class ControllerToolgenMixin:
                     "ast_ok": True,
                 }
             )
-            return None
+            return
 
         self._toolgen_staged_log_event(
             {
@@ -855,7 +1350,6 @@ class ControllerToolgenMixin:
                 )
         except Exception:
             pass
-        return metadata
 
     def _toolgen_build_aggregate_prompt_for_env(
         self,
@@ -1208,6 +1702,15 @@ class ControllerToolgenMixin:
             base_path = Path("outputs")
         return base_path / "callback_state" / "callback_generated_tool_logging"
 
+    def _failed_tool_calling_dir(self) -> Path:
+        base_path = None
+        log_path = getattr(self, "_generated_tools_log_path", None)
+        if log_path is not None:
+            base_path = Path(log_path).parent
+        if base_path is None:
+            base_path = Path("outputs")
+        return base_path / "callback_state" / "callback_generated_tool_calling"
+
     def _toolgen_staged_log_path(self) -> Optional[Path]:
         log_path = getattr(self, "_generated_tools_log_path", None)
         if log_path is None:
@@ -1265,8 +1768,6 @@ class ControllerToolgenMixin:
             ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
             suffix = "py" if code else "txt"
             filename = f"{tool_name}__{stage}__{ts}.{suffix}"
-            out_dir = self._failed_tool_log_dir()
-            out_dir.mkdir(parents=True, exist_ok=True)
             header = (
                 f"# stage: {stage}\n"
                 f"# tool_name: {tool_name}\n"
@@ -1285,7 +1786,9 @@ class ControllerToolgenMixin:
                     "raw_output": raw_output,
                 }
                 content = header + "\n" + json.dumps(meta, ensure_ascii=True, default=str, indent=2)
-            (out_dir / filename).write_text(content, encoding="utf-8")
+            for out_dir in (self._failed_tool_log_dir(), self._failed_tool_calling_dir()):
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (out_dir / filename).write_text(content, encoding="utf-8")
         except Exception:
             return
 
@@ -1450,12 +1953,18 @@ class ControllerToolgenMixin:
         force: bool = False,
         use_pipeline: bool = True,
     ) -> Optional[ToolMetadata]:
-        if getattr(self, "_toolgen_off", False):
+        negative_trigger = self._toolgen_negative_mark_triggered()
+        if getattr(self, "_toolgen_off", False) and not negative_trigger:
             return None
         if not query.strip():
             return None
+        if negative_trigger:
+            allow_reuse = False
+            force = True
+            use_pipeline = False
         if (
             getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3"
+            and not negative_trigger
             and True
         ):
             env_name = self._resolved_environment_label()

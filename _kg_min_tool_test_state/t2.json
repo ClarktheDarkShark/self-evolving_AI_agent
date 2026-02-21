@@ -1,0 +1,15 @@
+{
+  "run_id": "t2",
+  "notes": {
+    "entities": [
+      "Goat"
+    ],
+    "best_entity": "Goat",
+    "observed_vars": [],
+    "known_vars": {},
+    "relations_by_subject": {}
+  },
+  "history": [
+    "t2:Start by exploring relations for Goat"
+  ]
+}

@@ -1,0 +1,1 @@
+{"history": ["next=get_relations(A)", "next=get_relations(A)", "next=count(#2) after intersection", "next=get_relations(#0)", "next=get_relations(A)", "next=count(#2) after intersection"], "notes": {"entities": ["A", "B"], "observed_vars": ["#0", "#1", "#2"], "relations_by_subject": {}}}

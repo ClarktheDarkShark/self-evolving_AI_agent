@@ -166,6 +166,15 @@ class ControllerHistoryMixin:
 
         return None
 
+    def _is_advisory_result(self, result: ToolResult) -> bool:
+        """Check if tool result uses the advisory (sidecar) output schema."""
+        if not isinstance(result.output, Mapping):
+            return False
+        return (
+            "pruned_observation" in result.output
+            or "confidence_score" in result.output
+        )
+
     def _format_tool_result(self, name: str, result: ToolResult) -> str:
         payload = {
             "tool_name": name,
@@ -173,25 +182,87 @@ class ControllerHistoryMixin:
             "output": result.output,
             "error": result.error,
         }
-        # Extract next_action recommendation if present in tool output
         if isinstance(result.output, Mapping):
+            # Advisory schema: pruned_observation, answer_recommendation, confidence_score
+            pruned = result.output.get("pruned_observation")
+            if pruned is not None:
+                payload["pruned_observation"] = pruned
+            recommendation = result.output.get("answer_recommendation")
+            if recommendation is not None:
+                payload["answer_recommendation"] = recommendation
+            confidence = result.output.get("confidence_score")
+            if isinstance(confidence, (int, float)):
+                payload["confidence_score"] = float(confidence)
+
+            # Backward compat: legacy tools returning next_action without advisory fields
             next_action = result.output.get("next_action")
             if isinstance(next_action, Mapping):
-                action_name = next_action.get("name")
-                if not isinstance(action_name, str):
-                    action_name = next_action.get("action")
-                args = next_action.get("args")
-                if action_name:
-                    payload["recommended_next_action"] = action_name
-                    if args is not None:
-                        payload["recommended_args"] = args
-            # Also include status to help solver understand tool state
+                if "pruned_observation" not in result.output:
+                    # Auto-convert legacy next_action to advisory format
+                    action_name = next_action.get("name")
+                    if not isinstance(action_name, str):
+                        action_name = next_action.get("action")
+                    args = next_action.get("args", [])
+                    if action_name:
+                        payload["answer_recommendation"] = (
+                            f"Legacy tool suggests: {action_name}({args})"
+                        )
+                        payload["confidence_score"] = 0.5
+                        payload["recommended_next_action"] = action_name
+                        if args is not None:
+                            payload["recommended_args"] = args
+                else:
+                    # Advisory tool that also provides next_action — keep as secondary info
+                    action_name = next_action.get("name") or next_action.get("action")
+                    if isinstance(action_name, str):
+                        payload["recommended_next_action"] = action_name
+                        args = next_action.get("args")
+                        if args is not None:
+                            payload["recommended_args"] = args
+
             status = result.output.get("status")
             if isinstance(status, str):
                 payload["status"] = status
         return "TOOL_RESULT: " + json.dumps(
             payload, ensure_ascii=True, default=str
         )
+
+    def _format_advisory_result(self, name: str, result: ToolResult) -> str:
+        """Format tool result as human-readable advisory sidecar text."""
+        if not isinstance(result.output, Mapping):
+            return self._format_tool_result(name, result)
+
+        parts = []
+        recommendation = result.output.get("answer_recommendation")
+        pruned = result.output.get("pruned_observation")
+        confidence = result.output.get("confidence_score", 0.0)
+        status = result.output.get("status")
+
+        if recommendation:
+            parts.append(f"Recommendation: {recommendation}")
+        if pruned is not None:
+            parts.append(
+                f"Filtered Data: {json.dumps(pruned, ensure_ascii=True, default=str)}"
+            )
+        if isinstance(confidence, (int, float)):
+            parts.append(f"Confidence: {float(confidence)}")
+        if isinstance(status, str):
+            parts.append(f"Status: {status}")
+
+        rationale = result.output.get("rationale")
+        if isinstance(rationale, list) and rationale:
+            parts.append(
+                f"Rationale: {'; '.join(str(r) for r in rationale[:3])}"
+            )
+
+        warnings = result.output.get("warnings")
+        if isinstance(warnings, list) and warnings:
+            parts.append(f"Warnings: {'; '.join(str(w) for w in warnings[:3])}")
+
+        if not parts:
+            return self._format_tool_result(name, result)
+
+        return f"TOOL_ADVISORY ({name}):\n" + "\n".join(parts)
 
     def _format_tool_result_payload(
         self, tool_name: str, result: ToolResult, max_output_len: int = 1200

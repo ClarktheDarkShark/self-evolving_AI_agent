@@ -1,0 +1,21 @@
+{
+  "run_id": "t4",
+  "notes": {
+    "entities": [
+      "E"
+    ],
+    "best_entity": "E",
+    "observed_vars": [
+      "#1",
+      "#2"
+    ],
+    "known_vars": {
+      "#1": "set.type",
+      "#2": "set.type"
+    },
+    "relations_by_subject": {}
+  },
+  "history": [
+    "t4:Intersect #1 and #2 to find common entities"
+  ]
+}

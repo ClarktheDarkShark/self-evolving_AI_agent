@@ -1,0 +1,27 @@
+{
+  "history": [
+    "goal=x; next=get_neighbors",
+    "st=need_step na=get_relations w= e="
+  ],
+  "notes": {
+    "entities": [
+      "A"
+    ],
+    "observed_vars": [],
+    "relations_by_subject": {
+      "A": [
+        "rel.a",
+        "rel.b"
+      ]
+    },
+    "relations_summary": {
+      "A": {
+        "sample": [
+          "rel.a",
+          "rel.b"
+        ],
+        "total": 2
+      }
+    }
+  }
+}

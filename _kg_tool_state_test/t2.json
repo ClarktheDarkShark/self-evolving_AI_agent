@@ -1,0 +1,14 @@
+{
+  "history": [
+    "goal=x; next=None",
+    "st=need_step na=get_relations w=actions_spec_sanitized e="
+  ],
+  "notes": {
+    "entities": [
+      "A"
+    ],
+    "observed_vars": [],
+    "relations_by_subject": {},
+    "relations_summary": {}
+  }
+}

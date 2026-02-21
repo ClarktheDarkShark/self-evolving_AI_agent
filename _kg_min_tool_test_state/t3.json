@@ -1,0 +1,20 @@
+{
+  "run_id": "t3",
+  "notes": {
+    "entities": [
+      "Goat"
+    ],
+    "best_entity": "Goat",
+    "observed_vars": [],
+    "known_vars": {},
+    "relations_by_subject": {
+      "Goat": [
+        "a.b",
+        "x.y"
+      ]
+    }
+  },
+  "history": [
+    "t3:Progress appears stalled; try switching to a different action family (e.g., use get_neighbors or get_relations inste."
+  ]
+}

@@ -100,12 +100,30 @@ class GeneratedToolLoggingCallback(Callback):
         trace_len_after = len(trace)
         trace_new = trace[trace_len_before:] if trace_len_after > trace_len_before else []
         compact_new = []
+        def _truncate_arg(value: Any, max_len: int = 80) -> Any:
+            if value is None:
+                return None
+            text = str(value)
+            return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+        def _truncate_args(value: Any) -> Any:
+            if isinstance(value, list):
+                return [_truncate_arg(item) for item in value]
+            return _truncate_arg(value)
+
+        def _truncate_output(value: Any, max_len: int = 200) -> Any:
+            if value is None:
+                return None
+            return self._truncate_text(str(value), max_len)
+
         for step in trace_new:
             if isinstance(step, dict):
                 compact_new.append(
                     {
                         "action": step.get("action"),
+                        "args": _truncate_args(step.get("args")),
                         "ok": step.get("ok"),
+                        "output": _truncate_output(step.get("output")),
                         "error": step.get("error"),
                     }
                 )
@@ -201,8 +219,16 @@ class GeneratedToolLoggingCallback(Callback):
                 if not payload.get("result_next_action") and status == "need_step":
                     step_event["next_action_missing"] = True
 
-            # Log answer_recommendation for done status
-            if status == "done":
+            # Log advisory paradigm fields
+            result_confidence = payload.get("result_confidence_score")
+            if isinstance(result_confidence, (int, float)):
+                step_event["confidence_score"] = result_confidence
+            result_pruned = payload.get("result_pruned_observation")
+            if result_pruned is not None:
+                step_event["has_pruned_observation"] = True
+
+            # Log answer_recommendation for done and advisory statuses
+            if status in {"done", "advisory"}:
                 answer_rec = payload.get("result_answer_recommendation")
                 if answer_rec is not None:
                     step_event["answer_recommendation"] = self._summarize_text(str(answer_rec), 150)

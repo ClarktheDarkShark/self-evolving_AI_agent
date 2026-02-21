@@ -1,0 +1,15 @@
+{
+  "run_id": "t1",
+  "notes": {
+    "entities": [
+      "how many"
+    ],
+    "best_entity": "how many",
+    "observed_vars": [],
+    "known_vars": {},
+    "relations_by_subject": {}
+  },
+  "history": [
+    "t1:Start by exploring relations for how many"
+  ]
+}

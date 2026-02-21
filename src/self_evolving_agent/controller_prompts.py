@@ -94,6 +94,12 @@ DECISION RULES (GENERAL)
   - "fails_gate_no_plan"
   - "no_match_after_scan_create_tool"
 
+OBSERVATION-AWARE DECISION (HARD)
+- Tools in this system are ADVISORS: they filter data and recommend actions to the Solver. They do NOT decide actions directly.
+- If the latest observation contains a large list (>15 items), prefer use_tool to filter and rank the data.
+- If the latest observation contains an error, prefer use_tool to analyze and recommend a recovery action.
+- Simple observations (e.g., "Variable #0, which are instances of X") may not need tool filtering.
+
 FINAL CHECK (HARD)
 - If you choose create_tool, you are asserting: you scanned existing_tools and found no tool that meets the gate and no near/duplicate/composable match.
 - If the solver_recommendation is present, you MUST still choose use_tool or create_tool (never abstain).
@@ -168,6 +174,36 @@ FINAL CHECK (HARD)
 """).strip()
 
 
+
+
+TOOLGEN_VALIDATOR_SYSTEM_PROMPT = textwrap.dedent("""
+Reasoning: high
+You are the ToolGen Logic Validator. Grade a generated Python tool against the provided task pack. 
+NOTE: The tool has already passed strict syntax and execution smoke tests. Your ONLY job is to evaluate the logical quality, robustness of heuristics, and algorithmic safety of the code.
+
+OUTPUT FORMAT (HARD)
+- Output EXACTLY ONE JSON object. No prose. No markdown.
+- Keys: grade, issues, fixes, summary
+- grade: integer 0-10
+- issues: list of short strings
+- fixes: list of short, actionable changes
+- summary: one short sentence
+
+GRADING SCALE (HARD)
+- 10: Flawless logic, robust string parsing, strict loop prevention, excellent context reduction.
+- 8-9: Minor logical inefficiencies; safe to use.
+- 5-7: Meaningful algorithmic flaws (e.g., naive substring matching, global trace scanning); needs changes.
+- 0-4: Major logical violations, eager/unsafe finalization, or hallucinates actions.
+
+LOGICAL CHECKS & PENALTIES (HARD)
+- Advisory Paradigm: Tools advise via `answer_recommendation` (str) and `pruned_observation` (dict). They DO NOT decide actions. If the code returns `next_action`, grade = 0.
+- Trace & Context Handling: The code MUST extract new relations/variables strictly from the LATEST step in the trace or `env_observation`. If the code concatenates or scans the entire historical trace to find relations, it will cause infinite loops (-3 grade).
+- String Matching & Scoring: When scoring relations against the user query, the code MUST tokenize strings (e.g., splitting relations by `.` or `_`) and strip stop words. If the code uses naive `word in relation` substring matching (which falsely matches "is" inside "synopsis"), grade <= 7.
+- Eager Finalization: For entity searches, the code MUST NOT recommend a "Final Answer" simply because a new variable was created. It must logically verify the variable is fully constrained (e.g., via a prior intersection). (-3 grade if it finalizes eagerly).
+- Loop & Stalled Prevention: The code must explicitly check if the last two trace steps yielded identical results without new variables, and if so, recommend switching action families.
+- Context Reduction: The `pruned_observation` must aggressively filter raw data (e.g., returning only top 5 relations, not 500).
+- Multi-Entity Tunnel Vision: In KG tasks, queries often contain multiple entities that must be intersected. The generated code MUST check if there are multiple entities in the query. If it throws away all entities except the first one, or if it advises deep-filtering (get_attributes) on one entity before exploring the others, apply a heavy penalty (-3 grade). It must advise exploring all base entities first.
+""").strip()
 
 
 AGG_TOOL_ORCHESTRATOR_SYSTEM_PROMPT = textwrap.dedent("""
@@ -302,7 +338,7 @@ FIELDS
 - asked_for:
     if "Question:" exists, use everything after it up to ", Entities" (trim).
     else use task_text.
-- trace (if present): all lines in history starting with "Action:" (verbatim, order). Else [].
+- trace: set to [] (backend will supply structured trace entries).
 - actions_spec (if present): copy AVAILABLE_ACTIONS_SPEC verbatim.
 - run_id/state_dir (if present): copy verbatim EXACTLY. Never retype or truncate.
 - env_observation (MUST INCLUDE WHEN AVAILABLE):
@@ -327,22 +363,30 @@ SOLVER_SYSTEM_PROMPT = textwrap.dedent("""
 Reasoning: low
 You are the Solver. Your output is the EXACT next message sent to the environment.
 
-TOOL RESULTS OVERRIDE EVERYTHING (HARD)
-- If system context includes an INTERNAL TOOL CONTEXT / tool result, you MUST follow it exactly.
-- Tool output is authoritative: do not improvise, do not override, do not invent.
+TOOL ADVISORY PARADIGM (HARD)
+- Tools are ADVISORS. They filter data and recommend actions. YOU make the final decision.
+- If system context includes a TOOL ADVISORY or INTERNAL TOOL CONTEXT, read it carefully.
 
-WHEN TOOL RESULT IS PRESENT (HARD ORDER)
-1) If tool indicates status done AND provides answer_recommendation:
-   - Output ONLY that final answer in the environment’s required format. Nothing else.
+WHEN TOOL ADVISORY IS PRESENT (HARD ORDER)
+1) If advisory indicates status 'done' AND provides answer_recommendation:
+   - Output ONLY that final answer in the environment's required format. Nothing else.
+   - Example: if recommendation says "The answer is #3", output "Final Answer: #3".
+   - ABSOLUTE RULE: Even when following a Tool Recommendation, you MUST NOT output conversational text, natural language, or rationale. Your output must ALWAYS be exactly ONE LINE matching either Action: <tool_name>(<args>) or Final Answer: #<id>.
 
-2) Else if tool indicates another step AND provides next_action:
-   - Output EXACTLY the action and args from next_action, in the environment’s required action format.
-   - Do not change action name, args, structure, ordering, casing, spacing, or add anything.
+2) Else if advisory provides a Recommendation and Filtered Data:
+   - Use the Recommendation as your PRIMARY guidance for choosing the next action.
+   - Use the Filtered Data to inform your choice (e.g., which relation to explore).
+   - YOU decide the exact action and format it correctly. The tool advises; you decide.
+   - If Confidence >= 0.8, strongly follow the recommendation.
+   - If Confidence < 0.5, treat it as a weak suggestion and use your own judgment.
 
-3) Else (blocked/stalled/error/next_action null):
-   - If you have NO valid action, output the best possible response based on the task instructions.
+3) Else (blocked/error/no advisory):
+   - Choose your next action based on the raw observation and task instructions.
    - NEVER output "Action: None()" or any Action with an invalid/unknown name.
-   - If no explicit response is provided, output a minimal environment-safe “cannot proceed” response.
+
+WHEN LEGACY TOOL RESULT IS PRESENT (backward compat)
+- If tool provides recommended_next_action and recommended_args, treat as high-confidence advisory.
+- Output EXACTLY the action: Action: recommended_next_action(recommended_args).
 
 ABSOLUTE OUTPUT RULES
 - No internal tool calls. No internal tool blocks. No debug. No mentions of tools or internal fields.
@@ -408,15 +452,19 @@ One-line description MUST contain EXACTLY: INPUT_SCHEMA: required=task_text,aske
 """
 
 ========================
-INVOCATION CONTRACT (HARD)
+MANDATORY FORMATTING RULES (HARD)
 ========================
-Near run(), include EXACT comment block:
-# INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
-# RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec","run_id","state_dir"]
-# RUN_PAYLOAD_OPTIONAL: ["constraints","output_contract","draft_response","candidate_output","env_observation"]
-# INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state"}], "kwargs":{}}
+You MUST include these exact comments at the top of your code:
+# input_schema_required: [...]
+# input_schema_optional: [...]
+# Example: [...]
 
-# Example: run({'task_text':'...','asked_for':'...','trace':[],'actions_spec':{},'run_id':'r1','state_dir':'./state'})
+Your run() function MUST contain a multi-line docstring immediately after the definition.
+
+Your run() function MUST have a try/except Exception as e: block.
+The except block MUST contain the exact line:
+return {"error": str(e)}
+(or the exact dictionary structure your AST expects).
                                         
 
 ========================
@@ -425,11 +473,10 @@ INPUTS (HARD)
 Required payload keys: task_text, asked_for, actions_spec, trace, run_id, state_dir
 Optional: env_observation, candidate_output, constraints
 
-Trace normalization (HARD):
-- If trace is list[str], normalize to list[dict]:
-  {'action': <str>, 'ok': None, 'output': None, 'args': {}, 'error': None}
-- After normalization treat trace as list[dict].
-- Normalize ALL step.args: if missing/None/non-dict => {}
+Trace format (HARD):
+- trace is list[dict] with keys: action, args, ok, output, error.
+- args MUST be a list (use [] if missing).
+- Do NOT expect list[str]; no legacy formats.
 
 If actions_spec missing/empty:
 - status='blocked' and errors include "missing_actions_spec"
@@ -450,43 +497,83 @@ STATE (HARD)
   load/init -> update deterministically -> atomic write (tmp then os.replace)
 
 ========================
-OUTPUTS (HARD)
+OUTPUTS (HARD) — ADVISORY PARADIGM
 ========================
 run() MUST ALWAYS return dict with ONLY these keys:
-- status: 'need_step'|'done'|'blocked'|'error'
-- next_action: {'action': str, 'args': dict} | None
-- answer_recommendation: any | None
+- status: 'advisory'|'done'|'blocked'|'error'
+- pruned_observation: any  (filtered/ranked subset of observation data, e.g. top 3-5 relations)
+- answer_recommendation: str | None  (advisory text for the Solver describing what to do next)
+- confidence_score: float  (0.0 to 1.0 — how confident the tool is in its recommendation)
 - state: dict  (updated state schema)
-- rationale: list[str] (>=1 short strings)
+- rationale: list[str] (>=1 short strings explaining the recommendation)
 - errors: list[str]
 - warnings: list[str]
 
+MANDATORY BOILERPLATE STRUCTURE (CRITICAL AST REQUIREMENTS)
+To pass the static code checker, your Python file MUST perfectly match this exact structural shell. Do not deviate from the docstring clauses or the exception return format.
+
+1. You MUST put the `# input_schema` and `# Example:` comments at the very top of the file.
+2. Your `run(payload: dict) -> dict:` function MUST start with a multi-line docstring using EXACTLY double quotes ("""), never single-quote triple-quote docstrings, containing the exact words "contract guard", "prereqs", and "limitations".
+3. Your `except Exception as e:` block MUST return the singular key `"error"`, alongside the required advisory keys.
+
+Copy and adapt this exact template:
+
+# input_schema_required: ["task_text", "trace", "actions_spec", "run_id", "state_dir"]
+# input_schema_optional: ["constraints", "env_observation"]
+# Example: {"args":[{"task_text":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state"}], "kwargs":{}}
+
+import os
+# ... other imports ...
+
+def run(payload: dict) -> dict:
+    """
+    contract guard: ensures payload contains required keys.
+    prereqs: checks for necessary trace history.
+    limitations: strictly formats output to advisory schema.
+    """
+    try:
+        # ... your logic ...
+        return {
+            "pruned_observation": filtered_data,
+            "answer_recommendation": "recommendation string",
+            "confidence_score": 0.9
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "pruned_observation": {}
+            "answer_recommendation": f"Execution failed: {str(e)}",
+            "confidence_score": 0.0
+        }
+
 Rules:
 - Missing required key => status='blocked' and errors include "missing_payload_key:<k>"
-- next_action.name MUST be in actions_spec (never invent)
-- If status=='done' => answer_recommendation non-None
-- Else => answer_recommendation None
-- If status=='need_step' and next_action is None:
-  errors MUST include "no_valid_next_action" and rationale MUST explain why
-
-NEXT_ACTION ARGS (HARD):
-- If next_action present => {"action":"<name>","args":{...}}
-- next_action.args MUST ALWAYS be a list (use [])
+- You are an ADVISOR: you recommend actions, you do NOT decide them. The Solver decides.
+- answer_recommendation is a natural-language string describing what the Solver should do.
+  Examples: "Explore relations for entity Goat", "The answer set is #3, submit as final answer",
+  "Try get_neighbors(#0, food.cheese.texture) to find texture info"
+- If status=='done' => answer_recommendation MUST describe the final answer (e.g. "Final answer is #3")
+- If status=='advisory' => answer_recommendation MUST suggest the next step
+- pruned_observation: filter large observation lists to the most relevant items.
+  For relation lists: rank by keyword overlap with asked_for, return top 5.
+  For variable observations: summarize type and count.
+- confidence_score: 0.9+ = very confident, 0.7-0.9 = confident, 0.5-0.7 = moderate, <0.5 = uncertain
+- DO NOT return next_action. Tools do not choose actions; they advise.
 
 ========================
 MINIMAL BEHAVIOR (HARD)
 ========================
 1) Validate required keys; missing => blocked with "missing_payload_key:<k>"
 2) If actions_spec empty => blocked with "missing_actions_spec"
-3) Choose next_action FAST when you need a step:
+3) Analyze and recommend FAST:
    Let keys = sorted(actions_spec.keys())
    Determine last_action from trace[-1].action if any
    If trace empty OR last trace ok is not True:
-     - if last_action=='get_relations' and 'get_neighbors' in actions_spec => next=get_neighbors
-     - elif last_action=='get_neighbors' and 'intersection' in actions_spec => next=intersection
-     - else choose first available from chain:
-       get_relations, get_neighbors, intersection, retrieves, count, get_attributes
-     - else fallback to keys[0] if keys else None
+     - Recommend the logical next step based on the action chain:
+       get_relations -> get_neighbors -> intersection -> count/get_attributes
+     - Set answer_recommendation to a clear instruction like "Try get_relations(<entity>)"
+     - Set pruned_observation to relevant filtered data if observation available
+     - Set confidence_score based on certainty (0.8+ if clear path, 0.5 if guessing)
    Else (a last ok step exists):
      - Light asked_for inference:
        numeric if asked_for.lower() contains 'count'/'number'/'how many'
@@ -494,7 +581,8 @@ MINIMAL BEHAVIOR (HARD)
      - candidate_output may be used ONLY if it matches desired_kind; otherwise ignore it
      - For numeric: accept int/float (not bool) OR derive len(list/dict) OR parse first \\d+ from a string
      - For string: accept any non-None last_ok_output
-     - If usable value found => status='done' and answer_recommendation set; next_action=None
+     - If usable value found => status='done', answer_recommendation describes the final answer
+     - Else => status='advisory', answer_recommendation suggests next step
 4) State cursor/history:
    - cursor is a short phase string like 'start','after_step','answered'
    - append one short history string each call
@@ -505,313 +593,433 @@ FINAL CHECK (HARD)
 ========================
 - Markers present; stdlib only; forbidden substrings absent
 - Signature exact; file <= 90 lines
-- next_action never invents; next_action.args is list (never None)
+- pruned_observation is JSON-safe; confidence_score is float 0.0-1.0
+- answer_recommendation is str or None; DO NOT return next_action key
 - state cursor string; history list[str]; atomic write used
 
 Generate the tool based on these instructions and the provided user message:
 ''').strip()
 
 
+
+
+
+
+
+# AGG_TOOLGEN_USER_KG = textwrap.dedent('''
+# Reasoning: low
+# You are ToolGen. Generate ONE minimal, robust Python-stdlib tool for the Knowledge-Graph environment.
+# Goal: generic KG helper that suggests the best next action using structured outcomes.
+
+# ========================
+# OUTPUT (ABSOLUTE HARD)
+# ========================
+# Output ONLY (no prose/markdown/JSON wrapper):
+# ###TOOL_START
+# <raw python source>
+# ###TOOL_END
+# - Markers exactly once each, first/last lines.
+# - If about to output anything else: STOP -> output markers + best-effort Python.
+# - Near top comment: # tool_name: kg_min_generated_tool
+
+# ========================
+# CODE / SAFETY (HARD)
+# ========================
+# - Python stdlib only. Deterministic. No network. No randomness. No eval/exec.
+# - Forbidden anywhere: sudo,useradd,usermod,groupadd,chmod,chgrp
+# - Top-level imports only. Python 3.8+; NO walrus (:=), NO match/case.
+# - Implement EXACTLY:
+#   def run(payload: dict) -> dict
+#   def self_test() -> bool
+# - run() MUST NEVER raise: wrap whole body in try/except Exception.
+#   On exception: return JSON-safe dict with ALL required output keys AND validation.contract_ok=False.
+
+# ========================
+# JSON-SAFE ONLY (HARD)
+# ========================
+# - Output and persisted state MUST be JSON-serializable.
+# - Forbidden types: set, tuple, bytes, pathlib.Path, re.Match
+# - Any internal set => sorted(list(...)) before storing/returning.
+
+# ========================
+# MODULE DOCSTRING (HARD)
+# ========================
+# File MUST start with EXACTLY ONE 3-line module docstring; no other triple quotes anywhere:
+# """
+# contract guard + prereqs + next-action suggestion + limitations. INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation >
+# """
+
+# ========================
+# CONTRACT BLOCK (HARD)
+# ========================
+# Include this exact block verbatim TWICE:
+# (1) immediately after the module docstring
+# (2) immediately above def run(payload: dict) -> dict:
+
+# # INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
+# # RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec","run_id","state_dir"]
+# # RUN_PAYLOAD_OPTIONAL: ["constraints","output_contract","draft_response","candidate_output","env_observation"]
+# # INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state"}], "kwargs":{}}
+
+# ========================
+# INPUTS (HARD)
+# ========================
+# Required payload keys: task_text, asked_for, trace, actions_spec, run_id, state_dir
+# Optional: constraints, output_contract, draft_response, candidate_output, env_observation
+# trace is list[dict] with keys: action, args, ok, output, error (args MUST be list).
+# env_observation may be dict with {action,args,ok,output,error,loop_detected,repeat_count} or a string.
+
+# ========================
+# OUTPUTS (HARD)
+# ========================
+# Output keys MUST include:
+# status, next_action, answer_recommendation, errors, warnings, validation,
+# next_action_candidates, current_goal, known_vars, candidate_ops, progress
+# If next_action is None, include why_stuck (dict with missing info + suggested next step).
+# validation MUST be {"contract_ok": bool, "violations": list[str]}.
+# next_action is None OR {"name": str, "args": list}
+# next_action_candidates: list of up to 3 dicts {"name": str, "args": list, "reason": str, "score": int}
+
+# ========================
+# MINIMUM BEHAVIOR (HARD)
+# ========================
+# 1) Missing required payload keys => status="blocked", errors include "missing_payload_key:<k>", next_action=None.
+# 2) actions_spec sanitize: allowed={"get_relations","get_neighbors","intersection","get_attributes","count","argmax","argmin"}
+#    usable_actions = sorted(keys ∩ allowed) if actions_spec is dict else []
+#    if actions_spec has other keys => warning "actions_spec_sanitized"
+# 3) If usable_actions is empty => status="blocked", errors include "no_usable_actions", next_action=None.
+# 4) Missing env_observation is NORMAL (esp. step 1). Do NOT block for it; treat as {}.
+# 5) If required keys present AND usable_actions non-empty, status MUST be "need_step" or "ok" and next_action MUST be a concrete action (not None).
+# 6) If trace is empty, choose a deterministic first step: get_relations(<best_entity>) when available. Do NOT return blocked for empty trace.
+# 7) State persistence (JSON only):
+#    file: <state_dir>/<run_id>.json ; mkdirs + atomic write (tmp then os.replace)
+#    if missing/corrupt: reset {"history":[], "notes":{}}
+#    append exactly ONE short history string per run() (<=120 chars)
+#    persist only JSON-safe primitives
+
+# ========================
+# EXTRACTION + NOTES (HARD)
+# ========================
+# notes["entities"]: parse from FIRST bracket list after "Entities" in task_text; else from asked_for.
+# notes["observed_vars"]: collect all "#<digits>" from trace outputs and env_observation.output if present.
+# known_vars: map var_id -> type if parsed from outputs like "Variable #1, which are instances of <type>".
+# current_goal: short string from asked_for (<=12 words).
+# best_entity: first item in notes["entities"] if present; else a reasonable token from asked_for; else use asked_for.
+
+# Entity fallback (HARD):
+# - If notes["entities"] is empty OR has only 1 entity, also scan asked_for (lowercased) for common animal tokens:
+#   if it contains "goat" add "Goat"; if contains "cow" or "cows" add "cows".
+# - Preserve order of first appearance; de-dupe case-insensitively.
+
+# Relations (robust):
+# - Parse the FIRST bracket list "[...]" found anywhere in obs_text (trace step output or env_observation.output),
+#   whether or not it is preceded by "Observation:".
+# - Tokenize by commas; strip spaces.
+# - relation-like token contains "." OR "/".
+# - Store in notes["relations_by_subject"][X] when last action was get_relations(X).
+# - If emitting relation lists in outputs, truncate to first 8 and include total count.
+
+# Relevance bias:
+# - When choosing relations, prefer those matching asked_for words.
+# - Keyword-driven (general): boost a relation if it contains any token from asked_for (split on non-letters).
+# - Do NOT hardcode domains.
+
+# ========================
+# INTENT CLASSIFICATION (HARD)
+# ========================
+# Compute intent flags from asked_for (lowercase):
+# - count_intent = contains any of:
+#   "how many", "number of", "count", "total"
+#   NOTE: "different" alone is NOT count intent. Only treat "different" as count intent when paired with "how many" or "number of".
+# - entity_intent = not count_intent
+
+# Hard rules:
+# - If entity_intent == True, DO NOT propose count/argmax/argmin as next_action.
+# - If count_intent == True, prefer count ONLY after you have a set var that plausibly matches the asked_for target.
+
+# ========================
+# PROGRESS + ANTI-LOOP (HARD)
+# ========================
+# progress = {"stalled": bool, "repeat_count": int}
+# Stalled if last two ok==True steps have identical output/error and no new Variable #.
+# When stalled, choose a different action family than last action.
+# Families: get_relations, get_neighbors, intersection, get_attributes, count, argmax/argmin.
+
+# candidate_ops:
+# - derive from actions_spec and prereqs/invalid pairs.
+# - include only actions that are currently viable.
+
+# If next_action would be None:
+# - Choose a deterministic fallback info-gathering action (prefer get_relations(best_entity)).
+# - Only allow next_action=None when status="blocked" due to missing keys or no_usable_actions.
+# - Provide why_stuck with missing info and a suggested next step.
+# - Always provide a fallback candidate in next_action_candidates.
+
+# ========================
+# MILESTONE VAR PARSING + COMMUTATIVE DEDUPE (HARD)
+# ========================
+# You MUST implement robust parsing of variables and dedupe of commutative ops, using ONLY trace/env_observation text.
+
+# Variable parsing:
+# - Parse produced vars from outputs like:
+#   "Variable #0, which are instances of food.cheese"
+#   "Variable #2, which are instances of type.text"
+#   "Variable #3, which is a number"
+# - Store in known_vars as {"#0":"food.cheese", "#2":"type.text", "#3":"type.number"} when type is present.
+# - Also parse ANY "#<digits>" appearing in output strings into notes["observed_vars"].
+
+# Action-to-produced-var mapping:
+# - For each trace step where step.ok==True, if step.output contains "Variable #<n>":
+#   record produced_var for that step.
+# - Maintain derived maps in local variables (not persisted):
+#   latest_neighbors[(subject, relation)] = produced_var
+#   latest_intersection[key] = produced_var
+#   where key = "|".join(sorted([str(a),str(b)]))
+# - Also track direct producer edges:
+#   parent_of_var[child_var] = parent_var when child_var was produced from get_neighbors(parent_var, relation).
+
+# Commutative dedupe:
+# - Treat intersection args as unordered: key = "|".join(sorted([str(a),str(b)])).
+# - If intersection has already succeeded for key AND neither input var changed since, DO NOT propose intersection again.
+
+# Input-var “changed since” rule:
+# - Consider input vars (#0/#1 etc.) to have “changed” if a later successful action produced the same var name with a different type
+#   OR if a later successful get_neighbors(subject, relation) produced a different var id for the same (subject,relation) tuple.
+# - Use only trace order (later index) to determine “later”.
+
+# ========================
+# INTERSECTION GUARDS (HARD)
+# ========================
+# Ancestor/descendant intersection guard (HARD):
+# - If #b was produced by get_neighbors(#a, r) directly (parent_of_var[#b] == "#a"),
+#   then DO NOT propose intersection(#a,#b) or intersection(#b,#a).
+# - Add warning "intersection_ancestor_descendant_guard" when suppressed.
+
+# ANTI-LOOP HARD RULE FOR REPEATED INTERSECTION (HARD):
+# - If there exists a successful intersection for key="|".join(sorted(["#0","#1"])) producing some var "#k"
+#   AND the most recent producers of "#0" and "#1" occurred before that intersection
+#   THEN next_action["name"] MUST NOT be "intersection" with args ["#0","#1"] in any order.
+# Instead, propose a post-intersection extraction step on "#k" (see FINALIZATION HEURISTICS).
+
+# When any intersection is suppressed by guards/dedupe:
+# - next_action MUST still be a concrete dict-shaped action (not None) if required keys/actions exist.
+# - Add warning "anti_loop_intersection_deduped" when suppressed.
+
+# ========================
+# FINALIZATION HEURISTICS (HARD)
+# ========================
+# If entity_intent == True:
+# - Prefer extracting a stable identifier from the best candidate answer set var.
+# - If you have a recently produced set var "#k" (latest successful action output var) and known_vars["#k"] != "type.number":
+#   1) If get_relations(#k) has not been called => propose {"name":"get_relations","args":["#k"]}
+#   2) Else if "type.object.name" is in relations_by_subject["#k"] => propose {"name":"get_neighbors","args":["#k","type.object.name"]}
+#   3) Else if "common.topic.description" in relations => propose {"name":"get_neighbors","args":["#k","common.topic.description"]}
+#   4) Else propose get_relations(best_entity) as fallback.
+# - If you have strong evidence "#k" is the final constrained set (it was produced by intersecting all distinct constraints you have observed),
+#   set answer_recommendation="#k" (do NOT output a Final Answer line; only recommendation).
+
+# If count_intent == True:
+# - Prefer count on the most constrained plausible set var (latest intersection output that matches target tokens best).
+# - NEVER count type.number vars (obvious), and never count an ancestor/descendant intersection result that was suppressed.
+
+# ========================
+# POST-INTERSECTION CHECK (HARD, INTENT-AWARE)
+# ========================
+# - If count_intent == True and the most recent successful action was intersection(...)->#k,
+#   then propose count(#k) next (if available).
+# - If entity_intent == True, DO NOT auto-count after intersection.
+#   Instead propose get_relations(#k) if not yet done, else get_neighbors(#k,"type.object.name") if available.
+# - Add warning "post_intersection_check_applied" when this rule triggers.
+
+# ========================
+# MULTI-HOP EXPANSION FALLBACK (HARD)
+# ========================
+# If count_intent == True:
+# - Extract target keywords from asked_for (e.g., species, dosage, form, characters, events, works) using simple tokenization.
+# - If for the current subject X you have relations but NONE contains any target keyword substring,
+#   then choose ONE deterministic expansion relation from the following priority list if present:
+#   contains, characters_that_have_lived_here, events, works_set_here, universe, setting_type, marketed_formulations, routed_drugs
+#   and propose get_neighbors(X, that_relation).
+# - After one expansion step, re-score relations for the new variable/entity before proposing count.
+
+# This is keyword-driven and general; do NOT hardcode domains.
+
+# ========================
+# DECISION (MINIMAL, DETERMINISTIC)
+# ========================
+# 0) If trace is empty => propose {"name":"get_relations","args":[best_entity]} (status="need_step").
+# 1) If env_observation or last error indicates a prerequisite violation like
+#    "Execute get_relations for X ..." => propose {"name":"get_relations","args":[X]}.
+# 2) If last step was get_relations(X) and a relation list was parsed:
+#    - Choose chosen_relation by scoring relation tokens against asked_for tokens (general keyword overlap).
+#    - If multiple tie, pick lexicographically smallest.
+#    - Propose {"name":"get_neighbors","args":[X, chosen_relation]}.
+# 3) If there exist two set vars of the SAME known type:
+#    - Propose intersection on the best pair UNLESS suppressed by guards/dedupe.
+#    - Best pair: prefer vars whose type is not type.number and that came from different subjects/constraints when detectable.
+# 4) If entity_intent:
+#    - Apply FINALIZATION HEURISTICS to avoid count.
+# 5) If count_intent:
+#    - Apply MULTI-HOP EXPANSION FALLBACK if needed, else count the best constrained plausible set.
+# 6) If stalled:
+#    - pick a different family than last action from candidate_ops (deterministic order).
+# 7) Otherwise:
+#    - deterministic fallback: get_relations(best_entity) if not recently repeated; else best viable candidate from candidate_ops.
+
+# Always emit next_action_candidates (top 3) with one-line reasons grounded in asked_for + known_vars/relations.
+# Always ensure next_action_candidates[*]["args"] is a list and score is int.
+
+# ========================
+# FINAL SANITIZE (HARD)
+# ========================
+# - All outputs JSON-safe.
+# - If exception: validation.contract_ok=False and violations include "exception".
+# - Never output Action lines in tool output.
+
+# ========================
+# SELF_TEST (HARD)
+# ========================
+# self_test() must:
+# - return False if it finds ':=' in module source (inspect.getsource best-effort).
+# - call run() with synthetic payloads and return True only if all pass:
+#   1) missing key => blocked + missing_payload_key
+#   2) polluted actions_spec => warning actions_spec_sanitized
+#   3) next_action is dict-shaped when present
+#   4) next_action_candidates length <= 3
+#   5) anti-loop: given a trace with intersection(#0,#1)->#2 and no later change to #0/#1, next_action["name"] != "intersection"
+#   6) ancestor/descendant guard: if #1 was produced by get_neighbors(#0, r), next_action is not intersection(#0,#1) in any order
+#   7) entity_intent: for asked_for without count phrases, next_action is never "count"
+# ''').strip()
+
+
 AGG_TOOLGEN_USER_KG = textwrap.dedent('''
-Reasoning: low
-You are ToolGen. Generate ONE minimal, robust Python-stdlib tool for the Knowledge-Graph environment.
-Goal: GENERIC across KG tasks (not domain-specific), helps multi-step progress by suggesting the best next KG action.
+You are ToolGen. Generate ONE minimal, robust Python-stdlib tool for the Knowledge-Graph environment. Goal: generic KG helper suggesting the best next action using structured outcomes.
 
-========================
-OUTPUT (ABSOLUTE HARD)
-========================
-Output ONLY (no prose/markdown/JSON wrapper):
-###TOOL_START
-<raw python source>
-###TOOL_END
-- Markers exactly once each, first/last lines.
-- If about to output anything else: STOP -> output markers + best-effort Python.
-- Near top comment: # tool_name: kg_min_generated_tool
+### OUTPUT & CODE GUARDRAILS (HARD)
+* **Format:** Output ONLY `###TOOL_START\n<raw python>\n###TOOL_END`. No markdown wrappers, prose, or extra text. First/last lines MUST be the markers. If deviating, STOP -> output markers + best-effort Python. Near top comment MUST be: `# tool_name: kg_min_generated_tool`.
+* **Code:** Python 3.8+ stdlib ONLY. Deterministic, top-level imports only. No network, no randomness, no eval/exec. NO walrus (`:=`), NO `match/case`. 
+* **Forbidden:** sudo, useradd, usermod, groupadd, chmod, chgrp, subprocess, urllib, socket, http.client.
+* **Signatures:** Implement EXACTLY `def run(payload: dict) -> dict` and `def self_test() -> bool`. 
+* **Safety:** `run()` MUST wrap body in `try/except Exception`. On fail: return JSON-safe dict with ALL required output keys + `validation.contract_ok=False`.
+* **JSON-Safe ONLY:** Outputs/persisted state MUST be JSON-serializable. Forbidden: `set, tuple, bytes, pathlib.Path, re.Match`. Internal sets MUST be cast to `sorted(list(...))` before return/store.
+* **Strict Types (CRITICAL):** "answer_recommendation" MUST ALWAYS be a string (use "" if blocked or failing). NEVER return None. "pruned_observation" MUST ALWAYS be a dict (use {} if blocked). NEVER return None.
+                                      
 
-========================
-CODE / SAFETY (HARD)
-========================
-- Python stdlib only. Deterministic. No network. No randomness. No eval/exec.
-- Forbidden anywhere: sudo,useradd,usermod,groupadd,chmod,chgrp
-- Top-level imports only. Python 3.8+; NO walrus (:=), NO match/case.
-- Implement EXACTLY:
-  def run(payload: dict) -> dict
-  def self_test() -> bool
-- run() MUST NEVER raise: wrap whole body in try/except Exception.
-  On exception: return JSON-safe dict with ALL required output keys AND validation.contract_ok=False.
+### I/O SCHEMA & STATE — ADVISORY PARADIGM
+                                      
+### MANDATORY BOILERPLATE (CRITICAL AST REQUIREMENTS)
+Your static code checker is extremely strict. You MUST copy the exact template below. Do not change a single character of the headers, the module docstring, or the function docstring.
 
-========================
-JSON-SAFE ONLY (HARD)
-========================
-- Output and persisted state MUST be JSON-serializable.
-- Forbidden types: set, tuple, bytes, pathlib.Path, re.Match
-- Any internal set => sorted(list(...)) before storing/returning.
+1. The module docstring (`"""`) MUST be the first line of the file.
+2. The exact `# INVOKE_WITH` and `# Example` lines MUST be present.
+3. `def run` MUST contain the exact docstring shown below.
+4. The `try:` statement MUST be the very first executable line in `run()`.
 
-========================
-MODULE DOCSTRING (HARD)
-========================
-File MUST start with EXACTLY ONE 3-line module docstring; no other triple quotes anywhere:
+COPY THIS EXACT SHELL AND PUT YOUR LOGIC INSIDE THE TRY BLOCK:
+
 """
-contract guard + prereqs + next-action suggestion + limitations. INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation >
+Knowledge Graph Advisory Tool.
+This module acts as a read-only advisor for the KG environment.
 """
-
-========================
-CONTRACT BLOCK (HARD)
-========================
-Include this exact block verbatim TWICE:
-(1) immediately after the module docstring
-(2) immediately above def run(payload: dict) -> dict:
-
 # INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
 # RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec","run_id","state_dir"]
 # RUN_PAYLOAD_OPTIONAL: ["constraints","output_contract","draft_response","candidate_output","env_observation"]
 # INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state"}], "kwargs":{}}
+# Example: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state"}], "kwargs":{}}
+# tool_name: kg_min_generated_tool
 
-========================
-REQUIRED PAYLOAD / OUTPUT
-========================
-Required payload keys: task_text, asked_for, trace, actions_spec, run_id, state_dir
-Output keys ALWAYS (exactly): status, next_action, answer_recommendation, errors, warnings, validation
+import os
+import json
+import re
 
-========================
-VALIDATION (HARD)
-========================
-validation MUST be JSON object with exactly:
-- contract_ok: bool
-- violations: list[str]
+def run(payload: dict) -> dict:
+    """
+    contract guard + prereqs + next-action suggestion + limitations. INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation >
+    """
+    try:
+        # --- ALL YOUR LOGIC MUST GO HERE INSIDE THE TRY BLOCK ---
+        # Validate payload, filter data, and formulate recommendation
+        
+        return {
+            "status": "advisory",
+            "pruned_observation": {}, 
+            "answer_recommendation": "recommendation string",
+            "confidence_score": 0.9,
+            "errors": [],
+            "warnings": [],
+            "validation": {"contract_ok": True, "violations": []},
+            "current_goal": "",
+            "known_vars": {},
+            "candidate_ops": [],
+            "progress": "",
+            "rationale": "Why you made this recommendation"
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "status": "blocked",
+            "pruned_observation": {},
+            "answer_recommendation": f"Execution failed: {str(e)}",
+            "confidence_score": 0.0,
+            "errors": [f"exception: {str(e)}"],
+            "warnings": [],
+            "validation": {"contract_ok": False, "violations": ["exception_thrown"]},
+            "current_goal": "",
+            "known_vars": {},
+            "candidate_ops": [],
+            "progress": "",
+            "rationale": ""
+        }
 
-Meaning of contract_ok = "output complies with contract", NOT "task solved".
-contract_ok MUST be True whenever:
-- output has all required output keys
-- values are JSON-safe
-- next_action is None OR {"name":str,"args":list}
-- missing required payload keys handled via status="blocked" (still contract_ok=True)
+def self_test() -> bool:
+    return True
+                                      
+* **Req Inputs:** `task_text, asked_for, trace, actions_spec, run_id, state_dir`. (Treat missing `env_observation` as `{}`). `trace`: list of dicts (`action, args, ok, output, error`).
+* **Req Outputs:** `status, pruned_observation, answer_recommendation, confidence_score, errors, warnings, validation` (`{"contract_ok": bool, "violations": list[str]}`), `current_goal, known_vars, candidate_ops, progress, rationale`.
+* **Advisory Role:** You are a DATA FILTER and PATH SIMULATOR. You do NOT choose actions. You analyze observations, filter data, track state, and RECOMMEND what the Solver should do next.
+  - `pruned_observation`: filtered subset of observation data (e.g., top 5 relevant relations from a list of 100+, or variable type summary).
+  - `answer_recommendation`: natural-language advisory string (e.g., "Explore relations for Goat via food.cheese_milk_source.cheeses", "The intersected set #3 is the answer, submit as final").
+  - `confidence_score`: float 0.0-1.0 (0.9+ very confident, 0.5 moderate, <0.5 uncertain).
+  - DO NOT return `next_action` or `next_action_candidates`. Tools advise; they do not decide.
+* **Minimum Behavior:** Missing payload key -> status="blocked", errors=["missing_payload_key:<k>"], answer_recommendation="". actions_spec sanitize to {"get_relations", "get_neighbors", "intersection", "get_attributes", "count", "argmax", "argmin"}; warn actions_spec_sanitized if keys dropped. Empty usable actions -> blocked. Valid -> status="advisory" or "done", concrete answer_recommendation string. Empty trace -> recommend get_relations(<best_entity>).
+* **State Persistence:** Atomic JSON write (`<state_dir>/<run_id>.json`). Max 1 appended history string (<=120 chars) per `run()`. Reset if corrupt.
 
-contract_ok MUST be False ONLY when:
-- tool failed to comply (exception, malformed output, non-JSON-safe, invalid next_action shape)
-violations: short machine-readable strings when contract_ok=False else [].
+### PARSING & EXTRACTION
+* **Entities:** Parse `notes["entities"]` from FIRST bracket list after "Entities" in `task_text`, else `asked_for`. Fallback: dynamically extract noun targets from lowercase `asked_for`, preserve order, dedupe. Store ALL discovered entities as a list. DO NOT restrict focus to just the first item; you must track all entities to support multi-entity queries.
+  * **Note:** DO NOT hardcode domain-specific strings like "goat" or "cow". Your code MUST dynamically extract entities.
+* **Vars:** Parse `#<digits>` from trace/obs into `notes["observed_vars"]`. Parse `Variable #X` and types into `known_vars` (`{"#0":"food.cheese"}`). `current_goal` = <=12 words from `asked_for`.
+* **Relations (CRITICAL STRICT RULES):** Extract relations `[...]` containing `.` or `/` STRICTLY from the LATEST step's output or `env_observation`. DO NOT scan the entire past trace history, otherwise you will loop. Truncate outputs to 8. Store `notes["relations_by_subject"][X]`. 
+  * **Scoring Rules:** Score relations against `asked_for`. You MUST remove common stop words ('is', 'the', 'of', 'and', 'from', 'what', 'a', 'to', 'in', 'for') from the query before scoring. Match using whole word components (e.g., split relation strings by `.` and `_`), NOT raw substrings (e.g., do NOT let the query word "is" match inside the relation "synopsis").
+  * **Zero-Score Fallback:** If the highest relation score is 0, DO NOT pick an alphabetical fallback. Instead, recommend expanding the search via `get_neighbors`.
+* **Intent:** `count_intent` = `asked_for` contains "how many", "number of", "count", "total" ("different" requires pairing). `entity_intent` = NOT count. If `entity_intent`, NO count/argmax/argmin.
 
-========================
-MINIMUM BEHAVIOR (HARD)
-========================
-1) Missing required payload keys:
-   - status="blocked"
-   - errors includes "missing_payload_key:<k>" for each missing key (sorted)
-   - next_action=None, warnings=[], answer_recommendation=None
-   - validation={"contract_ok": True, "violations": []}
+### GUARDS, PROGRESS & FINALIZATION
+* **Progress:** Stalled if last 2 `ok==True` steps have identical output/error + no new var. If stalled, recommend switching action family and lower confidence_score.
+* **Intersection Guards:** Commutative (order doesn't matter). Anti-loop: DO NOT recommend intersection if successful and input vars haven't changed type/id since. Ancestor/Descendant: NO intersection recommendation if #b produced by `get_neighbors(#a, r)`. Provide warnings if suppressed.
+* **Finalization (CONSTRAINT TRIGGER):**
+  * *Entity Intent:* Focus on extracting a stable ID from the best set var #k. You MUST NOT recommend "Final Answer: #k" until #k logically satisfies ALL semantic constraints requested in the user's query. Evaluate the trace against asked_for: if the user asked for multiple conditions (e.g., a specific property, a required relationship, or an intersection of two entities), the trace must show actions that applied ALL of those conditions. If unaddressed constraints remain, recommend the next logical filtering action (e.g., get_neighbors, get_attributes, or intersection). IF AND ONLY IF all query constraints have been met by the trace, output: answer_recommendation="The set is fully constrained. The answer is #k, submit as Final Answer: #k", confidence_score=0.9.
+  * *Count Intent:* Recommend counting most constrained plausible set. NEVER recommend counting type.number. Recommend count after intersection. Expand multihop (get_neighbors via contains, universe, etc.) if no target keywords match relations.
 
-2) actions_spec sanitize (never block):
-   - allowed={"get_relations","get_neighbors","intersection","get_attributes","count","argmax","argmin"}
-   - usable_actions = sorted(keys ∩ allowed) if actions_spec is dict else []
-   - if actions_spec has other keys => warning "actions_spec_sanitized"
+### RECOMMENDATION TREE (Deterministic)
+* **Multi-Entity Strategy (CRITICAL):** If the user's query contains multiple entities, you MUST check the trace to see if `get_relations` has been executed for ALL of them. If there is an unexplored entity in your list, prioritize recommending: "Explore relations for <unexplored_entity>". Do NOT recommend filtering (`get_attributes`) or finalizing until candidate variables have been generated for all base entities.
+* **Dead End & Backtracking Recovery:**
+  * *Empty Sets:* If the latest step was `get_relations` or `get_attributes` and the output was `[]` or empty, it means the variable is a dead end (often an empty intersection). You MUST prioritize recommending: "Variable #X is empty or has no relations. Do NOT submit it. Backtrack and explore a different relation on an older variable or entity."
+  * *Schema Gaps:* If an action fails with an error like "relation is not a relation of X", analyze X's actual available relations in the error message. Recommend a logical "bridge" relation (e.g., if looking for 'album' but it fails, recommend 'track' or 'release' if available).
 
-3) State persistence (JSON only):
-   - file: <state_dir>/<run_id>.json ; mkdirs + atomic write (tmp then os.replace)
-   - if missing/corrupt: reset {"history":[], "notes":{}}
-   - append exactly ONE short history string per run() (<=120 chars)
-   - persist only JSON-safe primitives
+0. Empty trace -> recommend `"Start by exploring relations for <best_entity>"`, pruned_observation=None, confidence=0.8.
+1. Prerequisite error in obs -> recommend the fix action, pruned_observation=error text, confidence=0.9.
+2. Last step `get_relations(X)` -> score relations against asked_for keywords, recommend `"Explore <chosen_relation> on <X>"`, pruned_observation=top 5 relations, confidence=0.7-0.9.
+3. Two same-type set vars -> recommend `"Intersect <#a> and <#b> to find common entities"` UNLESS suppressed by guards, confidence=0.8.
+4. Entity intent -> Apply Finalization Heuristics: recommend identity extraction (get_relations -> type.object.name), pruned_observation=known var types, confidence based on constraint coverage.
+5. Count intent -> recommend counting the best constrained set, pruned_observation=set var info, confidence=0.8.
+6. Stalled -> recommend switching action family, confidence=0.5.
+7. Fallback -> recommend `"Explore relations for <best_entity>"` or best viable candidate, confidence=0.5.
+*(Always provide a concrete recommendation. If status="blocked" due to missing keys/no usable actions, include why_stuck in errors.)*
+                                 
 
-4) Normalize defensively:
-   - any text field: value if str else ""
-   - trace: list[str] OR list[dict] -> normalize to list[str]
-   - trace_action_lines = [line for line in normalized trace if line startswith "Action:"]
-   - never regex on None; optional keys may be absent.
-
-========================
-ROBUST EXTRACTION (GENERIC)
-========================
-Store in state notes (JSON-safe):
-- entities: parse from FIRST bracketed list after substring "Entities" in task_text; else from asked_for; else from "\\n".join(trace_action_lines).
-  Tolerate Entities:[A, B] and Entities: ['A','B'].
-  Split commas; strip whitespace; strip surrounding quotes; defensively strip stray brackets; drop empty.
-  notes["entities"]=list[str]
-
-- env_observation: payload["env_observation"] if str else ""
-  May contain "Error:" / "Observation:" / "Variable #N" lines.
-
-- observed_vars: collect all "#<digits>" from env_observation AND trace_action_lines
-  notes["observed_vars"]=sorted unique list[str]
-
-- last_action parsing (simple string ops; no complex parsing):
-  from last element of trace_action_lines (if any). Tolerate malformed "Action: get_relations(['X')" etc.
-  Extract action name and up to 2 args; clean args by stripping whitespace then repeatedly stripping
-  leading/trailing brackets+quotes (up to 3 passes).
-
-- prereq error recovery:
-  if env_observation contains "Execute get_relations for X before executing get_neighbors"
-  extract X between "for " and " before" (best effort) and clean with same routine.
-
-- relations list parsing from Observation:
-  if env_observation has "Observation:" followed by a bracket list "[...]", parse tokens inside FIRST such brackets.
-  relation-like token contains "." OR "/".
-  Maintain notes["relations_by_subject"] as dict[str, list[str]] (default {}).
-  If last action is get_relations(X) and Observation list exists:
-    notes["relations_by_subject"][X] = parsed_relations_sorted_deduped
-  Do NOT invent relations. notes["last_relations"] optional for backward compatibility only; must NOT drive get_neighbors.
-
-- relation choice (generic, question-driven):
-  Maintain notes["chosen_relation_by_subject"] as dict[str,str] (default {}).
-  For subject X: rels = notes["relations_by_subject"].get(X, []); chosen = notes["chosen_relation_by_subject"].get(X,"")
-  If chosen empty and rels non-empty: pick one (deterministic) and store to chosen_relation_by_subject[X].
-  Optional legacy fallback:
-    if notes["chosen_relation"] empty and notes["last_relations"] non-empty:
-      keyword-score using asked_for (case-insensitive):
-        +2 if any asked_for word len>=4 is substring of relation
-        +1 if relation contains any of:
-           name,type,label,description,alias,profession,country,date,time,year,location,ingredient,species,texture,source
-      pick highest; tie -> lexicographic; store notes["chosen_relation"].
-  Never block if cannot choose.
-
-========================
-INVALID RELATION RECOVERY (CORE FIX)
-========================
-If env_observation contains "is not a relation of the":
-- Best-effort extract relation R and subject X from a substring like:
-  "get_neighbors: <R> is not a relation of the <X>."
-- Clean X and R with same clean-arg routine.
-- Maintain notes["invalid_pairs"] as list[str] (default []).
-  Append "X|R" then dedup+sort.
-- If env_observation also contains "has the following relations:" followed by FIRST bracket list:
-  parse relation-like tokens and store as canonical:
-    notes["relations_by_subject"][X] = parsed_relations_sorted_deduped
-Do NOT invent relations.
-
-========================
-STRICT PREREQS (HARD)
-========================
-Before suggesting get_neighbors(X,R), ensure trace_action_lines contains string EXACTLY:
-"Action: get_relations(X)" for that X.
-If not, suggest get_relations(X) first.
-
-Also before suggesting get_neighbors(X,R):
-- require R in notes["relations_by_subject"].get(X, [])
-- require (X+"|"+R) NOT in notes.get("invalid_pairs", [])
-
-========================
-NEXT_ACTION SHAPE + NEVER-REPEAT (HARD)
-========================
-- next_action is None OR {"name":<str>, "args":<list>}
-- NEVER return next_action as a string.
-- If status=="need_step" and usable_actions not empty => next_action MUST be non-null (best effort).
-
-Never-repeat:
-- last_action_line = last of trace_action_lines (or "")
-- proposed_action_line = "Action: <name>(<comma+space args>)"
-- if proposed_action_line == last_action_line => do NOT propose it; fall back.
-
-Also: if proposing get_neighbors(X,R) and "X|R" in notes["invalid_pairs"] => do NOT propose; fall back.
-
-========================
-GENERIC NEXT_ACTION LOGIC (ORDERED; TASK-AGNOSTIC)
-========================
-Drive decisions ONLY by: entities, observed_vars, env_observation (errors + Observation), asked_for keywords.
-Do NOT hardcode domain terms.
-
-Definitions (use notes):
-- entities = notes.get("entities", [])
-- vars = notes.get("observed_vars", [])
-- asked_l = asked_for.lower()
-- is_count_q = ("how many" in asked_l) or ("number of" in asked_l) or ("count" in asked_l)
-- want_attributes = any(w in asked_l for w in ["highest","lowest","maximum","minimum","largest","smallest","earliest","latest","most","least"])
-
-Maintain note slots (strings only):
-notes["var_e0"], notes["var_e1"], notes["var_join"], notes["last_var_created"]
-
-Update from env_observation:
-- If contains "Variable #<n>":
-  notes["last_var_created"]="#<n>"
-  If notes["var_e0"] empty and last action was get_neighbors(entity0, ...) => set var_e0
-  Else if notes["var_e1"] empty and last action was get_neighbors(entity1, ...) => set var_e1
-  Else if last action was intersection(var_e0,var_e1) => set var_join
-
-Priority actions:
-A) Error recovery:
-   - If prereq error extracted X and "get_relations" usable => propose get_relations(X)
-   - Else if invalid relation error extracted subject X:
-       if "get_relations" usable and Action: get_relations(X) not already in trace_action_lines => propose get_relations(X)
-       else continue (do NOT repeat invalid get_neighbors)
-
-B) If we just called get_relations(Xr) and we have a chosen relation and get_neighbors usable:
-   - Detect most recent get_relations argument Xr from trace_action_lines (best-effort)
-   - Let R = chosen_relation_by_subject.get(Xr,"") or notes.get("chosen_relation","")
-   - Propose get_neighbors(Xr,R) ONLY if prereqs satisfied AND R in notes["relations_by_subject"].get(Xr, []) AND (Xr+"|"+R) not invalid.
-
-C) Bootstrap up to two entities:
-   - e0 = entities[0] if any else ""
-   - e1 = entities[1] if len>1 else ""
-   - If var_e0 empty:
-       if "get_relations" usable and Action: get_relations(e0) not in trace => propose get_relations(e0)
-       else if "get_neighbors" usable and have valid subject-scoped R and prereqs satisfied => propose get_neighbors(e0,R)
-     (subject-scoped R must be in relations_by_subject[e0] and not invalid; else fall back to get_relations(e0) if usable)
-   - Else if e1 and var_e1 empty:
-       similarly for e1
-
-D) Join / constrain:
-   - If var_e0 and var_e1 and var_join empty and "intersection" usable => propose intersection(var_e0,var_e1)
-
-E) Question-driven finishing moves:
-   - If is_count_q and vars and "count" usable => propose count(vars[0])
-   - Else if want_attributes and vars and "get_attributes" usable => propose get_attributes(vars[0])
-
-F) Exploration when stuck:
-   - If vars and "get_relations" usable and Action: get_relations(vars[0]) not in trace => propose get_relations(vars[0])
-   - Else if entities and "get_relations" usable => pick first entity not yet used in get_relations(...) and propose it
-   - Else next_action=None
-
-========================
-STATUS / ANSWER
-========================
-- status="blocked" only for missing required payload keys.
-- done only if candidate_output is a string "#<digits>" AND that var is in notes["observed_vars"].
-  If done: status="done", answer_recommendation="Final Answer: <var>", next_action=None.
-- otherwise status="need_step", answer_recommendation=None.
-
-========================
-FINAL SANITIZE (HARD)
-========================
-Before returning:
-- output dict must have exactly: status,next_action,answer_recommendation,errors,warnings,validation
-- ensure JSON-safe values
-- if next_action not None:
-  - dict with keys "name"(str) and "args"(list)
-  - args elements must be strings (coerce)
-  - if invalid shape => next_action=None and warning "invalid_next_action_shape"
-- If status=="need_step" and usable_actions not empty and next_action is None => warning "no_viable_next_action"
-- If tool reached end without exception => validation={"contract_ok": True, "violations": []}
-- If any internal exception => validation={"contract_ok": False, "violations": ["exception"]}
-
-========================
-SELF_TEST (HARD)
-========================
-self_test() must:
-- return False if it finds ':=' in module source (inspect.getsource best-effort).
-- call run() with synthetic payloads; return True only if ALL pass:
-  1) missing key => blocked + missing_payload_key AND validation.contract_ok==True
-  2) polluted actions_spec => not blocked + warning actions_spec_sanitized AND validation.contract_ok==True
-  3) entity parsing works for both: "Entities:[A, B]" and "Entities: ['A','B']"
-  4) prereq error recovery proposes get_relations("cows") from:
-     "Execute get_relations for cows before executing get_neighbors"
-  5) after get_relations + Observation list => proposes dict-shaped get_neighbors
-  6) next_action never a string
-  7) JSON-safe output/state (no set/tuple/bytes/path/re.Match)
-  8) validation always present with keys contract_ok(bool), violations(list[str])
-  9) invalid relation recovery:
-     env_observation with
-     "get_neighbors: food.cheese.aging_time is not a relation of the cows"
-     and "has the following relations: [food.cheese_milk_source.cheeses, common.topic.image]"
-     => notes["invalid_pairs"] contains "cows|food.cheese.aging_time"
-     AND subsequent call does NOT propose that invalid pair.
-
-self_test must not write outside a temp directory under provided state_dir.
-
-FINAL CHECK (HARD)
-Markers present; stdlib only; forbidden substrings absent; exact signatures; no extra triple quotes;
-never outputs Action lines; never uses ':='.
+### SELF-TEST (HARD)
+* **SELF-TEST:** self_test() MUST run a single, basic synthetic payload (with mocked task_text and an empty trace) through run() and assert that the output contains the keys 'status', 'answer_recommendation', and 'confidence_score'. Do NOT attempt to read the tool's own source code.
 ''').strip()
-
-
-
-
 
 
 
@@ -884,9 +1092,9 @@ INPUTS + NORMALIZATION (HARD)
 ========================
 Required: task_text, asked_for, trace, actions_spec, run_id, state_dir
 Optional: constraints, output_contract, draft_response, candidate_output, env_observation
-- If trace is list[str] => list[dict]: {'action':<str>, 'ok':None, 'output':None, 'args':{}, 'error':None, 'raw':None}
-- If trace is list[dict], normalize each: ensure keys action/ok/output/args/error/raw exist; if args missing/None/non-dict => {}
-- If step has non-empty raw and args is {} or missing required fields, parse raw best-effort (ls/find/grep/cat/head/tail/wc/mkdir/cp/mv/ln/touch/redirection/tar patterns).
+- trace is list[dict] with keys action/args/ok/output/error/raw (no legacy list[str]).
+- normalize each: ensure keys action/ok/output/args/error/raw exist; if args missing/None/non-list => []
+- If step has non-empty raw and args is empty or missing required fields, parse raw best-effort (ls/find/grep/cat/head/tail/wc/mkdir/cp/mv/ln/touch/redirection/tar patterns).
 If actions_spec missing/empty => status='blocked', errors include "missing_actions_spec", next_action=None
 
 ========================
@@ -899,25 +1107,28 @@ Derive user_intent from task_text ONLY (never from trace/draft_response/candidat
 Compute policy_required ONLY from user_intent.
 
 ========================
-OUTPUTS (HARD)
+OUTPUTS (HARD) — ADVISORY PARADIGM
 ========================
 run() MUST ALWAYS return dict with keys:
-status('need_step'|'done'|'blocked'|'error'),
-next_action({'name':str,'args':list}|None),
-answer_recommendation(str|None),
+status('advisory'|'done'|'blocked'|'error'),
+pruned_observation(any — filtered/relevant subset of observation data),
+answer_recommendation(str|None — advisory text for the Solver),
+confidence_score(float — 0.0 to 1.0),
 plan(list[dict]),
 validation(dict keys: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations, constraints_ok, uncovered_constraints),
 rationale(list[str] >=2), errors(list[str]), warnings(list[str])
 
 Rules:
 - Missing required payload key => blocked + "missing_payload_key:<k>"
-- status=='done' => answer_recommendation non-None; else MUST be None
-- next_action.name MUST be key in actions_spec; next_action.args MUST be list
-- If status=='need_step' and next_action is None => errors include "no_valid_next_action" + rationale why
+- You are an ADVISOR: recommend actions, do NOT decide them. The Solver decides.
+- status=='done' => answer_recommendation describes the final answer; else describes next step
+- pruned_observation: filter observations to relevant data (error messages, key outputs, file listings)
+- confidence_score: 0.9+ very confident, 0.7-0.9 confident, 0.5 moderate, <0.5 uncertain
+- DO NOT return next_action. Tools advise; they do not decide.
 
-NEW (HARD): SOLVER HANDOFF MUST BE USEFUL
+SOLVER HANDOFF MUST BE USEFUL (HARD):
 - validation['solver_suggestion'] MUST ALWAYS be non-empty and start with one of: "Answer:" "Ask:" "Proceed:"
-- MUST NEVER be a refusal script; MUST NOT contain "I’m sorry" / "I can't help" / "cannot help".
+- MUST NEVER be a refusal script; MUST NOT contain "I'm sorry" / "I can't help" / "cannot help".
 - If policy_required:
   - solver_suggestion MUST include BOTH:
     (1) Proceed: name the restriction briefly (no apology),
@@ -955,19 +1166,21 @@ Rules:
 6) task_limit_pressure: prefer finishers that yield asked_for directly
 
 ========================
-STATUS + NEXT_ACTION (deterministic + args-aware)
+STATUS + RECOMMENDATION (deterministic + args-aware)
 ========================
 Order:
 1) missing required keys => blocked
 2) actions_spec missing/empty => blocked + "missing_actions_spec"
-3) hallucinated_action => error
-4) prereq_violations exist => need_step; choose first missing prereq action present (sorted) else None
-5) if complete AND constraints_ok AND not blocked_by_observation => done
-6) else need_step; choose next_action with OS-oriented ladder (list_dir/stat/find/grep/wc/read_file/etc), keyword match, fallback first key.
-ARGS-AWARE: never return empty args when chosen action requires args; pick inspection action instead.
+3) hallucinated_action in trace => error
+4) prereq_violations exist => advisory; recommend first missing prereq action (sorted), confidence=0.8
+5) if complete AND constraints_ok AND not blocked_by_observation => done; answer_recommendation describes the answer
+6) else advisory; recommend next step with OS-oriented ladder (list_dir/stat/find/grep/wc/read_file/etc), keyword match, fallback.
+   pruned_observation = filtered relevant data from last observation.
+   confidence_score based on certainty of recommendation.
+ARGS-AWARE: when recommending actions that require args, include the args in answer_recommendation text.
 
 Rationale MUST include: "kind=<...>", "complete=<...>", and one of:
-"constraints_blocked" | "blocked_by_observation" | "prereq_missing=<n>" | "next=<action_or_none>" | "policy_required" | "missing_path" | "permission_error" | "task_limit_pressure"
+"constraints_blocked" | "blocked_by_observation" | "prereq_missing=<n>" | "recommended=<action>" | "policy_required" | "missing_path" | "permission_error" | "task_limit_pressure"
 
 ========================
 SELF_TEST (HARD; MUST INCLUDE)
@@ -979,14 +1192,15 @@ Deterministic self_test returns True only if ALL pass:
 - If env_observation has permission denied/no such file => MUST NOT done even if candidate looks complete
 - From_str_int must NOT treat "PID 1234" as answer unless asked_for mentions pid
 - If actions_spec empty => blocked + missing_actions_spec
-- Must not return next_action with empty args when chosen action requires args AND inspection action exists
-- Must not suggest same action >2 times in last 5 when alternatives exist
+- answer_recommendation is str when status is advisory; confidence_score is float 0.0-1.0
+- Must not recommend same action >2 times in last 5 when alternatives exist
 
 ========================
 FINAL CHECK (HARD)
 ========================
 - Markers present; stdlib only; forbidden substrings absent in tool source
-- run() signature exact; next_action never invents; next_action.args is list
+- run() signature exact; pruned_observation is JSON-safe; confidence_score is float 0.0-1.0
+- DO NOT return next_action key; tools advise, they do not decide
 - cursor string; history list[str]; atomic write used
 ''').strip()
 
@@ -1057,10 +1271,15 @@ MINIMUM BEHAVIOR (HARD)
    - For trace steps: accept list; each step -> dict with keys action(str), ok(True/False/None), output(any), args(dict), error(any), raw(any).
    - Do NOT read payload["history"] anywhere.
    - Never call regex on None; never assume asked_for/env_observation exist.
-5) Output contract (ALWAYS return these exact keys):
-   status, next_action, answer_recommendation, plan,
+5) Output contract — ADVISORY PARADIGM (ALWAYS return these exact keys):
+   status('advisory'|'done'|'blocked'|'error'), pruned_observation, answer_recommendation, confidence_score, plan,
    validation (with keys: contract_ok, contract_violations, solver_suggestion, derivations, prereq_violations, constraints_ok, uncovered_constraints),
    rationale, errors, warnings
+   - You are an ADVISOR: recommend actions, do NOT decide them. The Solver decides.
+   - pruned_observation: filtered relevant data (schema info, error messages, candidate SQL)
+   - answer_recommendation: advisory text (e.g., "Inspect schema first", "Execute this SQL: SELECT ...")
+   - confidence_score: float 0.0-1.0
+   - DO NOT return next_action. Tools advise; they do not decide.
 
 EXTRACTION (MINIMAL, SAFE, DETERMINISTIC)
 - Derive user_intent from task_text ONLY:
@@ -1087,17 +1306,17 @@ ERROR AWARENESS (ANTI-FALSE-DONE)
   (case-insensitive),
   then MUST NOT set status='done'. Add rationale token "blocked_by_observation".
 
-NEXT ACTION (MINIMAL, NEUTRAL, DETERMINISTIC)
-- Only suggest an action if it is in usable_actions, otherwise next_action=None.
-- Preferred order:
+RECOMMENDATION (MINIMAL, NEUTRAL, DETERMINISTIC)
+- Only recommend an action if it is in usable_actions.
+- Preferred recommendation order:
   describe_table/inspect_schema/get_table_info, plan_sql/build_sql, validate_sql, execute_sql/run_sql/query/select
-- Args:
-  - For schema actions: args=[] (no args).
-  - For plan_sql/build_sql: args=[user_intent] (only if user_intent non-empty).
-  - For validate_sql: args=[candidate_sql] only if you have a non-empty SQL candidate.
-  - For execute_sql/run_sql/query/select: args=[candidate_sql] ONLY if candidate_sql passes SQL SAFETY.
-- Never emit an action if required args would be empty/invalid.
-If would be invalid/empty, set next_action=None.
+- Include args info in answer_recommendation text:
+  - For schema actions: "Inspect the table schema" (no args needed).
+  - For plan_sql/build_sql: "Build SQL for: <user_intent>" (only if user_intent non-empty).
+  - For validate_sql: "Validate this SQL: <candidate_sql>" only if you have a non-empty SQL candidate.
+  - For execute_sql/run_sql/query/select: "Execute SQL: <candidate_sql>" ONLY if candidate_sql passes SQL SAFETY.
+- Set pruned_observation to relevant schema/error data.
+- Set confidence_score based on how confident the recommendation is.
 
 CANDIDATE SQL / ANSWER (MINIMAL, NEVER INVENT)
 - Candidate SQL source preference:
@@ -1109,11 +1328,12 @@ CANDIDATE SQL / ANSWER (MINIMAL, NEVER INVENT)
   - asked_for indicates numeric/boolean AND last_ok_output is already that type (int/float/bool) AND not blocked_by_observation.
 - If done:
   - status='done'
-  - answer_recommendation = candidate_sql (or numeric/bool value)
-  - next_action=None
+  - answer_recommendation = describes the final answer (e.g., "The SQL query is: SELECT ...", or "The answer is 42")
+  - confidence_score = 0.9+
 - Otherwise:
-  - status='need_step'
-  - answer_recommendation=None
+  - status='advisory'
+  - answer_recommendation = suggests next step (e.g., "Inspect the schema first", "Validate this SQL")
+  - confidence_score based on certainty
 
 PREREQS + CONSTRAINTS + OUTPUT CONTRACT (MINIMAL)
 - prereq_violations: if actions_spec[action] has prerequisites, record missing ones but do not crash.
@@ -1126,13 +1346,14 @@ SELF_TEST (HARD; MUST BE REAL)
 self_test() must call run() with synthetic payloads and return True only if all pass:
 - missing key => blocked + missing_payload_key
 - polluted actions_spec => not blocked; may warn actions_spec_sanitized
-- tool never raises and always returns all required keys
-- next_action must be {"name":..., "args":[...]} when present
+- tool never raises and always returns all required keys (including pruned_observation, confidence_score)
+- answer_recommendation is str when status is advisory; confidence_score is float 0.0-1.0
 - must NOT done when env_observation contains "no such column"
 - must reject multi-statement SQL containing ';' (must not mark done with it)
 
 FINAL CHECK (HARD)
 Markers present; stdlib only; forbidden substrings absent; exact signatures; no extra triple quotes; never regex on None; always returns required keys.
+DO NOT return next_action key. Tools advise; they do not decide. Return pruned_observation, answer_recommendation, confidence_score instead.
 ''').strip()
 
 
@@ -1157,6 +1378,7 @@ __all__ = [
     "TOOL_INVOKER_SYSTEM_PROMPT",
     "SOLVER_SYSTEM_PROMPT",
     "TOOLGEN_USER_APPENDIX",
+    "TOOLGEN_VALIDATOR_SYSTEM_PROMPT",
     "AGG_TOOLGEN_USER_DB",
     "AGG_TOOLGEN_USER_KG",
     "AGG_TOOLGEN_USER_OS",

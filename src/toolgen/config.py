@@ -30,6 +30,8 @@ def get_toolgen_pipeline_config(default_registry_root: str) -> ToolgenPipelineCo
     else:
         agg_n = _parse_int(os.environ.get("TOOLGEN_AGG_N", "3"), 3)
     registry_root_env = os.environ.get("TOOL_REGISTRY_ROOT")
+    if "run_all_" in (default_registry_root or ""):
+        registry_root_env = None
     registry_root_from_env = registry_root_env is not None
     registry_root = (registry_root_env or default_registry_root).strip()
     if pipeline == "baseline" and not registry_root_from_env:

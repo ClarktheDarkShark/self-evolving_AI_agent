@@ -1,0 +1,16 @@
+{
+  "history": [
+    "goal=x",
+    "goal=x",
+    "next:get_relations args=[\"A\"]",
+    "next:get_relations args=[\"A\"]",
+    "st=blocked na=none w= e=missing_payload_key:asked_for"
+  ],
+  "notes": {
+    "entities": [
+      "A"
+    ],
+    "observed_vars": [],
+    "relations_by_subject": {}
+  }
+}

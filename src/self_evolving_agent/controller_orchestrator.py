@@ -122,6 +122,7 @@ class ControllerOrchestratorMixin:
             if hasattr(self._registry, "list_latest_tools")
             else self._registry.list_tools(environment=current_env)
         )
+        tools = [t for t in tools if getattr(t, "negative_marks", 0) < 3]
         print(f"[ORCHESTRATOR] Found {len(tools)} tools for environment '{current_env}'")
         compact: list[dict[str, Any]] = []
         for t in tools:
@@ -150,6 +151,8 @@ class ControllerOrchestratorMixin:
                     # usage_count removed - redundant with success+failure counts
                     "success": t.success_count,
                     "failure": t.failure_count,
+                    "reliability_score": t.reliability_score,
+                    "negative_marks": t.negative_marks,
                 }
             )
         # Limit to 15 most recent tools to reduce token usage
@@ -269,6 +272,7 @@ class ControllerOrchestratorMixin:
             "run_id": run_id,
             "state_dir": state_dir,
             "suggestion": suggestion or {},
+            "tools_summary": self._tool_invoker_tools_summary(),
             "output_schema": {
                 "tool_name": "required",
                 "payload": "object with required tool keys",
@@ -278,6 +282,25 @@ class ControllerOrchestratorMixin:
         if repair_note:
             payload["invoker_error"] = repair_note
         return json.dumps(payload, ensure_ascii=True, default=str)
+
+    def _tool_invoker_tools_summary(self) -> list[dict[str, Any]]:
+        current_env = self._resolved_environment_label()
+        tools = (
+            self._registry.list_latest_tools(environment=current_env)
+            if hasattr(self._registry, "list_latest_tools")
+            else self._registry.list_tools(environment=current_env)
+        )
+        tools = [t for t in tools if getattr(t, "negative_marks", 0) < 3]
+        summary: list[dict[str, Any]] = []
+        for tool in tools:
+            summary.append(
+                {
+                    "name": tool.name,
+                    "reliability_score": tool.reliability_score,
+                    "negative_marks": tool.negative_marks,
+                }
+            )
+        return summary
 
     def _available_actions_spec(self) -> dict[str, Any]:
         env = self._resolved_environment_label()
@@ -339,9 +362,44 @@ class ControllerOrchestratorMixin:
         chat_history: ChatHistory,
         *,
         solver_recommendation: Optional[str] = None,
+        observation_triggers: Optional[list[dict[str, Any]]] = None,
+        last_observation: Optional[dict[str, Any]] = None,  # reserved for LLM prompt enrichment
     ) -> dict[str, Any]:
+        _ = last_observation  # reserved for future orchestrator prompt enrichment
         if not self._orchestrator_agent:
             return {"action": "no_tool"}
+
+        # Trigger-based fast path: auto-decide based on observation characteristics
+        if observation_triggers:
+            try:
+                tools = self._orchestrator_compact_existing_tools()
+            except Exception:
+                tools = []
+            for trigger in observation_triggers:
+                trigger_type = trigger.get("type")
+                if trigger_type in {"size_trigger", "error_trigger"}:
+                    # Find an existing generated tool for this environment
+                    filter_tool = next(
+                        (
+                            t
+                            for t in tools
+                            if isinstance(t.get("name"), str)
+                            and t["name"].endswith("_generated_tool")
+                        ),
+                        None,
+                    )
+                    if filter_tool:
+                        return {
+                            "action": "use_tool",
+                            "tool_name": filter_tool["name"],
+                            "reason": f"{trigger_type}: {trigger.get('reason', '')}",
+                        }
+                    else:
+                        return {
+                            "action": "create_tool",
+                            "reason": f"{trigger_type}_no_tool: {trigger.get('reason', '')}",
+                        }
+
         prompt = self._orchestrator_request_prompt(
             query, chat_history, solver_recommendation=solver_recommendation
         )

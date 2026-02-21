@@ -4,6 +4,7 @@ import ast
 import hashlib
 import importlib.util
 import os
+import re
 import sys
 import sysconfig
 from dataclasses import dataclass
@@ -17,14 +18,15 @@ SCHEMA_CLAUSE = (
     "optional=constraints,output_contract,draft_response,candidate_output,env_observation >"
 )
 
-SCHEMA_ECHO_HEADINGS = [
-    "# INVOKE_WITH:",
-    "# RUN_PAYLOAD_REQUIRED:",
-    "# RUN_PAYLOAD_OPTIONAL:",
-    "# INVOKE_EXAMPLE:",
-    "# Example:",
-    "# input_schema_required:",
-    "# input_schema_optional:",
+SCHEMA_ECHO_REQUIRED = [
+    "RUN_PAYLOAD_REQUIRED",
+    "RUN_PAYLOAD_OPTIONAL",
+    "Example",
+]
+
+SCHEMA_ECHO_OPTIONAL_GROUP = [
+    "INVOKE_WITH",
+    "INVOKE_EXAMPLE",
 ]
 
 FORBIDDEN_SUBSTRINGS = [
@@ -36,6 +38,10 @@ FORBIDDEN_SUBSTRINGS = [
     "chgrp",
     "eval(",
     "exec(",
+    "subprocess",
+    "urllib",
+    "socket(",
+    "http.client",
 ]
 
 
@@ -124,26 +130,46 @@ def _is_stdlib_module(name: str) -> bool:
     return False
 
 
-def _check_docstring_invariant(lines: list[str], code: str) -> list[str]:
+def _check_run_docstring_invariant(_code: str, tree: ast.AST) -> list[str]:
     errors: list[str] = []
-    if not lines:
+    run_fn = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "run":
+            run_fn = node
+            break
+    if run_fn is None or not run_fn.body:
         return ["B:docstring_missing"]
-    if lines[0] != '"""':
+    first = run_fn.body[0]
+    if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str)):
         errors.append("B:docstring_start_missing")
-    if len(lines) < 3 or lines[2] != '"""':
+        return errors
+    doc = ast.get_docstring(run_fn) or ""
+    if not doc:
         errors.append("B:docstring_end_missing")
-    if len(lines) >= 2 and SCHEMA_CLAUSE not in lines[1]:
+        return errors
+    required_terms = ["contract guard", "prereqs", "limitations"]
+    doc_lower = doc.lower()
+    missing_terms = [term for term in required_terms if term not in doc_lower]
+    if missing_terms:
         errors.append("B:docstring_clause_missing")
-    if code.count('"""') != 2 or "'''" in code:
-        errors.append("B:docstring_triple_quotes_invalid")
     return errors
 
 
 def _check_schema_echo(code: str) -> list[str]:
     errors: list[str] = []
-    for heading in SCHEMA_ECHO_HEADINGS:
-        if heading not in code:
-            errors.append(f"G:schema_echo_missing:{heading}")
+    lines = code.splitlines()
+    head = "\n".join(lines[:80])
+    def _has_heading(name: str) -> bool:
+        pattern = r"^\s*#\s*%s\s*:" % re.escape(name)
+        return re.search(pattern, head, re.MULTILINE) is not None
+    for name in SCHEMA_ECHO_REQUIRED:
+        if not _has_heading(name):
+            errors.append(f"G:schema_echo_missing:# {name}:")
+    optional_present = any(_has_heading(name) for name in SCHEMA_ECHO_OPTIONAL_GROUP)
+    if optional_present:
+        for name in SCHEMA_ECHO_OPTIONAL_GROUP:
+            if not _has_heading(name):
+                errors.append(f"G:schema_echo_missing:# {name}:")
     return errors
 
 
@@ -187,10 +213,14 @@ def _check_run_try_except(tree: ast.AST) -> list[str]:
         return ["F:run_missing"]
     if not run_fn.body:
         return ["F:run_empty_body"]
-    if not isinstance(run_fn.body[0], ast.Try):
+    body_idx = 0
+    first = run_fn.body[0]
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+        body_idx = 1
+    if body_idx >= len(run_fn.body) or not isinstance(run_fn.body[body_idx], ast.Try):
         errors.append("F:run_not_wrapped")
         return errors
-    try_node = run_fn.body[0]
+    try_node = run_fn.body[body_idx]
     if not try_node.handlers:
         errors.append("F:run_missing_except")
         return errors
@@ -204,11 +234,15 @@ def _check_run_try_except(tree: ast.AST) -> list[str]:
                 keys.append(key.value)
             else:
                 keys.append(None)
-        if "status" not in keys or "errors" not in keys or "warnings" not in keys:
-            return False
-        for k, v in zip(keys, ret.value.values):
-            if k == "status" and isinstance(v, ast.Constant) and v.value == "error":
-                return True
+        # Accept any dict that contains an "error" key (advisory or legacy).
+        if "error" in keys:
+            return True
+        # Also accept legacy dicts with {"status": "error", "errors", "warnings"}.
+        legacy_needed = {"status", "errors", "warnings"}
+        if legacy_needed.issubset(set(keys)):
+            for k, v in zip(keys, ret.value.values):
+                if k == "status" and isinstance(v, ast.Constant) and v.value == "error":
+                    return True
         return False
 
     except_ok = False
@@ -224,14 +258,29 @@ def _check_run_try_except(tree: ast.AST) -> list[str]:
     return errors
 
 
+def _check_output_schema_presence(code: str) -> list[str]:
+    errors: list[str] = []
+    if not code:
+        return errors
+    advisory_keys = ["pruned_observation", "answer_recommendation", "confidence_score"]
+    legacy_keys = ["next_action", "next_action_candidates", "why_stuck"]
+    has_advisory = any(key in code for key in advisory_keys)
+    has_legacy = any(key in code for key in legacy_keys)
+    if has_advisory:
+        missing = [key for key in advisory_keys if key not in code]
+        if missing:
+            errors.append(f"H:advisory_keys_missing:{','.join(missing)}")
+    elif not has_legacy:
+        errors.append("H:output_schema_missing")
+    return errors
+
+
 def validate_toolgen_output(raw_text: str) -> ToolgenContractResult:
     code, errors = extract_marked_code(raw_text or "")
     normalized = normalize_tool_code(code or "")
     if not normalized:
         errors.append("A:empty_extracted_code")
-    lines = normalized.splitlines()
     if normalized:
-        errors.extend(_check_docstring_invariant(lines, normalized))
         errors.extend(_check_schema_echo(normalized))
         errors.extend(_check_signatures(normalized))
         for forbidden in FORBIDDEN_SUBSTRINGS:
@@ -243,7 +292,9 @@ def validate_toolgen_output(raw_text: str) -> ToolgenContractResult:
             errors.append("F:syntax_error")
         else:
             errors.extend(_check_imports(tree))
+            errors.extend(_check_run_docstring_invariant(normalized, tree))
             errors.extend(_check_run_try_except(tree))
+        errors.extend(_check_output_schema_presence(normalized))
     code_sha256 = hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
     return ToolgenContractResult(
         ok=len(errors) == 0,

@@ -579,6 +579,9 @@ class OpenaiLanguageModel(LanguageModel):
         sanitized_config.pop("allow_internal_tool_protocol", None)
         sanitized_config.pop("toolgen_extract_tool_calls", None)
         sanitized_config.pop("ollama_force_tool_calls", None)
+        # GPT-5-mini does not accept temperature values other than default.
+        if self.model_name == "gpt-5-mini":
+            sanitized_config.pop("temperature", None)
         timeout_override_s = sanitized_config.pop("request_timeout_s", None)
 
         # print(f"[LM] messages | base_len={len(base_messages)} request_len={len(request_messages)}")

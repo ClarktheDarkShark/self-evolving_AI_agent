@@ -37,6 +37,7 @@ class ToolMetadata:
     validation_count: int = 0
     success_count: int = 0
     failure_count: int = 0
+    negative_marks: int = 0
     last_used_time: Optional[str] = None
     environment_usage: Optional[dict[str, int]] = None
     environment: Optional[str] = None  # Environment this tool was created for
@@ -379,6 +380,21 @@ class ToolRegistry:
                     meta.reliability_score = max(meta.reliability_score, 0.8)
             self._save_metadata()
 
+    def record_negative_mark(self, name: str) -> None:
+        with self._lock:
+            meta = self._metadata.get(name)
+            if not meta:
+                return
+            meta.negative_marks += 1
+            meta.failure_count += 1
+            meta.reliability_score = self._calculate_reliability(meta)
+            self._save_metadata()
+
+    def record_task_outcome(self, name: str, *, success: bool) -> None:
+        if success:
+            return
+        self.record_negative_mark(name)
+
     @staticmethod
     def _preview(obj: Any, max_len: int = 300) -> str:
         try:
@@ -720,6 +736,8 @@ class ToolRegistry:
                 "description": m.description,
                 "docstring": m.docstring,
                 "usage_count": m.usage_count,
+                "reliability_score": m.reliability_score,
+                "negative_marks": m.negative_marks,
                 "tool_type": m.tool_type,
                 "tool_category": getattr(m, "tool_category", None),
                 "input_schema": m.input_schema,
@@ -1059,6 +1077,7 @@ class ToolRegistry:
                     metadata.success_count += 1
                 else:
                     metadata.failure_count += 1
+                    metadata.negative_marks += 1
                 env_name = inv_ctx.get("environment")
                 if env_name:
                     if metadata.environment_usage is None:
@@ -1085,10 +1104,13 @@ class ToolRegistry:
         result_plan = None
         result_output_keys = None
         result_output_summary = None
+        result_pruned_observation = None
+        result_confidence_score = None
         if isinstance(outcome.output, Mapping):
             status = outcome.output.get("status")
             if isinstance(status, str):
                 result_status = status
+            # Legacy next_action extraction (backward compat)
             next_action = outcome.output.get("next_action")
             if isinstance(next_action, Mapping):
                 action_name = next_action.get("name")
@@ -1119,6 +1141,13 @@ class ToolRegistry:
             answer_recommendation = outcome.output.get("answer_recommendation")
             if answer_recommendation is not None:
                 result_answer_recommendation = answer_recommendation
+            # Advisory paradigm fields
+            pruned_observation = outcome.output.get("pruned_observation")
+            if pruned_observation is not None:
+                result_pruned_observation = pruned_observation
+            confidence_score = outcome.output.get("confidence_score")
+            if isinstance(confidence_score, (int, float)):
+                result_confidence_score = float(confidence_score)
             final_answer_line = outcome.output.get("final_answer_line")
             if isinstance(final_answer_line, str):
                 result_final_answer_line = final_answer_line
@@ -1187,6 +1216,8 @@ class ToolRegistry:
                 "result_answer_recommendation": result_answer_recommendation,
                 "result_final_answer_line": result_final_answer_line,
                 "result_plan": result_plan,
+                "result_pruned_observation": result_pruned_observation,
+                "result_confidence_score": result_confidence_score,
                 "result_output_keys": result_output_keys,
                 "result_output_summary": result_output_summary,
                 "duration_ms": duration_ms,

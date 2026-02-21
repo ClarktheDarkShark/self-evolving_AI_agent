@@ -1,0 +1,1 @@
+{"history": ["goal=question x next=get_relations", "goal=question x next=get_neighbors"], "notes": {"entities": ["A"], "observed_vars": [], "relations_by_subject": {"A": ["food.made_from", "x/y"]}}}

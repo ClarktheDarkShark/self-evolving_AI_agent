@@ -1,1 +1,1 @@
-{"cursor": "after_step", "history": ["step1", "need_step step", "step", "step", "run:need_step", "run:r1"], "notes": {}}
+{"cursor": "after_step", "history": ["step1", "need_step step", "step", "step", "run:need_step", "run:r1", "goal:what is x next:get_relations", "goal:what is x next:get_relations", "goal:how many items next:count", "goal:how many items next:count", "goal:which item is related to a next:get_relations"], "notes": {"entities": ["A"], "observed_vars": ["#2"], "relations_by_subject": {}}}
