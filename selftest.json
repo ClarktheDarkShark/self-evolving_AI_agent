@@ -1,1 +1,1 @@
-{"run_id": "selftest", "last_recommendation": "Start by exploring relations for ExampleEntity", "history": ["Start by exploring relations for ExampleEntity"]}
+{"run_id": "selftest", "last_recommendation": "Start by exploring relations for ExampleEntity", "history": ["Start by exploring relations for ExampleEntity", "DEAD END: The last action returned an empty set or error. Do NOT submit this variable. Backtrack and try a different rel"]}

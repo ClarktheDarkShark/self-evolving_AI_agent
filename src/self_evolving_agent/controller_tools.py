@@ -569,7 +569,6 @@ class ControllerToolsMixin:
             if hasattr(self._registry, "list_latest_tools")
             else self._registry.list_tools(environment=current_env)
         )
-        tools = [t for t in tools if getattr(t, "negative_marks", 0) < 3]
         print(f"[REUSE_TOOL] Found {len(tools)} tools for environment '{current_env}'")
         retrieved = retrieve_tools(
             query,
@@ -599,7 +598,6 @@ class ControllerToolsMixin:
             if hasattr(self._registry, "list_latest_tools")
             else self._registry.list_tools(environment=current_env)
         )
-        tools = [t for t in tools if getattr(t, "negative_marks", 0) < 3]
         print(f"[SELECT_TOOL] Found {len(tools)} tools for environment '{current_env}'")
         retrieved = retrieve_tools(
             query,

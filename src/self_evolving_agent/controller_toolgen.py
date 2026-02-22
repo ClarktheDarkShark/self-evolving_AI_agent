@@ -658,7 +658,7 @@ class ControllerToolgenMixin:
     ) -> Optional[ToolMetadata]:
         mode = get_toolgen_mode()
         validate = self._toolgen_should_validate()
-        max_rounds = 3 if validate else 1
+        max_rounds = 4 if validate else 1
         base_prompt = user_prompt
         last_candidate: Optional[Mapping[str, Any]] = None
         last_validation: Optional[Mapping[str, Any]] = None
@@ -692,6 +692,7 @@ class ControllerToolgenMixin:
                 )
             except Exception:
                 pass
+            # --- Full file rewrite every round ---
             prompt = base_prompt
             if feedback_note:
                 code_block = ""
@@ -699,10 +700,11 @@ class ControllerToolgenMixin:
                     code_block = "\n\nLAST_TOOL_CODE:\n" + last_tool_code
                 prompt = (
                     base_prompt
-                    + "\n\nVALIDATOR_FEEDBACK (apply all fixes):\n"
+                    + "\n\nVALIDATOR_FEEDBACK (fix ONLY this issue):\n"
                     + feedback_note
                     + code_block
-                    + "\n\nRevise the tool accordingly."
+                    + "\n\nYou must output the ENTIRE file from scratch. "
+                    + "Fix ONLY the issue above. Leave all other logic exactly as it is."
                 )
             if mode == "legacy":
                 candidate = self._toolgen_generate_from_prompt_legacy(
@@ -981,6 +983,29 @@ class ControllerToolgenMixin:
                 )
             except Exception:
                 pass
+
+            # --- FEEDBACK THROTTLING ---
+            # Only feed the LLM the #1 issue to prevent cognitive overload
+            # and regressions from attempting too many simultaneous fixes.
+            try:
+                val_obj = feedback_payload.get("validation")
+                if isinstance(val_obj, dict):
+                    issues = val_obj.get("issues", [])
+                    fixes = val_obj.get("fixes", [])
+                    if len(issues) > 1:
+                        feedback_payload = dict(feedback_payload)
+                        throttled_val = dict(val_obj)
+                        throttled_val["issues"] = issues[:1]
+                        throttled_val["fixes"] = fixes[:1]
+                        throttled_val["CRITICAL_INSTRUCTION"] = (
+                            "You must output the ENTIRE file from scratch. "
+                            "Fix ONLY this single issue. "
+                            "Leave all other logic exactly as it is."
+                        )
+                        feedback_payload["validation"] = throttled_val
+            except Exception:
+                pass
+
             feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
         # Prefer the highest-graded validated candidate over the last one.
         use_candidate = best_candidate if best_candidate is not None else last_candidate

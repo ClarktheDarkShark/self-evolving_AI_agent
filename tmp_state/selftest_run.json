@@ -1,0 +1,7 @@
+{
+  "run_id": "selftest_run",
+  "entities": [
+    "X"
+  ],
+  "last_recommendation": "Start by exploring relations for X"
+}

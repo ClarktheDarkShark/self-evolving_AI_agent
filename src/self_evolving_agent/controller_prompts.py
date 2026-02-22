@@ -203,6 +203,9 @@ LOGICAL CHECKS & PENALTIES (HARD)
 - Loop & Stalled Prevention: The code must explicitly check if the last two trace steps yielded identical results without new variables, and if so, recommend switching action families.
 - Context Reduction: The `pruned_observation` must aggressively filter raw data (e.g., returning only top 5 relations, not 500).
 - Multi-Entity Tunnel Vision: In KG tasks, queries often contain multiple entities that must be intersected. The generated code MUST check if there are multiple entities in the query. If it throws away all entities except the first one, or if it advises deep-filtering (get_attributes) on one entity before exploring the others, apply a heavy penalty (-3 grade). It must advise exploring all base entities first.
+- Intent Detection: The code MUST use regex word boundaries (e.g., r"\\bcount\\b") or tokenization to detect intents like "count". If it uses naive substring matching (e.g., "count" in query) which triggers false positives on names like "Count Basie", apply a penalty (-2 grade).
+- Dead End & Backtracking: The code MUST check if the latest output is an empty list/set ("[]" or empty). If it blindly recommends filtering or intersecting an empty variable instead of explicitly advising the agent to backtrack, apply a penalty (-3 grade).
+- Schema Error Recovery: If the trace contains an environment error stating a relation "is not a relation of X", the code MUST parse the available valid relations from the error message and recommend a logical bridge relation. (-2 grade if it fails to handle schema errors).
 """).strip()
 
 
@@ -895,6 +898,11 @@ Generate the tool based on these instructions and the provided user message:
 AGG_TOOLGEN_USER_KG = textwrap.dedent('''
 You are ToolGen. Generate ONE minimal, robust Python-stdlib tool for the Knowledge-Graph environment. Goal: generic KG helper suggesting the best next action using structured outcomes.
 
+### CRITICAL CONSTRAINTS (PREVENT OUTPUT TRUNCATION)
+1. **CODE BLOAT:** Your previous generations were too long (>40,000 characters) and hit the hard output token limit, causing the code to be truncated mid-generation and fail syntax checks.
+2. **CONCISENESS:** You MUST write extremely concise, DRY (Don't Repeat Yourself) code. Consolidate repetitive `if/else` branches. Use list comprehensions and early returns. Keep the total file size as small as possible.
+3. **ONE FIX AT A TIME:** When you receive Validator Feedback, DO NOT try to fix all 7 or 8 issues at once. Pick ONLY the top 2 issues and implement minimal, surgical fixes for them. Leave the rest of the code strictly alone. Do not over-engineer.
+
 ### OUTPUT & CODE GUARDRAILS (HARD)
 * **Format:** Output ONLY `###TOOL_START\n<raw python>\n###TOOL_END`. No markdown wrappers, prose, or extra text. First/last lines MUST be the markers. If deviating, STOP -> output markers + best-effort Python. Near top comment MUST be: `# tool_name: kg_min_generated_tool`.
 * **Code:** Python 3.8+ stdlib ONLY. Deterministic, top-level imports only. No network, no randomness, no eval/exec. NO walrus (`:=`), NO `match/case`. 
@@ -991,7 +999,7 @@ def self_test() -> bool:
 * **Relations (CRITICAL STRICT RULES):** Extract relations `[...]` containing `.` or `/` STRICTLY from the LATEST step's output or `env_observation`. DO NOT scan the entire past trace history, otherwise you will loop. Truncate outputs to 8. Store `notes["relations_by_subject"][X]`. 
   * **Scoring Rules:** Score relations against `asked_for`. You MUST remove common stop words ('is', 'the', 'of', 'and', 'from', 'what', 'a', 'to', 'in', 'for') from the query before scoring. Match using whole word components (e.g., split relation strings by `.` and `_`), NOT raw substrings (e.g., do NOT let the query word "is" match inside the relation "synopsis").
   * **Zero-Score Fallback:** If the highest relation score is 0, DO NOT pick an alphabetical fallback. Instead, recommend expanding the search via `get_neighbors`.
-* **Intent:** `count_intent` = `asked_for` contains "how many", "number of", "count", "total" ("different" requires pairing). `entity_intent` = NOT count. If `entity_intent`, NO count/argmax/argmin.
+* **Intent:** count_intent = asked_for matches regex \b(how many|number of|total)\b or \bcount\b (CAUTION: You MUST ignore 'count' if it is part of a proper noun/entity like 'Count Dracula'). entity_intent = NOT count. If entity_intent, NO count/argmax/argmin.
 
 ### GUARDS, PROGRESS & FINALIZATION
 * **Progress:** Stalled if last 2 `ok==True` steps have identical output/error + no new var. If stalled, recommend switching action family and lower confidence_score.
@@ -1002,8 +1010,7 @@ def self_test() -> bool:
 
 ### RECOMMENDATION TREE (Deterministic)
 * **Multi-Entity Strategy (CRITICAL):** If the user's query contains multiple entities, you MUST check the trace to see if `get_relations` has been executed for ALL of them. If there is an unexplored entity in your list, prioritize recommending: "Explore relations for <unexplored_entity>". Do NOT recommend filtering (`get_attributes`) or finalizing until candidate variables have been generated for all base entities.
-* **Dead End & Backtracking Recovery:**
-  * *Empty Sets:* If the latest step was `get_relations` or `get_attributes` and the output was `[]` or empty, it means the variable is a dead end (often an empty intersection). You MUST prioritize recommending: "Variable #X is empty or has no relations. Do NOT submit it. Backtrack and explore a different relation on an older variable or entity."
+* **Dead End & Backtracking (CRITICAL):** * *Empty Sets & Errors:* If the LATEST output in the trace is exactly "[]", is completely empty, or contains the word "Error:", the path has failed. You MUST bypass all other logic and prioritize recommending: "DEAD END: The last action returned an empty set or error. Do NOT submit this variable. Backtrack and try a different relation or entity."
   * *Schema Gaps:* If an action fails with an error like "relation is not a relation of X", analyze X's actual available relations in the error message. Recommend a logical "bridge" relation (e.g., if looking for 'album' but it fails, recommend 'track' or 'release' if available).
 
 0. Empty trace -> recommend `"Start by exploring relations for <best_entity>"`, pruned_observation=None, confidence=0.8.

@@ -122,7 +122,6 @@ class ControllerOrchestratorMixin:
             if hasattr(self._registry, "list_latest_tools")
             else self._registry.list_tools(environment=current_env)
         )
-        tools = [t for t in tools if getattr(t, "negative_marks", 0) < 3]
         print(f"[ORCHESTRATOR] Found {len(tools)} tools for environment '{current_env}'")
         compact: list[dict[str, Any]] = []
         for t in tools:
@@ -290,7 +289,6 @@ class ControllerOrchestratorMixin:
             if hasattr(self._registry, "list_latest_tools")
             else self._registry.list_tools(environment=current_env)
         )
-        tools = [t for t in tools if getattr(t, "negative_marks", 0) < 3]
         summary: list[dict[str, Any]] = []
         for tool in tools:
             summary.append(
