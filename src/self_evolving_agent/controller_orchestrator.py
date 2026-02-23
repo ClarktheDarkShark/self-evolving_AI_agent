@@ -390,6 +390,14 @@ class ControllerOrchestratorMixin:
     ) -> list[dict[str, Any]]:
         # Use dynamic registry loader (filters inactive/broken tools)
         tools = self._load_dynamic_registry()
+        latest_tool = None
+        if tools:
+            try:
+                latest_tool = max(
+                    tools, key=lambda t: getattr(t, "creation_time", "") or ""
+                )
+            except Exception:
+                latest_tool = None
         current_env = self._resolved_environment_label()
         if query_text:
             try:
@@ -399,6 +407,14 @@ class ControllerOrchestratorMixin:
                     )
                     if retrieved:
                         tools = retrieved
+                        if (
+                            latest_tool
+                            and all(
+                                getattr(t, "name", None) != latest_tool.name
+                                for t in tools
+                            )
+                        ):
+                            tools = list(tools) + [latest_tool]
             except Exception:
                 pass
         print(f"[ORCHESTRATOR] Found {len(tools)} active tools for environment '{current_env}'")
@@ -785,6 +801,37 @@ class ControllerOrchestratorMixin:
             and not str(tool_name).endswith("_generated_tool")
         ):
             tool_name = None
+        has_agent_action = False
+        try:
+            for item in self._history_items(chat_history):
+                if item.role != Role.AGENT:
+                    continue
+                content = (item.content or "").strip()
+                if content.startswith("Action:") or content.startswith("Final Answer:"):
+                    has_agent_action = True
+                    break
+        except Exception:
+            has_agent_action = False
+        if action == "request_new_tool" and not has_agent_action:
+            candidates = [
+                t
+                for t in tools
+                if isinstance(t.get("name"), str)
+                and t["name"].endswith("_generated_tool")
+            ]
+            if candidates:
+                best = max(
+                    candidates,
+                    key=lambda t: (
+                        float(t.get("reliability_score") or 0.0),
+                        int(t.get("success") or 0),
+                        -int(t.get("failure") or 0),
+                    ),
+                )
+                action = "use_tool"
+                tool_name = best.get("name")
+                payload = dict(payload)
+                payload["reason"] = "bootstrap_tool_available_use_tool"
         if tools and action != "request_new_tool":
             selected_name = str(tool_name).strip() if tool_name else None
             if not selected_name or action != "use_tool":

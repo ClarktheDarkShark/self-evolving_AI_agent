@@ -170,10 +170,52 @@ class ControllerHistoryMixin:
         """Check if tool result uses the advisory (sidecar) output schema."""
         if not isinstance(result.output, Mapping):
             return False
+        tool_type = result.output.get("tool_type") or result.output.get("type")
+        if isinstance(tool_type, str) and tool_type.lower() == "macro":
+            return False
+        if any(k in result.output for k in ("final_answer", "macro_result", "final_result")):
+            return False
         return (
             "pruned_observation" in result.output
             or "confidence_score" in result.output
         )
+
+    def _is_macro_tool(self, name: str, result: ToolResult) -> bool:
+        try:
+            meta = self._get_tool_metadata(name)
+        except Exception:
+            meta = None
+        if meta and isinstance(meta.tool_type, str) and meta.tool_type.lower() == "macro":
+            return True
+        if isinstance(result.output, Mapping):
+            tool_type = result.output.get("tool_type") or result.output.get("type")
+            if isinstance(tool_type, str) and tool_type.lower() == "macro":
+                return True
+        return False
+
+    def _macro_instruction_from_output(self, output: Any) -> str:
+        if isinstance(output, Mapping):
+            final_answer = (
+                output.get("final_answer")
+                or output.get("answer")
+                or output.get("result")
+                or output.get("variable_id")
+            )
+            path = (
+                output.get("path")
+                or output.get("ontology_path")
+                or output.get("reasoning")
+                or output.get("explanation")
+            )
+            if final_answer is not None and path:
+                return f"The correct path is {path}, yield Final Answer: {final_answer}"
+            if final_answer is not None:
+                return f"yield Final Answer: {final_answer}"
+            return json.dumps(output, ensure_ascii=True, default=str)
+        if output is None:
+            return "(no output)"
+        text = str(output).strip()
+        return text or "(empty output)"
 
     def _format_tool_result(self, name: str, result: ToolResult) -> str:
         payload = {
@@ -182,6 +224,12 @@ class ControllerHistoryMixin:
             "output": result.output,
             "error": result.error,
         }
+        if self._is_macro_tool(name, result):
+            instruction = self._macro_instruction_from_output(result.output)
+            payload["macro_instruction"] = instruction
+            return "MACRO_TOOL_RESULT: " + instruction + "\nTOOL_RESULT: " + json.dumps(
+                payload, ensure_ascii=True, default=str
+            )
         if isinstance(result.output, Mapping):
             # Advisory schema: pruned_observation, answer_recommendation, confidence_score
             pruned = result.output.get("pruned_observation")

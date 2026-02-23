@@ -71,6 +71,10 @@ If the tool output is merely a guess, label, or non-executable summary, it is NO
 SPECIALIZATION REQUIREMENT (HARD)
 If the task requires specific operations (e.g., math, counting, strict multi-hop filtering) and the existing tool only provides generic search advice (e.g., "explore relations for base entities"), it FAILS the Suitability Gate. You MUST return request_new_tool to build a specialized tool for that specific operation.
 
+MACRO OVERRIDE (HARD)
+If your existing_tools catalog contains a MACRO tool whose description matches the task intent, you MUST use it.
+You are forbidden from using step-by-step advisory tools if a dedicated MACRO tool exists for the intent.
+
 DUPLICATE-PREVENTION (HARD, BEFORE request_new_tool)
 You MUST NOT return request_new_tool if ANY existing tool is a reasonable match under one of these:
 1) Direct match: tool description/capabilities clearly align with the asked_for/task_text.
@@ -221,6 +225,7 @@ GRADING SCALE (HARD)
 
 LOGICAL CHECKS & PENALTIES (HARD)
 - Macro Tool Exception: If the code is a MACRO tool (returns status='done' with a computed result rather than an advisory recommendation), the Advisory Paradigm check below does NOT apply. Macro tools MAY return concrete results directly. Grade them on correctness of the computation logic instead.
+- Macro Output Contract: Macro tools should emit a clear final answer (e.g., `final_answer` field or a single-line `Final Answer: #id` string). If missing or ambiguous, add an issue and reduce the grade.
 - Advisory Paradigm: Tools advise via `answer_recommendation` (str) and `pruned_observation` (dict). They DO NOT decide actions. If the code returns `next_action`, grade = 0.
 - Trace & Context Handling: The code MUST extract new relations/variables strictly from the LATEST step in the trace or `env_observation`. If the code concatenates or scans the entire historical trace to find relations, it will cause infinite loops (-3 grade).
 - String Matching & Scoring: When scoring relations against the user query, the code MUST tokenize strings (e.g., splitting relations by `.` or `_`) and strip stop words. If the code uses naive `word in relation` substring matching (which falsely matches "is" inside "synopsis"), grade <= 7.

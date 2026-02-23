@@ -153,7 +153,7 @@ def _run_agent(task_text: str, trace_hook) -> str:
             "LATM_FORCE_TOOLGEN", "1"
         ).strip()
         == "1",
-        tool_match_min_score=float(os.getenv("LATM_TOOL_MATCH_MIN_SCORE", "0.7")),
+        tool_match_min_score=float(os.getenv("LATM_TOOL_MATCH_MIN_SCORE", "0.55")),
         include_registry_in_prompt=os.getenv(
             "LATM_INCLUDE_REGISTRY", "1"
         ).strip()

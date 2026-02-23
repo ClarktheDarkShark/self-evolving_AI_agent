@@ -17,6 +17,11 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from src.typings.config import get_predefined_timestamp_structure
 
+try:
+    from openai import OpenAI as _OpenAI
+except ImportError:
+    _OpenAI = None  # type: ignore[assignment,misc]
+
 
 @dataclass
 class ToolMetadata:
@@ -62,6 +67,30 @@ class ToolResult:
     @classmethod
     def failure(cls, error: str) -> "ToolResult":
         return cls(success=False, output=None, error=error)
+
+
+_openai_client: Optional["_OpenAI"] = None  # type: ignore[type-arg]
+_openai_client_attempted: bool = False
+
+
+def _get_openai_client():
+    """Return a cached OpenAI client (or *None* if unavailable)."""
+    global _openai_client, _openai_client_attempted
+    if _openai_client is not None:
+        return _openai_client
+    if _openai_client_attempted:
+        return None
+    _openai_client_attempted = True
+    if _OpenAI is None:
+        return None
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        _openai_client = _OpenAI(api_key=api_key)
+        return _openai_client
+    except Exception:
+        return None
 
 
 class ToolRegistry:
@@ -116,6 +145,7 @@ class ToolRegistry:
         try:
             with open(self.metadata_path, "r", encoding="utf-8") as f:
                 data: Iterable[dict[str, Any]] = json.load(f)
+            any_embedding_upgraded = False
             for entry in data:
                 tool_metadata = ToolMetadata(**entry)
                 if not tool_metadata.docstring:
@@ -145,8 +175,13 @@ class ToolRegistry:
                         tool_metadata.optional_keys = opt_keys
                     if not tool_metadata.property_types:
                         tool_metadata.property_types = prop_types
+                old_model = tool_metadata.embedding_model
                 self._ensure_embedding(tool_metadata, persist=False)
+                if tool_metadata.embedding_model != old_model:
+                    any_embedding_upgraded = True
                 self._metadata[tool_metadata.name] = tool_metadata
+            if any_embedding_upgraded:
+                self._save_metadata()
         except Exception:
             # Corrupted metadata should not crash the run; start from an empty registry.
             self._metadata = {}
@@ -211,8 +246,10 @@ class ToolRegistry:
         sanitized = re.sub(r"[^0-9a-zA-Z_]+", "_", name).strip("_")
         return sanitized or "tool"
 
-    _EMBED_DIM = 256
-    _EMBED_MODEL = "hashing_v1"
+    _EMBED_DIM = 1536
+    _EMBED_MODEL = "text-embedding-3-small"
+    _EMBED_DIM_FALLBACK = 256
+    _EMBED_MODEL_FALLBACK = "hashing_v1"
 
     def _embedding_text(self, meta: ToolMetadata) -> str:
         parts = [
@@ -224,13 +261,14 @@ class ToolRegistry:
         ]
         return "\n".join([p for p in parts if p]).strip()
 
-    def _embed_text(self, text: str) -> list[float]:
+    def _embed_text_hashing(self, text: str) -> list[float]:
+        """Fallback: 256-dim sparse hash embedding (hashing_v1)."""
         if not text:
             return []
         tokens = re.findall(r"[a-zA-Z0-9]+", text.lower())
         if not tokens:
             return []
-        dim = self._EMBED_DIM
+        dim = self._EMBED_DIM_FALLBACK
         vec = [0.0] * dim
         for tok in tokens:
             h = hashlib.md5(tok.encode("utf-8")).hexdigest()
@@ -241,15 +279,37 @@ class ToolRegistry:
             vec = [v / norm for v in vec]
         return vec
 
+    def _embed_text(self, text: str) -> list[float]:
+        """Embed text using OpenAI text-embedding-3-small, falling back to hashing_v1."""
+        if not text:
+            return []
+        client = _get_openai_client()
+        if client is not None:
+            try:
+                response = client.embeddings.create(
+                    input=text, model=self._EMBED_MODEL
+                )
+                return response.data[0].embedding
+            except Exception:
+                pass
+        return self._embed_text_hashing(text)
+
     def _ensure_embedding(self, meta: ToolMetadata, *, persist: bool = False) -> None:
         text = self._embedding_text(meta)
         if not text:
             return
         text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        if meta.embedding and meta.embedding_text_hash == text_hash:
+        # Recompute if text changed OR if embedding model changed (migration)
+        if (
+            meta.embedding
+            and meta.embedding_text_hash == text_hash
+            and meta.embedding_model == self._EMBED_MODEL
+        ):
             return
         meta.embedding = self._embed_text(text)
-        meta.embedding_model = self._EMBED_MODEL
+        meta.embedding_model = (
+            self._EMBED_MODEL if _get_openai_client() else self._EMBED_MODEL_FALLBACK
+        )
         meta.embedding_text_hash = text_hash
         if persist:
             self._save_metadata()
@@ -774,7 +834,7 @@ class ToolRegistry:
         scored: list[tuple[float, ToolMetadata]] = []
         for meta in candidates:
             self._ensure_embedding(meta, persist=False)
-            if not meta.embedding:
+            if not meta.embedding or len(meta.embedding) != len(query_vec):
                 continue
             sim = sum(a * b for a, b in zip(query_vec, meta.embedding))
             scored.append((sim, meta))

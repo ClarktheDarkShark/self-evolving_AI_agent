@@ -80,7 +80,7 @@ class SelfEvolvingController(
             "specific output formats (e.g., Action: Operation) intact."
         ),
         force_tool_generation_if_missing: bool = True,
-        tool_match_min_score: float = 0.7,
+        tool_match_min_score: float = 0.55,
         include_registry_in_prompt: bool = True,
         use_orchestrator: bool = True,
         environment_label: str = "unknown",
@@ -875,7 +875,13 @@ class SelfEvolvingController(
     # ------------------------------------------------------------------
     # Reflection Forge: post-task failure tool generation
     # ------------------------------------------------------------------
-    def generate_tool_from_failure(self, session) -> None:
+    def generate_tool_from_failure(
+        self,
+        session,
+        *,
+        agent_output: Optional[Any] = None,
+        expected_answer: Optional[Any] = None,
+    ) -> None:
         """Generate a tool from a failed task session (Reflection Forge).
 
         Called after ``task.complete(session)`` when the evaluation outcome
@@ -919,14 +925,62 @@ class SelfEvolvingController(
         if not patterns:
             patterns.append("incorrect_final_answer")
 
+        def _stringify(value: Any, max_len: int = 800) -> str:
+            if value is None:
+                return ""
+            try:
+                if isinstance(value, (dict, list)):
+                    text = json.dumps(value, ensure_ascii=True, default=str)
+                else:
+                    text = str(value)
+            except Exception:
+                text = str(value)
+            return self._truncate(text, max_len)
+
+        agent_output_value = agent_output
+        if agent_output_value is None:
+            task_output = getattr(session, "task_output", None)
+            if isinstance(task_output, Mapping):
+                if "answer" in task_output:
+                    agent_output_value = task_output.get("answer")
+                elif task_output:
+                    agent_output_value = task_output
+            elif task_output is not None:
+                agent_output_value = task_output
+        if agent_output_value is None:
+            try:
+                for item in reversed(self._history_items(chat_history)):
+                    if item.role != Role.AGENT:
+                        continue
+                    content = (item.content or "").strip()
+                    if content:
+                        agent_output_value = content
+                        break
+            except Exception:
+                agent_output_value = None
+
+        expected_answer_value = expected_answer
+        if expected_answer_value is None:
+            expected_answer_value = getattr(session, "expected_answer", None)
+
+        agent_output_text = (
+            _stringify(agent_output_value, 800) or "unknown"
+        )
+        expected_answer_text = (
+            _stringify(expected_answer_value, 800) or "unknown"
+        )
+
         enriched_query = (
             f"REFLECTION FORGE: The agent failed this task.\n"
             f"TASK: {(task_query or '')[:500]}\n"
+            f"AGENT_OUTPUT: {agent_output_text}\n"
+            f"EXPECTED_ANSWER: {expected_answer_text}\n"
             f"TRACE SUMMARY (last {len(trace_tail)} steps): "
             f"{json.dumps(trace_tail, ensure_ascii=True, default=str)[:1500]}\n"
             f"FAILURE PATTERN: {', '.join(patterns)}\n"
-            f"DESIRED TOOL: A tool that handles this failure pattern and "
-            f"prevents the same mistake on similar tasks."
+            f"DESIRED TOOL: A MACRO tool that reverse-engineers the correct "
+            f"ontology path and produces the expected answer deterministically. "
+            f"Do NOT generate an advisory tool."
         )
 
         self._append_loop_log(
@@ -965,9 +1019,14 @@ class SelfEvolvingController(
                             env_contract = ""
                     reflection_header = (
                         "=== POST-TASK REFLECTION ===\n"
-                        "The agent failed the following task. Review the trace below "
-                        "and build a tool (Macro or Advisory) that prevents this "
-                        "specific failure.\n"
+                        "The agent failed the following task.\n"
+                        f"Task: {task_query}\n"
+                        f"Agent Output: {agent_output_text}\n"
+                        f"Expected Correct Answer: {expected_answer_text}\n"
+                        "Review the trace below to see where the agent took the wrong "
+                        "ontology path. You MUST write an executable 'Macro Tool' "
+                        "(Python script) that correctly reverse-engineers the path to "
+                        "yield the Expected Answer. Do NOT write an advisory tool.\n"
                         "============================\n\n"
                     )
                     user_prompt = build_task_pack(
@@ -1208,6 +1267,12 @@ class SelfEvolvingController(
 
         try:
             self._toolgen_prebootstrap_once(task_query, working_history)
+            # Refresh registry so freshly registered pre-boot tool is visible
+            if getattr(self, "_registry", None) is not None and hasattr(self._registry, "refresh"):
+                try:
+                    self._registry.refresh()
+                except Exception:
+                    pass
 
             print(
                 "\n[DEBUG] Entering Orchestrator Decision Phase",
@@ -1957,6 +2022,12 @@ class SelfEvolvingController(
 
             task_query = (original_query or "").strip() or (query or "").strip()
             self._toolgen_prebootstrap_once(task_query, working_history)
+            # Refresh registry so freshly registered pre-boot tool is visible
+            if getattr(self, "_registry", None) is not None and hasattr(self._registry, "refresh"):
+                try:
+                    self._registry.refresh()
+                except Exception:
+                    pass
 
             self._consider_tool_generation(task_query, working_history)
 
