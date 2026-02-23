@@ -531,6 +531,17 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                 try:
                     call_start = time.monotonic()
                     new_variable, execution_message = api(*processed_argument_list)
+                except TaskEnvironmentException:
+                    session.chat_history.inject(
+                        {
+                            "role": Role.USER,
+                            "content": (
+                                "Observation: Error - SPARQL query timed out or node "
+                                "explosion detected."
+                            ),
+                        }
+                    )
+                    return
                 except KnowledgeGraphAPIException as e:
                     error_message = str(e)
                     # region Replace the template in error_message with real value

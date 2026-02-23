@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "Bash(python -m pytest tests/self_evolving_agent/test_tool_registry.py -v)",
+      "Bash(pip3 list:*)",
+      "Bash(grep:*)"
     ]
   }
 }

@@ -435,6 +435,15 @@ def main() -> None:
         if callback_args.session_controller.should_task_complete:
             task.complete(session)
             callback_handler.on_task_complete(callback_args)
+        # Reflection Forge: generate tool from failure when outcome is incorrect
+        if (
+            session.evaluation_record.outcome == SessionEvaluationOutcome.INCORRECT
+            and hasattr(agent, "generate_tool_from_failure")
+        ):
+            try:
+                agent.generate_tool_from_failure(session)
+            except Exception:
+                logger.exception("Reflection forge failed.")
         session_list.append(session)
         json.dump(
             [s.model_dump() for s in session_list],

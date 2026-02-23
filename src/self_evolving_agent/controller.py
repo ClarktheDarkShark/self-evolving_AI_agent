@@ -4,6 +4,7 @@ import json
 import os
 import re
 import traceback
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 import threading
@@ -46,6 +47,7 @@ from .tool_registry import ToolMetadata, ToolResult, get_registry
 from .toolgen_debug_logger import ToolgenDebugLogger, toolgen_debug_enabled
 from src.toolgen.config import get_toolgen_pipeline_config
 from src.toolgen.prompts import get_toolgen_system_prompt
+from src.toolgen.prompting.build_task_pack import build_task_pack
 from src.toolgen.pipelines import build_toolgen_pipeline
 
 
@@ -126,21 +128,25 @@ class SelfEvolvingController(
             inference_config_dict=solver_cfg,
             agent_name="solver",
         )
+        self._orchestrator_system_prompt = COMBINED_ORCHESTRATOR_SYSTEM_PROMPT
+        self._tool_invoker_prompt = TOOL_INVOKER_SYSTEM_PROMPT
 
         output_dir_override = get_output_dir_override()
         if output_dir_override:
-            tool_registry_path = str(Path(output_dir_override) / "tool_library")
+            tool_registry_root = str(Path(output_dir_override) / "tool_library")
         else:
             run_stamp = get_predefined_timestamp_structure()["TIMESTAMP"]
-            tool_registry_path = str(Path("outputs") / run_stamp / "tool_library")
+            tool_registry_root = str(Path("outputs") / run_stamp / "tool_library")
 
-        pipeline_config = get_toolgen_pipeline_config(tool_registry_path)
-        tool_registry_path = pipeline_config.registry_dir
+        tool_registry_root = os.path.abspath(tool_registry_root)
+        pipeline_config = get_toolgen_pipeline_config(tool_registry_root)
+        tool_registry_path = os.path.abspath(pipeline_config.registry_dir)
+        self._registry_dir = tool_registry_path
         self._toolgen_pipeline_name = pipeline_config.pipeline
         self._toolgen_name_prefix = pipeline_config.name_prefix
         self._toolgen_agg_n = pipeline_config.agg_n
-        self._toolgen_registry_root = pipeline_config.registry_root
-        self._toolgen_registry_dir = pipeline_config.registry_dir
+        self._toolgen_registry_root = os.path.abspath(pipeline_config.registry_root)
+        self._toolgen_registry_dir = tool_registry_path
         self._toolgen_registry_root_from_env = pipeline_config.registry_root_from_env
         if self._toolgen_pipeline_name == "aggregate3":
             print(
@@ -150,7 +156,15 @@ class SelfEvolvingController(
         self._toolgen_preboot_envs: set[str] = set()
         self._toolgen_agg_bootstrapped_envs: set[str] = set()
         self._toolgen_preaggregate_envs: set[str] = set()
+        self._force_toolgen_always_on = (
+            os.getenv("FORCE_TOOLGEN_ALWAYS_ON", "0") == "1"
+        )
         self._toolgen_off = os.getenv("TOOLGEN_OFF", "1") != "0"
+        if self._toolgen_pipeline_name == "aggregate3":
+            # Hard-enable ToolGen for aggregate3 runs to avoid env loss in subprocesses.
+            self._force_toolgen_always_on = True
+        if self._force_toolgen_always_on:
+            self._toolgen_off = False
 
         base_cfg = dict(inference_config_dict) if inference_config_dict else {}
         for k in ("tools", "tool_choice", "functions", "function_call"):
@@ -159,7 +173,12 @@ class SelfEvolvingController(
         base_cfg["tool_choice"] = "none"
         base_cfg["toolgen_extract_tool_calls"] = True
         base_cfg["ollama_force_tool_calls"] = False
-        toolgen_system_prompt = get_toolgen_system_prompt("baseline")
+        toolgen_timeout_s = os.getenv("LIFELONG_TOOLGEN_TIMEOUT_S", "").strip()
+        if toolgen_timeout_s:
+            base_cfg["request_timeout_s"] = toolgen_timeout_s
+        toolgen_system_prompt = get_toolgen_system_prompt(
+            self._toolgen_pipeline_name, environment_label
+        )
         self._toolgen_agent = LanguageModelAgent(
             language_model=language_model,
             system_prompt=toolgen_system_prompt,
@@ -215,6 +234,11 @@ class SelfEvolvingController(
             )
 
         self._registry = get_registry(tool_registry_path)
+        if hasattr(self, "set_registry_dir"):
+            try:
+                self.set_registry_dir(self._registry_dir)
+            except Exception:
+                pass
         self._registry.set_run_snapshot(
             get_predefined_timestamp_structure()["TIMESTAMP"]
         )
@@ -227,11 +251,37 @@ class SelfEvolvingController(
             system_prompt_selector=get_toolgen_system_prompt,
             name_prefix=self._toolgen_name_prefix,
         )
+        if self._toolgen_pipeline is not None:
+            try:
+                setattr(self._toolgen_pipeline, "registry_dir", self._registry_dir)
+                setattr(self._toolgen_pipeline, "output_dir", self._registry_dir)
+            except Exception:
+                pass
+        if hasattr(self._toolgen_pipeline, "set_registry_dir"):
+            try:
+                self._toolgen_pipeline.set_registry_dir(self._registry_dir)
+            except Exception:
+                pass
+        try:
+            print(
+                f"[PATH_CHECK] Production Registry Dir: {self._registry_dir}",
+                file=sys.stderr,
+                flush=True,
+            )
+            pipe_registry = getattr(self._toolgen_pipeline, "registry_dir", None)
+            print(
+                f"[PATH_CHECK] ToolGen internal path: {pipe_registry}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
         self._tool_invocation_log_path: Optional[Path] = None
         self._generated_tools_log_path: Optional[Path] = None
         self._flow_session_log_path: Optional[Path] = None
         self._flow_full_log_path: Optional[Path] = None
         self._agent_system_prompt_path: Optional[Path] = None
+        self._loop_log_path: Optional[Path] = None
         self._toolgen_debug_logger: Optional[ToolgenDebugLogger] = None
         self._run_task_label: Optional[str] = None
         try:
@@ -252,6 +302,9 @@ class SelfEvolvingController(
                 self._agent_system_prompt_path = (
                     Path(output_dir) / prefix_filename("agent_system_prompts.json")
                 )
+                self._loop_log_path = (
+                    Path(output_dir) / prefix_filename("orchestrator_loop.log")
+                )
             else:
                 run_id = get_predefined_timestamp_structure()["TIMESTAMP"]
                 self._tool_invocation_log_path = (
@@ -267,12 +320,16 @@ class SelfEvolvingController(
                 self._agent_system_prompt_path = (
                     Path("outputs") / run_id / "agent_system_prompts.json"
                 )
+                self._loop_log_path = (
+                    Path("outputs") / run_id / "orchestrator_loop.log"
+                )
         except Exception:
             self._tool_invocation_log_path = None
             self._generated_tools_log_path = None
             self._flow_session_log_path = None
             self._flow_full_log_path = None
             self._agent_system_prompt_path = None
+            self._loop_log_path = None
         self._run_id: Optional[str] = None
         self._state_dir: Optional[str] = None
         try:
@@ -322,6 +379,7 @@ class SelfEvolvingController(
         self._toolgen_last_recommendation: Optional[str] = None
         self._tool_usage_logged: set[str] = set()
         self._outcome_scored: set[str] = set()
+        self._failure_forged: set[str] = set()
         self._run_task_metadata: Optional[dict[str, Any]] = None
         self._last_solver_output: Optional[str] = None
         self._last_solver_context_key: Optional[str] = None
@@ -332,6 +390,12 @@ class SelfEvolvingController(
         self._bootstrap_tools(bootstrap_tools or [])
         base_solver_prompt = (system_prompt or "").strip() or "You are a helpful assistant."
         self._solver_system_prompt = f"{base_solver_prompt}\n\n{SOLVER_SYSTEM_PROMPT}".strip()
+        if getattr(self, "_language_model_agent", None) is not None:
+            self._language_model_agent._system_prompt = self._solver_system_prompt
+        if getattr(self, "_orchestrator_agent", None) is not None:
+            self._orchestrator_agent._system_prompt = self._orchestrator_system_prompt
+        if getattr(self, "_tool_invoker_agent", None) is not None:
+            self._tool_invoker_agent._system_prompt = self._tool_invoker_prompt
 
 
     def _scoped_run_id_state_dir(
@@ -551,6 +615,77 @@ class SelfEvolvingController(
             last_obs["repeat_count"] = repeat_count
         return steps, last_obs
 
+    def _detect_derailment(
+        self,
+        structured_trace: list[dict[str, Any]],
+        last_obs: Optional[dict[str, Any]],
+    ) -> Optional[dict[str, str]]:
+        """Heuristic derailment detector.
+
+        Returns ``None`` when no derailment is detected, or a dict with
+        ``type``, ``severity`` ("high"/"medium"), and ``message`` keys.
+        Checked in priority order — first match wins.
+        """
+        if not structured_trace:
+            return None
+
+        # 1. action_loop — last 3 steps have identical (action, args)
+        if len(structured_trace) >= 3:
+            tail3 = structured_trace[-3:]
+            keys = [(s.get("action"), str(s.get("args"))) for s in tail3]
+            if keys[0] == keys[1] == keys[2]:
+                return {
+                    "type": "action_loop",
+                    "severity": "high",
+                    "message": (
+                        f"Agent repeated identical action 3 times: "
+                        f"{tail3[0].get('action')}({tail3[0].get('args')})"
+                    ),
+                }
+
+        # 2. error_streak — last 2 steps both failed
+        if len(structured_trace) >= 2:
+            tail2 = structured_trace[-2:]
+            if tail2[0].get("ok") is False and tail2[1].get("ok") is False:
+                return {
+                    "type": "error_streak",
+                    "severity": "high",
+                    "message": (
+                        f"Last 2 actions both failed: "
+                        f"{tail2[0].get('action')}, {tail2[1].get('action')}"
+                    ),
+                }
+
+        # 3. stall_no_new_vars — last 3 ok steps produced no new Variable #N
+        if len(structured_trace) >= 3:
+            tail3 = structured_trace[-3:]
+            all_ok = all(s.get("ok") is True for s in tail3)
+            if all_ok:
+                has_new_var = any(
+                    re.search(r"Variable\s+#\d+", str(s.get("output") or ""))
+                    for s in tail3
+                )
+                if not has_new_var:
+                    return {
+                        "type": "stall_no_new_vars",
+                        "severity": "medium",
+                        "message": "Last 3 successful actions produced no new variables.",
+                    }
+
+        # 4. excessive_turns — long trace with no tool assistance
+        if len(structured_trace) >= 12:
+            tool_used = getattr(self, "_tool_invoked_in_last_inference", False)
+            if not tool_used:
+                return {
+                    "type": "excessive_turns",
+                    "severity": "medium",
+                    "message": (
+                        f"Trace has {len(structured_trace)} steps with no tool assistance."
+                    ),
+                }
+
+        return None
+
     def _truncate_for_log(
         self, value: Any, max_chars: int = 400, max_list: int = 8
     ) -> Any:
@@ -737,6 +872,158 @@ class SelfEvolvingController(
                 pass
 
 
+    # ------------------------------------------------------------------
+    # Reflection Forge: post-task failure tool generation
+    # ------------------------------------------------------------------
+    def generate_tool_from_failure(self, session) -> None:
+        """Generate a tool from a failed task session (Reflection Forge).
+
+        Called after ``task.complete(session)`` when the evaluation outcome
+        is ``incorrect``.  Builds an enriched ToolGen query from the
+        session trace and triggers tool generation.
+        """
+        if self._toolgen_off and not getattr(self, "_force_toolgen_always_on", False):
+            return
+
+        chat_history = getattr(session, "chat_history", None)
+        if chat_history is None:
+            return
+
+        # Dedupe: one forge per (task_name, sample_index)
+        task_name = str(getattr(session, "task_name", ""))
+        sample_index = str(getattr(session, "sample_index", ""))
+        forge_key = f"{task_name}|{sample_index}"
+        if forge_key in self._failure_forged:
+            return
+        self._failure_forged.add(forge_key)
+
+        # Extract the original task query
+        user_items = [
+            item for item in self._history_items(chat_history)
+            if item.role == Role.USER
+        ]
+        task_query = user_items[1].content if len(user_items) >= 2 else ""
+
+        # Build structured trace
+        trace_steps, last_obs = self._build_structured_trace(chat_history)
+        trace_tail = trace_steps[-5:] if trace_steps else []
+
+        # Determine failure pattern
+        patterns: list[str] = []
+        if last_obs and last_obs.get("loop_detected"):
+            patterns.append(f"loop_detected (repeat_count={last_obs.get('repeat_count')})")
+        if last_obs and last_obs.get("ok") is False:
+            patterns.append(f"last_action_failed: {last_obs.get('action')}")
+        if last_obs and not str(last_obs.get("output") or "").strip():
+            patterns.append("empty_result")
+        if not patterns:
+            patterns.append("incorrect_final_answer")
+
+        enriched_query = (
+            f"REFLECTION FORGE: The agent failed this task.\n"
+            f"TASK: {(task_query or '')[:500]}\n"
+            f"TRACE SUMMARY (last {len(trace_tail)} steps): "
+            f"{json.dumps(trace_tail, ensure_ascii=True, default=str)[:1500]}\n"
+            f"FAILURE PATTERN: {', '.join(patterns)}\n"
+            f"DESIRED TOOL: A tool that handles this failure pattern and "
+            f"prevents the same mistake on similar tasks."
+        )
+
+        self._append_loop_log(
+            f"REFLECTION FORGE | sample={sample_index} patterns={patterns}"
+        )
+
+        try:
+            self._append_generated_tools_log(
+                {
+                    "event": "reflection_forge_start",
+                    "task_name": task_name,
+                    "sample_index": sample_index,
+                    "failure_patterns": patterns,
+                }
+            )
+        except Exception:
+            pass
+
+        try:
+            prev_relaxed = getattr(self, "_toolgen_relaxed_mode", False)
+            setattr(self, "_toolgen_relaxed_mode", True)
+            try:
+                if getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
+                    env_name = self._resolved_environment_label()
+                    env_contract = ""
+                    context = getattr(self, "_toolgen_agg_context", None)
+                    if isinstance(context, Mapping):
+                        env_contract = str(context.get("env_contract") or "")
+                    if not env_contract:
+                        try:
+                            for item in self._history_items(chat_history):
+                                if item.role == Role.USER:
+                                    env_contract = (item.content or "").strip()
+                                    break
+                        except Exception:
+                            env_contract = ""
+                    reflection_header = (
+                        "=== POST-TASK REFLECTION ===\n"
+                        "The agent failed the following task. Review the trace below "
+                        "and build a tool (Macro or Advisory) that prevents this "
+                        "specific failure.\n"
+                        "============================\n\n"
+                    )
+                    user_prompt = build_task_pack(
+                        env_name, env_contract, [enriched_query]
+                    )
+                    final_user_prompt = reflection_header + user_prompt
+                    exec_payload = self._build_toolgen_execution_payload(
+                        task_text=enriched_query,
+                        trace=trace_tail,
+                        failure_context=last_obs.get("output") if isinstance(last_obs, dict) else "",
+                        active_variables=None,
+                    )
+                    prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
+                    setattr(self, "_toolgen_execution_payload", exec_payload)
+                    system_prompt = get_toolgen_system_prompt("aggregate3", env_name)
+                    try:
+                        result = self._toolgen_generate_from_prompt(
+                            user_prompt=final_user_prompt,
+                            system_prompt=system_prompt,
+                            chat_history=chat_history,
+                            name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                        )
+                    finally:
+                        setattr(self, "_toolgen_execution_payload", prev_exec_payload)
+                else:
+                    result = self._maybe_generate_tool_for_query(
+                        enriched_query, chat_history, allow_reuse=False, force=True
+                    )
+            finally:
+                setattr(self, "_toolgen_relaxed_mode", prev_relaxed)
+
+            tool_name = None
+            if result is not None:
+                if isinstance(result, Mapping):
+                    tool_name = result.get("tool_name") or result.get("name")
+                else:
+                    tool_name = getattr(result, "name", None)
+
+            self._append_loop_log(
+                f"REFLECTION FORGE RESULT | tool={tool_name or 'FAILED'}"
+            )
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "reflection_forge_result",
+                        "task_name": task_name,
+                        "sample_index": sample_index,
+                        "tool_name": tool_name,
+                        "success": tool_name is not None,
+                    }
+                )
+            except Exception:
+                pass
+        except Exception:
+            self._append_loop_log("REFLECTION FORGE | ERROR (exception during toolgen)")
+
     def _orchestrated_inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
         if self._use_packaged_agent and self._packaged_shim is not None:
             return self._packaged_shim.inference(chat_history)
@@ -744,6 +1031,35 @@ class SelfEvolvingController(
         working_history = self._clone_history(self._prune_for_current_task(chat_history))
         self._tool_invoked_in_last_inference = False
         self._apply_outcome_penalties()
+        # --- TROUBLESHOOTING LOGS ---
+        try:
+            print(
+                f"[DEBUG_PATH] Controller Registry Dir: {getattr(self, '_registry_dir', None)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if getattr(self, "_registry", None) is not None:
+                base_path = getattr(self._registry, "base_path", "Unknown")
+                print(
+                    f"[DEBUG_PATH] Orchestrator is watching: {base_path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            pipeline = getattr(self, "_toolgen_pipeline", None)
+            if pipeline is not None:
+                pipe_registry = getattr(pipeline, "registry_dir", None)
+                print(
+                    f"[DEBUG_PATH] ToolGen is writing to: {pipe_registry}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception:
+            pass
+        if getattr(self, "_registry", None) is not None and hasattr(self._registry, "refresh"):
+            try:
+                self._registry.refresh()
+            except Exception:
+                pass
 
         user_items = [item for item in self._history_items(working_history) if item.role == Role.USER]
         if len(user_items) >= 2:
@@ -752,6 +1068,67 @@ class SelfEvolvingController(
             orig_last_user = self._get_last_user_item(working_history)
             original_query = orig_last_user.content if orig_last_user else ""
         task_query = (original_query or "").strip()
+
+        print("\n[DEBUG] --- TURN START ---", file=sys.stderr, flush=True)
+        print("[DEBUG] Prompt Name Tracing active.", file=sys.stderr, flush=True)
+        forced_decision: Optional[Mapping[str, Any]] = None
+        try:
+            forced_decision = self._orchestrate_decision(
+                task_query=task_query,
+                chat_history=chat_history,
+            )
+        except TypeError:
+            forced_decision = self._orchestrate_decision(task_query, chat_history)
+        print(
+            f"[DEBUG] Orchestrator Identity Verified. Decision: {forced_decision}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if isinstance(forced_decision, Mapping):
+            action_name = forced_decision.get("action")
+            if action_name == "request_new_tool":
+                print(
+                    f"[LATM_FLOW] Desired Behavior for Forge: "
+                    f"{forced_decision.get('desired_behavior')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"[!] ESCAPE HATCH TRIGGERED: "
+                    f"{forced_decision.get('reasoning')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                escape_result = self._handle_escape_hatch(
+                    forced_decision, task_query, working_history
+                )
+                if isinstance(escape_result, Mapping):
+                    solver_recommendation = str(
+                        escape_result.get("observation") or ""
+                    )
+                    forced_decision = self._orchestrate_decision(
+                        task_query,
+                        working_history,
+                        solver_recommendation=solver_recommendation,
+                    )
+
+        _loop_start = time.perf_counter()
+        turn_start_time = time.time()
+        _hist_len = chat_history.get_value_length()
+        _task_meta = self._get_run_task_metadata() or {}
+        turn_id = _task_meta.get("sample_index") if isinstance(_task_meta, dict) else None
+        if turn_id is None:
+            turn_id = _hist_len
+        self._last_turn_data = {"turn_id": turn_id, "orchestrator_decisions": []}
+        self._append_loop_log(
+            f"{'=' * 60}\n"
+            f"TURN START | env={self._resolved_environment_label()} "
+            f"sample={_task_meta.get('sample_index', '?')} "
+            f"history_len={_hist_len} "
+            f"toolgen_off={self._toolgen_off} "
+            f"force_toolgen_on={self._force_toolgen_always_on}\n"
+            f"  query: {task_query[:120]}{'...' if len(task_query) > 120 else ''}"
+        )
 
         def _record_tool_error(stage: str, message: str, tb: Optional[str] = None) -> None:
             self._trace("tool_pipeline_error", f"{stage}: {message}")
@@ -813,19 +1190,147 @@ class SelfEvolvingController(
                     }
                 )
 
+        # Derailment detection — broader heuristic over the full trace
+        derailment = self._detect_derailment(pre_orch_trace, pre_orch_obs)
+        if derailment is not None:
+            observation_triggers.append(
+                {
+                    "type": "derailment_trigger",
+                    "severity": derailment["severity"],
+                    "reason": derailment["message"],
+                }
+            )
+
+        if observation_triggers:
+            self._append_loop_log(
+                f"  triggers: {[t.get('type') for t in observation_triggers]}"
+            )
+
         try:
             self._toolgen_prebootstrap_once(task_query, working_history)
 
-            decision = self._orchestrate_decision(
-                task_query,
-                working_history,
-                solver_recommendation=solver_recommendation,
-                observation_triggers=observation_triggers,
-                last_observation=pre_orch_obs,
+            print(
+                "\n[DEBUG] Entering Orchestrator Decision Phase",
+                file=sys.stderr,
+                flush=True,
+            )
+            if forced_decision is None:
+                decision = self._orchestrate_decision(
+                    task_query,
+                    working_history,
+                    solver_recommendation=solver_recommendation,
+                    observation_triggers=observation_triggers,
+                    last_observation=pre_orch_obs,
+                )
+            else:
+                decision = dict(forced_decision)
+            print(
+                f"[DEBUG] Orchestrator Decision: {decision}",
+                file=sys.stderr,
+                flush=True,
             )
             action = decision.get("action", "no_tool")
-            if self._toolgen_off and action == "create_tool":
+            if action == "request_new_tool":
+                decision["tool_name"] = "request_new_tool"
                 action = "use_tool"
+            if (
+                self._toolgen_off
+                and not self._force_toolgen_always_on
+                and action in {"create_tool", "request_new_tool"}
+            ):
+                action = "use_tool"
+            if isinstance(self._last_turn_data, dict):
+                decision_record = dict(decision)
+                decision_record["action"] = action
+                decision_record["_stage"] = "initial"
+                self._last_turn_data["orchestrator_decision"] = decision_record
+                if isinstance(self._last_turn_data.get("orchestrator_decisions"), list):
+                    self._last_turn_data["orchestrator_decisions"].append(decision_record)
+
+            self._append_loop_log(
+                f"  orchestrator: action={action} "
+                f"tool={decision.get('tool_name') or '-'} "
+                f"reason={self._truncate(str(decision.get('reason') or ''), 80)}"
+            )
+
+            # Phase 4: Escape hatch intercept — request_new_tool
+            if (
+                action == "use_tool"
+                and str(decision.get("tool_name") or "").strip() == "request_new_tool"
+            ):
+                print(
+                    f"[LATM_FLOW] Desired Behavior for Forge: "
+                    f"{decision.get('desired_behavior')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._append_loop_log("  >>> ESCAPE HATCH TRIGGERED <<<")
+                escape_result = self._handle_escape_hatch(
+                    decision, task_query, working_history
+                )
+                escape_message = ""
+                if isinstance(escape_result, Mapping):
+                    escape_message = str(escape_result.get("observation") or "")
+                if not escape_message:
+                    escape_message = str(escape_result)
+                escape_status = "success" if "successfully created" in escape_message else "failure"
+                self._append_loop_log(
+                    {
+                        "event": "escape_hatch_complete",
+                        "turn": turn_id,
+                        "status": escape_status,
+                        "message": escape_message,
+                    }
+                )
+                self._append_loop_log(
+                    f"  escape_hatch: success={escape_result.get('success')} "
+                    f"new_tool={escape_result.get('tool_name') or '-'}"
+                )
+                # Re-run the Orchestrator with the ToolGen observation so it
+                # can see the refreshed catalog and select the new tool.
+                print(
+                    "\n[DEBUG] Entering Orchestrator Decision Phase (post-escape)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                decision = self._orchestrate_decision(
+                    task_query,
+                    working_history,
+                    solver_recommendation=escape_result["observation"],
+                    observation_triggers=observation_triggers,
+                    last_observation=pre_orch_obs,
+                )
+                print(
+                    f"[DEBUG] Orchestrator Decision (post-escape): {decision}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                action = decision.get("action", "no_tool")
+                if action == "request_new_tool":
+                    decision["tool_name"] = "request_new_tool"
+                    action = "use_tool"
+                if (
+                    self._toolgen_off
+                    and not self._force_toolgen_always_on
+                    and action in {"create_tool", "request_new_tool"}
+                ):
+                    action = "use_tool"
+                if isinstance(self._last_turn_data, dict):
+                    decision_record = dict(decision)
+                    decision_record["action"] = action
+                    decision_record["_stage"] = "post_escape"
+                    self._last_turn_data["orchestrator_decision"] = decision_record
+                    if isinstance(
+                        self._last_turn_data.get("orchestrator_decisions"), list
+                    ):
+                        self._last_turn_data["orchestrator_decisions"].append(
+                            decision_record
+                        )
+                self._append_loop_log(
+                    f"  orchestrator (post-escape): action={action} "
+                    f"tool={decision.get('tool_name') or '-'}"
+                )
+
             if action == "no_tool":
                 if not init_solver:
                     solver_prompt = self._solver_prompt_no_tools()
@@ -847,6 +1352,14 @@ class SelfEvolvingController(
                     solver_response = self._solver_inference_with_retry(
                         working_history, system_prompt=solver_prompt
                     )
+                    self._append_loop_log(
+                        {
+                            "event": "solver_execution",
+                            "turn": turn_id,
+                            "has_sidecar": False,
+                            "solver_response_preview": str(solver_response)[:150],
+                        }
+                    )
                     self._append_solver_io_log(
                         {
                             "event": "solver_output",
@@ -864,6 +1377,19 @@ class SelfEvolvingController(
                     content=content,
                 )
                 self._flush_tool_traces(tool_traces, content)
+                self._append_loop_log(
+                    {
+                        "event": "turn_complete",
+                        "turn": turn_id,
+                        "total_turn_duration_s": round(time.time() - turn_start_time, 2),
+                        "final_action": "no_tool",
+                    }
+                )
+                _dur = time.perf_counter() - _loop_start
+                self._append_loop_log(
+                    f"  solver(no_tool): {self._truncate(content, 100)}\n"
+                    f"TURN END | duration={_dur:.1f}s branch=no_tool\n"
+                )
                 return ChatHistoryItem(role=Role.AGENT, content=content)
             if action in {"use_tool", "create_tool"}:
                 tool_agent_traced = True
@@ -877,12 +1403,14 @@ class SelfEvolvingController(
                 }
 
                 if tool_action == "create_tool":
+                    self._append_loop_log("  create_tool: generating new tool via ToolGen...")
                     self._toolgen_last_recommendation = solver_recommendation
                     selected_tool = self._maybe_generate_tool_for_query(
                         task_query, working_history, allow_reuse=False, force=True
                     )
                     if selected_tool is None:
                         self._trace("registry_add_failed", "tool generation failed")
+                        self._append_loop_log("  create_tool: FAILED (toolgen returned None)")
                         tool_error = tool_error or "tool generation failed"
                         _record_tool_error("create_tool", tool_error)
                         tool_result = ToolResult.failure(tool_error)
@@ -892,6 +1420,7 @@ class SelfEvolvingController(
                         tool_result_injected = True
                     else:
                         self._trace("registry_add", selected_tool.name)
+                        self._append_loop_log(f"  create_tool: OK → {selected_tool.name}")
                         tool_suggestion["tool_name"] = selected_tool.name
 
                 if not tool_result_injected:
@@ -900,6 +1429,9 @@ class SelfEvolvingController(
                     )
                     tool_name = tool_invoker.get("tool_name")
                     payload = tool_invoker.get("payload")
+                    self._append_loop_log(
+                        f"  tool_invoker: selected={tool_name or '-'}"
+                    )
                     if tool_name:
                         args_auto_built = False
                         if not tool_result_injected:
@@ -1024,6 +1556,18 @@ class SelfEvolvingController(
                                         decision_action=tool_action,
                                     )
                                     last_tool_result = tool_result
+                                    _conf = None
+                                    _rec_preview = ""
+                                    if isinstance(tool_result.output, Mapping):
+                                        _conf = tool_result.output.get("confidence_score")
+                                        _rec_preview = self._truncate(
+                                            str(tool_result.output.get("answer_recommendation") or ""), 80
+                                        )
+                                    self._append_loop_log(
+                                        f"  tool_exec: success={tool_result.success} "
+                                        f"confidence={_conf} "
+                                        f"rec={_rec_preview or '-'}"
+                                    )
 
                             if not tool_result_injected:
                                 self._log_flow_event(
@@ -1206,6 +1750,14 @@ class SelfEvolvingController(
             solver_response = self._solver_inference_with_retry(
                 working_history, system_prompt=solver_prompt
             )
+            self._append_loop_log(
+                {
+                    "event": "solver_execution",
+                    "turn": turn_id,
+                    "has_sidecar": bool(solver_sidecar),
+                    "solver_response_preview": str(solver_response)[:150],
+                }
+            )
             self._append_solver_io_log(
                 {
                     "event": "solver_output",
@@ -1276,6 +1828,14 @@ class SelfEvolvingController(
                         content=content,
                     )
                     self._flush_tool_traces(tool_traces, content)
+                    self._append_loop_log(
+                        {
+                            "event": "turn_complete",
+                            "turn": turn_id,
+                            "total_turn_duration_s": round(time.time() - turn_start_time, 2),
+                            "final_action": action_name,
+                        }
+                    )
                     return ChatHistoryItem(role=Role.AGENT, content=content)
                 working_history = self._safe_inject(working_history, solver_response)
                 working_history = self._safe_inject(
@@ -1325,6 +1885,14 @@ class SelfEvolvingController(
                 content=content,
             )
             self._flush_tool_traces(tool_traces, content)
+            self._append_loop_log(
+                {
+                    "event": "turn_complete",
+                    "turn": turn_id,
+                    "total_turn_duration_s": round(time.time() - turn_start_time, 2),
+                    "final_action": action_name,
+                }
+            )
             self._log_flow_event(
                 "final_response",
                 chat_history=working_history,
@@ -1340,6 +1908,14 @@ class SelfEvolvingController(
             content=last_output,
         )
         self._flush_tool_traces(tool_traces, last_output)
+        self._append_loop_log(
+            {
+                "event": "turn_complete",
+                "turn": turn_id,
+                "total_turn_duration_s": round(time.time() - turn_start_time, 2),
+                "final_action": None,
+            }
+        )
         return ChatHistoryItem(role=Role.AGENT, content=last_output)
 
     def _inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
@@ -1574,6 +2150,10 @@ class SelfEvolvingController(
             return self._language_model_agent._inference(chat_history)
         finally:
             self._language_model_agent._system_prompt = original_prompt
+
+    def get_last_turn_data(self) -> dict[str, Any]:
+        data = getattr(self, "_last_turn_data", None)
+        return dict(data) if isinstance(data, dict) else {}
 
     @override
     def get_role_dict(self) -> Mapping[Role, str]:

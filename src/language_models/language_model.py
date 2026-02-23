@@ -69,6 +69,24 @@ class LanguageModel(ABC):
             if inference_config_dict is None:
                 inference_config_dict = {}
 
+            # --- PROMPT TRACING LOGIC ---
+            if system_prompt:
+                prompt_preview = system_prompt[:50].replace("\n", " ")
+                identity = "UNKNOWN"
+                if "Combined Orchestrator" in system_prompt:
+                    identity = "COMBINED_ORCHESTRATOR"
+                elif "TOOLGEN" in system_prompt or "ToolGen" in system_prompt:
+                    identity = "TOOLGEN_GENERATOR"
+                elif "###TOOL_START" in system_prompt or "Python" in system_prompt:
+                    identity = "TOOLGEN_GENERATOR"
+                elif "intelligent agent tasked with answering questions" in system_prompt:
+                    identity = "SOLVER_ACTOR"
+                elif "Actor" in system_prompt or "Solver" in system_prompt:
+                    identity = "SOLVER_ACTOR"
+                print(f"\n[PROMPT_TRACE] Agent Instance: {self.__class__.__name__}")
+                print(f"[PROMPT_TRACE] Detected Identity: {identity}")
+                print(f"[PROMPT_TRACE] System Prompt Preview: {prompt_preview}...")
+
             # ---- GLOBAL KILL SWITCH (prevents Ollama tool-call parsing 500) ----
             # Convert Mapping -> dict then recursively strip tool calling keys.
             cleaned = _strip_tool_calling(dict(inference_config_dict))

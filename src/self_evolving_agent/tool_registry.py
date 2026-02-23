@@ -44,6 +44,9 @@ class ToolMetadata:
     required_keys: list[str] = field(default_factory=list)
     optional_keys: list[str] = field(default_factory=list)
     property_types: dict[str, str] = field(default_factory=dict)
+    embedding: Optional[List[float]] = None
+    embedding_model: Optional[str] = None
+    embedding_text_hash: Optional[str] = None
 
 
 @dataclass
@@ -142,6 +145,7 @@ class ToolRegistry:
                         tool_metadata.optional_keys = opt_keys
                     if not tool_metadata.property_types:
                         tool_metadata.property_types = prop_types
+                self._ensure_embedding(tool_metadata, persist=False)
                 self._metadata[tool_metadata.name] = tool_metadata
         except Exception:
             # Corrupted metadata should not crash the run; start from an empty registry.
@@ -163,6 +167,14 @@ class ToolRegistry:
                 self._fingerprint_map = {}
         self._fingerprint_map = {}
         self._hydrate_fingerprint_map()
+
+    def refresh(self) -> None:
+        """Reload metadata and fingerprint maps from disk."""
+        with self._lock:
+            self._metadata = {}
+            self._fingerprint_map = {}
+            self._load_metadata()
+            self._load_fingerprint_map()
 
     def _save_fingerprint_map(self) -> None:
         try:
@@ -198,6 +210,49 @@ class ToolRegistry:
     def _sanitize_name(self, name: str) -> str:
         sanitized = re.sub(r"[^0-9a-zA-Z_]+", "_", name).strip("_")
         return sanitized or "tool"
+
+    _EMBED_DIM = 256
+    _EMBED_MODEL = "hashing_v1"
+
+    def _embedding_text(self, meta: ToolMetadata) -> str:
+        parts = [
+            meta.name or "",
+            meta.description or "",
+            meta.docstring or "",
+            meta.tool_type or "",
+            meta.tool_category or "",
+        ]
+        return "\n".join([p for p in parts if p]).strip()
+
+    def _embed_text(self, text: str) -> list[float]:
+        if not text:
+            return []
+        tokens = re.findall(r"[a-zA-Z0-9]+", text.lower())
+        if not tokens:
+            return []
+        dim = self._EMBED_DIM
+        vec = [0.0] * dim
+        for tok in tokens:
+            h = hashlib.md5(tok.encode("utf-8")).hexdigest()
+            idx = int(h, 16) % dim
+            vec[idx] += 1.0
+        norm = sum(v * v for v in vec) ** 0.5
+        if norm > 0:
+            vec = [v / norm for v in vec]
+        return vec
+
+    def _ensure_embedding(self, meta: ToolMetadata, *, persist: bool = False) -> None:
+        text = self._embedding_text(meta)
+        if not text:
+            return
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if meta.embedding and meta.embedding_text_hash == text_hash:
+            return
+        meta.embedding = self._embed_text(text)
+        meta.embedding_model = self._EMBED_MODEL
+        meta.embedding_text_hash = text_hash
+        if persist:
+            self._save_metadata()
 
     def _normalize_base_name(self, name: str) -> str:
         base = self._sanitize_name(name)
@@ -490,6 +545,7 @@ class ToolRegistry:
         input_schema: Optional[Any] = None,
         capabilities: Optional[Any] = None,
         environment: Optional[str] = None,
+        explicit_name: bool = False,
     ) -> Optional[ToolMetadata]:
         base_name = self._normalize_base_name(name)
         normalized_code = self._unwrap_code_block(code)
@@ -563,14 +619,21 @@ class ToolRegistry:
 
         version = 1
         tool_name = ""
-        if self._canonical_naming:
+        if explicit_name:
+            tool_name = base_name
+            if tool_name in self._metadata:
+                existing_meta = self._metadata[tool_name]
+                if existing_meta.code_hash == code_hash:
+                    if fingerprint and fingerprint not in self._fingerprint_map:
+                        self._fingerprint_map[fingerprint] = tool_name
+                        self._save_fingerprint_map()
+                    return existing_meta
+                version = self._next_version(base_name)
+                tool_name = f"{base_name}__v{version}"
+        elif self._canonical_naming:
             fingerprint_short = fingerprint or code_hash[:10]
             tool_name = self._canonical_name(base_name, fingerprint_short)
             if tool_name != base_name:
-                # print(
-                #     "[ToolRegistry] Canonicalized tool name "
-                #     f"'{base_name}' -> '{tool_name}'."
-                # )
                 pass
         else:
             version = self._next_version(base_name)
@@ -642,6 +705,7 @@ class ToolRegistry:
                 metadata.environment_usage = {}
             metadata.environment = environment  # Store the environment this tool was created for
             metadata.reliability_score = self._calculate_reliability(metadata)
+            self._ensure_embedding(metadata, persist=False)
             self._metadata[tool_name] = metadata
             self._save_metadata()
             if fingerprint:
@@ -695,6 +759,27 @@ class ToolRegistry:
             if base not in latest or meta.version > latest[base].version:
                 latest[base] = meta
         return list(latest.values())
+
+    def retrieve_similar_tools(
+        self,
+        query_text: str,
+        *,
+        top_k: int = 5,
+        environment: Optional[str] = None,
+    ) -> List[ToolMetadata]:
+        query_vec = self._embed_text(query_text or "")
+        if not query_vec:
+            return []
+        candidates = self.list_latest_tools(environment=environment)
+        scored: list[tuple[float, ToolMetadata]] = []
+        for meta in candidates:
+            self._ensure_embedding(meta, persist=False)
+            if not meta.embedding:
+                continue
+            sim = sum(a * b for a, b in zip(query_vec, meta.embedding))
+            scored.append((sim, meta))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [meta for _, meta in scored[: max(1, int(top_k))]]
 
     def resolve_name(self, name: str) -> Optional[str]:
         if name in self._metadata:

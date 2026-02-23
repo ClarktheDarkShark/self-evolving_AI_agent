@@ -100,8 +100,23 @@ class OpenaiLanguageModel(LanguageModel):
         self.disable_api_tools = disable_api_tools
 
         # Always-long timeout; no env var required.
-        timeout_s = self.DEFAULT_TIMEOUT_S
-        timeout = httpx.Timeout(timeout_s, read=timeout_s, write=timeout_s, connect=30.0)
+        env_timeout_raw = os.getenv("TOOLGEN_REQUEST_TIMEOUT_S", "").strip()
+        env_timeout_s: Optional[float]
+        if env_timeout_raw:
+            try:
+                env_timeout_s = float(env_timeout_raw)
+            except Exception:
+                env_timeout_s = None
+        else:
+            env_timeout_s = None
+        timeout_s = env_timeout_s if env_timeout_s is not None else self.DEFAULT_TIMEOUT_S
+        self._default_request_timeout_s = timeout_s
+        timeout = httpx.Timeout(
+            connect=60.0,
+            read=timeout_s,
+            write=60.0,
+            pool=60.0,
+        )
 
         http_client = self._build_httpx_client()
 
@@ -492,7 +507,28 @@ class OpenaiLanguageModel(LanguageModel):
         is_ollama: bool,
     ) -> ChatCompletion:
         self._assert_no_tool_request_fields(config, is_ollama=is_ollama)
-        return client.chat.completions.create(model=model, messages=messages, **config)
+        request_config = dict(config)
+        timeout_override = request_config.pop("request_timeout_s", None)
+        if timeout_override is None:
+            timeout_override = getattr(self, "_default_request_timeout_s", None)
+        timeout = httpx.Timeout(30.0, read=10.0, connect=5.0)
+        if timeout_override is not None:
+            try:
+                timeout_s = float(timeout_override)
+                timeout = httpx.Timeout(
+                    connect=60.0,
+                    read=timeout_s,
+                    write=60.0,
+                    pool=60.0,
+                )
+            except Exception:
+                pass
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            timeout=timeout,
+            **request_config,
+        )
 
 
     def _create_completion_with_optional_tool_choice_none(
@@ -582,7 +618,6 @@ class OpenaiLanguageModel(LanguageModel):
         # GPT-5-mini does not accept temperature values other than default.
         if self.model_name == "gpt-5-mini":
             sanitized_config.pop("temperature", None)
-        timeout_override_s = sanitized_config.pop("request_timeout_s", None)
 
         # print(f"[LM] messages | base_len={len(base_messages)} request_len={len(request_messages)}")
         if request_messages:
@@ -604,15 +639,6 @@ class OpenaiLanguageModel(LanguageModel):
 
         # Execute request
         client = self.client.with_options(max_retries=0) if is_ollama else self.client
-        if timeout_override_s is not None:
-            try:
-                timeout_s = float(timeout_override_s)
-                timeout = httpx.Timeout(
-                    timeout_s, read=timeout_s, write=timeout_s, connect=30.0
-                )
-                client = client.with_options(timeout=timeout)
-            except Exception:
-                pass
 
         def _request_completion(
             messages: Sequence[ChatCompletionMessageParam],

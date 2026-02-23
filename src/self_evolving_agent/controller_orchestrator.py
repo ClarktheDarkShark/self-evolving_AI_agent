@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from typing import Any, Mapping, Optional
 
 from src.typings import ChatHistory, ChatHistoryItem, Role
@@ -12,6 +13,20 @@ class ControllerOrchestratorMixin:
         r"<internal_tool\s+name=\"(?P<name>[^\"]+)\">(?P<body>[\s\S]*?)</internal_tool>"
     )
     _RELATIONS_OBS_PREFIX = "Observation: ["
+
+    def set_registry_dir(self, registry_dir: str) -> None:
+        """Align orchestrator registry path with the controller."""
+        if not registry_dir:
+            return
+        try:
+            from .tool_registry import get_registry
+        except Exception:
+            return
+        self._registry_dir = os.path.abspath(registry_dir)
+        try:
+            self._registry = get_registry(self._registry_dir)
+        except Exception:
+            pass
 
     def _extract_internal_tool_body(self, text: str) -> Optional[str]:
         match = self._INTERNAL_TOOL_RE.search(text or "")
@@ -107,6 +122,262 @@ class ControllerOrchestratorMixin:
         except Exception:
             return None
         return None
+    # ------------------------------------------------------------------
+    # Escape hatch baseline tool (Phase 4)
+    # ------------------------------------------------------------------
+    _REQUEST_NEW_TOOL_ENTRY = {
+        "name": "request_new_tool",
+        "signature": "request_new_tool(reasoning, failure_context, desired_behavior, active_variables, tool_type)",
+        "docstring": (
+            "CRITICAL: Trigger this ONLY when the Actor Agent is stuck in a loop, "
+            "experiences a database timeout (node explosion), or lacks an existing "
+            "tool in the catalog to perform the required logic. Do NOT use this if "
+            "an existing tool can accomplish the goal. This pauses the Actor and "
+            "commands the ToolGen pipeline to write a new Python tool. "
+            "Set tool_type='advisory' for read-only recommendation tools, or "
+            "'macro' for tools that execute multi-step operations directly."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["reasoning", "failure_context", "desired_behavior", "active_variables"],
+            "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": "Explanation of why existing tools are insufficient (prevents duplication).",
+                },
+                "failure_context": {
+                    "type": "string",
+                    "description": "What the Actor Agent just attempted that failed (e.g., '10-second timeout on get_relations(#3)').",
+                },
+                "desired_behavior": {
+                    "type": "string",
+                    "description": "Detailed step-by-step logic the new tool must execute.",
+                },
+                "active_variables": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of current KG variables from the ledger to pass to the tool.",
+                },
+                "tool_type": {
+                    "type": "string",
+                    "enum": ["advisory", "macro"],
+                    "description": "Whether to generate an advisory (read-only recommender) or macro (executable operation) tool.",
+                },
+            },
+        },
+        "required_keys": ["reasoning", "failure_context", "desired_behavior", "active_variables"],
+        "optional_keys": ["tool_type"],
+        "property_types": {
+            "reasoning": "string",
+            "failure_context": "string",
+            "desired_behavior": "string",
+            "active_variables": "array",
+            "tool_type": "string",
+        },
+        "invoke_with": None,
+        "run_payload_required": [],
+        "run_payload_optional": [],
+        "success": 0,
+        "failure": 0,
+        "reliability_score": 1.0,
+        "negative_marks": 0,
+    }
+
+    # ------------------------------------------------------------------
+    # Dynamic registry loader (Phase 3)
+    # ------------------------------------------------------------------
+    def _load_dynamic_registry(self):
+        """
+        Load the tool catalog from the persisted registry (metadata.json)
+        and filter out inactive / broken tools.
+
+        A tool is considered **inactive** when it has been invoked at least
+        once yet has zero successes (i.e. every invocation failed).  All
+        other tools — including brand-new tools that have never been invoked
+        — are treated as active.
+
+        Returns a list of ToolMetadata objects.  Gracefully returns an empty
+        list when the registry is empty or unreadable (first-run safe).
+        """
+        try:
+            current_env = self._resolved_environment_label()
+            tools = (
+                self._registry.list_latest_tools(environment=current_env)
+                if hasattr(self._registry, "list_latest_tools")
+                else self._registry.list_tools(environment=current_env)
+            )
+        except Exception:
+            return []
+
+        active_tools = []
+        for t in tools:
+            # Filter out tools where every invocation has failed
+            if t.usage_count > 0 and t.success_count == 0 and t.failure_count > 0:
+                continue
+            active_tools.append(t)
+        return active_tools
+
+    # ------------------------------------------------------------------
+    # Escape hatch handler (Phase 4)
+    # ------------------------------------------------------------------
+    def _handle_escape_hatch(
+        self,
+        decision: dict,
+        query: str,
+        chat_history,
+    ) -> dict:
+        """
+        Handle the ``request_new_tool`` escape hatch.
+
+        Pauses the Actor, triggers ToolGen with enriched context from the
+        Orchestrator's escape-hatch arguments, and returns an observation
+        dict for the Orchestrator to consume on its next turn.
+
+        Returns ``{"success": bool, "tool_name": str|None, "observation": str}``.
+        """
+        print(
+            "[!] ESCAPE HATCH TRIGGERED. "
+            "Pausing Actor Agent and spinning up ToolGen.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        # Extract escape hatch arguments from the orchestrator decision
+        reasoning = str(decision.get("reasoning") or decision.get("reason") or "")
+        failure_context = str(decision.get("failure_context") or "")
+        desired_behavior = str(
+            decision.get("desired_behavior")
+            or decision.get("needed_capabilities")
+            or ""
+        )
+        active_variables = decision.get("active_variables") or []
+        tool_type = str(decision.get("tool_type") or "advisory")
+
+        # Build an enriched query for ToolGen from the escape hatch context
+        parts = [query]
+        parts.append(f"TOOL_TYPE: {tool_type}")
+        if failure_context:
+            parts.append(f"FAILURE CONTEXT: {failure_context}")
+        if desired_behavior:
+            parts.append(f"DESIRED BEHAVIOR: {desired_behavior}")
+        if reasoning:
+            parts.append(f"REASONING: {reasoning}")
+        if active_variables:
+            parts.append(f"ACTIVE VARIABLES: {', '.join(str(v) for v in active_variables)}")
+        toolgen_query = "\n".join(parts)
+
+        self._trace("escape_hatch_trigger", toolgen_query)
+
+        # Trigger ToolGen (force=True, no reuse — existing tools are insufficient)
+        prev_relaxed = getattr(self, "_toolgen_relaxed_mode", False)
+        setattr(self, "_toolgen_relaxed_mode", True)
+        try:
+            runner = getattr(self, "_run_escape_hatch_toolgen", None)
+            if callable(runner):
+                new_tool = runner(decision, query, chat_history)
+            else:
+                new_tool = None
+        finally:
+            setattr(self, "_toolgen_relaxed_mode", prev_relaxed)
+
+        print(
+            f"\n[FORGE_DEBUG] Pipeline returned result type: {type(new_tool)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if new_tool:
+            if isinstance(new_tool, Mapping):
+                tool_name = new_tool.get("tool_name") or new_tool.get("name")
+                code = new_tool.get("code")
+                print(
+                    f"[FORGE_DEBUG] Tool Name: {tool_name or 'MISSING'}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"[FORGE_DEBUG] Code Found: {'YES' if code else 'NO'}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if code:
+                    print(
+                        f"[FORGE_DEBUG] Code Length: {len(code)} chars",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                if new_tool.get("error"):
+                    print(
+                        f"[FORGE_DEBUG] PIPELINE ERROR: {new_tool.get('error')}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
+                tool_name = getattr(new_tool, "name", None)
+                print(
+                    f"[FORGE_DEBUG] Tool Name: {tool_name or 'MISSING'}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    "[FORGE_DEBUG] Code Found: N/A (ToolMetadata)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            print(
+                "[FORGE_DEBUG] FATAL: Pipeline returned None or empty result.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if new_tool is not None:
+            if isinstance(new_tool, Mapping):
+                tool_spec = new_tool.get("tool_spec")
+                tool_code = new_tool.get("tool_code") or new_tool.get("code")
+                metadata = None
+                if tool_spec and tool_code:
+                    try:
+                        metadata = self._register_tool_from_payload_relaxed(
+                            tool_spec, tool_code, chat_history
+                        )
+                    except Exception:
+                        metadata = None
+                if metadata is None:
+                    self._trace("escape_hatch_failed", "toolgen_returned_mapping")
+                    return {
+                        "success": False,
+                        "tool_name": None,
+                        "observation": (
+                            "Observation: ToolGen returned code payload but "
+                            "registration failed. Check ToolGen logs."
+                        ),
+                    }
+                new_tool = metadata
+            # Hot-reload the registry so the Orchestrator sees the new tool
+            self._load_dynamic_registry()
+            self._trace("escape_hatch_success", new_tool.name)
+            return {
+                "success": True,
+                "tool_name": new_tool.name,
+                "observation": (
+                    "Observation: ToolGen successfully created and registered "
+                    "the new tool. Review your updated catalog and invoke the "
+                    "new tool now to advise the Solver."
+                ),
+            }
+        else:
+            self._trace("escape_hatch_failed", "toolgen_returned_none")
+            return {
+                "success": False,
+                "tool_name": None,
+                "observation": (
+                    "Observation: ToolGen failed to create a stable tool due "
+                    "to strict validation constraints. You must re-evaluate "
+                    "the problem and attempt to guide the Actor using existing "
+                    "tools."
+                ),
+            }
+
     def _format_orchestrator_docstring(self, tool) -> str:
         base_doc = (tool.docstring or "").strip()
         if base_doc:
@@ -114,15 +385,23 @@ class ControllerOrchestratorMixin:
         description = (tool.description or "").strip()
         return description or tool.name
 
-    def _orchestrator_compact_existing_tools(self) -> list[dict[str, Any]]:
-        # Filter tools by current environment
+    def _orchestrator_compact_existing_tools(
+        self, *, query_text: Optional[str] = None, top_k: int = 5
+    ) -> list[dict[str, Any]]:
+        # Use dynamic registry loader (filters inactive/broken tools)
+        tools = self._load_dynamic_registry()
         current_env = self._resolved_environment_label()
-        tools = (
-            self._registry.list_latest_tools(environment=current_env)
-            if hasattr(self._registry, "list_latest_tools")
-            else self._registry.list_tools(environment=current_env)
-        )
-        print(f"[ORCHESTRATOR] Found {len(tools)} tools for environment '{current_env}'")
+        if query_text:
+            try:
+                if hasattr(self._registry, "retrieve_similar_tools"):
+                    retrieved = self._registry.retrieve_similar_tools(
+                        query_text, top_k=top_k, environment=current_env
+                    )
+                    if retrieved:
+                        tools = retrieved
+            except Exception:
+                pass
+        print(f"[ORCHESTRATOR] Found {len(tools)} active tools for environment '{current_env}'")
         compact: list[dict[str, Any]] = []
         for t in tools:
             contract = self._parse_tool_invoke_contract(t.name)
@@ -155,7 +434,10 @@ class ControllerOrchestratorMixin:
                 }
             )
         # Limit to 15 most recent tools to reduce token usage
-        return compact[-15:]
+        compact = compact[-15:]
+        # Append the escape hatch baseline tool (Phase 4)
+        compact.append(dict(self._REQUEST_NEW_TOOL_ENTRY))
+        return compact
 
     def _orchestrator_request_prompt(
         self,
@@ -367,10 +649,22 @@ class ControllerOrchestratorMixin:
         if not self._orchestrator_agent:
             return {"action": "no_tool"}
 
+        obs_text = ""
+        try:
+            for item in reversed(list(self._history_items(chat_history))):
+                if item.role == Role.USER and "Observation:" in (item.content or ""):
+                    obs_text = item.content or ""
+                    break
+        except Exception:
+            obs_text = ""
+        retrieval_query = "\n".join([query or "", obs_text]).strip()
+
         # Trigger-based fast path: auto-decide based on observation characteristics
         if observation_triggers:
             try:
-                tools = self._orchestrator_compact_existing_tools()
+                tools = self._orchestrator_compact_existing_tools(
+                    query_text=retrieval_query
+                )
             except Exception:
                 tools = []
             for trigger in observation_triggers:
@@ -394,25 +688,58 @@ class ControllerOrchestratorMixin:
                         }
                     else:
                         return {
-                            "action": "create_tool",
+                            "action": "request_new_tool",
                             "reason": f"{trigger_type}_no_tool: {trigger.get('reason', '')}",
                         }
+                if trigger_type == "derailment_trigger":
+                    severity = trigger.get("severity", "medium")
+                    filter_tool = next(
+                        (
+                            t
+                            for t in tools
+                            if isinstance(t.get("name"), str)
+                            and t["name"].endswith("_generated_tool")
+                        ),
+                        None,
+                    )
+                    if severity == "high":
+                        # High severity: skip straight to new tool generation
+                        return {
+                            "action": "request_new_tool",
+                            "reason": f"derailment_high: {trigger.get('reason', '')}",
+                        }
+                    else:
+                        # Medium severity: prefer existing tool, else request new
+                        if filter_tool:
+                            return {
+                                "action": "use_tool",
+                                "tool_name": filter_tool["name"],
+                                "reason": f"derailment_medium: {trigger.get('reason', '')}",
+                            }
+                        else:
+                            return {
+                                "action": "request_new_tool",
+                                "reason": f"derailment_medium_no_tool: {trigger.get('reason', '')}",
+                            }
 
         prompt = self._orchestrator_request_prompt(
             query, chat_history, solver_recommendation=solver_recommendation
         )
         try:
-            tools = self._orchestrator_compact_existing_tools()
+            tools = self._orchestrator_compact_existing_tools(
+                query_text=retrieval_query
+            )
         except Exception:
             tools = []
         tool_list_text = json.dumps(tools, ensure_ascii=True, default=str)
         original_prompt = getattr(self._orchestrator_agent, "_system_prompt", "") or ""
-        self._orchestrator_agent._system_prompt = (
-            original_prompt
+        base_prompt = (getattr(self, "_orchestrator_system_prompt", "") or original_prompt).strip()
+        final_prompt = (
+            base_prompt
             + "\n\nThere are environment tools that you must NOT consider. Only use tools in the following list to make your decision. if the list is empty, you must generate a tool:\n"
             + tool_list_text
         ).strip()
-        self._write_agent_system_prompt("top_orchestrator", self._orchestrator_agent._system_prompt)
+        self._write_agent_system_prompt("top_orchestrator", final_prompt)
         self._trace("orchestrator_input", prompt)
         self._log_flow_event(
             "orchestrator_input",
@@ -423,8 +750,19 @@ class ControllerOrchestratorMixin:
         orchestration_history = self._safe_inject(
             orchestration_history, ChatHistoryItem(role=Role.USER, content=prompt)
         )
+        response = None
         try:
-            response = self._orchestrator_agent._inference(orchestration_history)
+            lm = getattr(self._orchestrator_agent, "_language_model", None)
+            cfg = getattr(self._orchestrator_agent, "_inference_config_dict", None) or {}
+            if lm is not None:
+                response = lm.inference(
+                    [orchestration_history],
+                    cfg,
+                    final_prompt,
+                )[0]
+            else:
+                self._orchestrator_agent._system_prompt = final_prompt
+                response = self._orchestrator_agent._inference(orchestration_history)
         finally:
             self._orchestrator_agent._system_prompt = original_prompt
         self._trace("orchestrator_result", response.content)
@@ -437,12 +775,17 @@ class ControllerOrchestratorMixin:
         if not isinstance(payload, Mapping):
             return {"action": "no_tool"}
         action = str(payload.get("action") or "no_tool").strip().lower()
-        if action not in {"use_tool", "no_tool", "create_tool"}:
+        if action not in {"use_tool", "no_tool", "create_tool", "request_new_tool"}:
             action = "no_tool"
         tool_name = payload.get("tool_name")
-        if action == "use_tool" and tool_name and not str(tool_name).endswith("_generated_tool"):
+        if (
+            action == "use_tool"
+            and tool_name
+            and str(tool_name) != "request_new_tool"
+            and not str(tool_name).endswith("_generated_tool")
+        ):
             tool_name = None
-        if tools:
+        if tools and action != "request_new_tool":
             selected_name = str(tool_name).strip() if tool_name else None
             if not selected_name or action != "use_tool":
                 fallback_name = None
@@ -463,6 +806,11 @@ class ControllerOrchestratorMixin:
             "evidence": payload.get("evidence"),
             "must_differ_from_existing": payload.get("must_differ_from_existing"),
             "self_test_cases": payload.get("self_test_cases"),
+            # Escape hatch fields (Phase 4)
+            "reasoning": payload.get("reasoning"),
+            "failure_context": payload.get("failure_context"),
+            "desired_behavior": payload.get("desired_behavior"),
+            "active_variables": payload.get("active_variables"),
         }
 
     def _tool_orchestrate_decision(
@@ -517,7 +865,11 @@ class ControllerOrchestratorMixin:
         if action not in {"use_tool", "create_tool"}:
             action = "create_tool"
         tool_name = payload.get("tool_name")
-        if tool_name and not str(tool_name).endswith("_generated_tool"):
+        if (
+            tool_name
+            and str(tool_name) != "request_new_tool"
+            and not str(tool_name).endswith("_generated_tool")
+        ):
             tool_name = None
             action = "create_tool"
         return {

@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from src.typings import ChatHistory
 from src.typings.config import get_predefined_timestamp_structure
@@ -15,6 +15,23 @@ from .tool_registry import ToolResult
 
 
 class ControllerLoggingMixin:
+    _trace_hook: Optional[Callable[[dict[str, Any]], None]] = None
+
+    def set_trace_hook(
+        self, hook: Optional[Callable[[dict[str, Any]], None]]
+    ) -> None:
+        """Register a trace hook for streaming live execution events."""
+        self._trace_hook = hook
+
+    def _emit_trace_event(self, payload: Mapping[str, Any]) -> None:
+        hook = getattr(self, "_trace_hook", None)
+        if not hook:
+            return
+        try:
+            hook(dict(payload))
+        except Exception:
+            return
+
     def _truncate(self, s: str, n: int) -> str:
         s = (s or "")
         return s if len(s) <= n else (s[:n] + "...[truncated]")
@@ -24,6 +41,23 @@ class ControllerLoggingMixin:
         # print(f"[TRACE] {label}:\n{text}")
         pass
 
+    # ── Orchestrator loop log ─────────────────────────────────────────────
+    def _append_loop_log(self, line: Any) -> None:
+        """Append a single line to orchestrator_loop.log."""
+        path = getattr(self, "_loop_log_path", None)
+        if isinstance(line, Mapping) or isinstance(line, list):
+            text = json.dumps(line, ensure_ascii=True, default=str)
+        else:
+            text = str(line)
+        try:
+            if path:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(text + "\n")
+        except Exception:
+            pass
+        self._emit_trace_event({"trace_type": "loop_log", "message": text})
+
     def _preview_for_log(self, obj: Any, max_len: int = 300) -> str:
         try:
             text = repr(obj)
@@ -32,16 +66,16 @@ class ControllerLoggingMixin:
         return text if len(text) <= max_len else text[: max_len - 3] + "..."
 
     def _append_generated_tools_log(self, payload: Mapping[str, Any]) -> None:
-        if not self._generated_tools_log_path:
-            return
         try:
-            self._generated_tools_log_path.parent.mkdir(parents=True, exist_ok=True)
             seq = self._next_generated_tools_log_seq()
             minimized = self._minimize_generated_tools_payload(payload, seq)
-            with self._generated_tools_log_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(minimized, ensure_ascii=True, default=str) + "\n")
+            if self._generated_tools_log_path:
+                self._generated_tools_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._generated_tools_log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(minimized, ensure_ascii=True, default=str) + "\n")
         except Exception:
             return
+        self._emit_trace_event({"trace_type": "generated_tool", **minimized})
 
     def _next_generated_tools_log_seq(self) -> int:
         path = self._generated_tools_log_path
@@ -610,6 +644,7 @@ class ControllerLoggingMixin:
             self._append_flow_log(payload, scope="session", chat_history=chat_history)
         if scope in {"both", "full"}:
             self._append_flow_log(payload, scope="full", chat_history=chat_history)
+        self._emit_trace_event({"trace_type": "flow_event", **payload})
 
     def _get_run_task_label(self) -> str:
         if self._run_task_label is not None:

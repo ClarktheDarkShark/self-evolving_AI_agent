@@ -7,9 +7,12 @@ import os
 import random
 import re
 import traceback
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 import ast
+import types
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from src.typings import ChatHistory, ChatHistoryItem, Role
 
@@ -18,7 +21,11 @@ from .tool_spec import ToolSpec
 from .tool_validation import validate_tool_code
 from .tool_retrieval import retrieve_tools
 from .toolgen_debug_logger import toolgen_debug_enabled
-from .controller_prompts import TOOLGEN_DEBUG_APPENDIX
+from .controller_prompts import (
+    TOOLGEN_DEBUG_APPENDIX,
+    TOOLGEN_SYSTEM_PROMPT_MARKERS,
+    TOOLGEN_VALIDATOR_SYSTEM_PROMPT,
+)
 from .toolgen_contracts import TOOL_START, TOOL_END, validate_toolgen_output
 from src.toolgen.prompts import get_toolgen_system_prompt
 from src.toolgen.prompting.build_task_pack import build_task_pack
@@ -187,6 +194,78 @@ class ControllerToolgenMixin:
             )
         return ""
 
+    def _strip_code_fences(self, text: str) -> str:
+        if not text:
+            return ""
+        fence = re.search(
+            r"```(?:python|py|text)?\s*([\s\S]*?)```",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if fence:
+            return fence.group(1).strip()
+        return text.strip()
+
+    def _toolgen_relaxed_mode_enabled(self) -> bool:
+        return bool(getattr(self, "_toolgen_relaxed_mode", False))
+
+    def _ensure_module_docstring(self, code: str) -> str:
+        try:
+            tree = ast.parse(code)
+            if ast.get_docstring(tree) is not None:
+                return code
+        except Exception:
+            return code
+        return '"""Auto-generated tool."""\n\n' + code.lstrip()
+
+    def _register_tool_from_payload_relaxed(
+        self,
+        tool_spec: Mapping[str, Any],
+        tool_code: str,
+        chat_history: ChatHistory,
+    ) -> Optional[ToolMetadata]:
+        if self._generated_tool_counter >= self._max_generated_tools_per_run:
+            return None
+        if not isinstance(tool_spec, Mapping) or not tool_code:
+            return None
+        spec_payload = self._normalize_tool_spec(dict(tool_spec))
+        spec_payload["code_lines"] = tool_code.splitlines()
+        spec = ToolSpec.from_payload(spec_payload)
+        code = self._ensure_module_docstring(tool_code)
+        try:
+            current_env = self._resolved_environment_label()
+            explicit_name = not self._is_generic_tool_name(spec.name)
+            metadata = self._registry.register_tool(
+                name=spec.name,
+                code=code,
+                signature=spec.signature,
+                description=spec.description,
+                tool_type=spec.tool_type,
+                tool_category=spec.tool_category,
+                input_schema=spec.input_schema,
+                capabilities=spec.capabilities,
+                environment=current_env,
+                explicit_name=explicit_name,
+            )
+        except Exception:
+            return None
+        if metadata is None:
+            try:
+                issues = []
+                if hasattr(self._registry, "_validate_tool_source"):
+                    issues = self._registry._validate_tool_source(code)
+                print(
+                    f"[TOOLGEN] Relaxed register failed issues={issues}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
+        if metadata:
+            self._generated_tool_counter += 1
+            self._mark_tool_invoked()
+        return metadata
+
     def _extract_marked_python(self, text: str) -> Optional[str]:
         if not text:
             return None
@@ -327,6 +406,8 @@ class ControllerToolgenMixin:
             return name
         if not name:
             return name
+        if not self._is_generic_tool_name(name):
+            return name
         if name.startswith(prefix):
             return name
         return f"{prefix}{name}"
@@ -353,8 +434,9 @@ class ControllerToolgenMixin:
         keywords = [w for w in words if w not in self._NAME_STOPWORDS]
         if not keywords:
             return None
-        name = "_".join(keywords[:4]) + "_tool"
-        return name[:50]
+        deduped = list(dict.fromkeys(keywords))
+        name = "_".join(deduped[:6])
+        return name[:60]
 
     def _parse_schema_keys_from_code(self, python_code: str) -> tuple[list[str], list[str]] | None:
         if not python_code:
@@ -541,6 +623,20 @@ class ControllerToolgenMixin:
         prompt = f"{prompt}\n\n{self._toolgen_tool_list_appendix()}".strip()
         return prompt
 
+    def _prepare_toolgen_agents(self, base_system_prompt: str) -> str:
+        agent = getattr(self, "_toolgen_agent", None)
+        if agent is not None:
+            agent._system_prompt = TOOLGEN_SYSTEM_PROMPT_MARKERS
+        validator = getattr(self, "_toolgen_validator_agent", None)
+        if validator is not None:
+            validator._system_prompt = TOOLGEN_VALIDATOR_SYSTEM_PROMPT
+        prompt = (base_system_prompt or "").strip()
+        if not prompt:
+            return TOOLGEN_SYSTEM_PROMPT_MARKERS
+        if "###TOOL_START" not in prompt:
+            return f"{TOOLGEN_SYSTEM_PROMPT_MARKERS}\n\n{prompt}".strip()
+        return prompt
+
     def _toolgen_call_llm(self, *, system_prompt: str, user_prompt: str) -> str:
         tool_history = ChatHistory()
         tool_history = self._safe_inject(
@@ -603,6 +699,11 @@ class ControllerToolgenMixin:
     ) -> Optional[Mapping[str, Any]]:
         if not tool_code:
             return None
+        exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        if isinstance(exec_payload, Mapping):
+            execution_validation = self._toolgen_execution_check(tool_code, exec_payload)
+            if execution_validation is not None:
+                return execution_validation
         payload = {
             "task_pack": task_pack,
             "tool": {
@@ -648,6 +749,212 @@ class ControllerToolgenMixin:
                 return True
         return False
 
+    def _build_toolgen_execution_payload(
+        self,
+        *,
+        task_text: str,
+        trace: Optional[Sequence[Mapping[str, Any]]],
+        failure_context: str = "",
+        active_variables: Optional[Sequence[Any]] = None,
+    ) -> dict[str, Any]:
+        actions_spec = {}
+        try:
+            actions_spec = self._available_actions_spec()
+        except Exception:
+            actions_spec = {}
+        registry_dir = getattr(self, "_registry_dir", "") or getattr(self, "_toolgen_registry_root", "") or "."
+        state_dir = os.path.join(registry_dir, "tool_state")
+        run_id = "toolgen_exec"
+        payload: dict[str, Any] = {
+            "task_text": task_text,
+            "asked_for": task_text,
+            "trace": trace or [],
+            "actions_spec": actions_spec,
+            "run_id": run_id,
+            "state_dir": state_dir,
+            "env_observation": failure_context,
+            "constraints": {
+                "active_variables": list(active_variables or []),
+                "failure_context": failure_context,
+            },
+        }
+        return payload
+
+    def _toolgen_execution_check(
+        self, tool_code: str, payload: Mapping[str, Any]
+    ) -> Optional[Mapping[str, Any]]:
+        if not tool_code or not isinstance(payload, Mapping):
+            return None
+        try:
+            compiled = compile(tool_code, "<generated_tool>", "exec")
+        except Exception as exc:
+            tb = traceback.format_exc()
+            return {
+                "grade": 0,
+                "issues": [f"execution_compile_failed: {exc}"],
+                "fixes": ["Fix syntax errors so the tool can compile."],
+                "summary": "Execution failed during compile.",
+                "traceback": tb,
+            }
+        module = types.ModuleType("generated_tool_exec")
+        try:
+            exec(compiled, module.__dict__)
+        except Exception as exc:
+            tb = traceback.format_exc()
+            return {
+                "grade": 0,
+                "issues": [f"execution_exec_failed: {exc}"],
+                "fixes": ["Fix module-level errors so the tool can import."],
+                "summary": "Execution failed during import.",
+                "traceback": tb,
+            }
+        run_fn = getattr(module, "run", None)
+        if not callable(run_fn):
+            return {
+                "grade": 0,
+                "issues": ["execution_run_missing: run() not callable"],
+                "fixes": ["Implement run(payload: dict) -> dict."],
+                "summary": "Execution failed: run() missing.",
+            }
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_fn, dict(payload))
+                result = future.result(timeout=4.0)
+        except TimeoutError:
+            return {
+                "grade": 0,
+                "issues": ["execution_timeout: run() exceeded 4s"],
+                "fixes": ["Reduce runtime and ensure run() is efficient."],
+                "summary": "Execution failed: timeout.",
+            }
+        except Exception as exc:
+            tb = traceback.format_exc()
+            return {
+                "grade": 0,
+                "issues": [f"execution_exception: {exc}"],
+                "fixes": ["Handle failure_context/trace defensively to avoid exceptions."],
+                "summary": "Execution failed: exception in run().",
+                "traceback": tb,
+            }
+        if not isinstance(result, Mapping):
+            return {
+                "grade": 0,
+                "issues": ["execution_output_invalid: run() did not return dict"],
+                "fixes": ["Ensure run() returns a dict with required keys."],
+                "summary": "Execution failed: output not dict.",
+            }
+        status = str(result.get("status") or "").lower()
+        recommendation = str(result.get("answer_recommendation") or "").strip()
+        pruned = result.get("pruned_observation")
+        rec_lower = recommendation.lower()
+        dead_end = False
+        if status in {"blocked", "error"}:
+            dead_end = True
+        if not recommendation and status != "done":
+            dead_end = True
+        if (
+            isinstance(pruned, (dict, list))
+            and not pruned
+            and status != "done"
+            and not recommendation
+        ):
+            dead_end = True
+        if "dead end" in rec_lower or "empty set" in rec_lower or "empty variable" in rec_lower:
+            dead_end = True
+        if dead_end:
+            return {
+                "grade": 0,
+                "issues": ["execution_dead_end: tool returned empty/blocked output"],
+                "fixes": ["Use failure_context/active_variables/trace to propose a concrete next step."],
+                "summary": "Execution failed: dead-end output.",
+            }
+        return None
+
+    def _run_escape_hatch_toolgen(
+        self,
+        decision: Mapping[str, Any],
+        query: str,
+        chat_history: ChatHistory,
+    ) -> Optional[ToolMetadata]:
+        def _stringify(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, (list, tuple, set)):
+                return ", ".join(str(v) for v in value)
+            return str(value)
+
+        reasoning = _stringify(decision.get("reasoning") or decision.get("reason"))
+        failure_context = _stringify(decision.get("failure_context"))
+        desired_behavior = _stringify(decision.get("desired_behavior"))
+        tool_type = _stringify(
+            decision.get("tool_type") or decision.get("needed_capabilities")
+        )
+        active_variables = decision.get("active_variables") or []
+        active_variables_str = _stringify(active_variables)
+
+        blueprint_header = (
+            "=== ORCHESTRATOR BLUEPRINT ===\n"
+            f"TOOL TYPE REQUIRED: {tool_type}\n"
+            f"FAILURE CONTEXT: {failure_context}\n"
+            f"DESIRED BEHAVIOR: {desired_behavior}\n"
+            f"ACTIVE VARIABLES: {active_variables_str}\n"
+            "==============================\n\n"
+        )
+
+        parts = [query]
+        if failure_context:
+            parts.append(f"FAILURE CONTEXT: {failure_context}")
+        if desired_behavior:
+            parts.append(f"DESIRED BEHAVIOR: {desired_behavior}")
+        if reasoning:
+            parts.append(f"REASONING: {reasoning}")
+        if active_variables_str:
+            parts.append(f"ACTIVE VARIABLES: {active_variables_str}")
+        toolgen_query = "\n".join(parts)
+
+        env_name = self._resolved_environment_label()
+        env_contract = ""
+        context = getattr(self, "_toolgen_agg_context", None)
+        if isinstance(context, Mapping):
+            env_contract = str(context.get("env_contract") or "")
+        if not env_contract:
+            try:
+                for item in self._history_items(chat_history):
+                    if item.role == Role.USER:
+                        env_contract = (item.content or "").strip()
+                        break
+            except Exception:
+                env_contract = ""
+
+        user_prompt = build_task_pack(env_name, env_contract, [toolgen_query])
+        final_user_prompt = blueprint_header + user_prompt
+        system_prompt = get_toolgen_system_prompt(
+            getattr(self, "_toolgen_pipeline_name", "baseline"),
+            env_name,
+        )
+        trace_steps = []
+        try:
+            trace_steps, _ = self._build_structured_trace(chat_history)
+        except Exception:
+            trace_steps = []
+        exec_payload = self._build_toolgen_execution_payload(
+            task_text=toolgen_query,
+            trace=trace_steps[-10:] if trace_steps else [],
+            failure_context=failure_context,
+            active_variables=active_variables,
+        )
+        prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        setattr(self, "_toolgen_execution_payload", exec_payload)
+        try:
+            return self._toolgen_generate_from_prompt(
+                user_prompt=final_user_prompt,
+                system_prompt=system_prompt,
+                chat_history=chat_history,
+                name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+            )
+        finally:
+            setattr(self, "_toolgen_execution_payload", prev_exec_payload)
+
     def _toolgen_generate_from_prompt(
         self,
         *,
@@ -656,9 +963,11 @@ class ControllerToolgenMixin:
         chat_history: ChatHistory,
         name_prefix: str,
     ) -> Optional[ToolMetadata]:
+        system_prompt = self._prepare_toolgen_agents(system_prompt)
         mode = get_toolgen_mode()
         validate = self._toolgen_should_validate()
-        max_rounds = 4 if validate else 1
+        max_rounds = 8 if validate else 1
+        relaxed_mode = self._toolgen_relaxed_mode_enabled()
         base_prompt = user_prompt
         last_candidate: Optional[Mapping[str, Any]] = None
         last_validation: Optional[Mapping[str, Any]] = None
@@ -742,6 +1051,37 @@ class ControllerToolgenMixin:
                 error = str(candidate.get("error"))
                 raw_output = candidate.get("raw_output")
                 try:
+                    raw_len = len(raw_output or "")
+                    has_start = "###TOOL_START" in (raw_output or "")
+                    has_end = "###TOOL_END" in (raw_output or "")
+                    has_run = "def run" in (raw_output or "")
+                    print(
+                        f"[TOOLGEN] candidate_error={error} raw_len={raw_len} "
+                        f"start={has_start} end={has_end} has_run={has_run}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                if relaxed_mode and isinstance(raw_output, str):
+                    salvage = self._extract_marked_python(raw_output)
+                    if not salvage:
+                        salvage = self._strip_code_fences(raw_output)
+                    if salvage and "def run" in salvage:
+                        tool_spec = self._wrap_marker_tool_spec(salvage)
+                        tool_name = str(tool_spec.get("name") or "")
+                        tool_spec["name"] = self._apply_tool_name_prefix(tool_name, name_prefix)
+                        metadata = self._register_tool_from_payload_relaxed(
+                            tool_spec, salvage, chat_history
+                        )
+                        if metadata:
+                            print(
+                                f"[TOOLGEN] Salvaged registration succeeded: {metadata.name}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            return metadata
+                try:
                     self._append_generated_tools_log(
                         {
                             "event": "toolgen_round_failed",
@@ -792,6 +1132,18 @@ class ControllerToolgenMixin:
             last_tool_spec = tool_spec
             last_static_ok = False
             last_smoke_ok = False
+
+            if relaxed_mode:
+                metadata = self._register_tool_from_payload_relaxed(
+                    tool_spec, tool_code, chat_history
+                )
+                if metadata:
+                    print(
+                        f"[TOOLGEN] Relaxed registration succeeded: {metadata.name}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return metadata
 
             static_ok, static_err = self._toolgen_static_check(tool_code)
             if not static_ok:
@@ -921,6 +1273,11 @@ class ControllerToolgenMixin:
                 tool_spec, tool_code, task_pack=base_prompt
             )
             if not validation:
+                print(
+                    "[DEBUG] ToolGen Validator Result: no_validation_returned",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 continue
             last_validation = validation
             grade_raw = validation.get("grade")
@@ -929,6 +1286,16 @@ class ControllerToolgenMixin:
             except Exception:
                 grade = 0
             last_grade = grade
+            try:
+                issues = validation.get("issues")
+                print(
+                    f"[DEBUG] ToolGen Validator Result: grade={grade} "
+                    f"issues={issues}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
             try:
                 self._append_generated_tools_log(
                     {
@@ -946,7 +1313,14 @@ class ControllerToolgenMixin:
             if grade > best_grade:
                 best_grade = grade
                 best_candidate = candidate
-            if grade >= 8:
+            min_grade = 8
+            try:
+                override = os.getenv("LIFELONG_TOOLGEN_MIN_GRADE", "").strip()
+                if override:
+                    min_grade = max(8, int(override))
+            except Exception:
+                min_grade = 8
+            if grade >= min_grade:
                 metadata = self._register_tool_from_payload(tool_spec, chat_history)
                 if staged_meta:
                     self._toolgen_log_staged_registration(staged_meta, metadata)
@@ -954,6 +1328,11 @@ class ControllerToolgenMixin:
                     self._registry.record_validation_result(metadata.name, success=True)
                     return metadata
                 continue
+            print(
+                "[WARN] Tool rejected by Validator. Registry will not be updated.",
+                file=sys.stderr,
+                flush=True,
+            )
             feedback_payload = {
                 "validation": validation,
                 "last_tool_name": tool_spec.get("name"),
@@ -1010,6 +1389,22 @@ class ControllerToolgenMixin:
         # Prefer the highest-graded validated candidate over the last one.
         use_candidate = best_candidate if best_candidate is not None else last_candidate
         if not use_candidate:
+            if relaxed_mode and last_tool_spec and last_tool_code:
+                metadata = self._register_tool_from_payload_relaxed(
+                    last_tool_spec, last_tool_code, chat_history
+                )
+                if metadata:
+                    print(
+                        f"[TOOLGEN] Relaxed fallback registration succeeded: {metadata.name}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return metadata
+                return {
+                    "error": "relaxed_registration_failed",
+                    "tool_spec": last_tool_spec,
+                    "tool_code": last_tool_code,
+                }
             try:
                 self._append_generated_tools_log(
                     {
@@ -1087,6 +1482,20 @@ class ControllerToolgenMixin:
 
         self._trace("tool_agent_input", user_prompt)
         final_system_prompt = self._toolgen_build_system_prompt(system_prompt)
+
+        # --- TRUNCATION LOGIC TO PREVENT HANGS ---
+        max_chars = 40000  # Safety limit (~10k tokens)
+        prompt_str = str(final_system_prompt) + str(user_prompt)
+
+        if len(prompt_str) > max_chars:
+            print(f"[WARN] Prompt too large ({len(prompt_str)} chars). Truncating history...")
+            # Keep the system instructions (final_system_prompt) but slice the user history
+            user_prompt = str(user_prompt)[-max_chars:]
+
+        print(
+            f"[DEBUG] Final Staged Prompt Length: "
+            f"{len(str(final_system_prompt)) + len(str(user_prompt))} chars"
+        )
         debug_prompt = os.getenv("TOOLGEN_DEBUG_PROMPT") == "1"
         if debug_prompt and not getattr(self, "_toolgen_first_prompt_printed", False):
             print("[ToolGen] first_run system_prompt:\n" + final_system_prompt)
@@ -1096,17 +1505,46 @@ class ControllerToolgenMixin:
         raw_text_full = ""
         extracted = None
         for attempt in range(3):
-            print("[TOOLGEN] Calling toolgen agent inference...")
+            print(
+                "[TOOLGEN] Calling toolgen agent inference...",
+                file=sys.stderr,
+                flush=True,
+            )
             try:
                 raw_text_full = self._toolgen_call_llm(
                     system_prompt=final_system_prompt,
                     user_prompt=user_prompt,
                 )
-                print("[TOOLGEN] Toolgen agent inference completed")
+                print(
+                    "[TOOLGEN] Toolgen agent inference completed",
+                    file=sys.stderr,
+                    flush=True,
+                )
             except Exception as e:
-                print(f"[TOOLGEN] ERROR: Toolgen agent inference failed: {e}")
+                print(
+                    f"[TOOLGEN] ERROR: Toolgen agent inference failed: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 raise
 
+            try:
+                raw_len = len(raw_text_full or "")
+                head = (raw_text_full or "")[:200].replace("\n", "\\n")
+                tail = (raw_text_full or "")[-200:].replace("\n", "\\n")
+                print(
+                    f"[TOOLGEN] raw_output_len={raw_len} head={head}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if raw_len > 200:
+                    print(
+                        f"[TOOLGEN] raw_output_tail={tail}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except Exception:
+                pass
             self._trace("tool_agent_result", raw_text_full)
             extracted = self._extract_marked_python(raw_text_full)
             if extracted:
@@ -1114,12 +1552,32 @@ class ControllerToolgenMixin:
             if attempt < 2:
                 continue
         if not extracted:
-            self._write_failed_tool_artifact(
-                stage="toolgen_markers_missing",
-                error="marker_block_not_found",
-                raw_output=raw_text_full,
-            )
-            return {"error": "toolgen_markers_missing", "raw_output": raw_text_full}
+            fallback = self._strip_code_fences(raw_text_full)
+            if fallback and "def run" in fallback:
+                print(
+                    "[TOOLGEN] Fallback: extracted code from fenced block",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                extracted = fallback
+            else:
+                try:
+                    has_start = "###TOOL_START" in (raw_text_full or "")
+                    has_end = "###TOOL_END" in (raw_text_full or "")
+                    has_run = "def run" in (raw_text_full or "")
+                    print(
+                        f"[TOOLGEN] marker_missing start={has_start} end={has_end} has_run={has_run}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                self._write_failed_tool_artifact(
+                    stage="toolgen_markers_missing",
+                    error="marker_block_not_found",
+                    raw_output=raw_text_full,
+                )
+                return {"error": "toolgen_markers_missing", "raw_output": raw_text_full}
 
         tool_spec = self._wrap_marker_tool_spec(extracted)
         tool_name = str(tool_spec.get("name") or "")
@@ -1178,6 +1636,7 @@ class ControllerToolgenMixin:
             "environment": self._resolved_environment_label(),
             "note": "chat_history is embedded in user_prompt history for recent actions.",
         }
+        print(f"[DEBUG] Sending ToolGen prompt. Length: {len(str(final_system_prompt)) + len(str(user_prompt))} chars")
         raw_text_full = ""
         extracted = None
         for attempt in range(3):
@@ -1194,12 +1653,16 @@ class ControllerToolgenMixin:
             if attempt < 2:
                 continue
         if not extracted:
-            self._write_failed_tool_artifact(
-                stage="toolgen_markers_missing",
-                error="marker_block_not_found",
-                raw_output=raw_text_full,
-            )
-            return {"error": "toolgen_markers_missing", "raw_output": raw_text_full}
+            fallback = self._strip_code_fences(raw_text_full)
+            if fallback and "def run" in fallback:
+                extracted = fallback
+            else:
+                self._write_failed_tool_artifact(
+                    stage="toolgen_markers_missing",
+                    error="marker_block_not_found",
+                    raw_output=raw_text_full,
+                )
+                return {"error": "toolgen_markers_missing", "raw_output": raw_text_full}
         tool_name = self._extract_tool_name_from_code(extracted) or "unknown_generated_tool"
         final_sha256 = hashlib.sha256(extracted.encode("utf-8")).hexdigest()
         line_count = len(extracted.splitlines())
@@ -1218,7 +1681,15 @@ class ControllerToolgenMixin:
             }
         )
         if run_sig_error:
-            return None
+            try:
+                print(
+                    f"[TOOLGEN] run signature error: {run_sig_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return {"error": "run_signature", "raw_output": raw_text_full}
 
         def _excerpt(code: str, lineno: Optional[int], window: int = 5) -> list[str]:
             if not lineno:
@@ -1648,6 +2119,18 @@ class ControllerToolgenMixin:
             if derived:
                 normalized["name"] = derived
                 name = derived
+        if self._is_generic_tool_name(name):
+            derived = self._toolgen_name_from_description(
+                str(getattr(self, "_toolgen_last_query", "") or "")
+            )
+            if derived:
+                normalized["name"] = derived
+                name = derived
+        if name.startswith("agg3__"):
+            candidate = name[len("agg3__"):]
+            if candidate and not self._is_generic_tool_name(candidate):
+                normalized["name"] = candidate
+                name = candidate
         if name and not name.endswith("_generated_tool"):
             normalized["name"] = f"{name}_generated_tool"
         normalized.setdefault("description", self._toolgen_default_description())
@@ -1881,8 +2364,27 @@ class ControllerToolgenMixin:
         try:
             # Get current environment to organize tools by env
             current_env = self._resolved_environment_label()
-            print(f"[TOOL_REGISTER] Registering tool '{spec.name}' for environment '{current_env}'")
+            print(
+                f"[TOOL_REGISTER] Registering tool '{spec.name}' for environment '{current_env}'",
+                file=sys.stderr,
+                flush=True,
+            )
+            registry_base = ""
+            tool_path = ""
+            try:
+                registry_base = getattr(self._registry, "base_path", "")
+                tool_path = getattr(
+                    self._registry, "_get_tool_path", lambda n, environment=None: ""
+                )(spec.name, environment=current_env)
+                print(
+                    f"[TOOL_REGISTER] registry_base={registry_base} tool_path={tool_path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
 
+            explicit_name = not self._is_generic_tool_name(spec.name)
             metadata = self._registry.register_tool(
                 name=spec.name,
                 code=code,
@@ -1893,6 +2395,7 @@ class ControllerToolgenMixin:
                 input_schema=spec.input_schema,
                 capabilities=spec.capabilities,
                 environment=current_env,
+                explicit_name=explicit_name,
             )
         except Exception as exc:
             self._trace("tool_generation_error", f"stage=register_exception error={exc}")
@@ -1904,8 +2407,67 @@ class ControllerToolgenMixin:
                 raw_spec=raw_spec,
             )
             return None
+        try:
+            if tool_path:
+                print(
+                    f"[DEBUG_FILE] Attempting to save tool to: {tool_path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if os.path.exists(tool_path):
+                    print(
+                        "[DEBUG_FILE] SUCCESS: File exists on disk. "
+                        f"Size: {os.path.getsize(tool_path)} bytes",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[DEBUG_FILE] ERROR: File NOT found on disk after write attempt!",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            registry_dir = getattr(self, "_registry_dir", "") or registry_base
+            if registry_dir and os.path.isdir(registry_dir):
+                print(
+                    f"[DEBUG_FILE] Current files in registry: "
+                    f"{os.listdir(registry_dir)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception:
+            pass
+        if metadata is None:
+            try:
+                issues = []
+                if hasattr(self._registry, "_validate_tool_source"):
+                    issues = self._registry._validate_tool_source(code)
+                print(
+                    f"[TOOL_REGISTER] FAILED: issues={issues} "
+                    f"tool='{spec.name}' env='{current_env}'",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return None
         if metadata:
             self._tool_creation_successes += 1
+            print(
+                f"[DEBUG] Tool added to registry: {metadata.name}",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                if hasattr(self._registry, "refresh"):
+                    self._registry.refresh()
+                    print(
+                        "[TOOL_REGISTER] Registry refresh complete",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except Exception:
+                pass
             try:
                 payload = {
                     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1979,13 +2541,19 @@ class ControllerToolgenMixin:
         use_pipeline: bool = True,
     ) -> Optional[ToolMetadata]:
         negative_trigger = self._toolgen_negative_mark_triggered()
-        if getattr(self, "_toolgen_off", False) and not negative_trigger:
+        if (
+            getattr(self, "_toolgen_off", False)
+            and not getattr(self, "_force_toolgen_always_on", False)
+            and not negative_trigger
+        ):
             return None
         if not query.strip():
             return None
         if negative_trigger:
             allow_reuse = False
             force = True
+            use_pipeline = False
+        if force and getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
             use_pipeline = False
         if (
             getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3"
@@ -2051,9 +2619,13 @@ class ControllerToolgenMixin:
             return None
 
         prompt = self._toolgen_request_prompt(query, chat_history)
+        system_prompt = get_toolgen_system_prompt(
+            getattr(self, "_toolgen_pipeline_name", "baseline"),
+            env_name,
+        )
         return self._toolgen_generate_from_prompt(
             user_prompt=prompt,
-            system_prompt=getattr(self._toolgen_agent, "_system_prompt", "") or "",
+            system_prompt=system_prompt,
             chat_history=chat_history,
             name_prefix="",
         )
