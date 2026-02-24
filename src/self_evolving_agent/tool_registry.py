@@ -49,6 +49,7 @@ class ToolMetadata:
     required_keys: list[str] = field(default_factory=list)
     optional_keys: list[str] = field(default_factory=list)
     property_types: dict[str, str] = field(default_factory=dict)
+    quality_score: float = 5.0
     embedding: Optional[List[float]] = None
     embedding_model: Optional[str] = None
     embedding_text_hash: Optional[str] = None
@@ -252,10 +253,14 @@ class ToolRegistry:
     _EMBED_MODEL_FALLBACK = "hashing_v1"
 
     def _embedding_text(self, meta: ToolMetadata) -> str:
+        # Name and docstring are primary signals for semantic retrieval.
+        # They appear first so the embedder weights them most heavily.
+        name = meta.name or ""
+        docstring = meta.docstring or meta.description or ""
         parts = [
-            meta.name or "",
+            name,
+            docstring,
             meta.description or "",
-            meta.docstring or "",
             meta.tool_type or "",
             meta.tool_category or "",
         ]
@@ -506,9 +511,30 @@ class ToolRegistry:
             self._save_metadata()
 
     def record_task_outcome(self, name: str, *, success: bool) -> None:
-        if success:
-            return
-        self.record_negative_mark(name)
+        with self._lock:
+            meta = self._metadata.get(name)
+            if meta is not None:
+                if success:
+                    meta.quality_score = min(10.0, meta.quality_score + 0.1)
+                    meta.success_count += 1
+                else:
+                    meta.quality_score = max(0.0, meta.quality_score - 0.2)
+                    meta.negative_marks += 1
+                    meta.failure_count += 1
+                meta.reliability_score = self._calculate_reliability(meta)
+                self._save_metadata()
+                return
+        if not success:
+            self.record_negative_mark(name)
+
+    def set_quality_score(self, name: str, score: float) -> None:
+        """Set the quality_score for a tool (e.g. from its validation grade)."""
+        with self._lock:
+            meta = self._metadata.get(name)
+            if not meta:
+                return
+            meta.quality_score = max(0.0, min(10.0, float(score)))
+            self._save_metadata()
 
     @staticmethod
     def _preview(obj: Any, max_len: int = 300) -> str:
@@ -711,6 +737,9 @@ class ToolRegistry:
         tool_path = self._get_tool_path(tool_name, environment=environment)
         module_doc, run_doc = self._extract_docstrings(normalized_code)
         docstring = run_doc or module_doc or description
+        # Use module docstring as description for semantic retrieval/dedup
+        if module_doc:
+            description = module_doc
         with self._lock:
             # print(f"[ToolRegistry] Persisting tool '{tool_name}' to '{tool_path}'")
             try:
@@ -837,7 +866,10 @@ class ToolRegistry:
             if not meta.embedding or len(meta.embedding) != len(query_vec):
                 continue
             sim = sum(a * b for a, b in zip(query_vec, meta.embedding))
-            scored.append((sim, meta))
+            # Weight by quality_score so proven tools rank higher.
+            q = getattr(meta, "quality_score", 5.0)
+            final_score = sim * (max(0.1, q) / 10.0)
+            scored.append((final_score, meta))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [meta for _, meta in scored[: max(1, int(top_k))]]
 

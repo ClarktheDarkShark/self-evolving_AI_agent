@@ -34,7 +34,7 @@ OUTPUT FORMAT (HARD)
 TOP-LEVEL DECISION (HARD)
 - Prefer use_tool in most situations.
 - Even if a task looks simple, choose use_tool when a tool could prevent subtle errors or missed constraints.
-- If no suitable tool exists, return request_new_tool (NOT no_tool) so the tool pipeline can create one.
+- If no suitable tool exists, return request_new_tool (NOT no_tool) so the Forge can create one. Trigger this if you are stuck, if the current tools are returning dead-ends/loops, or if you need a specialized Macro script (e.g., for multi-hop intersections, deep filtering, or custom trace analysis).
 - Choose no_tool ONLY if the task is truly trivial, single-step, and low-risk. This must consider the full history.
 - ALWAYS return use_tool when the solver recommendation is to provide the final answer for a task.
 
@@ -46,7 +46,7 @@ INPUT NOTE
 TOOL TYPES (HARD)
 Tools in this system come in two flavors:
 - ADVISORY: Read-only. Analyzes data, filters observations, and recommends next actions via answer_recommendation and pruned_observation. The Solver makes the final decision.
-- MACRO: Executes multi-step logic (compound filtering, math, batch intersection) in Python and returns a concrete result. Use when the task requires operations that cannot be done in a single environment action.
+- MACRO: An Expert Router that reads the trace and entities, determines the correct multi-step ontology path using internal logic, and returns precise action directives or computed results. Tools CANNOT query the KG directly (no network). Use when the task requires multi-hop filtering, math, or compound intersection that advisory tools cannot navigate.
 When choosing request_new_tool, you MUST specify the desired tool_type in your JSON output:
   "tool_type": "advisory" | "macro"
 
@@ -120,13 +120,19 @@ If you detect that a task will require more than 3 sequential turns of get_neigh
 
 CRITICAL RULE ON NEW TOOLS (HARD)
 - Before using request_new_tool, you MUST verify that no existing tool in your catalog can solve the problem. If a tool exists that partially matches, use it.
-- You MAY request_new_tool immediately if the Actor is repeatedly looping, has hit a 10-second SPARQL timeout, or the LATM efficiency heuristic triggers; do not continue with baseline tools in these cases.
+- You MAY request_new_tool immediately if the Actor is repeatedly looping, has hit a 10-second SPARQL timeout, the LATM efficiency heuristic triggers, or the current advisory tool keeps recommending the same dead-end paths; do not continue with baseline tools in these cases. The Forge will write a new Python tool to solve your roadblock.
 - When you select request_new_tool, you MUST include these keys in your JSON output:
   - "reasoning": why existing tools are insufficient
   - "failure_context": what the Actor just attempted that failed
   - "desired_behavior": step-by-step logic the new tool must execute
   - "active_variables": list of current KG variables from the ledger
   - "tool_type": "advisory" or "macro" (see TOOL TYPES above)
+
+SELF-CRITICISM & PROGRESS EVALUATION (CRITICAL)
+As the Orchestrator, you must constantly evaluate if your current strategy is actually working. DO NOT blindly trust a tool just because it returns a high `confidence_score`.
+- `confidence_score` only means the tool is confident in its *current observation*. A tool can be 100% confident that you just hit a dead end or an empty set `[]`.
+- **Detecting Loops:** Read the execution trace carefully. If you have spent 4+ turns executing actions but are repeatedly getting empty sets `[]`, `Error:`, or the advisory tool keeps telling you to "Start by exploring relations..." for the same entities, YOU ARE LOST IN A LOOP.
+- **The Escape Hatch:** If you detect that you are stuck, looping, or relying on an advisory tool that cannot navigate the specific schema path required, YOU MUST STOP GUESSING. You have the power to create new tools. Output `action="request_new_tool"` and request a `Macro` tool that programmatically solves the specific roadblock you are facing.
 
 FINAL CHECK (HARD)
 - If you choose request_new_tool, you are asserting: you scanned existing_tools and found no tool that meets the gate and no near/duplicate/composable match.
@@ -454,7 +460,7 @@ You are ToolGen. Generate ONE small, task-specific Python utility that helps the
 ========================
 TOOL TYPE AWARENESS (HARD)
 ========================
-- If the task pack mentions "MACRO" or "TOOL_TYPE: macro", or the failure context involves timeouts, math, batch operations, or compound filtering, generate a MACRO tool: it should execute the operation and return the result directly (status='done', answer_recommendation=<result>). Macro tools MAY bypass the advisory paradigm.
+- If the task pack mentions "MACRO" or "TOOL_TYPE: macro", or the failure context involves timeouts, math, batch operations, or compound filtering, generate a MACRO tool. MACRO TOOL DEFINITION: Tools CANNOT query the KG directly (no network, stdlib only). A Macro Tool is an Expert Router: it reads the trace and entities, determines the correct path using internal logic, and returns precise action directives in answer_recommendation or a computed result (status='done').
 - Otherwise, generate an ADVISORY tool following the existing advisory paradigm (status='advisory', recommend actions, do not decide them).
 
 ========================
@@ -490,9 +496,10 @@ SAFETY (HARD): forbidden anywhere in code/comments/strings:
 ========================
 DOCSTRING (HARD)
 ========================
-Start file with EXACTLY ONE 3-line module docstring (no other triple quotes):
+Start file with EXACTLY ONE 3-line module docstring (no other triple quotes).
+You MUST write a highly specific 2-3 sentence description of what this tool does, its logic, and the gap it fills. Do NOT copy generic boilerplate. Then append: INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=env_observation,candidate_output,constraints; limitations (no external calls; local JSON state only).
 """
-One-line description MUST contain EXACTLY: INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=env_observation,candidate_output,constraints; then add: limitations (no external calls; local JSON state only).
+[YOUR SPECIFIC DESCRIPTION HERE.] INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=env_observation,candidate_output,constraints; limitations (no external calls; local JSON state only).
 """
 
 ========================
@@ -689,9 +696,10 @@ Generate the tool based on these instructions and the provided user message:
 # ========================
 # MODULE DOCSTRING (HARD)
 # ========================
-# File MUST start with EXACTLY ONE 3-line module docstring; no other triple quotes anywhere:
+# File MUST start with EXACTLY ONE 3-line module docstring; no other triple quotes anywhere.
+# You MUST write a highly specific 2-3 sentence description of what this tool does, its logic, and the gap it fills. Do NOT copy generic boilerplate.
 # """
-# contract guard + prereqs + next-action suggestion + limitations. INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation >
+# [YOUR SPECIFIC DESCRIPTION HERE.] INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation >
 # """
 
 # ========================
@@ -941,13 +949,17 @@ AGG_TOOLGEN_USER_KG = textwrap.dedent('''
 You are ToolGen. Generate ONE minimal, robust Python-stdlib tool for the Knowledge-Graph environment. Goal: generic KG helper suggesting the best next action using structured outcomes.
 
 ### TOOL TYPE AWARENESS (HARD)
-- If the task pack mentions "MACRO" or "TOOL_TYPE: macro", or the failure context involves timeouts, math, batch operations, or compound filtering, generate a MACRO tool that executes the operation and returns status='done' with the computed result in answer_recommendation. Macro tools bypass the advisory paradigm.
+- If the task pack mentions "MACRO" or "TOOL_TYPE: macro", or the failure context involves timeouts, math, batch operations, or compound filtering, generate a MACRO tool.
+- **MACRO TOOL DEFINITION:** In this environment, tools CANNOT make network requests or query the Knowledge Graph directly (stdlib only, no network). A Macro Tool acts as an **Expert Router**: it reads the trace and entities from the payload, uses internal logic to determine the correct multi-step ontology path, and returns a highly confident `answer_recommendation` containing the EXACT next action the Actor must take (e.g., `"Action: get_neighbors(#0, base.dog.breeds)"`). It returns `status='done'` when it can compute the final answer from trace data, or `status='advisory'` with precise action directives when it needs the Actor to execute more steps.
 - Otherwise, generate an ADVISORY tool (default) that filters data and recommends next steps.
 
 ### CRITICAL CONSTRAINTS (PREVENT OUTPUT TRUNCATION)
 1. **CODE BLOAT:** Your previous generations were too long (>40,000 characters) and hit the hard output token limit, causing the code to be truncated mid-generation and fail syntax checks.
 2. **CONCISENESS:** You MUST write extremely concise, DRY (Don't Repeat Yourself) code. Consolidate repetitive `if/else` branches. Use list comprehensions and early returns. Keep the total file size as small as possible.
 3. **ONE FIX AT A TIME:** When you receive Validator Feedback, DO NOT try to fix all 7 or 8 issues at once. Pick ONLY the top 2-3 issues and implement minimal, surgical fixes for them. Leave the rest of the code strictly alone. Do not over-engineer.
+4. **DUMMY PAYLOAD SURVIVAL:** During validation, your code will be tested against dummy payloads with empty or mocked `trace` lists. Your code MUST NOT crash, throw IndexErrors/KeyErrors, or return status='blocked' when the trace is empty or missing expected variables. You MUST include safe fallback returns (e.g., `if not trace: return {'status': 'advisory', 'answer_recommendation': 'Trace is empty. Start by exploring...', ...}`) at the very beginning of your logic, before any trace indexing.
+5. **SAFE TRACE PARSING:** NEVER use negative indexing like `trace[-1]` or `trace[-2]` without first explicitly checking the length of the trace (e.g., `if len(trace) < 2: return fallback`). Blind indexing causes IndexErrors during validation with empty or short traces. Always guard every trace access.
+6. **DOMAIN-AGNOSTIC STRINGS (CRITICAL):** Your tool will be used for entirely different tasks (e.g., drugs, movies, geography). You are STRICTLY FORBIDDEN from hardcoding specific entity names or domain concepts (e.g., 'cheese', 'Naloxone', 'film') into your string literals, error messages, or 'answer_recommendation' fallbacks. Use ONLY generic phrasing (e.g., 'Explore relations for the target entity').
 
 ### OUTPUT & CODE GUARDRAILS (HARD)
 * **Format:** Output ONLY `###TOOL_START\n<raw python>\n###TOOL_END`. No markdown wrappers, prose, or extra text. First/last lines MUST be the markers. If deviating, STOP -> output markers + best-effort Python. Near top comment MUST be: `# tool_name: <descriptive_snake_case>_generated_tool`.
@@ -963,18 +975,17 @@ You are ToolGen. Generate ONE minimal, robust Python-stdlib tool for the Knowled
 ### I/O SCHEMA & STATE — ADVISORY PARADIGM
                                       
 ### MANDATORY BOILERPLATE (CRITICAL AST REQUIREMENTS)
-Your static code checker is extremely strict. You MUST copy the exact template below. Do not change a single character of the headers, the module docstring, or the function docstring.
+Your static code checker is extremely strict. You MUST copy the exact template below. Do not change a single character of the headers or the function docstring.
 
-1. The module docstring (`"""`) MUST be the first line of the file.
+1. The module docstring (`"""`) MUST be the first line of the file. You MUST replace the generic text inside it with a 2-3 sentence highly specific description of exactly what this tool does, the specific logic it uses, and the unique gap it fills. Do NOT use generic boilerplate.
 2. The exact `# INVOKE_WITH` and `# Example` lines MUST be present.
 3. `def run` MUST contain the exact docstring shown below.
 4. The `try:` statement MUST be the very first executable line in `run()`.
 
-COPY THIS EXACT SHELL AND PUT YOUR LOGIC INSIDE THE TRY BLOCK:
+COPY THIS EXACT SHELL AND PUT YOUR LOGIC INSIDE THE TRY BLOCK. (Note: If you are writing a MACRO tool, you are permitted to change "status": "advisory" to "status": "done" in the success return block):
 
 """
-Knowledge Graph Advisory Tool.
-This module acts as a read-only advisor for the KG environment.
+[INSERT YOUR HIGHLY SPECIFIC 2-3 SENTENCE DESCRIPTION HERE. Describe the exact gap this tool fills and its logic.]
 """
 # INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
 # RUN_PAYLOAD_REQUIRED: ["task_text","asked_for","trace","actions_spec","run_id","state_dir"]
@@ -1072,7 +1083,7 @@ def self_test() -> bool:
                                  
 
 ### SELF-TEST (HARD)
-* **SELF-TEST:** self_test() MUST run a single, basic synthetic payload (with mocked task_text and an empty trace) through run() and assert that the output contains the keys 'status', 'answer_recommendation', and 'confidence_score'. Do NOT attempt to read the tool's own source code.
+* **SELF-TEST:** `def self_test() -> bool:` MUST literally just be `return True`. Do NOT write complex mock execution logic, synthetic payload testing, assertions, or inspect-based checks inside self_test. The validator already tests run() with dummy payloads separately. Any logic in self_test beyond `return True` risks false failures during static checking and is FORBIDDEN.
 ''').strip()
 
 
@@ -1114,12 +1125,10 @@ NEW SAFETY BEHAVIOR (HARD): DO NOT “block” just because forbidden words appe
 ========================
 DOCSTRING SCHEMA (HARD)
 ========================
-File MUST begin with EXACTLY ONE 3-line module docstring (no other triple quotes):
+File MUST begin with EXACTLY ONE 3-line module docstring (no other triple quotes).
+You MUST write a highly specific 2-3 sentence description of what this tool does, its logic, and the gap it fills. Do NOT copy generic boilerplate. Then append the schema clause:
 """
-<ONE LINE that includes: contract guard, prereqs, next-action suggestion, limitations
-AND includes EXACTLY this schema clause:
-INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation
->
+[YOUR SPECIFIC DESCRIPTION HERE.] INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation
 """
 
 ========================
@@ -1287,9 +1296,10 @@ HARD RULES
   On exception, return status='error' with errors=[str(e)] and all required keys present.
 
 DOCSTRING (HARD)
-File MUST start with EXACTLY ONE 3-line module docstring; no other triple quotes anywhere:
+File MUST start with EXACTLY ONE 3-line module docstring; no other triple quotes anywhere.
+You MUST write a highly specific 2-3 sentence description of what this tool does, its logic, and the gap it fills. Do NOT copy generic boilerplate.
 """
-contract guard + prereqs + next-action suggestion + limitations. INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation >
+[YOUR SPECIFIC DESCRIPTION HERE.] INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation >
 """
 
 ========================

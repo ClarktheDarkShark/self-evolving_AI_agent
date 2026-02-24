@@ -873,6 +873,29 @@ class SelfEvolvingController(
 
 
     # ------------------------------------------------------------------
+    # Dynamic quality feedback
+    # ------------------------------------------------------------------
+    def update_tool_quality_for_outcome(self, *, success: bool) -> None:
+        """Reward or penalize all tools invoked in the current sample.
+
+        Called from the experiment loop after the sample outcome is known.
+        +0.1 for correct, -0.2 for incorrect (clamped to [0, 10]).
+        Persists immediately to metadata.json.
+        """
+        if not hasattr(self, "_registry"):
+            return
+        tool_names: set[str] = set()
+        for key in self._tool_usage_logged:
+            parts = key.split("|")
+            if len(parts) >= 4:
+                tool_names.add(parts[3])
+        for name in tool_names:
+            try:
+                self._registry.record_task_outcome(name, success=success)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
     # Reflection Forge: post-task failure tool generation
     # ------------------------------------------------------------------
     def generate_tool_from_failure(
@@ -974,13 +997,45 @@ class SelfEvolvingController(
             f"REFLECTION FORGE: The agent failed this task.\n"
             f"TASK: {(task_query or '')[:500]}\n"
             f"AGENT_OUTPUT: {agent_output_text}\n"
-            f"EXPECTED_ANSWER: {expected_answer_text}\n"
+            f"EXPECTED_ANSWER (use to reverse-engineer the general ontology "
+            f"path — do NOT hardcode): {expected_answer_text}\n"
             f"TRACE SUMMARY (last {len(trace_tail)} steps): "
             f"{json.dumps(trace_tail, ensure_ascii=True, default=str)[:1500]}\n"
             f"FAILURE PATTERN: {', '.join(patterns)}\n"
-            f"DESIRED TOOL: A MACRO tool that reverse-engineers the correct "
-            f"ontology path and produces the expected answer deterministically. "
-            f"Do NOT generate an advisory tool."
+            f"DESIRED TOOL: A parametric MACRO tool that reverse-engineers the "
+            f"correct ontology path and produces the expected answer "
+            f"deterministically. It must dynamically extract entities from "
+            f"payload['task_text']. Do NOT generate an advisory tool."
+        )
+        reflection_header = (
+            "=== POST-TASK REFLECTION ===\n"
+            "The agent failed the following task.\n"
+            f"Task: {task_query}\n"
+            f"Agent Output: {agent_output_text}\n"
+            f"Expected Correct Answer (use ONLY to reverse-engineer the "
+            f"general ontology path — do NOT hardcode this value): "
+            f"{expected_answer_text}\n"
+            "Review the trace below to see where the agent took the wrong "
+            "ontology path. You MUST write a 'Macro Tool' (Expert Router) "
+            "that reads the trace and entities from the payload, determines "
+            "the correct multi-step ontology path using internal logic, and "
+            "returns precise action directives in answer_recommendation. "
+            "The tool CANNOT query the KG directly (no network, stdlib only). "
+            "Do NOT write an advisory tool.\n"
+            "MACRO TOOL DEFINITION: In this offline environment, tools "
+            "CANNOT make network requests. A Macro Tool acts as an Expert "
+            "Router. It reads the trace and returns the EXACT next action "
+            "string (e.g., 'Action: get_neighbors(#0, base.dog.breeds)') "
+            "in its recommendation. Do not write dummy network code.\n"
+            "CRITICAL ABSTRACTION RULE: You are generating a tool for a "
+            "class of problems, not a specific task. You MUST write "
+            "PARAMETRIC code. Do NOT hardcode entities (like 'Naloxone', "
+            "'goats', 'cows') into the script. Your script must dynamically "
+            "extract entities from 'payload[\"task_text\"]' or "
+            "'payload[\"asked_for\"]' and execute the search abstractly. "
+            "Give the tool a generic, descriptive name "
+            "(e.g., 'multi_entity_intersection_macro_tool').\n"
+            "============================\n\n"
         )
 
         self._append_loop_log(
@@ -1000,63 +1055,81 @@ class SelfEvolvingController(
             pass
 
         try:
-            prev_relaxed = getattr(self, "_toolgen_relaxed_mode", False)
-            setattr(self, "_toolgen_relaxed_mode", True)
-            try:
-                if getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
-                    env_name = self._resolved_environment_label()
-                    env_contract = ""
-                    context = getattr(self, "_toolgen_agg_context", None)
-                    if isinstance(context, Mapping):
-                        env_contract = str(context.get("env_contract") or "")
-                    if not env_contract:
-                        try:
-                            for item in self._history_items(chat_history):
-                                if item.role == Role.USER:
-                                    env_contract = (item.content or "").strip()
-                                    break
-                        except Exception:
-                            env_contract = ""
-                    reflection_header = (
-                        "=== POST-TASK REFLECTION ===\n"
-                        "The agent failed the following task.\n"
-                        f"Task: {task_query}\n"
-                        f"Agent Output: {agent_output_text}\n"
-                        f"Expected Correct Answer: {expected_answer_text}\n"
-                        "Review the trace below to see where the agent took the wrong "
-                        "ontology path. You MUST write an executable 'Macro Tool' "
-                        "(Python script) that correctly reverse-engineers the path to "
-                        "yield the Expected Answer. Do NOT write an advisory tool.\n"
-                        "============================\n\n"
-                    )
-                    user_prompt = build_task_pack(
-                        env_name, env_contract, [enriched_query]
-                    )
-                    final_user_prompt = reflection_header + user_prompt
-                    exec_payload = self._build_toolgen_execution_payload(
-                        task_text=enriched_query,
-                        trace=trace_tail,
-                        failure_context=last_obs.get("output") if isinstance(last_obs, dict) else "",
-                        active_variables=None,
-                    )
-                    prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
-                    setattr(self, "_toolgen_execution_payload", exec_payload)
-                    system_prompt = get_toolgen_system_prompt("aggregate3", env_name)
+            # NOTE: force_strict=True ensures the full 8-round gen→val→repair
+            # loop runs.  No relaxed-mode bypass for reflection forges.
+            if getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
+                env_name = self._resolved_environment_label()
+                env_contract = ""
+                context = getattr(self, "_toolgen_agg_context", None)
+                if isinstance(context, Mapping):
+                    env_contract = str(context.get("env_contract") or "")
+                if not env_contract:
                     try:
-                        result = self._toolgen_generate_from_prompt(
-                            user_prompt=final_user_prompt,
-                            system_prompt=system_prompt,
-                            chat_history=chat_history,
-                            name_prefix=getattr(self, "_toolgen_name_prefix", ""),
-                        )
-                    finally:
-                        setattr(self, "_toolgen_execution_payload", prev_exec_payload)
-                else:
-                    result = self._maybe_generate_tool_for_query(
-                        enriched_query, chat_history, allow_reuse=False, force=True
+                        for item in self._history_items(chat_history):
+                            if item.role == Role.USER:
+                                env_contract = (item.content or "").strip()
+                                break
+                    except Exception:
+                        env_contract = ""
+                user_prompt = build_task_pack(
+                    env_name, env_contract, [enriched_query]
+                )
+                final_user_prompt = reflection_header + user_prompt
+                exec_payload = self._build_toolgen_execution_payload(
+                    task_text=enriched_query,
+                    trace=trace_tail,
+                    failure_context=last_obs.get("output") if isinstance(last_obs, dict) else "",
+                    active_variables=None,
+                )
+                prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
+                setattr(self, "_toolgen_execution_payload", exec_payload)
+                system_prompt = get_toolgen_system_prompt("aggregate3", env_name)
+                try:
+                    result = self._toolgen_generate_from_prompt(
+                        user_prompt=final_user_prompt,
+                        system_prompt=system_prompt,
+                        chat_history=chat_history,
+                        name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                        force_strict=True,
+                        force_max_rounds=8,
                     )
-            finally:
-                setattr(self, "_toolgen_relaxed_mode", prev_relaxed)
+                finally:
+                    setattr(self, "_toolgen_execution_payload", prev_exec_payload)
+            else:
+                env_name = self._resolved_environment_label()
+                env_contract = ""
+                try:
+                    for item in self._history_items(chat_history):
+                        if item.role == Role.USER:
+                            env_contract = (item.content or "").strip()
+                            break
+                except Exception:
+                    env_contract = ""
+                user_prompt = build_task_pack(env_name, env_contract, [enriched_query])
+                final_user_prompt = reflection_header + user_prompt
+                system_prompt = get_toolgen_system_prompt(
+                    getattr(self, "_toolgen_pipeline_name", "baseline"),
+                    env_name,
+                )
+                prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
+                exec_payload = self._build_toolgen_execution_payload(
+                    task_text=enriched_query,
+                    trace=trace_tail,
+                    failure_context=last_obs.get("output") if isinstance(last_obs, dict) else "",
+                    active_variables=None,
+                )
+                setattr(self, "_toolgen_execution_payload", exec_payload)
+                try:
+                    result = self._toolgen_generate_from_prompt(
+                        user_prompt=final_user_prompt,
+                        system_prompt=system_prompt,
+                        chat_history=chat_history,
+                        name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                        force_strict=True,
+                        force_max_rounds=8,
+                    )
+                finally:
+                    setattr(self, "_toolgen_execution_payload", prev_exec_payload)
 
             tool_name = None
             if result is not None:
@@ -1080,6 +1153,17 @@ class SelfEvolvingController(
                 )
             except Exception:
                 pass
+
+            # Auto-refresh registry so the new tool is embedded and
+            # available for the very next sample.
+            if tool_name is not None:
+                if getattr(self, "_registry", None) is not None and hasattr(
+                    self._registry, "refresh"
+                ):
+                    try:
+                        self._registry.refresh()
+                    except Exception:
+                        pass
         except Exception:
             self._append_loop_log("REFLECTION FORGE | ERROR (exception during toolgen)")
 
@@ -1130,6 +1214,25 @@ class SelfEvolvingController(
 
         print("\n[DEBUG] --- TURN START ---", file=sys.stderr, flush=True)
         print("[DEBUG] Prompt Name Tracing active.", file=sys.stderr, flush=True)
+        # Pre-boot ToolGen must run before any orchestrator decision on first loop.
+        try:
+            preboot_tasks = getattr(self, "_preboot_tasks", None)
+            if isinstance(preboot_tasks, list) and preboot_tasks:
+                self._toolgen_prebootstrap_once(
+                    task_query, working_history, tasks=preboot_tasks
+                )
+                self._preboot_tasks = []
+            else:
+                self._toolgen_prebootstrap_once(task_query, working_history)
+            if getattr(self, "_registry", None) is not None and hasattr(
+                self._registry, "refresh"
+            ):
+                try:
+                    self._registry.refresh()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         forced_decision: Optional[Mapping[str, Any]] = None
         try:
             forced_decision = self._orchestrate_decision(
@@ -1266,14 +1369,6 @@ class SelfEvolvingController(
             )
 
         try:
-            self._toolgen_prebootstrap_once(task_query, working_history)
-            # Refresh registry so freshly registered pre-boot tool is visible
-            if getattr(self, "_registry", None) is not None and hasattr(self._registry, "refresh"):
-                try:
-                    self._registry.refresh()
-                except Exception:
-                    pass
-
             print(
                 "\n[DEBUG] Entering Orchestrator Decision Phase",
                 file=sys.stderr,

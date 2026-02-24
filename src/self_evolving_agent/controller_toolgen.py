@@ -502,11 +502,12 @@ class ControllerToolgenMixin:
         }
 
     def _toolgen_prebootstrap_once(
-        self, task_query: str, chat_history: ChatHistory
+        self,
+        task_query: str,
+        chat_history: ChatHistory,
+        *,
+        tasks: Optional[Sequence[str]] = None,
     ) -> None:
-        if not task_query.strip():
-            print("[TOOLGEN_PREBOOT] Skipping: empty task_query")
-            return
         if getattr(self, "_toolgen_agent", None) is None:
             print("[TOOLGEN_PREBOOT] Skipping: _toolgen_agent is None")
             return
@@ -528,6 +529,45 @@ class ControllerToolgenMixin:
         if env_name in preboot_envs:
             print(f"[TOOLGEN_PREBOOT] Env '{env_name}' already bootstrapped, skipping")
             return
+        if tasks is not None:
+            trimmed = [t.strip() for t in tasks if isinstance(t, str) and t.strip()]
+            if len(trimmed) != 10:
+                print(
+                    f"[TOOLGEN_PREBOOT] ERROR: expected 10 tasks, got {len(trimmed)}"
+                )
+                return
+            user_prompt = build_task_pack(env_name, "", list(trimmed))
+            missing = [t for t in trimmed if t not in user_prompt]
+            if missing:
+                print(
+                    f"[TOOLGEN_PREBOOT] WARNING: {len(missing)} tasks missing from prompt"
+                )
+                return
+            tool = self._toolgen_generate_from_prompt(
+                user_prompt=user_prompt,
+                system_prompt=get_toolgen_system_prompt("aggregate3", env_name),
+                chat_history=chat_history,
+                name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+            )
+            if tool:
+                print(
+                    f"[TOOLGEN_PREBOOT] SUCCESS: Tool '{tool.name}' generated for env '{env_name}'"
+                )
+            else:
+                print(
+                    "[TOOLGEN_PREBOOT] WARNING: Tool generation returned None for env "
+                    f"'{env_name}'"
+                )
+            preboot_envs.add(env_name)
+            agg_envs = getattr(self, "_toolgen_agg_bootstrapped_envs", None)
+            if not isinstance(agg_envs, set):
+                agg_envs = set()
+            agg_envs.add(env_name)
+            self._toolgen_agg_bootstrapped_envs = agg_envs
+            return
+        if not task_query.strip():
+            print("[TOOLGEN_PREBOOT] Skipping: empty task_query")
+            return
         if getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
             # Check if context is ready
             context = getattr(self, "_toolgen_agg_context", None)
@@ -545,32 +585,6 @@ class ControllerToolgenMixin:
                     print(f"[TOOLGEN_PREBOOT] Aggregate prompt failed (likely env mismatch)")
             else:
                 print(f"[TOOLGEN_PREBOOT] WARNING: _toolgen_agg_context not ready (type={type(context).__name__})")
-
-            # Fallback: Use simple prompt if aggregate prompt not available
-            if not prompt:
-                print(f"[TOOLGEN_PREBOOT] Falling back to simple prompt for env '{env_name}'")
-                # Build a simple prompt from the current task query and env contract
-                env_contract = ""
-                if chat_history is not None:
-                    try:
-                        for item in self._history_items(chat_history):
-                            if item.role == Role.USER:
-                                env_contract = (item.content or "").strip()
-                                break
-                    except Exception:
-                        pass
-
-                if env_contract and task_query:
-                    prompt = (
-                        f"ENVIRONMENT: {env_name}\n\n"
-                        f"ENVIRONMENT CONTRACT:\n{env_contract}\n\n"
-                        f"CURRENT TASK:\n{task_query}\n\n"
-                        f"Create a utility tool that will help solve tasks in this environment. "
-                        f"The tool should be reusable across multiple similar tasks."
-                    )
-                    print(f"[TOOLGEN_PREBOOT] Simple prompt built (length={len(prompt)})")
-                else:
-                    print(f"[TOOLGEN_PREBOOT] Cannot build simple prompt: env_contract={bool(env_contract)}, task_query={bool(task_query)}")
 
             if not prompt:
                 print(f"[TOOLGEN_PREBOOT] No prompt available for env '{env_name}', skipping tool generation")
@@ -595,13 +609,6 @@ class ControllerToolgenMixin:
                 agg_envs = set()
             agg_envs.add(env_name)
             self._toolgen_agg_bootstrapped_envs = agg_envs
-            return
-        pipeline = getattr(self, "_toolgen_pipeline", None)
-        if pipeline is not None:
-            tools = pipeline.maybe_generate_tools(env_name, task_query, chat_history)
-            if tools:
-                preboot_envs.add(env_name)
-                return
             return
         system_prompt = get_toolgen_system_prompt(
             getattr(self, "_toolgen_pipeline_name", "baseline"),
@@ -690,6 +697,64 @@ class ControllerToolgenMixin:
         except Exception:
             return None
 
+    def _toolgen_contamination_check(
+        self, tool_code: str, payload: Mapping[str, Any]
+    ) -> Optional[Mapping[str, Any]]:
+        """Fail the tool if it hardcodes task-specific entities in string literals."""
+        if not tool_code or not isinstance(payload, Mapping):
+            return None
+        task_text = str(payload.get("task_text") or "")
+        asked_for = str(payload.get("asked_for") or "")
+        combined = f"{task_text} {asked_for}"
+        # Extract candidate entity tokens: capitalized words and quoted strings.
+        entities: set[str] = set()
+        for quoted in re.findall(r"[\"']([^\"']{4,})[\"']", combined):
+            entities.add(quoted.strip())
+        for word in re.findall(r"\b[A-Z][a-z]{3,}\b", combined):
+            entities.add(word)
+        # Filter out generic English / KG environment noise words.
+        _noise = {
+            "Action", "What", "Which", "Where", "When", "Find", "List",
+            "Give", "Show", "Name", "Type", "True", "False", "None",
+            "Start", "There", "This", "That", "Each", "From", "With",
+            "About", "Have", "Does", "Some", "Many", "More", "Most",
+            "Only", "Also", "Then", "Than", "Into", "Over", "Such",
+            "Very", "Just", "Will", "Here", "Trace", "Entity",
+        }
+        entities -= _noise
+        # Programming/system keywords that naturally appear in Python code.
+        _programming_whitelist = {
+            "error", "exception", "true", "false", "none", "null", "dict",
+            "list", "str", "int", "float", "bool", "return", "def", "class",
+            "import", "json", "variable", "instance", "type", "string",
+            "trace", "payload", "status", "advisory", "done", "blocked",
+            "answer", "recommendation", "action", "args", "kwargs", "output",
+            "ok",
+        }
+        entities = {e for e in entities if e.lower() not in _programming_whitelist}
+        if not entities:
+            return None
+        # Scan the raw generated Python code for the entities.
+        for entity in entities:
+            if len(entity) <= 3:
+                continue
+            if entity.lower() in tool_code.lower():
+                return {
+                    "grade": 0,
+                    "issues": [
+                        f"Semantic Contamination: You hardcoded the specific "
+                        f"domain entity '{entity}' into your tool logic or "
+                        f"strings. You must write parametric, domain-agnostic code."
+                    ],
+                    "fixes": [
+                        "Remove all task-specific entity names from your code. "
+                        "Use generic phrasing like 'target entity' and extract "
+                        "real entities from payload['task_text'] at runtime."
+                    ],
+                    "summary": f"Semantic contamination: hardcoded '{entity}'.",
+                }
+        return None
+
     def _toolgen_validate_candidate_tool(
         self,
         tool_spec: Mapping[str, Any],
@@ -700,6 +765,12 @@ class ControllerToolgenMixin:
         if not tool_code:
             return None
         exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        # Phase 1: Contamination check (before execution)
+        if isinstance(exec_payload, Mapping):
+            contamination = self._toolgen_contamination_check(tool_code, exec_payload)
+            if contamination is not None:
+                return contamination
+        # Phase 2: Execution check
         if isinstance(exec_payload, Mapping):
             execution_validation = self._toolgen_execution_check(tool_code, exec_payload)
             if execution_validation is not None:
@@ -847,9 +918,23 @@ class ControllerToolgenMixin:
         recommendation = str(result.get("answer_recommendation") or "").strip()
         pruned = result.get("pruned_observation")
         rec_lower = recommendation.lower()
-        dead_end = False
+        # Specific handling for blocked status — surface the real exception.
         if status in {"blocked", "error"}:
-            dead_end = True
+            actual_error = str(result.get("error") or "Unknown exception")
+            return {
+                "grade": 0,
+                "issues": [
+                    f"execution_blocked: Your code raised an exception during "
+                    f"dummy-payload testing: {actual_error}. Fix the bug."
+                ],
+                "fixes": [
+                    "Your tool CANNOT query the KG directly (no network). "
+                    "It must read the trace and return a concrete answer_recommendation string. "
+                    "Ensure the tool does not crash or return status='blocked' on empty/dummy traces."
+                ],
+                "summary": f"Execution failed: {actual_error}",
+            }
+        dead_end = False
         if not recommendation and status != "done":
             dead_end = True
         if (
@@ -862,11 +947,20 @@ class ControllerToolgenMixin:
         if "dead end" in rec_lower or "empty set" in rec_lower or "empty variable" in rec_lower:
             dead_end = True
         if dead_end:
+            error_msg = result.get("error") or ""
+            error_detail = f" Exception: {error_msg}" if error_msg else ""
+            rec_detail = f" answer_recommendation={recommendation!r}" if recommendation else ""
             return {
                 "grade": 0,
-                "issues": ["execution_dead_end: tool returned empty/blocked output"],
-                "fixes": ["Use failure_context/active_variables/trace to propose a concrete next step."],
-                "summary": "Execution failed: dead-end output.",
+                "issues": [
+                    f"execution_dead_end: tool returned empty output.{error_detail}{rec_detail}"
+                ],
+                "fixes": [
+                    "Your tool CANNOT query the KG directly (no network). "
+                    "It must read the trace and return a concrete answer_recommendation string. "
+                    "Ensure the tool does not crash or return status='blocked' on empty/dummy traces."
+                ],
+                "summary": f"Execution failed: dead-end output.{error_detail}",
             }
         return None
 
@@ -889,15 +983,18 @@ class ControllerToolgenMixin:
         tool_type = _stringify(
             decision.get("tool_type") or decision.get("needed_capabilities")
         )
-        active_variables = decision.get("active_variables") or []
-        active_variables_str = _stringify(active_variables)
-
         blueprint_header = (
             "=== ORCHESTRATOR BLUEPRINT ===\n"
             f"TOOL TYPE REQUIRED: {tool_type}\n"
             f"FAILURE CONTEXT: {failure_context}\n"
             f"DESIRED BEHAVIOR: {desired_behavior}\n"
-            f"ACTIVE VARIABLES: {active_variables_str}\n"
+            "CRITICAL ABSTRACTION RULE: You are generating a tool for a class "
+            "of problems, not a specific task. You MUST write PARAMETRIC code. "
+            "Do NOT hardcode entities (like 'Naloxone', 'goats', 'cows') into "
+            "the script. Your script must dynamically extract entities from "
+            "'payload[\"task_text\"]' or 'payload[\"asked_for\"]' and execute "
+            "the search abstractly. Give the tool a generic, descriptive name "
+            "(e.g., 'multi_entity_intersection_macro_tool').\n"
             "==============================\n\n"
         )
 
@@ -908,8 +1005,6 @@ class ControllerToolgenMixin:
             parts.append(f"DESIRED BEHAVIOR: {desired_behavior}")
         if reasoning:
             parts.append(f"REASONING: {reasoning}")
-        if active_variables_str:
-            parts.append(f"ACTIVE VARIABLES: {active_variables_str}")
         toolgen_query = "\n".join(parts)
 
         env_name = self._resolved_environment_label()
@@ -941,7 +1036,7 @@ class ControllerToolgenMixin:
             task_text=toolgen_query,
             trace=trace_steps[-10:] if trace_steps else [],
             failure_context=failure_context,
-            active_variables=active_variables,
+            active_variables=[],
         )
         prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
         setattr(self, "_toolgen_execution_payload", exec_payload)
@@ -951,6 +1046,8 @@ class ControllerToolgenMixin:
                 system_prompt=system_prompt,
                 chat_history=chat_history,
                 name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                force_strict=True,
+                force_max_rounds=8,
             )
         finally:
             setattr(self, "_toolgen_execution_payload", prev_exec_payload)
@@ -962,12 +1059,14 @@ class ControllerToolgenMixin:
         system_prompt: str,
         chat_history: ChatHistory,
         name_prefix: str,
+        force_strict: bool = False,
+        force_max_rounds: Optional[int] = None,
     ) -> Optional[ToolMetadata]:
         system_prompt = self._prepare_toolgen_agents(system_prompt)
         mode = get_toolgen_mode()
         validate = self._toolgen_should_validate()
-        max_rounds = 8 if validate else 1
-        relaxed_mode = self._toolgen_relaxed_mode_enabled()
+        max_rounds = force_max_rounds if force_max_rounds is not None else (8 if validate else 1)
+        relaxed_mode = False if force_strict else self._toolgen_relaxed_mode_enabled()
         base_prompt = user_prompt
         last_candidate: Optional[Mapping[str, Any]] = None
         last_validation: Optional[Mapping[str, Any]] = None
@@ -1326,6 +1425,9 @@ class ControllerToolgenMixin:
                     self._toolgen_log_staged_registration(staged_meta, metadata)
                 if metadata:
                     self._registry.record_validation_result(metadata.name, success=True)
+                    # Initialize quality_score from the validation grade.
+                    if hasattr(self._registry, "set_quality_score"):
+                        self._registry.set_quality_score(metadata.name, float(grade))
                     return metadata
                 continue
             print(
@@ -2081,9 +2183,20 @@ class ControllerToolgenMixin:
             return None
         return "\n".join(normalized_lines).rstrip() + "\n"
 
+    def _extract_module_docstring(self, code: str) -> str:
+        """Extract the module-level docstring from generated Python code."""
+        try:
+            tree = ast.parse(code)
+            doc = ast.get_docstring(tree) or ""
+            return doc.strip()
+        except SyntaxError:
+            return ""
+
     def _wrap_marker_tool_spec(self, python_code: str) -> dict[str, Any]:
         name = self._extract_tool_name_from_code(python_code) or self._toolgen_default_name()
-        description = self._toolgen_default_description()
+        # Prefer the LLM-written module docstring as description for dedup/retrieval
+        module_doc = self._extract_module_docstring(python_code)
+        description = module_doc if module_doc else self._toolgen_default_description()
         signature = "run(payload: dict) -> dict"
         tool_type = "utility"
         tool_category = "utility"
@@ -2143,6 +2256,13 @@ class ControllerToolgenMixin:
                 ["constraints", "output_contract", "draft_response", "candidate_output", "env_observation"],
             )
         normalized.setdefault("capabilities", [])
+        # Extract module docstring from code and use as description for dedup/retrieval
+        code_lines = normalized.get("code_lines")
+        if isinstance(code_lines, list):
+            code_text = "\n".join(str(line) for line in code_lines)
+            module_doc = self._extract_module_docstring(code_text)
+            if module_doc:
+                normalized["description"] = module_doc
         code_lines = normalized.get("code_lines")
         if isinstance(code_lines, list):
             code = "\n".join(str(line) for line in code_lines)

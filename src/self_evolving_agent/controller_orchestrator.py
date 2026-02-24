@@ -250,7 +250,6 @@ class ControllerOrchestratorMixin:
             or decision.get("needed_capabilities")
             or ""
         )
-        active_variables = decision.get("active_variables") or []
         tool_type = str(decision.get("tool_type") or "advisory")
 
         # Build an enriched query for ToolGen from the escape hatch context
@@ -262,23 +261,18 @@ class ControllerOrchestratorMixin:
             parts.append(f"DESIRED BEHAVIOR: {desired_behavior}")
         if reasoning:
             parts.append(f"REASONING: {reasoning}")
-        if active_variables:
-            parts.append(f"ACTIVE VARIABLES: {', '.join(str(v) for v in active_variables)}")
         toolgen_query = "\n".join(parts)
 
         self._trace("escape_hatch_trigger", toolgen_query)
 
         # Trigger ToolGen (force=True, no reuse — existing tools are insufficient)
-        prev_relaxed = getattr(self, "_toolgen_relaxed_mode", False)
-        setattr(self, "_toolgen_relaxed_mode", True)
-        try:
-            runner = getattr(self, "_run_escape_hatch_toolgen", None)
-            if callable(runner):
-                new_tool = runner(decision, query, chat_history)
-            else:
-                new_tool = None
-        finally:
-            setattr(self, "_toolgen_relaxed_mode", prev_relaxed)
+        # NOTE: force_strict=True is passed inside _run_escape_hatch_toolgen so
+        # all escape-hatch tools go through the full 8-round validation loop.
+        runner = getattr(self, "_run_escape_hatch_toolgen", None)
+        if callable(runner):
+            new_tool = runner(decision, query, chat_history)
+        else:
+            new_tool = None
 
         print(
             f"\n[FORGE_DEBUG] Pipeline returned result type: {type(new_tool)}",
@@ -467,7 +461,9 @@ class ControllerOrchestratorMixin:
             max_chars_per_item=1200,
             preserve_first_user_n=2,
         )
-        history_lines = history_text_full.splitlines()[-6:]
+        history_lines = history_text_full.splitlines()
+        if history_lines:
+            history_lines = history_lines[1:]
         history_text = "\n".join(history_lines)
         cleaned_query = self._truncate((query or ""), 1200)
 

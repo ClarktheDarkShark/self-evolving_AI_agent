@@ -21,6 +21,9 @@ from src.typings import (
     PathConfig,
     GeneralInstanceFactory,
     SessionMetricCalculationPartial,
+    ChatHistory,
+    ChatHistoryItem,
+    Role,
 )
 from src.tasks import Task, DatasetItem
 from src.agents import Agent
@@ -403,6 +406,40 @@ def main() -> None:
         except Exception:
             logger.exception("Pre-aggregation tool generation failed.")
             raise
+    # Hardwired pre-boot tool generation (blocking, 10-task aggregate)
+    bootstrap_indices = list(unfinished_sample_order)[:10]
+    if hasattr(agent, "_toolgen_prebootstrap_once") and bootstrap_indices:
+        try:
+            env_name = getattr(getattr(task, "task_name", None), "value", None) or str(
+                getattr(task, "task_name", "")
+            )
+            getter = None
+            try:
+                getter = object.__getattribute__(task, "_Task__get_dataset_item")
+            except AttributeError:
+                getter = None
+            bootstrap_tasks: list[str] = []
+            if callable(getter) and hasattr(agent, "_toolgen_build_task_prompt"):
+                for sample_index in bootstrap_indices:
+                    try:
+                        dataset_item = getter(sample_index)
+                        task_prompt = agent._toolgen_build_task_prompt(
+                            env_name, dataset_item
+                        )
+                        if task_prompt:
+                            bootstrap_tasks.append(task_prompt.strip())
+                    except Exception:
+                        continue
+            if len(bootstrap_tasks) == 10:
+                agent._toolgen_prebootstrap_once(
+                    "bootstrap",
+                    ChatHistory(),
+                    tasks=bootstrap_tasks,
+                )
+                if hasattr(agent, "_registry") and hasattr(agent._registry, "refresh"):
+                    agent._registry.refresh()
+        except Exception:
+            logger.exception("Hardwired pre-boot tool generation failed.")
     # endregion
     # region Run experiment
     logger.info(
@@ -435,7 +472,45 @@ def main() -> None:
         if callback_args.session_controller.should_task_complete:
             task.complete(session)
             callback_handler.on_task_complete(callback_args)
-        # Reflection Forge is disabled to prevent post-task overfitting.
+        # Reflection Forge: if the task failed, trigger strict post-task
+        # tool generation so the agent can learn from its mistakes.
+        try:
+            is_incorrect = (
+                session.evaluation_record.outcome == SessionEvaluationOutcome.INCORRECT
+            )
+            is_limit_reached = (
+                session.finish_reason is not None
+                and "task_limit" in session.finish_reason
+            )
+            if (is_incorrect or is_limit_reached) and hasattr(
+                agent, "generate_tool_from_failure"
+            ):
+                agent.generate_tool_from_failure(
+                    session,
+                    expected_answer=session.expected_answer,
+                )
+                logger.info(
+                    f"Sample {sample_index}: Reflection Forge completed."
+                )
+        except Exception:
+            logger.exception(
+                f"Sample {sample_index}: Reflection Forge failed."
+            )
+        # Dynamic quality feedback: reward/penalize invoked tools.
+        try:
+            is_correct = (
+                session.evaluation_record.outcome == SessionEvaluationOutcome.CORRECT
+            )
+            if hasattr(agent, "update_tool_quality_for_outcome"):
+                agent.update_tool_quality_for_outcome(success=is_correct)
+                logger.info(
+                    f"Sample {sample_index}: Tool quality updated "
+                    f"(success={is_correct})."
+                )
+        except Exception:
+            logger.exception(
+                f"Sample {sample_index}: Tool quality update failed."
+            )
         session_list.append(session)
         json.dump(
             [s.model_dump() for s in session_list],
@@ -511,6 +586,14 @@ def main() -> None:
     # region Release
     task.release()
     # endregion
+    print(
+        "\n" + "=" * 70
+        + "\n[CLEANUP REMINDER] Before running the next benchmark, manually delete"
+        "\n any existing 'Macro' tools in your generated_tools directory that"
+        "\n were created before these anti-contamination changes. Old tools may"
+        "\n carry hardcoded domain entities (semantic contamination)."
+        "\n" + "=" * 70
+    )
 
 
 if __name__ == "__main__":
