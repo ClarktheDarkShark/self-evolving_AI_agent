@@ -149,9 +149,35 @@ def validate_tool_code(
             error="run() must accept exactly one required parameter named 'payload'",
         )
 
+    # Build a smoke payload that includes mock callable actions_spec so
+    # Macro tools pass callable() checks during validation.
+    # NOTE: include 'entities' and other optional keys that generated tools
+    # may declare as required, to avoid false-negative failures during smoke
+    # testing.  The payload must be a superset of what real Orchestrator
+    # payloads provide.
+    smoke_payload: dict = {
+        "_smoke": True,
+        "task_text": "smoke test",
+        "asked_for": "smoke test",
+        "trace": [],
+        "run_id": "smoke",
+        "state_dir": "/tmp",
+        "entities": [],
+        "env_observation": "",
+        "constraints": {},
+        "actions_spec": {
+            "get_relations": lambda *_args: "Relations of mock: [mock.rel]",
+            "get_neighbors": lambda *_args: "Variable #99 = get_neighbors(mock, mock.rel)",
+            "intersection": lambda *_args: "Variable #100 = intersection(#98, #99)",
+            "get_attributes": lambda *_args: "Attributes of #99: [mock.attr]",
+            "argmax": lambda *_args: "Variable #101 = argmax(#99, mock.attr)",
+            "argmin": lambda *_args: "Variable #102 = argmin(#99, mock.attr)",
+            "count": lambda *_args: "Count of #99 is 42",
+        },
+    }
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_fn, {"_smoke": True})
+            future = executor.submit(run_fn, smoke_payload)
             result = future.result(timeout=timeout_s)
     except TimeoutError:
         return ToolValidationResult(success=False, error="smoke test timed out")

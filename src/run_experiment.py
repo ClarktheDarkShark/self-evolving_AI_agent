@@ -37,6 +37,13 @@ from src.callbacks import (
 )
 
 
+# Toggle for post-task Reflection Forge.  When False the automatic
+# generate_tool_from_failure() call after each incorrect/limit-reached
+# task is skipped.  The mid-run Orchestrator escape-hatch
+# (request_new_tool) remains fully operational regardless of this flag.
+ENABLE_POST_TASK_REFLECTION = False
+
+
 class ConfigUtilityCaller(StrEnum):
     CLIENT = "client"
     SERVER = "server"
@@ -370,6 +377,13 @@ def main() -> None:
     # region Construct variable, valid config
     config_utility.preprocess()
     task, agent, callback_dict = config_utility.construct()
+    # Late-bind: give the agent a reference to the KG task so Macro tools
+    # can be routed to the server-side _execute_macro engine.
+    # IMPORTANT: Do NOT use hasattr(task, ...) here — if `task` is a
+    # Client proxy, hasattr triggers Client.__getattr__ which makes a
+    # network call to /get_attribute before the server is ready.
+    if hasattr(agent, "_route_macro_to_server"):
+        agent._kg_task_ref = task
     config_utility.postprocess(task, agent)
     config_utility.validate(task, agent)
     ContinualAgentBenchException.set_record_file(path_config.exception_record_file_path)
@@ -462,6 +476,7 @@ def main() -> None:
         # region Run session
         while session.sample_status == SampleStatus.RUNNING:
             if callback_args.session_controller.should_agent_inference:
+                agent._current_session = session
                 agent.inference(session)
                 callback_handler.on_agent_inference(callback_args)
             if callback_args.session_controller.should_task_interact:
@@ -474,28 +489,32 @@ def main() -> None:
             callback_handler.on_task_complete(callback_args)
         # Reflection Forge: if the task failed, trigger strict post-task
         # tool generation so the agent can learn from its mistakes.
-        try:
-            is_incorrect = (
-                session.evaluation_record.outcome == SessionEvaluationOutcome.INCORRECT
-            )
-            is_limit_reached = (
-                session.finish_reason is not None
-                and "task_limit" in session.finish_reason
-            )
-            if (is_incorrect or is_limit_reached) and hasattr(
-                agent, "generate_tool_from_failure"
-            ):
-                agent.generate_tool_from_failure(
-                    session,
-                    expected_answer=session.expected_answer,
+        # Gated by ENABLE_POST_TASK_REFLECTION (default False).
+        # The mid-run Orchestrator escape-hatch (request_new_tool) is
+        # unaffected by this gate.
+        if ENABLE_POST_TASK_REFLECTION:
+            try:
+                is_incorrect = (
+                    session.evaluation_record.outcome == SessionEvaluationOutcome.INCORRECT
                 )
-                logger.info(
-                    f"Sample {sample_index}: Reflection Forge completed."
+                is_limit_reached = (
+                    session.finish_reason is not None
+                    and "task_limit" in session.finish_reason
                 )
-        except Exception:
-            logger.exception(
-                f"Sample {sample_index}: Reflection Forge failed."
-            )
+                if (is_incorrect or is_limit_reached) and hasattr(
+                    agent, "generate_tool_from_failure"
+                ):
+                    agent.generate_tool_from_failure(
+                        session,
+                        expected_answer=session.expected_answer,
+                    )
+                    logger.info(
+                        f"Sample {sample_index}: Reflection Forge completed."
+                    )
+            except Exception:
+                logger.exception(
+                    f"Sample {sample_index}: Reflection Forge failed."
+                )
         # Dynamic quality feedback: reward/penalize invoked tools.
         try:
             is_correct = (

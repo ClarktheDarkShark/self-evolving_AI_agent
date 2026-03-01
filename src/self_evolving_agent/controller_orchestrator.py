@@ -127,7 +127,7 @@ class ControllerOrchestratorMixin:
     # ------------------------------------------------------------------
     _REQUEST_NEW_TOOL_ENTRY = {
         "name": "request_new_tool",
-        "signature": "request_new_tool(reasoning, failure_context, desired_behavior, active_variables, tool_type)",
+        "signature": "request_new_tool(tool_type, reason)",
         "docstring": (
             "CRITICAL: Trigger this ONLY when the Actor Agent is stuck in a loop, "
             "experiences a database timeout (node explosion), or lacks an existing "
@@ -135,44 +135,28 @@ class ControllerOrchestratorMixin:
             "an existing tool can accomplish the goal. This pauses the Actor and "
             "commands the ToolGen pipeline to write a new Python tool. "
             "Set tool_type='advisory' for read-only recommendation tools, or "
-            "'macro' for tools that execute multi-step operations directly."
+            "'macro' for tools that execute live multi-step KG operations directly."
         ),
         "input_schema": {
             "type": "object",
-            "required": ["reasoning", "failure_context", "desired_behavior", "active_variables"],
+            "required": ["tool_type", "reason"],
             "properties": {
-                "reasoning": {
-                    "type": "string",
-                    "description": "Explanation of why existing tools are insufficient (prevents duplication).",
-                },
-                "failure_context": {
-                    "type": "string",
-                    "description": "What the Actor Agent just attempted that failed (e.g., '10-second timeout on get_relations(#3)').",
-                },
-                "desired_behavior": {
-                    "type": "string",
-                    "description": "Detailed step-by-step logic the new tool must execute.",
-                },
-                "active_variables": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of current KG variables from the ledger to pass to the tool.",
-                },
                 "tool_type": {
                     "type": "string",
                     "enum": ["advisory", "macro"],
-                    "description": "Whether to generate an advisory (read-only recommender) or macro (executable operation) tool.",
+                    "description": "Whether to generate an advisory (read-only recommender) or macro (autonomous executor) tool.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Must follow the template: INPUT: [raw data/variables in trace]. GOAL: [exact transformation or execution needed].",
                 },
             },
         },
-        "required_keys": ["reasoning", "failure_context", "desired_behavior", "active_variables"],
-        "optional_keys": ["tool_type"],
+        "required_keys": ["tool_type", "reason"],
+        "optional_keys": [],
         "property_types": {
-            "reasoning": "string",
-            "failure_context": "string",
-            "desired_behavior": "string",
-            "active_variables": "array",
             "tool_type": "string",
+            "reason": "string",
         },
         "invoke_with": None,
         "run_payload_required": [],
@@ -243,31 +227,21 @@ class ControllerOrchestratorMixin:
         )
 
         # Extract escape hatch arguments from the orchestrator decision
-        reasoning = str(decision.get("reasoning") or decision.get("reason") or "")
-        failure_context = str(decision.get("failure_context") or "")
-        desired_behavior = str(
-            decision.get("desired_behavior")
-            or decision.get("needed_capabilities")
-            or ""
-        )
+        reason = str(decision.get("reason") or "")
         tool_type = str(decision.get("tool_type") or "advisory")
 
         # Build an enriched query for ToolGen from the escape hatch context
         parts = [query]
         parts.append(f"TOOL_TYPE: {tool_type}")
-        if failure_context:
-            parts.append(f"FAILURE CONTEXT: {failure_context}")
-        if desired_behavior:
-            parts.append(f"DESIRED BEHAVIOR: {desired_behavior}")
-        if reasoning:
-            parts.append(f"REASONING: {reasoning}")
+        if reason:
+            parts.append(f"FORGE CONTEXT: {reason}")
         toolgen_query = "\n".join(parts)
 
         self._trace("escape_hatch_trigger", toolgen_query)
 
         # Trigger ToolGen (force=True, no reuse — existing tools are insufficient)
         # NOTE: force_strict=True is passed inside _run_escape_hatch_toolgen so
-        # all escape-hatch tools go through the full 8-round validation loop.
+        # all escape-hatch tools go through the validation loop (2 rounds for advisory).
         runner = getattr(self, "_run_escape_hatch_toolgen", None)
         if callable(runner):
             new_tool = runner(decision, query, chat_history)
@@ -326,6 +300,20 @@ class ControllerOrchestratorMixin:
 
         if new_tool is not None:
             if isinstance(new_tool, Mapping):
+                if (
+                    new_tool.get("reason") == "aborted_duplicate"
+                    or new_tool.get("error") == "aborted_duplicate"
+                ):
+                    self._trace("escape_hatch_failed", "aborted_duplicate")
+                    return {
+                        "success": False,
+                        "tool_name": None,
+                        "observation": (
+                            "Observation: Tool generation FAILED. You attempted to create a tool that is a duplicate "
+                            "of an existing tool in the catalog. You MUST either USE an existing tool from the catalog, "
+                            "or change your strategy. DO NOT request this specific tool again."
+                        ),
+                    }
                 tool_spec = new_tool.get("tool_spec")
                 tool_code = new_tool.get("tool_code") or new_tool.get("code")
                 metadata = None
@@ -350,6 +338,7 @@ class ControllerOrchestratorMixin:
             # Hot-reload the registry so the Orchestrator sees the new tool
             self._load_dynamic_registry()
             self._trace("escape_hatch_success", new_tool.name)
+            setattr(self, "_just_generated_tool", new_tool.name)
             return {
                 "success": True,
                 "tool_name": new_tool.name,
@@ -455,6 +444,8 @@ class ControllerOrchestratorMixin:
         chat_history: ChatHistory,
         *,
         solver_recommendation: Optional[str] = None,
+        stagnation_count: Optional[int] = None,
+        forced_tool_name: Optional[str] = None,
     ) -> str:
         history_text_full = self._toolgen_render_history(
             chat_history,
@@ -478,19 +469,30 @@ class ControllerOrchestratorMixin:
             output_schema["evidence"] = "specific symptoms from inputs/trace/tool metadata"
             output_schema["must_differ_from_existing"] = "delta vs existing tools"
             output_schema["self_test_cases"] = "minimal tests"
-        payload = {
+        payload: dict[str, Any] = {
             "environment": self._resolved_environment_label(),
             "task_text": cleaned_query,
             "history": history_text,
             "output_schema": output_schema,
         }
+        if stagnation_count is not None:
+            payload["SYSTEM STATUS"] = {
+                "Stagnation Count": int(stagnation_count),
+            }
         if solver_recommendation:
             payload["solver_recommendation"] = solver_recommendation
             payload["recommendation_note"] = (
                 "Solver provided a draft response. Use it to decide whether a tool "
                 "can validate or strengthen the draft before returning it."
             )
-        return json.dumps(payload, ensure_ascii=True, default=str)
+        prompt = json.dumps(payload, ensure_ascii=True, default=str)
+        if forced_tool_name:
+            prompt += (
+                f"\n\n[CRITICAL OVERRIDE]: The Forge just successfully generated a new tool "
+                f"named '{forced_tool_name}' specifically to solve your current roadblock. "
+                f"You MUST output action='use_tool' and tool_name='{forced_tool_name}' on this exact turn."
+            )
+        return prompt
 
     def _tool_orchestrator_request_prompt(
         self,
@@ -656,6 +658,7 @@ class ControllerOrchestratorMixin:
         solver_recommendation: Optional[str] = None,
         observation_triggers: Optional[list[dict[str, Any]]] = None,
         last_observation: Optional[dict[str, Any]] = None,  # reserved for LLM prompt enrichment
+        stagnation_count: Optional[int] = None,
     ) -> dict[str, Any]:
         _ = last_observation  # reserved for future orchestrator prompt enrichment
         if not self._orchestrator_agent:
@@ -734,9 +737,16 @@ class ControllerOrchestratorMixin:
                                 "reason": f"derailment_medium_no_tool: {trigger.get('reason', '')}",
                             }
 
+        forced_tool_name = getattr(self, "_just_generated_tool", None)
         prompt = self._orchestrator_request_prompt(
-            query, chat_history, solver_recommendation=solver_recommendation
+            query,
+            chat_history,
+            solver_recommendation=solver_recommendation,
+            stagnation_count=stagnation_count,
+            forced_tool_name=forced_tool_name,
         )
+        if forced_tool_name:
+            setattr(self, "_just_generated_tool", None)
         try:
             tools = self._orchestrator_compact_existing_tools(
                 query_text=retrieval_query
@@ -844,16 +854,12 @@ class ControllerOrchestratorMixin:
             "action": action,
             "tool_name": str(tool_name).strip() if tool_name else None,
             "reason": payload.get("reason"),
+            "tool_type": payload.get("tool_type"),
             "insufficiency": payload.get("insufficiency"),
             "needed_capabilities": payload.get("needed_capabilities"),
             "evidence": payload.get("evidence"),
             "must_differ_from_existing": payload.get("must_differ_from_existing"),
             "self_test_cases": payload.get("self_test_cases"),
-            # Escape hatch fields (Phase 4)
-            "reasoning": payload.get("reasoning"),
-            "failure_context": payload.get("failure_context"),
-            "desired_behavior": payload.get("desired_behavior"),
-            "active_variables": payload.get("active_variables"),
         }
 
     def _tool_orchestrate_decision(
@@ -1146,6 +1152,39 @@ class ControllerOrchestratorMixin:
             except Exception:
                 pass
             return {"tool_name": None, "payload": None, "reason": "parse_failed"}
+
+        # ── Inject controller-known mandatory keys as defaults ──────────
+        # The tool_invoker LLM may not echo back every required key.
+        # Inject them here so _validate_tool_invoker_payload sees a
+        # complete payload.  Using setdefault preserves any value the
+        # LLM explicitly provided.
+        if isinstance(payload_dict, dict):
+            payload_dict.setdefault("task_text", (query or "").strip())
+            payload_dict.setdefault("asked_for", (query or "").strip())
+            payload_dict.setdefault("run_id", run_id)
+            payload_dict.setdefault("state_dir", state_dir)
+            payload_dict.setdefault("trace", [])
+            payload_dict.setdefault("actions_spec", actions_spec or self._available_actions_spec())
+            payload_dict.setdefault("entities", [])
+            payload_dict.setdefault("env_observation", "")
+            entities_val = payload_dict.get("entities")
+            if not isinstance(entities_val, list) or not any(
+                isinstance(item, str) and item.strip() for item in entities_val
+            ):
+                text = (query or "").strip()
+                extracted: list[str] = []
+                match = re.search(r"Entities\s*:\s*\[([^\]]+)\]", text, flags=re.IGNORECASE)
+                if match:
+                    raw = match.group(1)
+                    parts = re.findall(r"'([^']+)'|\"([^\"]+)\"|([^,]+)", raw)
+                    for part in parts:
+                        token = next((x for x in part if x and x.strip()), None)
+                        if token:
+                            extracted.append(token.strip())
+                if extracted:
+                    payload_dict["entities"] = extracted
+        elif payload_dict is None:
+            pass  # will be caught by validation below
 
         payload_errors = self._validate_tool_invoker_payload(tool_name, payload_dict)
         if payload_errors:

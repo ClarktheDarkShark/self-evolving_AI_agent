@@ -282,6 +282,21 @@ class KnowledgeGraphAPI:
         results = self.sparql_executor.execute_query(sparql_query)
         return results
 
+    def get_variable_size(self, variable: Variable) -> Optional[int]:
+        try:
+            count_program = f"(COUNT {variable.program})"
+            processed_code = LogicFormUtil.postprocess_raw_code(count_program)
+            sparql_query = LogicFormUtil.lisp_to_sparql(processed_code)
+            results = self.sparql_executor.execute_query(sparql_query)
+            if not results:
+                return 0
+            try:
+                return int(results[0])
+            except Exception:
+                return None
+        except Exception:
+            return None
+
     def get_relations(self, argument: Union[Variable, str]) -> tuple[None, str]:
         logger = logging.getLogger(__name__)
         resolved_candidates: list[str] = []
@@ -289,6 +304,13 @@ class KnowledgeGraphAPI:
         # region Validate argument
         if isinstance(argument, Variable):
             KnowledgeGraphAPI._validate_variable("get_relations", [argument])
+            MAX_SAFE_CARDINALITY = 50
+            var_size = self.get_variable_size(argument)
+            if var_size and var_size > MAX_SAFE_CARDINALITY:
+                raise KnowledgeGraphAPIException(
+                    "Error: Node Explosion Prevented. Variable <<ARGUMENT0>> contains "
+                    f"{var_size} entities, which exceeds the safe query limit of {MAX_SAFE_CARDINALITY}."
+                )
         else:
             if argument == "__DEBUG_GOAT__":
                 resolved_candidates = ["m.03fwl"]
@@ -397,6 +419,14 @@ class KnowledgeGraphAPI:
                 f"get_neighbors: <<ARGUMENT1>> is not a relation of the <<ARGUMENT0>>. "
                 f"<<ARGUMENT0>> has the following relations: {self.variable_to_relations_cache[argument]}"
             )
+        if isinstance(argument, Variable):
+            MAX_SAFE_CARDINALITY = 50
+            var_size = self.get_variable_size(argument)
+            if var_size and var_size > MAX_SAFE_CARDINALITY:
+                raise KnowledgeGraphAPIException(
+                    "Error: Node Explosion Prevented. Variable <<ARGUMENT0>> contains "
+                    f"{var_size} entities, which exceeds the safe query limit of {MAX_SAFE_CARDINALITY}."
+                )
         # endregion
         resolved_entity = resolved[0] if not isinstance(argument, Variable) else None
         logger.info(
@@ -550,4 +580,5 @@ class KnowledgeGraphAPI:
             "get_attributes",
             "argmax",
             "argmin",
+            "execute_macro",
         ]

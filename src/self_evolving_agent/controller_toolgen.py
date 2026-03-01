@@ -1,6 +1,7 @@
 #controller_toolgen.py
 
 import datetime
+import difflib
 import hashlib
 import json
 import os
@@ -25,6 +26,8 @@ from .controller_prompts import (
     TOOLGEN_DEBUG_APPENDIX,
     TOOLGEN_SYSTEM_PROMPT_MARKERS,
     TOOLGEN_VALIDATOR_SYSTEM_PROMPT,
+    AGG_TOOLGEN_USER_KG,
+    MACRO_TOOLGEN_USER_KG,
 )
 from .toolgen_contracts import TOOL_START, TOOL_END, validate_toolgen_output
 from src.toolgen.prompts import get_toolgen_system_prompt
@@ -69,6 +72,39 @@ class ControllerToolgenMixin:
         "being",
         "tool",
         "utility",
+    }
+    # Hard floor: tools graded at or below this threshold are never registered,
+    # even through relaxed / fallback paths.
+    MIN_REGISTRATION_GRADE = 6
+
+    # ── Hardened feedback overrides for common static-check failures ──
+    _HARDENED_STATIC_FEEDBACK: dict[str, str] = {
+        "G:schema_echo_missing": (
+            "CRITICAL: You are missing required metadata headers. "
+            "ALL FIVE metadata headers must appear in the first 80 lines as "
+            "Python comments: # INVOKE_WITH:, # RUN_PAYLOAD_REQUIRED:, "
+            "# RUN_PAYLOAD_OPTIONAL:, # INVOKE_EXAMPLE:, and # Example:. "
+            "Copy them exactly from the template."
+        ),
+        "B:docstring_start_missing": (
+            "CRITICAL: The FIRST statement inside def run(payload: dict) -> dict: "
+            "MUST be the triple-quoted docstring containing 'contract guard', "
+            "'prereqs', and 'limitations'. Do NOT place any code (including "
+            "payload = payload or {}) before the docstring. The exact structural "
+            "order is: 1) docstring, 2) try: block, 3) inside try: "
+            "payload = payload or {}."
+        ),
+        "input_schema_required_mismatch": (
+            "CRITICAL: Your RUN_PAYLOAD_REQUIRED metadata is wrong. "
+            "The six mandatory payload keys — task_text, asked_for, trace, "
+            "actions_spec, run_id, state_dir — MUST ALL appear in "
+            "RUN_PAYLOAD_REQUIRED. If your tool needs additional keys "
+            "(like 'entities'), ADD them to the list alongside the six "
+            "mandatory ones. Do NOT move mandatory keys to OPTIONAL. "
+            "Correct example:\n"
+            '# RUN_PAYLOAD_REQUIRED: ["task_text", "asked_for", "trace", '
+            '"actions_spec", "run_id", "state_dir", "entities"]'
+        ),
     }
 
     def _toolgen_build_task_prompt(self, env_name: str, dataset_item: Any) -> str:
@@ -263,7 +299,7 @@ class ControllerToolgenMixin:
                 pass
         if metadata:
             self._generated_tool_counter += 1
-            self._mark_tool_invoked()
+            self._mark_tool_invoked(metadata.name)
         return metadata
 
     def _extract_marked_python(self, text: str) -> Optional[str]:
@@ -548,7 +584,16 @@ class ControllerToolgenMixin:
                 system_prompt=get_toolgen_system_prompt("aggregate3", env_name),
                 chat_history=chat_history,
                 name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                prompt_name=f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}",
+                force_max_rounds=2,
             )
+            if isinstance(tool, Mapping) and tool.get("error"):
+                print(
+                    f"[TOOLGEN_PREBOOT] WARNING: Tool generation aborted ({tool.get('error')}) for env '{env_name}'",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                tool = None
             if tool:
                 print(
                     f"[TOOLGEN_PREBOOT] SUCCESS: Tool '{tool.name}' generated for env '{env_name}'"
@@ -596,8 +641,17 @@ class ControllerToolgenMixin:
                 system_prompt=get_toolgen_system_prompt("aggregate3", env_name),
                 chat_history=chat_history,
                 name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                prompt_name=f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}",
+                force_max_rounds=2,
             )
 
+            if isinstance(tool, Mapping) and tool.get("error"):
+                print(
+                    f"[TOOLGEN_PREBOOT] WARNING: Tool generation aborted ({tool.get('error')}) for env '{env_name}'",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                tool = None
             if tool:
                 print(f"[TOOLGEN_PREBOOT] SUCCESS: Tool '{tool.name}' generated for env '{env_name}'")
             else:
@@ -614,12 +668,17 @@ class ControllerToolgenMixin:
             getattr(self, "_toolgen_pipeline_name", "baseline"),
             self._resolved_environment_label(),
         )
+        prompt_name = (
+            f"TOOLGEN_SYSTEM_PROMPT:{getattr(self, '_toolgen_pipeline_name', 'baseline')}:{self._resolved_environment_label()}"
+        )
         prompt = self._toolgen_request_prompt(task_query, chat_history)
         self._toolgen_generate_from_prompt(
             user_prompt=prompt,
             system_prompt=system_prompt,
             chat_history=chat_history,
             name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+            prompt_name=prompt_name,
+            force_max_rounds=2,
         )
         preboot_envs.add(env_name)
 
@@ -697,62 +756,33 @@ class ControllerToolgenMixin:
         except Exception:
             return None
 
-    def _toolgen_contamination_check(
-        self, tool_code: str, payload: Mapping[str, Any]
-    ) -> Optional[Mapping[str, Any]]:
-        """Fail the tool if it hardcodes task-specific entities in string literals."""
-        if not tool_code or not isinstance(payload, Mapping):
+    def _toolgen_duplicate_abort_check(
+        self, tool_code: str, *, threshold: float = 0.80
+    ) -> Optional[tuple[str, float]]:
+        if not tool_code:
             return None
-        task_text = str(payload.get("task_text") or "")
-        asked_for = str(payload.get("asked_for") or "")
-        combined = f"{task_text} {asked_for}"
-        # Extract candidate entity tokens: capitalized words and quoted strings.
-        entities: set[str] = set()
-        for quoted in re.findall(r"[\"']([^\"']{4,})[\"']", combined):
-            entities.add(quoted.strip())
-        for word in re.findall(r"\b[A-Z][a-z]{3,}\b", combined):
-            entities.add(word)
-        # Filter out generic English / KG environment noise words.
-        _noise = {
-            "Action", "What", "Which", "Where", "When", "Find", "List",
-            "Give", "Show", "Name", "Type", "True", "False", "None",
-            "Start", "There", "This", "That", "Each", "From", "With",
-            "About", "Have", "Does", "Some", "Many", "More", "Most",
-            "Only", "Also", "Then", "Than", "Into", "Over", "Such",
-            "Very", "Just", "Will", "Here", "Trace", "Entity",
-        }
-        entities -= _noise
-        # Programming/system keywords that naturally appear in Python code.
-        _programming_whitelist = {
-            "error", "exception", "true", "false", "none", "null", "dict",
-            "list", "str", "int", "float", "bool", "return", "def", "class",
-            "import", "json", "variable", "instance", "type", "string",
-            "trace", "payload", "status", "advisory", "done", "blocked",
-            "answer", "recommendation", "action", "args", "kwargs", "output",
-            "ok",
-        }
-        entities = {e for e in entities if e.lower() not in _programming_whitelist}
-        if not entities:
+        candidate_doc = self._extract_module_docstring(tool_code)
+        if not candidate_doc:
+            match = re.search(r'"""(.*?)"""', tool_code, flags=re.DOTALL)
+            if not match:
+                match = re.search(r"'''(.*?)'''", tool_code, flags=re.DOTALL)
+            if match:
+                candidate_doc = match.group(1).strip()
+        if not candidate_doc:
             return None
-        # Scan the raw generated Python code for the entities.
-        for entity in entities:
-            if len(entity) <= 3:
+        current_env = self._resolved_environment_label()
+        tools = (
+            self._registry.list_latest_tools(environment=current_env)
+            if hasattr(self._registry, "list_latest_tools")
+            else self._registry.list_tools(environment=current_env)
+        )
+        for tool in tools:
+            existing_desc = (tool.description or tool.docstring or "").strip()
+            if not existing_desc:
                 continue
-            if entity.lower() in tool_code.lower():
-                return {
-                    "grade": 0,
-                    "issues": [
-                        f"Semantic Contamination: You hardcoded the specific "
-                        f"domain entity '{entity}' into your tool logic or "
-                        f"strings. You must write parametric, domain-agnostic code."
-                    ],
-                    "fixes": [
-                        "Remove all task-specific entity names from your code. "
-                        "Use generic phrasing like 'target entity' and extract "
-                        "real entities from payload['task_text'] at runtime."
-                    ],
-                    "summary": f"Semantic contamination: hardcoded '{entity}'.",
-                }
+            similarity = difflib.SequenceMatcher(None, candidate_doc, existing_desc).ratio()
+            if similarity > threshold:
+                return tool.name, similarity
         return None
 
     def _toolgen_validate_candidate_tool(
@@ -765,12 +795,7 @@ class ControllerToolgenMixin:
         if not tool_code:
             return None
         exec_payload = getattr(self, "_toolgen_execution_payload", None)
-        # Phase 1: Contamination check (before execution)
-        if isinstance(exec_payload, Mapping):
-            contamination = self._toolgen_contamination_check(tool_code, exec_payload)
-            if contamination is not None:
-                return contamination
-        # Phase 2: Execution check
+        # Phase 1: Execution check (no semantic heuristics; LLM validator owns contamination)
         if isinstance(exec_payload, Mapping):
             execution_validation = self._toolgen_execution_check(tool_code, exec_payload)
             if execution_validation is not None:
@@ -808,6 +833,57 @@ class ControllerToolgenMixin:
                 err += "\n" + traceback.format_exc()
         return False, err
 
+    @staticmethod
+    def quick_structural_precheck(code: str) -> list[str]:
+        """Fast regex pre-check for common structural errors.
+
+        Returns a list of human-readable issue strings.  An empty list
+        means the code passed the quick checks.  This is intentionally
+        lightweight — it runs *before* the full AST static checker to
+        give the LLM actionable feedback without wasting an AST parse.
+        """
+        issues: list[str] = []
+        head = code[:3000]
+
+        # -- metadata header completeness --
+        required_headers = [
+            "# INVOKE_WITH:",
+            "# RUN_PAYLOAD_REQUIRED:",
+            "# RUN_PAYLOAD_OPTIONAL:",
+            "# INVOKE_EXAMPLE:",
+            "# Example:",
+        ]
+        missing = [h for h in required_headers if h not in head]
+        if missing:
+            issues.append(
+                "CRITICAL: You are missing required metadata headers. "
+                "ALL FIVE metadata headers must appear in the first 80 lines as "
+                "Python comments: # INVOKE_WITH:, # RUN_PAYLOAD_REQUIRED:, "
+                "# RUN_PAYLOAD_OPTIONAL:, # INVOKE_EXAMPLE:, and # Example:. "
+                "Copy them exactly from the template."
+            )
+
+        # -- docstring must be first statement inside run() --
+        run_match = re.search(
+            r"def\s+run\s*\(\s*payload\s*:\s*dict\s*\)\s*->\s*dict\s*:", code
+        )
+        if run_match:
+            after_sig = code[run_match.end():]
+            # Strip leading whitespace / blank lines but preserve structure
+            stripped = after_sig.lstrip("\n\r \t")
+            if not (stripped.startswith('"""') or stripped.startswith("'''")):
+                issues.append(
+                    "CRITICAL: The FIRST statement inside "
+                    "def run(payload: dict) -> dict: MUST be the triple-quoted "
+                    "docstring containing 'contract guard', 'prereqs', and "
+                    "'limitations'. Do NOT place any code (including "
+                    "payload = payload or {}) before the docstring. The exact "
+                    "structural order is: 1) docstring, 2) try: block, "
+                    "3) inside try: payload = payload or {}."
+                )
+
+        return issues
+
     def _toolgen_negative_mark_triggered(self) -> bool:
         current_env = self._resolved_environment_label()
         tools = (
@@ -819,6 +895,19 @@ class ControllerToolgenMixin:
             if getattr(tool, "negative_marks", 0) >= 3:
                 return True
         return False
+
+    @staticmethod
+    def _mock_kg_actions_spec() -> dict[str, Any]:
+        """Return mock callable functions for KG actions_spec during smoke tests."""
+        return {
+            "get_relations": lambda *args: "Relations of mock_entity: [mock.relation.one, mock.relation.two]",
+            "get_neighbors": lambda *args: "Variable #99 = get_neighbors(mock_entity, mock.relation.one)",
+            "intersection": lambda *args: "Variable #100 = intersection(#98, #99)",
+            "get_attributes": lambda *args: "The attributes of Variable #99 are: [mock.attr]",
+            "argmax": lambda *args: "Variable #101 = argmax(#99, mock.attr)",
+            "argmin": lambda *args: "Variable #102 = argmin(#99, mock.attr)",
+            "count": lambda *args: "The number of entities in Variable #99 is 42",
+        }
 
     def _build_toolgen_execution_payload(
         self,
@@ -833,9 +922,37 @@ class ControllerToolgenMixin:
             actions_spec = self._available_actions_spec()
         except Exception:
             actions_spec = {}
+        # Inject mock callables so Macro tools pass callable() checks during
+        # smoke testing.  The mocks return plausible string outputs.
+        if self._resolved_environment_label() == "knowledge_graph":
+            actions_spec = {**actions_spec, **self._mock_kg_actions_spec()}
         registry_dir = getattr(self, "_registry_dir", "") or getattr(self, "_toolgen_registry_root", "") or "."
         state_dir = os.path.join(registry_dir, "tool_state")
         run_id = "toolgen_exec"
+        # Extract entity hints from task_text so tools that expect an
+        # 'entities' key in the payload have something to work with during
+        # the validator execution check.  This mirrors what the live
+        # Orchestrator populates when it invokes Macro tools.
+        entities: list[str] = []
+        if isinstance(task_text, str):
+            # Try "Entities: [A, B]" pattern first
+            ent_match = re.search(r"Entities\s*:\s*\[([^\]]+)\]", task_text)
+            if ent_match:
+                entities = [
+                    e.strip().strip("'\"")
+                    for e in ent_match.group(1).split(",")
+                    if e.strip()
+                ]
+            # Fallback: "Entities: A, B" (no brackets)
+            if not entities:
+                ent_match2 = re.search(r"Entities\s*:\s*([^\n\r;]+)", task_text)
+                if ent_match2:
+                    entities = [
+                        e.strip().strip("'\"")
+                        for e in ent_match2.group(1).split(",")
+                        if e.strip()
+                    ]
+
         payload: dict[str, Any] = {
             "task_text": task_text,
             "asked_for": task_text,
@@ -844,6 +961,7 @@ class ControllerToolgenMixin:
             "run_id": run_id,
             "state_dir": state_dir,
             "env_observation": failure_context,
+            "entities": entities,
             "constraints": {
                 "active_variables": list(active_variables or []),
                 "failure_context": failure_context,
@@ -919,18 +1037,54 @@ class ControllerToolgenMixin:
         pruned = result.get("pruned_observation")
         rec_lower = recommendation.lower()
         # Specific handling for blocked status — surface the real exception.
+        # Macro tools may legitimately return status='blocked' if they detect
+        # missing live environment functions during smoke testing; that is
+        # acceptable behavior and not a failure.
         if status in {"blocked", "error"}:
-            actual_error = str(result.get("error") or "Unknown exception")
+            # Build a detailed error message from ALL available fields so the
+            # LLM generator can actually diagnose what went wrong instead of
+            # seeing an opaque "Unknown exception".
+            error_field = result.get("error")
+            errors_list = result.get("errors") or []
+            answer_rec = str(result.get("answer_recommendation") or "").strip()
+
+            if isinstance(errors_list, list) and any(
+                "missing_actions_spec" in str(e) for e in errors_list
+            ):
+                # Macro correctly detected mock/missing actions_spec — pass.
+                return None
+
+            # Assemble the most informative description available.
+            detail_parts: list[str] = []
+            if error_field:
+                detail_parts.append(f"error={error_field}")
+            if isinstance(errors_list, list) and errors_list:
+                detail_parts.append(
+                    f"errors={errors_list!r}"
+                )
+            if answer_rec:
+                detail_parts.append(
+                    f"answer_recommendation={answer_rec!r}"
+                )
+            actual_error = "; ".join(detail_parts) if detail_parts else "Unknown exception"
+
             return {
                 "grade": 0,
                 "issues": [
-                    f"execution_blocked: Your code raised an exception during "
-                    f"dummy-payload testing: {actual_error}. Fix the bug."
+                    f"execution_blocked: Your code returned status='{status}' during "
+                    f"dummy-payload testing. Details: {actual_error}. "
+                    f"The dummy payload does NOT contain an 'entities' key — your "
+                    f"tool must tolerate its absence (extract entities from "
+                    f"'task_text' and 'asked_for' instead, or return a safe "
+                    f"default). Fix the bug."
                 ],
                 "fixes": [
-                    "Your tool CANNOT query the KG directly (no network). "
-                    "It must read the trace and return a concrete answer_recommendation string. "
-                    "Ensure the tool does not crash or return status='blocked' on empty/dummy traces."
+                    "Do NOT require non-standard payload keys like 'entities'. "
+                    "The execution harness only guarantees: task_text, asked_for, "
+                    "trace, actions_spec, run_id, state_dir, env_observation, "
+                    "constraints. Extract entities from task_text/asked_for at "
+                    "runtime. Use .get() with fallbacks for all payload access "
+                    "and return a valid dict with status='done'."
                 ],
                 "summary": f"Execution failed: {actual_error}",
             }
@@ -956,9 +1110,9 @@ class ControllerToolgenMixin:
                     f"execution_dead_end: tool returned empty output.{error_detail}{rec_detail}"
                 ],
                 "fixes": [
-                    "Your tool CANNOT query the KG directly (no network). "
-                    "It must read the trace and return a concrete answer_recommendation string. "
-                    "Ensure the tool does not crash or return status='blocked' on empty/dummy traces."
+                    "Ensure the tool returns a non-empty answer_recommendation string "
+                    "and a populated pruned_observation dict. "
+                    "Handle empty traces and mocked payloads gracefully."
                 ],
                 "summary": f"Execution failed: dead-end output.{error_detail}",
             }
@@ -977,17 +1131,26 @@ class ControllerToolgenMixin:
                 return ", ".join(str(v) for v in value)
             return str(value)
 
-        reasoning = _stringify(decision.get("reasoning") or decision.get("reason"))
-        failure_context = _stringify(decision.get("failure_context"))
-        desired_behavior = _stringify(decision.get("desired_behavior"))
-        tool_type = _stringify(
-            decision.get("tool_type") or decision.get("needed_capabilities")
+        reason = _stringify(decision.get("reason"))
+        tool_type = _stringify(decision.get("tool_type"))
+        catalog_summary = ""
+        try:
+            catalog_summary = self._toolgen_tool_list_appendix()
+        except Exception:
+            catalog_summary = ""
+        catalog_block = (
+            "=== EXISTING TOOL CATALOG ===\n"
+            f"{catalog_summary}\n\n"
+            "=== GAP ANALYSIS REQUIREMENT ===\n"
+            "You must review the existing tools above. DO NOT generate a tool that duplicates this "
+            "functionality. The existing tools failed or were insufficient. You must identify the GAP "
+            "and write a specialized tool that performs a NEW graph computation or filter.\n\n"
         )
+
         blueprint_header = (
             "=== ORCHESTRATOR BLUEPRINT ===\n"
             f"TOOL TYPE REQUIRED: {tool_type}\n"
-            f"FAILURE CONTEXT: {failure_context}\n"
-            f"DESIRED BEHAVIOR: {desired_behavior}\n"
+            f"FORGE CONTEXT: {reason}\n"
             "CRITICAL ABSTRACTION RULE: You are generating a tool for a class "
             "of problems, not a specific task. You MUST write PARAMETRIC code. "
             "Do NOT hardcode entities (like 'Naloxone', 'goats', 'cows') into "
@@ -996,15 +1159,12 @@ class ControllerToolgenMixin:
             "the search abstractly. Give the tool a generic, descriptive name "
             "(e.g., 'multi_entity_intersection_macro_tool').\n"
             "==============================\n\n"
+            + catalog_block
         )
 
         parts = [query]
-        if failure_context:
-            parts.append(f"FAILURE CONTEXT: {failure_context}")
-        if desired_behavior:
-            parts.append(f"DESIRED BEHAVIOR: {desired_behavior}")
-        if reasoning:
-            parts.append(f"REASONING: {reasoning}")
+        if reason:
+            parts.append(f"FORGE CONTEXT: {reason}")
         toolgen_query = "\n".join(parts)
 
         env_name = self._resolved_environment_label()
@@ -1023,10 +1183,26 @@ class ControllerToolgenMixin:
 
         user_prompt = build_task_pack(env_name, env_contract, [toolgen_query])
         final_user_prompt = blueprint_header + user_prompt
-        system_prompt = get_toolgen_system_prompt(
-            getattr(self, "_toolgen_pipeline_name", "baseline"),
-            env_name,
-        )
+        requested_tool_type = tool_type.strip().lower()
+        if env_name == "knowledge_graph":
+            system_prompt = (
+                MACRO_TOOLGEN_USER_KG
+                if requested_tool_type == "macro"
+                else AGG_TOOLGEN_USER_KG
+            )
+            prompt_name = (
+                "MACRO_TOOLGEN_USER_KG"
+                if requested_tool_type == "macro"
+                else "AGG_TOOLGEN_USER_KG"
+            )
+        else:
+            system_prompt = get_toolgen_system_prompt(
+                getattr(self, "_toolgen_pipeline_name", "baseline"),
+                env_name,
+            )
+            prompt_name = (
+                f"TOOLGEN_SYSTEM_PROMPT:{getattr(self, '_toolgen_pipeline_name', 'baseline')}:{env_name}"
+            )
         trace_steps = []
         try:
             trace_steps, _ = self._build_structured_trace(chat_history)
@@ -1035,7 +1211,7 @@ class ControllerToolgenMixin:
         exec_payload = self._build_toolgen_execution_payload(
             task_text=toolgen_query,
             trace=trace_steps[-10:] if trace_steps else [],
-            failure_context=failure_context,
+            failure_context=reason,
             active_variables=[],
         )
         prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
@@ -1046,6 +1222,7 @@ class ControllerToolgenMixin:
                 system_prompt=system_prompt,
                 chat_history=chat_history,
                 name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                prompt_name=prompt_name,
                 force_strict=True,
                 force_max_rounds=8,
             )
@@ -1059,13 +1236,14 @@ class ControllerToolgenMixin:
         system_prompt: str,
         chat_history: ChatHistory,
         name_prefix: str,
+        prompt_name: Optional[str] = None,
         force_strict: bool = False,
         force_max_rounds: Optional[int] = None,
     ) -> Optional[ToolMetadata]:
         system_prompt = self._prepare_toolgen_agents(system_prompt)
         mode = get_toolgen_mode()
         validate = self._toolgen_should_validate()
-        max_rounds = force_max_rounds if force_max_rounds is not None else (8 if validate else 1)
+        max_rounds = force_max_rounds if force_max_rounds is not None else (9 if validate else 1)
         relaxed_mode = False if force_strict else self._toolgen_relaxed_mode_enabled()
         base_prompt = user_prompt
         last_candidate: Optional[Mapping[str, Any]] = None
@@ -1085,6 +1263,7 @@ class ControllerToolgenMixin:
                     "mode": mode,
                     "max_rounds": max_rounds,
                     "prompt_chars": len(base_prompt or ""),
+                    "system_prompt_name": prompt_name or "custom",
                 }
             )
         except Exception:
@@ -1232,6 +1411,63 @@ class ControllerToolgenMixin:
             last_static_ok = False
             last_smoke_ok = False
 
+            # ── Quick structural pre-check (fast regex, before heavy AST) ──
+            precheck_issues = self.quick_structural_precheck(tool_code)
+            if precheck_issues:
+                precheck_err = " | ".join(precheck_issues)
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_precheck_fail",
+                            "mode": mode,
+                            "round": round_idx,
+                            "tool_name": tool_spec.get("name"),
+                            "issues": precheck_issues,
+                        }
+                    )
+                except Exception:
+                    pass
+                self._write_failed_tool_artifact(
+                    stage="precheck",
+                    error=precheck_err,
+                    code=tool_code,
+                    raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                )
+                feedback_note = json.dumps(
+                    {"phase": "precheck", "error": precheck_err},
+                    ensure_ascii=True,
+                    default=str,
+                )
+                continue
+
+            duplicate_hit = self._toolgen_duplicate_abort_check(tool_code)
+            if duplicate_hit:
+                dup_name, dup_score = duplicate_hit
+                print(
+                    f"[SYSTEM] ABORTING TOOLGEN: Candidate is {dup_score*100:.1f}% similar to {dup_name}.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_duplicate_abort",
+                            "mode": mode,
+                            "round": round_idx,
+                            "tool_name": tool_spec.get("name"),
+                            "duplicate_of": dup_name,
+                            "similarity": dup_score,
+                        }
+                    )
+                except Exception:
+                    pass
+                return {
+                    "success": False,
+                    "reason": "aborted_duplicate",
+                    "code": None,
+                    "error": "aborted_duplicate",
+                }
+
             if relaxed_mode:
                 metadata = self._register_tool_from_payload_relaxed(
                     tool_spec, tool_code, chat_history
@@ -1286,11 +1522,25 @@ class ControllerToolgenMixin:
                     )
                 except Exception:
                     pass
-                feedback_note = json.dumps(
-                    {"phase": "static_check", "error": static_err},
-                    ensure_ascii=True,
-                    default=str,
-                )
+                # Check for hardened feedback override before falling
+                # back to the generic JSON error dump.
+                hardened_msg = None
+                for err_key, err_msg in self._HARDENED_STATIC_FEEDBACK.items():
+                    if err_key in static_err:
+                        hardened_msg = err_msg
+                        break
+                if hardened_msg:
+                    feedback_note = json.dumps(
+                        {"phase": "static_check", "error": hardened_msg},
+                        ensure_ascii=True,
+                        default=str,
+                    )
+                else:
+                    feedback_note = json.dumps(
+                        {"phase": "static_check", "error": static_err},
+                        ensure_ascii=True,
+                        default=str,
+                    )
                 continue
             last_static_ok = True
             try:
@@ -1366,6 +1616,38 @@ class ControllerToolgenMixin:
                     self._toolgen_log_staged_registration(staged_meta, metadata)
                 if metadata:
                     return metadata
+                # Registration failed (likely spec_alignment) — surface it
+                print(
+                    f"[WARN] Tool (no-validate path) "
+                    f"_register_tool_from_payload returned None. "
+                    f"Feeding back spec_alignment guidance.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_registration_rejected",
+                            "mode": mode,
+                            "round": round_idx,
+                            "tool_name": tool_spec.get("name"),
+                            "reason": "spec_alignment_or_validate",
+                        }
+                    )
+                except Exception:
+                    pass
+                feedback_note = json.dumps(
+                    {
+                        "phase": "registration",
+                        "error": self._HARDENED_STATIC_FEEDBACK.get(
+                            "input_schema_required_mismatch",
+                            "Registration failed: check RUN_PAYLOAD_REQUIRED "
+                            "includes all six mandatory keys.",
+                        ),
+                    },
+                    ensure_ascii=True,
+                    default=str,
+                )
                 continue
 
             validation = self._toolgen_validate_candidate_tool(
@@ -1412,7 +1694,7 @@ class ControllerToolgenMixin:
             if grade > best_grade:
                 best_grade = grade
                 best_candidate = candidate
-            min_grade = 8
+            min_grade = 9
             try:
                 override = os.getenv("LIFELONG_TOOLGEN_MIN_GRADE", "").strip()
                 if override:
@@ -1429,6 +1711,49 @@ class ControllerToolgenMixin:
                     if hasattr(self._registry, "set_quality_score"):
                         self._registry.set_quality_score(metadata.name, float(grade))
                     return metadata
+                # --- Registration failed despite passing validation ---
+                print(
+                    f"[WARN] Tool grade={grade} passed validator but "
+                    f"_register_tool_from_payload returned None "
+                    f"(likely spec_alignment failure). Feeding back to LLM.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_registration_rejected",
+                            "mode": mode,
+                            "round": round_idx,
+                            "tool_name": tool_spec.get("name"),
+                            "grade": grade,
+                            "reason": "spec_alignment_or_validate",
+                        }
+                    )
+                except Exception:
+                    pass
+                reg_feedback = {
+                    "phase": "registration",
+                    "error": (
+                        "CRITICAL: Your tool scored grade={grade} but was REJECTED "
+                        "at registration because RUN_PAYLOAD_REQUIRED is wrong. "
+                        "The six mandatory keys — task_text, asked_for, trace, "
+                        "actions_spec, run_id, state_dir — MUST ALL appear in "
+                        "RUN_PAYLOAD_REQUIRED (not OPTIONAL). Any extra keys your "
+                        "tool needs (like 'entities') should be ADDED to the list, "
+                        "not used as a replacement. Correct format:\n"
+                        '# RUN_PAYLOAD_REQUIRED: ["task_text", "asked_for", '
+                        '"trace", "actions_spec", "run_id", "state_dir", "entities"]'
+                    ).format(grade=grade),
+                }
+                # Check for hardened feedback override
+                for err_key, err_msg in self._HARDENED_STATIC_FEEDBACK.items():
+                    if "input_schema_required_mismatch" in err_key:
+                        reg_feedback["error"] = err_msg
+                        break
+                feedback_note = json.dumps(
+                    reg_feedback, ensure_ascii=True, default=str
+                )
                 continue
             print(
                 "[WARN] Tool rejected by Validator. Registry will not be updated.",
@@ -1492,16 +1817,24 @@ class ControllerToolgenMixin:
         use_candidate = best_candidate if best_candidate is not None else last_candidate
         if not use_candidate:
             if relaxed_mode and last_tool_spec and last_tool_code:
-                metadata = self._register_tool_from_payload_relaxed(
-                    last_tool_spec, last_tool_code, chat_history
-                )
-                if metadata:
+                if (last_grade or 0) < self.MIN_REGISTRATION_GRADE:
                     print(
-                        f"[TOOLGEN] Relaxed fallback registration succeeded: {metadata.name}",
+                        f"[TOOLGEN] Relaxed fallback blocked: grade={last_grade} "
+                        f"< MIN_REGISTRATION_GRADE={self.MIN_REGISTRATION_GRADE}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    return metadata
+                else:
+                    metadata = self._register_tool_from_payload_relaxed(
+                        last_tool_spec, last_tool_code, chat_history
+                    )
+                    if metadata:
+                        print(
+                            f"[TOOLGEN] Relaxed fallback registration succeeded: {metadata.name}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        return metadata
                 return {
                     "error": "relaxed_registration_failed",
                     "tool_spec": last_tool_spec,
@@ -1542,6 +1875,14 @@ class ControllerToolgenMixin:
                 )
             except Exception:
                 pass
+            return None
+        if best_grade < self.MIN_REGISTRATION_GRADE:
+            print(
+                f"[TOOLGEN] Fallback registration blocked: best_grade={best_grade} "
+                f"< MIN_REGISTRATION_GRADE={self.MIN_REGISTRATION_GRADE}",
+                file=sys.stderr,
+                flush=True,
+            )
             return None
         tool_spec = use_candidate.get("tool_spec")
         if not isinstance(tool_spec, Mapping):
@@ -2268,7 +2609,20 @@ class ControllerToolgenMixin:
             code = "\n".join(str(line) for line in code_lines)
             schema_keys = self._parse_schema_keys_from_code(code)
             if schema_keys:
-                normalized["input_schema"] = self._build_input_schema(schema_keys[0], schema_keys[1])
+                required, optional = list(schema_keys[0]), list(schema_keys[1])
+                # ── Auto-repair: ensure the 6 mandatory keys are always
+                # in required, regardless of what the LLM declared in
+                # RUN_PAYLOAD_REQUIRED.  Extra keys the tool added (e.g.
+                # "entities") are preserved.
+                _must_have = {"task_text", "asked_for", "trace", "actions_spec", "run_id", "state_dir"}
+                _required_set = set(required)
+                _missing = _must_have - _required_set
+                if _missing:
+                    for key in sorted(_missing):
+                        if key in optional:
+                            optional.remove(key)
+                        required.append(key)
+                normalized["input_schema"] = self._build_input_schema(required, optional)
         schema = normalized.get("input_schema")
         if isinstance(schema, Mapping):
             # If a legacy payload wrapper schema is provided, unwrap to flat.
@@ -2629,7 +2983,7 @@ class ControllerToolgenMixin:
         metadata = self._validate_and_register_tool(spec, chat_history, raw_spec=tool_spec)
         if metadata:
             self._generated_tool_counter += 1
-            self._mark_tool_invoked()
+            self._mark_tool_invoked(metadata.name)
         return metadata
 
     def _consider_tool_generation(
@@ -2696,6 +3050,7 @@ class ControllerToolgenMixin:
                     system_prompt=get_toolgen_system_prompt("aggregate3", env_name),
                     chat_history=chat_history,
                     name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                    prompt_name=f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}",
                 )
                 if tool:
                     print(f"agg3 bootstrapped env={env_name} tools=1")
@@ -2748,6 +3103,7 @@ class ControllerToolgenMixin:
             system_prompt=system_prompt,
             chat_history=chat_history,
             name_prefix="",
+            prompt_name=f"TOOLGEN_SYSTEM_PROMPT:{getattr(self, '_toolgen_pipeline_name', 'baseline')}:{env_name}",
         )
 
     def _reuse_matches_request(self, tool: ToolMetadata) -> bool:

@@ -4,12 +4,115 @@ import re
 from typing import Any, Mapping, Optional, Sequence
 
 from src.typings import ChatHistory, Role
+from src.typings import Session, ChatHistoryItem
 
 from .tool_registry import ToolMetadata, ToolResult
 from .tool_retrieval import retrieve_tools
 
 
 class ControllerToolsMixin:
+    # ------------------------------------------------------------------
+    # Macro routing: execute Macro tools on the server via task.interact
+    # ------------------------------------------------------------------
+    def _route_macro_to_server(
+        self, tool_name: str, args: list[Any]
+    ) -> ToolResult:
+        """Route a Macro tool execution to the server-side _execute_macro engine.
+
+        Instead of running the Macro locally (which lacks live KG context),
+        this method sends a lightweight action string containing ONLY the tool
+        name and entity list.  The server's ``_execute_macro`` constructs the
+        full payload (task_text, trace, live actions_spec callables, etc.).
+
+        This avoids serializing the entire trace/payload into the chat history
+        which was causing exponential context bloat and preventing the macro
+        from receiving real callable functions.
+        """
+        task_ref = getattr(self, "_kg_task_ref", None)
+        session: Optional[Session] = getattr(self, "_current_session", None)
+
+        if task_ref is None or session is None:
+            return ToolResult.failure(
+                "macro_route_failed:missing_task_ref_or_session"
+            )
+
+        # Extract entities from the payload if present; fall back to
+        # regex extraction from task_text.  Do NOT serialize the full
+        # payload — the server builds its own with live callables, etc.
+        entities: list[str] = []
+        if args and isinstance(args[0], Mapping):
+            # Handle the {"args": [payload], "kwargs": {}} wrapper that
+            # _invoke_tool_by_payload passes.  Drill down to the actual
+            # payload dict when the wrapper structure is detected.
+            raw_arg = args[0]
+            if "args" in raw_arg and isinstance(raw_arg.get("args"), (list, tuple)):
+                inner_args = raw_arg["args"]
+                payload_dict = inner_args[0] if inner_args and isinstance(inner_args[0], Mapping) else raw_arg
+            else:
+                payload_dict = raw_arg
+
+            raw_entities = payload_dict.get("entities") or []
+            if isinstance(raw_entities, (list, tuple)):
+                entities = [str(e) for e in raw_entities if e]
+            # Fallback: extract from task_text when LLM omits entities
+            if not entities:
+                task_text = str(payload_dict.get("task_text") or "")
+                ent_match = re.search(
+                    r"Entities\s*:\s*\[([^\]]+)\]", task_text, flags=re.IGNORECASE
+                )
+                if ent_match:
+                    entities = [
+                        e.strip().strip("'\"")
+                        for e in ent_match.group(1).split(",")
+                        if e.strip()
+                    ]
+                if not entities:
+                    ent_match2 = re.search(
+                        r"Entities\s*:\s*([^\n\r;]+)", task_text, flags=re.IGNORECASE
+                    )
+                    if ent_match2:
+                        entities = [
+                            e.strip().strip("'\"")
+                            for e in ent_match2.group(1).split(",")
+                            if e.strip()
+                        ]
+        try:
+            tool_name_json = json.dumps(str(tool_name), ensure_ascii=True)
+            # BYPASS: Join with pipe to avoid environment comma-splitting
+            entities_str = "|".join([str(e) for e in entities])
+            entities_json = json.dumps(entities_str, ensure_ascii=True)
+        except Exception as exc:
+            return ToolResult.failure(f"macro_route_failed:serialize:{exc}")
+        action_str = f"Action: execute_macro({tool_name_json}, {entities_json})"
+
+        # Inject the lightweight macro action into the live session and let
+        # the server handle payload construction + execution.
+        session.chat_history.inject(
+            ChatHistoryItem(role=Role.AGENT, content=action_str)
+        )
+
+        try:
+            task_ref.interact(session)
+        except Exception as exc:
+            return ToolResult.failure(f"macro_execution_failed:{exc}")
+
+        # The server appends the observation as the last USER message.
+        try:
+            obs_item = session.chat_history.get_item_deep_copy(-1)
+            observation = obs_item.content or ""
+        except Exception:
+            observation = ""
+
+        self._log_flow_event(
+            "macro_routed",
+            tool_name=tool_name,
+            observation_preview=observation[:200],
+        )
+
+        return ToolResult.success_result(
+            {"macro_observation": observation, "tool_name": tool_name, "tool_type": "macro"}
+        )
+
     def _read_tool_source(self, tool_name: str) -> Optional[str]:
         resolved_name = (
             self._registry.resolve_name(tool_name)
@@ -265,6 +368,24 @@ class ControllerToolsMixin:
         # Look up signature so we can enforce "payload tools always get 1 dict arg"
         tool_meta = self._get_tool_metadata(resolved_name)
 
+        # ---- Macro routing: bypass local execution, send to server ----
+        _is_macro = (
+            (tool_meta and tool_meta.tool_type and "macro" in tool_meta.tool_type.lower())
+            or "macro" in resolved_name.lower()
+        )
+        if _is_macro and self._resolved_environment_label() == "knowledge_graph":
+            self._log_flow_event(
+                "macro_route_detected",
+                tool_name=resolved_name,
+                reason=reason,
+            )
+            self._mark_tool_invoked(resolved_name)
+            self._tool_invocation_attempts += 1
+            result = self._route_macro_to_server(resolved_name, [tool_args])
+            if result.success:
+                self._tool_invocation_successes += 1
+            return result
+
         args: list[Any] = []
         kwargs: dict[str, Any] = {}
 
@@ -395,7 +516,7 @@ class ControllerToolsMixin:
             reason=reason,
         )
 
-        self._mark_tool_invoked()
+        self._mark_tool_invoked(resolved_name or tool_name)
         self._tool_invocation_attempts += 1
 
         result = self._registry.invoke_tool(
@@ -484,8 +605,33 @@ class ControllerToolsMixin:
             kwargs_preview=self._preview_for_log(kwargs),
             reason=reason,
         )
-        self._mark_tool_invoked()
+        self._mark_tool_invoked(tool.name)
         self._tool_invocation_attempts += 1
+
+        # ---- Macro routing: bypass local execution, send to server ----
+        _is_macro = (
+            (tool.tool_type and "macro" in tool.tool_type.lower())
+            or "macro" in tool.name.lower()
+        )
+        if _is_macro and self._resolved_environment_label() == "knowledge_graph":
+            self._log_flow_event(
+                "macro_route_detected",
+                tool_name=tool.name,
+                reason=reason,
+            )
+            result = self._route_macro_to_server(tool.name, list(args))
+            if result.success:
+                self._tool_invocation_successes += 1
+            self._log_flow_event(
+                "tool_agent_output",
+                tool_name=tool.name,
+                success=result.success,
+                error=result.error,
+                output=result.output,
+            )
+            self._trace("tool_agent_result", self._format_tool_result(tool.name, result))
+            return result, args, kwargs
+
         result = self._registry.invoke_tool(
             tool.name,
             *args,
@@ -623,7 +769,7 @@ class ControllerToolsMixin:
         payload: Mapping[str, Any],
         chat_history: ChatHistory,
     ) -> tuple[ToolResult, list[Any], dict[str, Any], str]:
-        self._mark_tool_invoked()
+        self._mark_tool_invoked(tool_name)
         if "_parse_error" in payload:
             return (
                 ToolResult.failure(str(payload.get("_parse_error"))),
@@ -694,9 +840,28 @@ class ControllerToolsMixin:
 
         # NO MUTATION POLICY: Payload passed as-is, tool handles missing fields
 
+        effective_name = resolved_name or tool_name
+
+        # ---- Macro routing: bypass local execution, send to server ----
+        _is_macro = (
+            (tool_meta and tool_meta.tool_type and "macro" in tool_meta.tool_type.lower())
+            or "macro" in effective_name.lower()
+        )
+        if _is_macro and self._resolved_environment_label() == "knowledge_graph":
+            self._log_flow_event(
+                "macro_route_detected",
+                tool_name=effective_name,
+                reason="internal_tool",
+            )
+            self._tool_invocation_attempts += 1
+            result = self._route_macro_to_server(effective_name, list(tool_args))
+            if result.success:
+                self._tool_invocation_successes += 1
+            return result, tool_args, tool_kwargs, effective_name
+
         self._tool_invocation_attempts += 1
         result = self._registry.invoke_tool(
-            resolved_name or tool_name,
+            effective_name,
             *tool_args,
             invocation_context={"environment": self._resolved_environment_label()},
             **tool_kwargs,
@@ -704,7 +869,7 @@ class ControllerToolsMixin:
         if result.success:
             self._tool_invocation_successes += 1
         self._log_tool_invocation_event(
-            tool_name=resolved_name or tool_name,
+            tool_name=effective_name,
             args=tool_args,
             kwargs=tool_kwargs,
             result=result,
@@ -712,4 +877,4 @@ class ControllerToolsMixin:
             args_auto_built=args_auto_built,
             decision_action="use_tool",
         )
-        return result, tool_args, tool_kwargs, (resolved_name or tool_name)
+        return result, tool_args, tool_kwargs, effective_name

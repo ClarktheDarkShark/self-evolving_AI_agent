@@ -790,8 +790,8 @@ class ControllerLoggingMixin:
         payload.update(self._get_run_task_metadata())
         self._append_generated_tools_log(payload)
 
-    def _mark_tool_invoked(self) -> None:
-        self._tool_invoked_in_last_inference = True
+    def _mark_tool_invoked(self, tool_name: Optional[str] = None) -> None:
+        self._tool_invoked_in_last_inference = tool_name or True
 
     def _format_tool_response_text(self, result: ToolResult) -> str:
         lines = [f"Success: {result.success}"]

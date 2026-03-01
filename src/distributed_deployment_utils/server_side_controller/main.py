@@ -6,6 +6,8 @@ import traceback
 import time
 import docker
 import psutil
+import threading
+import os
 from typing import Optional
 
 from src.typings import LoggerConfig
@@ -30,6 +32,9 @@ class ServerSideController:
         self.server_up_flag = False
         self.server_related_docker_container_id_list: list[str] = []
         self.server_pid: Optional[int] = None
+        self._docker_watchdog_thread: Optional[threading.Thread] = None
+        self._docker_watchdog_stop: Optional[threading.Event] = None
+        self._docker_watchdog_reported: set[str] = set()
         self.logger.info("ServerSideController initialized.")
 
     def start_server(self, request: StartServerRequest) -> StartServerResponse:
@@ -85,6 +90,7 @@ class ServerSideController:
         self.logger.info(f"{self.server_related_docker_container_id_list=}")
         self.server_up_flag = True
         self.server_pid = server_process.pid
+        self._start_docker_watchdog()
         return StartServerResponse(
             success_flag=True, message="Server started successfully"
         )
@@ -163,9 +169,93 @@ class ServerSideController:
             p.kill()
 
     def _reset_state(self) -> None:
+        if self._docker_watchdog_stop is not None:
+            self._docker_watchdog_stop.set()
+        if self._docker_watchdog_thread is not None:
+            self._docker_watchdog_thread.join(timeout=2.0)
         self.server_up_flag = False
         self.server_pid = None
         self.server_related_docker_container_id_list = []
+        self._docker_watchdog_thread = None
+        self._docker_watchdog_stop = None
+        self._docker_watchdog_reported = set()
+
+    def _start_docker_watchdog(self) -> None:
+        if not self.server_related_docker_container_id_list:
+            self.logger.info("Docker watchdog not started: no container IDs captured.")
+            return
+        if self._docker_watchdog_thread and self._docker_watchdog_thread.is_alive():
+            return
+        self._docker_watchdog_stop = threading.Event()
+        self._docker_watchdog_thread = threading.Thread(
+            target=self._docker_watchdog_loop, daemon=True
+        )
+        self._docker_watchdog_thread.start()
+        self.logger.info(
+            "Docker watchdog started for containers=%s",
+            self.server_related_docker_container_id_list,
+        )
+
+    def _docker_watchdog_loop(self) -> None:
+        try:
+            interval_s = float(os.getenv("LIFELONG_DOCKER_WATCHDOG_S", "10").strip())
+        except Exception:
+            interval_s = 10.0
+        try:
+            client = docker.from_env()
+        except Exception as e:
+            self.logger.error("Docker watchdog failed to init: %s", e)
+            return
+        while self._docker_watchdog_stop and not self._docker_watchdog_stop.is_set():
+            container_ids = list(self.server_related_docker_container_id_list)
+            for container_id in container_ids:
+                if container_id in self._docker_watchdog_reported:
+                    continue
+                try:
+                    container = client.containers.get(container_id)
+                except Exception as e:
+                    self.logger.error(
+                        "Docker watchdog: container %s missing or unreachable: %s",
+                        container_id,
+                        e,
+                    )
+                    self._docker_watchdog_reported.add(container_id)
+                    continue
+                state = container.attrs.get("State", {})
+                status = str(state.get("Status", "")).lower()
+                if status and status != "running":
+                    exit_code = state.get("ExitCode")
+                    oom_killed = state.get("OOMKilled")
+                    error = state.get("Error")
+                    started_at = state.get("StartedAt")
+                    finished_at = state.get("FinishedAt")
+                    self.logger.error(
+                        "Docker container crashed: id=%s status=%s exit_code=%s oom=%s "
+                        "error=%s started_at=%s finished_at=%s",
+                        container_id,
+                        status,
+                        exit_code,
+                        oom_killed,
+                        error,
+                        started_at,
+                        finished_at,
+                    )
+                    try:
+                        tail = container.logs(tail=200).decode("utf-8", errors="ignore")
+                        self.logger.error(
+                            "Docker container logs (tail=200) id=%s:\n%s",
+                            container_id,
+                            tail,
+                        )
+                    except Exception as e:
+                        self.logger.error(
+                            "Docker watchdog failed to read logs for %s: %s",
+                            container_id,
+                            e,
+                        )
+                    self._docker_watchdog_reported.add(container_id)
+            if self._docker_watchdog_stop is not None:
+                self._docker_watchdog_stop.wait(interval_s)
 
 
 def main() -> None:

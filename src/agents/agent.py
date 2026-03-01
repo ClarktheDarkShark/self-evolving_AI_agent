@@ -51,9 +51,9 @@ class Agent(ABC):
             chat_history_item = ChatHistoryItem(role=Role.AGENT, content="")
         finally:
             tool_invoked = getattr(self, "_tool_invoked_in_last_inference", None)
-            invoked = tool_invoked if isinstance(tool_invoked, bool) else False
-            session.tool_invoked.append(invoked)
-            session.tool_invoked_any = session.tool_invoked_any or invoked
+            tool_name = tool_invoked if isinstance(tool_invoked, str) else None
+            session.tool_invoked.append(tool_name)
+            session.tool_invoked_any = session.tool_invoked_any or bool(tool_invoked)
             clear_inference_context()
         session.chat_history.inject(chat_history_item)
 

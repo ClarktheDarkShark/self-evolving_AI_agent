@@ -40,6 +40,8 @@ from .controller_prompts import (
     TOOL_INVOKER_SYSTEM_PROMPT,
     COMBINED_ORCHESTRATOR_SYSTEM_PROMPT,
     TOOLGEN_VALIDATOR_SYSTEM_PROMPT,
+    AGG_TOOLGEN_USER_KG,
+    MACRO_TOOLGEN_USER_KG,
 )
 from .controller_toolgen import ControllerToolgenMixin
 from .controller_tools import ControllerToolsMixin
@@ -377,6 +379,7 @@ class SelfEvolvingController(
         self._toolgen_debug_registered_tools: dict[str, int] = {}
         self._last_toolgen_parse_source: Optional[str] = None
         self._toolgen_last_recommendation: Optional[str] = None
+        self._just_generated_tool: Optional[str] = None
         self._tool_usage_logged: set[str] = set()
         self._outcome_scored: set[str] = set()
         self._failure_forged: set[str] = set()
@@ -1007,6 +1010,21 @@ class SelfEvolvingController(
             f"deterministically. It must dynamically extract entities from "
             f"payload['task_text']. Do NOT generate an advisory tool."
         )
+        catalog_summary = ""
+        try:
+            if hasattr(self, "_toolgen_tool_list_appendix"):
+                catalog_summary = self._toolgen_tool_list_appendix()
+        except Exception:
+            catalog_summary = ""
+        catalog_block = (
+            "=== EXISTING TOOL CATALOG ===\n"
+            f"{catalog_summary}\n\n"
+            "=== GAP ANALYSIS REQUIREMENT ===\n"
+            "You must review the existing tools above. DO NOT generate a tool that duplicates this "
+            "functionality. The existing tools failed or were insufficient. You must identify the GAP "
+            "and write a specialized tool that performs a NEW graph computation or filter.\n\n"
+        )
+
         reflection_header = (
             "=== POST-TASK REFLECTION ===\n"
             "The agent failed the following task.\n"
@@ -1036,6 +1054,7 @@ class SelfEvolvingController(
             "Give the tool a generic, descriptive name "
             "(e.g., 'multi_entity_intersection_macro_tool').\n"
             "============================\n\n"
+            + catalog_block
         )
 
         self._append_loop_log(
@@ -1083,13 +1102,28 @@ class SelfEvolvingController(
                 )
                 prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
                 setattr(self, "_toolgen_execution_payload", exec_payload)
-                system_prompt = get_toolgen_system_prompt("aggregate3", env_name)
+                requested_tool_type = "macro"
+                if env_name == "knowledge_graph":
+                    system_prompt = (
+                        MACRO_TOOLGEN_USER_KG
+                        if requested_tool_type == "macro"
+                        else AGG_TOOLGEN_USER_KG
+                    )
+                    prompt_name = (
+                        "MACRO_TOOLGEN_USER_KG"
+                        if requested_tool_type == "macro"
+                        else "AGG_TOOLGEN_USER_KG"
+                    )
+                else:
+                    system_prompt = get_toolgen_system_prompt("aggregate3", env_name)
+                    prompt_name = f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}"
                 try:
                     result = self._toolgen_generate_from_prompt(
                         user_prompt=final_user_prompt,
                         system_prompt=system_prompt,
                         chat_history=chat_history,
                         name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                        prompt_name=prompt_name,
                         force_strict=True,
                         force_max_rounds=8,
                     )
@@ -1107,10 +1141,24 @@ class SelfEvolvingController(
                     env_contract = ""
                 user_prompt = build_task_pack(env_name, env_contract, [enriched_query])
                 final_user_prompt = reflection_header + user_prompt
-                system_prompt = get_toolgen_system_prompt(
-                    getattr(self, "_toolgen_pipeline_name", "baseline"),
-                    env_name,
-                )
+                requested_tool_type = "macro"
+                if env_name == "knowledge_graph":
+                    system_prompt = (
+                        MACRO_TOOLGEN_USER_KG
+                        if requested_tool_type == "macro"
+                        else AGG_TOOLGEN_USER_KG
+                    )
+                    prompt_name = (
+                        "MACRO_TOOLGEN_USER_KG"
+                        if requested_tool_type == "macro"
+                        else "AGG_TOOLGEN_USER_KG"
+                    )
+                else:
+                    system_prompt = get_toolgen_system_prompt(
+                        getattr(self, "_toolgen_pipeline_name", "baseline"),
+                        env_name,
+                    )
+                    prompt_name = f"TOOLGEN_SYSTEM_PROMPT:{getattr(self, '_toolgen_pipeline_name', 'baseline')}:{env_name}"
                 prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
                 exec_payload = self._build_toolgen_execution_payload(
                     task_text=enriched_query,
@@ -1125,6 +1173,7 @@ class SelfEvolvingController(
                         system_prompt=system_prompt,
                         chat_history=chat_history,
                         name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                        prompt_name=prompt_name,
                         force_strict=True,
                         force_max_rounds=8,
                     )
@@ -1250,14 +1299,14 @@ class SelfEvolvingController(
             action_name = forced_decision.get("action")
             if action_name == "request_new_tool":
                 print(
-                    f"[LATM_FLOW] Desired Behavior for Forge: "
-                    f"{forced_decision.get('desired_behavior')}",
+                    f"[LATM_FLOW] Forge reason: "
+                    f"{forced_decision.get('reason')}",
                     file=sys.stderr,
                     flush=True,
                 )
                 print(
-                    f"[!] ESCAPE HATCH TRIGGERED: "
-                    f"{forced_decision.get('reasoning')}",
+                    f"[!] ESCAPE HATCH TRIGGERED: tool_type="
+                    f"{forced_decision.get('tool_type', 'advisory')}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1323,6 +1372,25 @@ class SelfEvolvingController(
 
         # Phase 1: Extract latest observation immediately (before any solver call)
         pre_orch_trace, pre_orch_obs = self._build_structured_trace(working_history)
+        def _is_stagnant_step(step: Mapping[str, Any]) -> bool:
+            if step.get("ok") is False:
+                return True
+            if step.get("error"):
+                return True
+            output = step.get("output")
+            if isinstance(output, (list, tuple, dict)) and len(output) == 0:
+                return True
+            if isinstance(output, str):
+                if output.strip() in {"", "[]"}:
+                    return True
+            return False
+
+        stagnation_count = 0
+        for step in reversed(pre_orch_trace):
+            if _is_stagnant_step(step):
+                stagnation_count += 1
+            else:
+                break
         observation_triggers: list[dict[str, Any]] = []
         if pre_orch_obs is not None:
             obs_output = str(pre_orch_obs.get("output") or "")
@@ -1381,6 +1449,7 @@ class SelfEvolvingController(
                     solver_recommendation=solver_recommendation,
                     observation_triggers=observation_triggers,
                     last_observation=pre_orch_obs,
+                    stagnation_count=stagnation_count,
                 )
             else:
                 decision = dict(forced_decision)
@@ -1419,8 +1488,8 @@ class SelfEvolvingController(
                 and str(decision.get("tool_name") or "").strip() == "request_new_tool"
             ):
                 print(
-                    f"[LATM_FLOW] Desired Behavior for Forge: "
-                    f"{decision.get('desired_behavior')}",
+                    f"[LATM_FLOW] Forge reason: "
+                    f"{decision.get('reason')}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1459,6 +1528,7 @@ class SelfEvolvingController(
                     solver_recommendation=escape_result["observation"],
                     observation_triggers=observation_triggers,
                     last_observation=pre_orch_obs,
+                    stagnation_count=stagnation_count,
                 )
                 print(
                     f"[DEBUG] Orchestrator Decision (post-escape): {decision}",
@@ -1608,6 +1678,60 @@ class SelfEvolvingController(
                                     if not optional_keys:
                                         optional_keys = list(tool_meta.optional_keys or [])
                             payload_map: dict[str, Any] = dict(payload) if isinstance(payload, Mapping) else {}
+
+                            # ── Inject mandatory payload keys as defaults ──
+                            # The tool_invoker LLM may not echo all required
+                            # keys.  Inject them from controller state so the
+                            # missing_keys check (below) does not block valid
+                            # invocations.  Using setdefault preserves any
+                            # value the LLM explicitly provided.
+                            _inv_meta = self._get_run_task_metadata()
+                            _inv_run_id, _inv_state_dir, _ = self._scoped_run_id_state_dir(
+                                task_text_full=(task_query or "").strip(),
+                                asked_for="",
+                                sample_index=_inv_meta.get("sample_index"),
+                                task_name=_inv_meta.get("task_name") or self._environment_label,
+                            )
+                            payload_map.setdefault("task_text", (task_query or "").strip())
+                            payload_map.setdefault("asked_for", (task_query or "").strip())
+                            payload_map.setdefault("run_id", _inv_run_id)
+                            payload_map.setdefault("state_dir", _inv_state_dir)
+                            payload_map.setdefault("actions_spec", self._available_actions_spec())
+                            payload_map.setdefault("entities", [])
+                            # Fallback: extract entities from task_query
+                            # when the Tool Invoker LLM omits them.
+                            _ent_val = payload_map.get("entities")
+                            if not isinstance(_ent_val, list) or not any(
+                                isinstance(e, str) and e.strip() for e in _ent_val
+                            ):
+                                _q = (task_query or "").strip()
+                                _extracted: list[str] = []
+                                _em = re.search(
+                                    r"Entities\s*:\s*\[([^\]]+)\]",
+                                    _q,
+                                    flags=re.IGNORECASE,
+                                )
+                                if _em:
+                                    _extracted = [
+                                        e.strip().strip("'\"")
+                                        for e in _em.group(1).split(",")
+                                        if e.strip()
+                                    ]
+                                if not _extracted:
+                                    _em2 = re.search(
+                                        r"Entities\s*:\s*([^\n\r;]+)",
+                                        _q,
+                                        flags=re.IGNORECASE,
+                                    )
+                                    if _em2:
+                                        _extracted = [
+                                            e.strip().strip("'\"")
+                                            for e in _em2.group(1).split(",")
+                                            if e.strip()
+                                        ]
+                                if _extracted:
+                                    payload_map["entities"] = _extracted
+
                             structured_trace, last_obs = self._build_structured_trace(working_history)
                             last_structured_trace = structured_trace
                             last_structured_obs = last_obs
