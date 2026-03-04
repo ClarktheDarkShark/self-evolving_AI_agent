@@ -62,3 +62,20 @@ class TaskClient(Client, TaskInterface):
             TaskResponse.CalculateMetric,
         )
         return response.metric
+
+    def evaluate_generated_macro(
+        self, tool_code: str, execution_payload_json: str
+    ) -> str:
+        """Delegate live macro execution to the task server.
+
+        Returns a JSON string of the run() result dict (or error description).
+        """
+        response: TaskResponse.EvaluateGeneratedMacro = self._call_server(
+            "/evaluate_generated_macro",
+            TaskRequest.EvaluateGeneratedMacro(
+                tool_code=tool_code,
+                execution_payload_json=execution_payload_json,
+            ),
+            TaskResponse.EvaluateGeneratedMacro,
+        )
+        return response.result_json

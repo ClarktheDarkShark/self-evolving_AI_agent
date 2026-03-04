@@ -5,7 +5,12 @@
       "Bash(python -m pytest tests/self_evolving_agent/test_tool_registry.py -v)",
       "Bash(pip3 list:*)",
       "Bash(grep:*)",
-      "Bash(python -m py_compile:*)"
+      "Bash(python -m py_compile:*)",
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(conda env list:*)",
+      "Bash(pip show:*)",
+      "Bash(/opt/anaconda3/envs/lifelong/bin/python:*)"
     ]
   }
 }

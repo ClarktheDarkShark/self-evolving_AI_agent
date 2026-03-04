@@ -1,5 +1,6 @@
 #controller_toolgen.py
 
+import copy
 import datetime
 import difflib
 import hashlib
@@ -157,6 +158,8 @@ class ControllerToolgenMixin:
         *,
         raw_config: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        if os.environ.get("SKIP_ADVISOR_PREGEN") == "1":
+            return
         if getattr(self, "_toolgen_pipeline_name", "baseline") != "aggregate3":
             return
         if raw_config is None:
@@ -544,6 +547,8 @@ class ControllerToolgenMixin:
         *,
         tasks: Optional[Sequence[str]] = None,
     ) -> None:
+        if os.environ.get("SKIP_ADVISOR_PREGEN") == "1":
+            return
         if getattr(self, "_toolgen_agent", None) is None:
             print("[TOOLGEN_PREBOOT] Skipping: _toolgen_agent is None")
             return
@@ -785,6 +790,43 @@ class ControllerToolgenMixin:
                 return tool.name, similarity
         return None
 
+    def _toolgen_is_upgrade_attempt(self) -> tuple[bool, str]:
+        """Detect explicit upgrade/evolution requests that should bypass dedupe abort.
+
+        The signal comes from orchestrator failure/upgrade context injected into
+        the execution payload by _build_toolgen_execution_payload().
+        """
+        exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        if not isinstance(exec_payload, Mapping):
+            return False, ""
+
+        context_blobs: list[str] = []
+        for key in ("upgrade_goal", "env_observation", "failure_context"):
+            value = exec_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                context_blobs.append(value)
+        constraints = exec_payload.get("constraints")
+        if isinstance(constraints, Mapping):
+            fc = constraints.get("failure_context")
+            if isinstance(fc, str) and fc.strip():
+                context_blobs.append(fc)
+
+        if not context_blobs:
+            return False, ""
+        combined = "\n".join(context_blobs).upper()
+        markers = (
+            "MACRO EXHAUSTED",
+            "V2_UPGRADE",
+            "V2_PAGINATED_UPGRADE",
+            "UPGRADE_GOAL",
+            "CREATE_DUE_TO_TOOL_FAILURE",
+            "PREVIOUS_TOOL_FAILED",
+        )
+        for marker in markers:
+            if marker in combined:
+                return True, marker
+        return False, ""
+
     def _toolgen_validate_candidate_tool(
         self,
         tool_spec: Mapping[str, Any],
@@ -795,13 +837,43 @@ class ControllerToolgenMixin:
         if not tool_code:
             return None
         exec_payload = getattr(self, "_toolgen_execution_payload", None)
-        # Phase 1: Execution check (no semantic heuristics; LLM validator owns contamination)
+        # Live execution check — crash-only mode.
+        # We run the tool and report ONLY hard runtime errors (compile failures,
+        # NameError, timeout, etc.) to the validator.  Functional dead-ends
+        # ("MACRO EXHAUSTED", empty results) are silently discarded so the
+        # validator grades on code logic alone, not live KG outcome.
+        _CRASH_ISSUE_PREFIXES = (
+            "execution_compile_failed",
+            "execution_exec_failed",
+            "execution_run_missing",
+            "execution_timeout",
+            "execution_exception",
+            "execution_output_invalid",
+        )
+        live_test_str = ""
         if isinstance(exec_payload, Mapping):
             execution_validation = self._toolgen_execution_check(tool_code, exec_payload)
-            if execution_validation is not None:
-                return execution_validation
+            if execution_validation is None:
+                # Clean run — no crash, no note needed.
+                pass
+            else:
+                first_issue = str((execution_validation.get("issues") or [""])[0])
+                is_crash = any(first_issue.startswith(p) for p in _CRASH_ISSUE_PREFIXES)
+                if is_crash:
+                    try:
+                        result_json = json.dumps(execution_validation, ensure_ascii=True, default=str, indent=2)
+                    except Exception:
+                        result_json = str(execution_validation)
+                    live_test_str = f"LIVE_TEST_RESULTS (crash detected):\n{result_json}"
+                # else: functional dead-end — drop silently, grade on logic only
+        # Aggressively truncate to avoid flooding the Validator LLM context.
+        if len(live_test_str) > 2000:
+            live_test_str = live_test_str[:1000] + "\n...[TRUNCATED]...\n" + live_test_str[-1000:]
+        augmented_task_pack = task_pack
+        if live_test_str:
+            augmented_task_pack = task_pack + "\n\n" + live_test_str
         payload = {
-            "task_pack": task_pack,
+            "task_pack": augmented_task_pack,
             "tool": {
                 "name": tool_spec.get("name"),
                 "description": tool_spec.get("description"),
@@ -882,6 +954,52 @@ class ControllerToolgenMixin:
                     "3) inside try: payload = payload or {}."
                 )
 
+        # -- undefined bare function calls --
+        # Use AST to detect calls like clean_env_output(...) where the function
+        # is not defined anywhere in the file and is not a builtin or import.
+        try:
+            import builtins as _builtins_mod
+            _builtin_names = set(dir(_builtins_mod))
+            tree = ast.parse(code)
+            _defined: set[str] = set()
+            _imported: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    _defined.add(node.name)
+                elif isinstance(node, ast.ClassDef):
+                    _defined.add(node.name)
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        _imported.add(alias.asname or alias.name.split(".")[0])
+                elif isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name != "*":
+                            _imported.add(alias.asname or alias.name)
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            _defined.add(target.id)
+                elif isinstance(node, ast.AnnAssign):
+                    if isinstance(node.target, ast.Name):
+                        _defined.add(node.target.id)
+            _known = _defined | _imported | _builtin_names
+            _undef_calls: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    if node.func.id not in _known:
+                        _undef_calls.add(node.func.id)
+            if _undef_calls:
+                issues.append(
+                    "CRITICAL: The following functions are called but never defined "
+                    f"in this file: {sorted(_undef_calls)}. You MUST define each "
+                    "helper function inline (e.g., 'def clean_env_output(...):') "
+                    "before calling it, or remove the call entirely."
+                )
+        except SyntaxError:
+            pass  # syntax errors are caught by the AST static check
+        except Exception:
+            pass
+
         return issues
 
     def _toolgen_negative_mark_triggered(self) -> bool:
@@ -916,22 +1034,21 @@ class ControllerToolgenMixin:
         trace: Optional[Sequence[Mapping[str, Any]]],
         failure_context: str = "",
         active_variables: Optional[Sequence[Any]] = None,
+        target_archetype_hint: str = "",
     ) -> dict[str, Any]:
-        actions_spec = {}
-        try:
-            actions_spec = self._available_actions_spec()
-        except Exception:
-            actions_spec = {}
-        # Inject mock callables so Macro tools pass callable() checks during
-        # smoke testing.  The mocks return plausible string outputs.
-        if self._resolved_environment_label() == "knowledge_graph":
-            actions_spec = {**actions_spec, **self._mock_kg_actions_spec()}
+        # The live execution check routes to the task server via
+        # evaluate_generated_macro(), where the real shadow proxy interceptor is
+        # built natively next to the KG API objects.  Keep a non-callable spec
+        # here so the payload dict is fully JSON-serializable for HTTP transfer.
+        actions_spec = self._available_actions_spec()
+        # The dummy guard in generated tools (run_id == "smoke") handles the
+        # smoke-test isolation; live_eval bypasses it intentionally.
         registry_dir = getattr(self, "_registry_dir", "") or getattr(self, "_toolgen_registry_root", "") or "."
         state_dir = os.path.join(registry_dir, "tool_state")
-        run_id = "toolgen_exec"
+        run_id = "live_eval"
         # Extract entity hints from task_text so tools that expect an
         # 'entities' key in the payload have something to work with during
-        # the validator execution check.  This mirrors what the live
+        # the live execution check.  This mirrors what the live
         # Orchestrator populates when it invokes Macro tools.
         entities: list[str] = []
         if isinstance(task_text, str):
@@ -953,6 +1070,30 @@ class ControllerToolgenMixin:
                         if e.strip()
                     ]
 
+        # Parse target_archetype from multiple sources in priority order:
+        # 1. explicit hint from the Orchestrator decision dict (most reliable),
+        # 2. failure_context / reason string,
+        # 3. task_text itself.
+        # This ensures we have a non-empty archetype even on the very first
+        # generation turn when no prior failure has occurred.
+        target_archetype = ""
+        _ARCH_RE = re.compile(
+            r"\b(COUNTER|INTERSECTOR|SINGLE-HOP PATHFINDER|PATHFINDER)\b",
+            re.IGNORECASE,
+        )
+        for _src in (target_archetype_hint, failure_context, task_text):
+            if _src:
+                _m = _ARCH_RE.search(_src)
+                if _m:
+                    target_archetype = _m.group(1).upper()
+                    break
+        # If an explicit hint was provided but didn't match the regex pattern
+        # (e.g., a novel archetype string), use it verbatim so we don't lose it.
+        if not target_archetype and target_archetype_hint:
+            target_archetype = target_archetype_hint.strip().upper()
+        # upgrade_goal is the full Orchestrator reason string passed as failure_context.
+        upgrade_goal = failure_context
+
         payload: dict[str, Any] = {
             "task_text": task_text,
             "asked_for": task_text,
@@ -962,6 +1103,8 @@ class ControllerToolgenMixin:
             "state_dir": state_dir,
             "env_observation": failure_context,
             "entities": entities,
+            "target_archetype": target_archetype,
+            "upgrade_goal": upgrade_goal,
             "constraints": {
                 "active_variables": list(active_variables or []),
                 "failure_context": failure_context,
@@ -1005,10 +1148,46 @@ class ControllerToolgenMixin:
                 "fixes": ["Implement run(payload: dict) -> dict."],
                 "summary": "Execution failed: run() missing.",
             }
+        # Snapshot mutable controller state so run() cannot leave phantom
+        # variables or trace entries on the controller object itself.
+        _snap_exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        _run_payload = dict(payload)
         try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(run_fn, dict(payload))
-                result = future.result(timeout=4.0)
+            _run_payload["trace"] = copy.deepcopy(list(payload.get("trace") or []))
+            _run_payload["entities"] = copy.deepcopy(list(payload.get("entities") or []))
+        except Exception:
+            pass
+
+        # Prefer server-side execution: the task server has native access to
+        # KnowledgeGraphAPI and builds its own shadow proxy interceptor there,
+        # avoiding the serialization crash that occurs when the controller tries
+        # to access kg_api through the HTTP TaskClient.__getattr__ proxy.
+        _task_ref = getattr(self, "_kg_task_ref", None)
+        _eval_fn = getattr(_task_ref, "evaluate_generated_macro", None) if _task_ref else None
+        _server_eval_used = False
+        result: Any = {}
+        try:
+            if callable(_eval_fn):
+                _server_eval_used = True
+                # Strip non-serializable values (callables) before JSON encoding.
+                _serializable = {
+                    k: v for k, v in _run_payload.items()
+                    if k != "actions_spec" and not callable(v)
+                }
+                try:
+                    _result_json = _eval_fn(
+                        tool_code,
+                        json.dumps(_serializable, default=str),
+                    )
+                    result = json.loads(_result_json)
+                except Exception as exc:
+                    result = {"status": "error", "error": f"server_eval_failed: {exc}"}
+            else:
+                # Fallback: run locally only when the task is in-process
+                # (e.g., integration tests with a direct Task reference).
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(run_fn, _run_payload)
+                    result = future.result(timeout=4.0)
         except TimeoutError:
             return {
                 "grade": 0,
@@ -1025,6 +1204,12 @@ class ControllerToolgenMixin:
                 "summary": "Execution failed: exception in run().",
                 "traceback": tb,
             }
+        finally:
+            # Revert any controller state mutated during the call.
+            try:
+                setattr(self, "_toolgen_execution_payload", _snap_exec_payload)
+            except Exception:
+                pass
         if not isinstance(result, Mapping):
             return {
                 "grade": 0,
@@ -1048,7 +1233,13 @@ class ControllerToolgenMixin:
             errors_list = result.get("errors") or []
             answer_rec = str(result.get("answer_recommendation") or "").strip()
 
-            if isinstance(errors_list, list) and any(
+            # Only grant the pass-through when the tool legitimately had no
+            # callable actions_spec to work with.  When the server-side proxy
+            # was used (_server_eval_used), the tool DID receive real callable
+            # functions on the server, so missing_actions_spec is a genuine bug.
+            _spec = payload.get("actions_spec") or {}
+            _proxy_active = _server_eval_used or any(callable(v) for v in _spec.values())
+            if not _proxy_active and isinstance(errors_list, list) and any(
                 "missing_actions_spec" in str(e) for e in errors_list
             ):
                 # Macro correctly detected mock/missing actions_spec — pass.
@@ -1208,11 +1399,15 @@ class ControllerToolgenMixin:
             trace_steps, _ = self._build_structured_trace(chat_history)
         except Exception:
             trace_steps = []
+        target_archetype_hint = _stringify(
+            decision.get("target_archetype") or decision.get("archetype") or ""
+        )
         exec_payload = self._build_toolgen_execution_payload(
             task_text=toolgen_query,
             trace=trace_steps[-10:] if trace_steps else [],
             failure_context=reason,
             active_variables=[],
+            target_archetype_hint=target_archetype_hint,
         )
         prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
         setattr(self, "_toolgen_execution_payload", exec_payload)
@@ -1256,6 +1451,8 @@ class ControllerToolgenMixin:
         last_smoke_ok = False
         best_grade: int = -1
         best_candidate: Optional[Mapping[str, Any]] = None
+        round_history: list[dict] = []  # compact per-round memory (no code)
+        is_upgrade_attempt, upgrade_trigger = self._toolgen_is_upgrade_attempt()
         try:
             self._append_generated_tools_log(
                 {
@@ -1264,6 +1461,8 @@ class ControllerToolgenMixin:
                     "max_rounds": max_rounds,
                     "prompt_chars": len(base_prompt or ""),
                     "system_prompt_name": prompt_name or "custom",
+                    "upgrade_attempt": is_upgrade_attempt,
+                    "upgrade_trigger": upgrade_trigger or None,
                 }
             )
         except Exception:
@@ -1285,13 +1484,25 @@ class ControllerToolgenMixin:
                 code_block = ""
                 if last_tool_code:
                     code_block = "\n\nLAST_TOOL_CODE:\n" + last_tool_code
+                history_block = ""
+                if round_history:
+                    lines = ["PRIOR_ROUNDS (do not repeat these mistakes):"]
+                    for h in round_history:
+                        lines.append(
+                            f"  Round {h['round']}: grade={h['grade']} | "
+                            f"top_issue={h['top_issue']} | "
+                            f"summary={h['summary']}"
+                        )
+                    history_block = "\n\n" + "\n".join(lines)
                 prompt = (
                     base_prompt
-                    + "\n\nVALIDATOR_FEEDBACK (fix ONLY this issue):\n"
+                    + history_block
+                    + "\n\nVALIDATOR_FEEDBACK:\n"
                     + feedback_note
                     + code_block
                     + "\n\nYou must output the ENTIRE file from scratch. "
-                    + "Fix ONLY the issue above. Leave all other logic exactly as it is."
+                    + "Implement all requested fixes and refactor the code as necessary "
+                    + "to pass the live evaluation."
                 )
             if mode == "legacy":
                 candidate = self._toolgen_generate_from_prompt_legacy(
@@ -1443,30 +1654,53 @@ class ControllerToolgenMixin:
             duplicate_hit = self._toolgen_duplicate_abort_check(tool_code)
             if duplicate_hit:
                 dup_name, dup_score = duplicate_hit
-                print(
-                    f"[SYSTEM] ABORTING TOOLGEN: Candidate is {dup_score*100:.1f}% similar to {dup_name}.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                try:
-                    self._append_generated_tools_log(
-                        {
-                            "event": "toolgen_duplicate_abort",
-                            "mode": mode,
-                            "round": round_idx,
-                            "tool_name": tool_spec.get("name"),
-                            "duplicate_of": dup_name,
-                            "similarity": dup_score,
-                        }
+                if is_upgrade_attempt:
+                    print(
+                        "[SYSTEM] BYPASSING TOOLGEN DEDUPE: "
+                        f"Candidate is {dup_score*100:.1f}% similar to {dup_name}, "
+                        f"but upgrade trigger '{upgrade_trigger}' is active.",
+                        file=sys.stderr,
+                        flush=True,
                     )
-                except Exception:
-                    pass
-                return {
-                    "success": False,
-                    "reason": "aborted_duplicate",
-                    "code": None,
-                    "error": "aborted_duplicate",
-                }
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "toolgen_duplicate_bypass",
+                                "mode": mode,
+                                "round": round_idx,
+                                "tool_name": tool_spec.get("name"),
+                                "duplicate_of": dup_name,
+                                "similarity": dup_score,
+                                "upgrade_trigger": upgrade_trigger,
+                            }
+                        )
+                    except Exception:
+                        pass
+                else:
+                    print(
+                        f"[SYSTEM] ABORTING TOOLGEN: Candidate is {dup_score*100:.1f}% similar to {dup_name}.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "toolgen_duplicate_abort",
+                                "mode": mode,
+                                "round": round_idx,
+                                "tool_name": tool_spec.get("name"),
+                                "duplicate_of": dup_name,
+                                "similarity": dup_score,
+                            }
+                        )
+                    except Exception:
+                        pass
+                    return {
+                        "success": False,
+                        "reason": "aborted_duplicate",
+                        "code": None,
+                        "error": "aborted_duplicate",
+                    }
 
             if relaxed_mode:
                 metadata = self._register_tool_from_payload_relaxed(
@@ -1676,6 +1910,17 @@ class ControllerToolgenMixin:
                     flush=True,
                 )
             except Exception:
+                issues = []
+            # Record compact round summary for next-round memory (no code)
+            try:
+                _top_issue = (issues[0] if issues else None)
+                round_history.append({
+                    "round": round_idx,
+                    "grade": grade,
+                    "top_issue": _top_issue,
+                    "summary": validation.get("summary", ""),
+                })
+            except Exception:
                 pass
             try:
                 self._append_generated_tools_log(
@@ -1694,11 +1939,11 @@ class ControllerToolgenMixin:
             if grade > best_grade:
                 best_grade = grade
                 best_candidate = candidate
-            min_grade = 9
+            min_grade = 8
             try:
                 override = os.getenv("LIFELONG_TOOLGEN_MIN_GRADE", "").strip()
                 if override:
-                    min_grade = max(8, int(override))
+                    min_grade = max(7, int(override))
             except Exception:
                 min_grade = 8
             if grade >= min_grade:
@@ -1790,27 +2035,12 @@ class ControllerToolgenMixin:
             except Exception:
                 pass
 
-            # --- FEEDBACK THROTTLING ---
-            # Only feed the LLM the #1 issue to prevent cognitive overload
-            # and regressions from attempting too many simultaneous fixes.
-            try:
-                val_obj = feedback_payload.get("validation")
-                if isinstance(val_obj, dict):
-                    issues = val_obj.get("issues", [])
-                    fixes = val_obj.get("fixes", [])
-                    if len(issues) > 1:
-                        feedback_payload = dict(feedback_payload)
-                        throttled_val = dict(val_obj)
-                        throttled_val["issues"] = issues[:1]
-                        throttled_val["fixes"] = fixes[:1]
-                        throttled_val["CRITICAL_INSTRUCTION"] = (
-                            "You must output the ENTIRE file from scratch. "
-                            "Fix ONLY this single issue. "
-                            "Leave all other logic exactly as it is."
-                        )
-                        feedback_payload["validation"] = throttled_val
-            except Exception:
-                pass
+            # Pass the full validation dict (all issues and fixes) intact.
+            feedback_payload["CRITICAL_INSTRUCTION"] = (
+                "You must output the ENTIRE file from scratch. "
+                "Implement all requested fixes and refactor the code as necessary "
+                "to pass the live evaluation."
+            )
 
             feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
         # Prefer the highest-graded validated candidate over the last one.

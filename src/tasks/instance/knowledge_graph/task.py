@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Optional, Callable, Any, Sequence, Mapping
 from pydantic import field_validator
 import inspect
@@ -521,6 +523,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
 
     def _build_macro_actions_spec(
         self,
+        entity_dict: Optional[dict[str, str]] = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         assert self.variable_list is not None
 
@@ -531,6 +534,18 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                     idx = int(m.group(1))
                     if 0 <= idx < len(self.variable_list):
                         return self.variable_list[idx]
+            return arg
+
+        def _resolve_entity(arg: Any) -> Any:
+            """Translate a string entity name to its canonical Freebase MID.
+
+            _interact does this via current_dataset_item.entity_dict before
+            calling the API.  Macro wrapper functions must do the same so that
+            entity names like "cows" are resolved to the correct KG node instead
+            of going through the unreliable SPARQL name-search fallback.
+            """
+            if isinstance(arg, str) and entity_dict and arg in entity_dict:
+                return entity_dict[arg]
             return arg
 
         def _track_variable(new_var, msg):
@@ -546,7 +561,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
 
         def get_relations_fn(entity_or_var):
             raw = str(entity_or_var)
-            resolved = _resolve_arg(entity_or_var)
+            resolved = _resolve_entity(_resolve_arg(entity_or_var))
             try:
                 _, msg = self.knowledge_graph_api.get_relations(resolved)
                 msg = _safe_msg(msg, [raw])
@@ -556,7 +571,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
 
         def get_neighbors_fn(entity_or_var, relation):
             raw = str(entity_or_var)
-            resolved = _resolve_arg(entity_or_var)
+            resolved = _resolve_entity(_resolve_arg(entity_or_var))
             try:
                 new_var, msg = self.knowledge_graph_api.get_neighbors(
                     resolved, relation
@@ -636,6 +651,294 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         }
         return actions_spec, raw_actions_spec
 
+    def evaluate_generated_macro(
+        self, tool_code: str, execution_payload_json: str
+    ) -> str:
+        """Server-side live execution sandbox for a generated Macro tool.
+
+        The controller cannot access self.knowledge_graph_api directly (it
+        lives behind an HTTP proxy that cannot serialize KnowledgeGraphAPI).
+        This method runs on the task server where the KG objects are native,
+        builds a shadow Proxy Interceptor that mirrors the real KG API without
+        mutating self.variable_list, exec()s the tool code, and returns the
+        result as a JSON string.
+
+        Args:
+            tool_code: Python source code string for the macro tool.
+            execution_payload_json: JSON-serialized execution payload.  Must
+                NOT contain an 'actions_spec' key — this method builds its own.
+
+        Returns:
+            JSON string of the run() result dict, or an error-description JSON.
+        """
+        logger = logging.getLogger(__name__)
+        try:
+            base_payload: dict = json.loads(execution_payload_json)
+        except Exception as exc:
+            return json.dumps({"status": "error", "error": f"payload_parse_error: {exc}"})
+
+        kg_api = self.knowledge_graph_api
+        real_var_list = self.variable_list or []
+
+        # Resolve the canonical entity_dict for this sample so that proxy
+        # functions apply the same MID substitution that _interact performs.
+        # Without this, string entity names (e.g. "cows") go through the
+        # unreliable SPARQL name-search fallback and may resolve to the wrong
+        # Freebase node (e.g. a dog-breed entity instead of cattle).
+        try:
+            _entity_dict: dict[str, str] = self._get_current_dataset_item().entity_dict
+        except Exception:
+            _entity_dict = {}
+
+        # --- Shadow Proxy Interceptor (same design as controller_toolgen.py) ---
+        shadow_var_list: list = []
+        shadow_base: int = len(real_var_list)
+
+        # Cache key snapshots for cleanup.
+        pre_cache_rel_keys: set = set(kg_api.variable_to_relations_cache.keys())
+        pre_cache_attr_keys: set = set(
+            getattr(kg_api, "variable_to_attributes_cache", {}).keys()
+        )
+
+        # Tripwire: prevent runaway tool from hammering the KG backend.
+        proxy_call_count = 0
+        MAX_PROXY_CALLS = 15
+
+        def _check_tripwire() -> None:
+            nonlocal proxy_call_count
+            proxy_call_count += 1
+            if proxy_call_count > MAX_PROXY_CALLS:
+                raise RuntimeError(
+                    f"Proxy Execution Tripwire: tool exceeded {MAX_PROXY_CALLS} "
+                    "live KG calls. Refactor to reduce query volume."
+                )
+
+        def _resolve(arg: Any) -> Any:
+            s = str(arg).strip()
+            m = re.match(r"^#(\d+)$", s)
+            if m:
+                idx = int(m.group(1))
+                shadow_idx = idx - shadow_base
+                if 0 <= shadow_idx < len(shadow_var_list):
+                    return shadow_var_list[shadow_idx]
+                if 0 <= idx < len(real_var_list):
+                    return real_var_list[idx]
+            return arg
+
+        def _track(new_var: Any, msg: str) -> str:
+            if new_var is not None and "<<NEW_VARIABLE>>" in msg:
+                idx = shadow_base + len(shadow_var_list)
+                msg = msg.replace("<<NEW_VARIABLE>>", f"#{idx}")
+                shadow_var_list.append(new_var)
+            return msg
+
+        def _sub(msg: str, raw_args: list) -> str:
+            for i, a in enumerate(raw_args):
+                msg = msg.replace(f"<<ARGUMENT{i}>>", str(a))
+            return msg
+
+        def _resolve_entity_mid(arg: Any) -> Any:
+            """Translate a string entity name to its canonical Freebase MID,
+            mirroring the substitution _interact performs via entity_dict."""
+            if isinstance(arg, str) and _entity_dict and arg in _entity_dict:
+                return _entity_dict[arg]
+            return arg
+
+        def proxy_get_relations(entity_or_var: Any) -> str:
+            _check_tripwire()
+            raw = str(entity_or_var)
+            resolved = _resolve_entity_mid(_resolve(entity_or_var))
+            try:
+                _, msg = kg_api.get_relations(resolved)
+                return _sub(msg, [raw]).replace("<<API_STR>>", f"get_relations({raw})")
+            except Exception as exc:
+                return f"Error: {_sub(str(exc), [raw])}"
+
+        def proxy_get_neighbors(entity_or_var: Any, relation: str) -> str:
+            _check_tripwire()
+            raw = str(entity_or_var)
+            resolved = _resolve_entity_mid(_resolve(entity_or_var))
+            try:
+                new_var, msg = kg_api.get_neighbors(resolved, relation)
+                msg = _sub(msg, [raw, relation]).replace(
+                    "<<API_STR>>", f"get_neighbors({raw}, {relation})"
+                )
+                return _track(new_var, msg)
+            except Exception as exc:
+                return f"Error: {_sub(str(exc), [raw, relation])}"
+
+        def proxy_intersection(var1: Any, var2: Any) -> str:
+            _check_tripwire()
+            try:
+                new_var, msg = kg_api.intersection(_resolve(var1), _resolve(var2))
+                msg = _sub(msg, [str(var1), str(var2)]).replace(
+                    "<<API_STR>>", f"intersection({var1}, {var2})"
+                )
+                return _track(new_var, msg)
+            except Exception as exc:
+                return f"Error: {_sub(str(exc), [str(var1), str(var2)])}"
+
+        def proxy_get_attributes(var: Any) -> str:
+            _check_tripwire()
+            try:
+                _, msg = kg_api.get_attributes(_resolve(var))
+                return _sub(msg, [str(var)]).replace("<<API_STR>>", f"get_attributes({var})")
+            except Exception as exc:
+                return f"Error: {_sub(str(exc), [str(var)])}"
+
+        def proxy_argmax(var: Any, attribute: str) -> str:
+            _check_tripwire()
+            try:
+                new_var, msg = kg_api.argmax(_resolve(var), attribute)
+                msg = _sub(msg, [str(var), attribute]).replace(
+                    "<<API_STR>>", f"argmax({var}, {attribute})"
+                )
+                return _track(new_var, msg)
+            except Exception as exc:
+                return f"Error: {_sub(str(exc), [str(var), attribute])}"
+
+        def proxy_argmin(var: Any, attribute: str) -> str:
+            _check_tripwire()
+            try:
+                new_var, msg = kg_api.argmin(_resolve(var), attribute)
+                msg = _sub(msg, [str(var), attribute]).replace(
+                    "<<API_STR>>", f"argmin({var}, {attribute})"
+                )
+                return _track(new_var, msg)
+            except Exception as exc:
+                return f"Error: {_sub(str(exc), [str(var), attribute])}"
+
+        def proxy_count(var: Any) -> str:
+            _check_tripwire()
+            try:
+                new_var, msg = kg_api.count(_resolve(var))
+                return _track(new_var, _sub(msg, [str(var)]).replace(
+                    "<<API_STR>>", f"count({var})"
+                ))
+            except Exception as exc:
+                return f"Error: {_sub(str(exc), [str(var)])}"
+
+        proxy_actions_spec = {
+            "get_relations": proxy_get_relations,
+            "get_neighbors": proxy_get_neighbors,
+            "intersection": proxy_intersection,
+            "get_attributes": proxy_get_attributes,
+            "argmax": proxy_argmax,
+            "argmin": proxy_argmin,
+            "count": proxy_count,
+        }
+
+        # Build payload with proxy injected.
+        payload = dict(base_payload)
+        payload["actions_spec"] = proxy_actions_spec
+
+        result: dict = {}
+        allowed_modules = {
+            "os",
+            "json",
+            "re",
+            "math",
+            "statistics",
+            "itertools",
+            "functools",
+            "collections",
+            "datetime",
+            "typing",
+        }
+
+        def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name in allowed_modules:
+                return __import__(name, globals, locals, fromlist, level)
+            raise ImportError(f"module '{name}' is not allowed in execute_macro")
+
+        safe_builtins = {
+            "__import__": _safe_import,
+            "len": len,
+            "range": range,
+            "min": min,
+            "max": max,
+            "sum": sum,
+            "sorted": sorted,
+            "enumerate": enumerate,
+            "iter": iter,
+            "next": next,
+            "float": float,
+            "int": int,
+            "str": str,
+            "dict": dict,
+            "list": list,
+            "set": set,
+            "tuple": tuple,
+            "abs": abs,
+            "all": all,
+            "any": any,
+            "zip": zip,
+            "bool": bool,
+            "type": type,
+            "isinstance": isinstance,
+            "hasattr": hasattr,
+            "getattr": getattr,
+            "setattr": setattr,
+            "print": print,
+            "map": map,
+            "filter": filter,
+            "round": round,
+            "callable": callable,
+            "Exception": Exception,
+        }
+        safe_globals = {
+            "__builtins__": safe_builtins,
+            "json": json,
+            "re": re,
+            "os": os,
+        }
+        try:
+            exec(tool_code, safe_globals)  # noqa: S102
+            run_fn = safe_globals.get("run")
+            if not callable(run_fn):
+                return json.dumps(
+                    {"status": "error", "error": "run() not found in generated tool"}
+                )
+            # Run in a thread with a generous timeout. The tripwire (15 calls)
+            # is the primary safeguard; the timeout is the backstop for pure
+            # CPU-bound runaway loops.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_fn, payload)
+                result = future.result(timeout=20.0)
+        except FutureTimeoutError:
+            result = {
+                "status": "error",
+                "error": "evaluate_generated_macro: run() exceeded 20s server-side timeout",
+            }
+        except Exception as exc:
+            result = {
+                "status": "error",
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        finally:
+            # Purge shadow cache entries to keep kg_api.variable_to_relations_cache clean.
+            for k in list(kg_api.variable_to_relations_cache.keys()):
+                if k not in pre_cache_rel_keys:
+                    try:
+                        del kg_api.variable_to_relations_cache[k]
+                    except KeyError:
+                        pass
+            attr_cache = getattr(kg_api, "variable_to_attributes_cache", None)
+            if isinstance(attr_cache, dict):
+                for k in list(attr_cache.keys()):
+                    if k not in pre_cache_attr_keys:
+                        try:
+                            del attr_cache[k]
+                        except KeyError:
+                            pass
+
+        try:
+            return json.dumps(result, default=str)
+        except Exception as exc:
+            logger.warning("evaluate_generated_macro: result serialization failed: %s", exc)
+            return json.dumps({"status": "error", "error": f"result_serialization_failed: {exc}"})
+
     def _execute_macro(
         self,
         session: Session,
@@ -644,6 +947,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         current_dataset_item: KnowledgeGraphDatasetItem,
         api_str: str,
     ) -> None:
+        logger = logging.getLogger(__name__)
         if not tool_name or not isinstance(payload, Mapping):
             session.chat_history.inject(
                 {
@@ -704,7 +1008,9 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             return
         entity_list = list(current_dataset_item.entity_dict.keys())
         trace = self._build_macro_trace(session, entity_list)
-        actions_spec, raw_actions_spec = self._build_macro_actions_spec()
+        actions_spec, raw_actions_spec = self._build_macro_actions_spec(
+            current_dataset_item.entity_dict
+        )
         run_id = payload_map.get("run_id") or f"{session.task_name}_{session.sample_index}"
         os.makedirs(state_dir_value, exist_ok=True)
         last_user = session.chat_history.get_item_deep_copy(
@@ -787,10 +1093,12 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             "re": re,
             "os": os,
         }
-        safe_locals: dict[str, Any] = {}
+        logger.info(
+            f"[MACRO EXEC] Tool: {tool_name} | Concept: {payload_map.get('target_concept')} | Hints: {payload_map.get('domain_hints')}"
+        )
         try:
-            exec(code, safe_globals, safe_locals)
-            run_fn = safe_locals.get("run") or safe_globals.get("run")
+            exec(code, safe_globals)
+            run_fn = safe_globals.get("run")
             if not callable(run_fn):
                 raise RuntimeError("macro_run_not_found")
             result = run_fn(payload_map)

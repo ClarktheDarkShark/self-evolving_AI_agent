@@ -29,6 +29,12 @@ class TaskRequest:
     class CalculateMetric(BaseModel):
         session_partial_list: Sequence[SessionMetricCalculationPartial]
 
+    class EvaluateGeneratedMacro(BaseModel):
+        tool_code: str
+        # Serialized JSON of the execution payload (actions_spec excluded —
+        # the server builds its own proxy interceptor).
+        execution_payload_json: str
+
 
 class ChatHistoryItemFactoryRequest:
     class Construct(BaseModel):

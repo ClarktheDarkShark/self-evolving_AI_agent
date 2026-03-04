@@ -838,18 +838,6 @@ class ControllerOrchestratorMixin:
                 tool_name = best.get("name")
                 payload = dict(payload)
                 payload["reason"] = "bootstrap_tool_available_use_tool"
-        if tools and action != "request_new_tool":
-            selected_name = str(tool_name).strip() if tool_name else None
-            if not selected_name or action != "use_tool":
-                fallback_name = None
-                for tool in tools:
-                    candidate = tool.get("name")
-                    if isinstance(candidate, str) and candidate.endswith("_generated_tool"):
-                        fallback_name = candidate
-                        break
-                if fallback_name:
-                    action = "use_tool"
-                    tool_name = fallback_name
         return {
             "action": action,
             "tool_name": str(tool_name).strip() if tool_name else None,
@@ -1147,6 +1135,12 @@ class ControllerOrchestratorMixin:
                         "parse_error": parse_error,
                         "wrapper_stripped": wrapper_stripped,
                         "environment_label": self._resolved_environment_label(),
+                        "target_concept_value": payload_dict.get("target_concept")
+                        if isinstance(payload_dict, Mapping)
+                        else None,
+                        "domain_hints_value": payload_dict.get("domain_hints")
+                        if isinstance(payload_dict, Mapping)
+                        else None,
                     }
                 )
             except Exception:
@@ -1205,6 +1199,12 @@ class ControllerOrchestratorMixin:
                         "output": output_summary,
                         "wrapper_stripped": wrapper_stripped,
                         "environment_label": self._resolved_environment_label(),
+                        "target_concept_value": payload_dict.get("target_concept")
+                        if isinstance(payload_dict, Mapping)
+                        else None,
+                        "domain_hints_value": payload_dict.get("domain_hints")
+                        if isinstance(payload_dict, Mapping)
+                        else None,
                     }
                 )
             except Exception:
@@ -1222,6 +1222,12 @@ class ControllerOrchestratorMixin:
                         "output": output_summary,
                         "wrapper_stripped": wrapper_stripped,
                         "environment_label": self._resolved_environment_label(),
+                        "target_concept_value": payload_dict.get("target_concept")
+                        if isinstance(payload_dict, Mapping)
+                        else None,
+                        "domain_hints_value": payload_dict.get("domain_hints")
+                        if isinstance(payload_dict, Mapping)
+                        else None,
                     }
                 )
             except Exception:
@@ -1237,6 +1243,12 @@ class ControllerOrchestratorMixin:
                     "payload_keys_count": len(payload_dict or {}),
                     "wrapper_stripped": wrapper_stripped,
                     "environment_label": self._resolved_environment_label(),
+                    "target_concept_value": payload_dict.get("target_concept")
+                    if isinstance(payload_dict, Mapping)
+                    else None,
+                    "domain_hints_value": payload_dict.get("domain_hints")
+                    if isinstance(payload_dict, Mapping)
+                    else None,
                 }
             )
         except Exception:

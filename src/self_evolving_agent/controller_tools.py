@@ -94,6 +94,13 @@ class ControllerToolsMixin:
         try:
             task_ref.interact(session)
         except Exception as exc:
+            # Roll back the injected AGENT message so the role-alternation invariant
+            # is preserved. Without this, agent.inference:58 would attempt a second
+            # AGENT inject into a history that already ends with AGENT → AssertionError.
+            try:
+                session.chat_history.pop(-1)
+            except Exception:
+                pass
             return ToolResult.failure(f"macro_execution_failed:{exc}")
 
         # The server appends the observation as the last USER message.

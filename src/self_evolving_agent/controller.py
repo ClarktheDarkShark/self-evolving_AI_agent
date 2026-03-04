@@ -162,9 +162,6 @@ class SelfEvolvingController(
             os.getenv("FORCE_TOOLGEN_ALWAYS_ON", "0") == "1"
         )
         self._toolgen_off = os.getenv("TOOLGEN_OFF", "1") != "0"
-        if self._toolgen_pipeline_name == "aggregate3":
-            # Hard-enable ToolGen for aggregate3 runs to avoid env loss in subprocesses.
-            self._force_toolgen_always_on = True
         if self._force_toolgen_always_on:
             self._toolgen_off = False
 
@@ -383,6 +380,8 @@ class SelfEvolvingController(
         self._tool_usage_logged: set[str] = set()
         self._outcome_scored: set[str] = set()
         self._failure_forged: set[str] = set()
+        self._executed_tool_payloads: set[str] = set()
+        self._executed_tool_payloads_session_key: Optional[tuple[str, str]] = None
         self._run_task_metadata: Optional[dict[str, Any]] = None
         self._last_solver_output: Optional[str] = None
         self._last_solver_context_key: Optional[str] = None
@@ -1222,6 +1221,20 @@ class SelfEvolvingController(
 
         working_history = self._clone_history(self._prune_for_current_task(chat_history))
         self._tool_invoked_in_last_inference = False
+        try:
+            current_session = getattr(self, "_current_session", None)
+            task_name = str(getattr(current_session, "task_name", "") or "")
+            sample_index = str(getattr(current_session, "sample_index", "") or "")
+            if not task_name and not sample_index:
+                meta = self._get_run_task_metadata() or {}
+                task_name = str(meta.get("task_name") or "")
+                sample_index = str(meta.get("sample_index") or "")
+            session_key = (task_name, sample_index)
+            if self._executed_tool_payloads_session_key != session_key:
+                self._executed_tool_payloads.clear()
+                self._executed_tool_payloads_session_key = session_key
+        except Exception:
+            pass
         self._apply_outcome_penalties()
         # --- TROUBLESHOOTING LOGS ---
         try:
@@ -1775,6 +1788,8 @@ class SelfEvolvingController(
                                         "payload_keys": payload_keys,
                                         "payload_missing": missing_keys,
                                         "wrapper_shape": invoke_with,
+                                        "target_concept_value": payload_map.get("target_concept"),
+                                        "domain_hints_value": payload_map.get("domain_hints"),
                                     }
                                 )
                             except Exception:
@@ -1823,35 +1838,57 @@ class SelfEvolvingController(
                                     ):
                                         args = [dict(args[0].get("payload") or {})]
                                     tool_args = {"args": args, "kwargs": kwargs}
-                                    self._log_flow_event(
-                                        "tool_agent_input",
-                                        chat_history=working_history,
-                                        tool_name=tool_name,
-                                        tool_args=tool_args,
-                                        reason="tool_invoker",
-                                    )
-                                    # Now invoke
-                                    tool_result = self._invoke_tool_by_payload(
-                                        tool_name,
-                                        tool_args,
-                                        reason="tool_invoker",
-                                        chat_history=working_history,
-                                        args_auto_built=args_auto_built,
-                                        decision_action=tool_action,
-                                    )
-                                    last_tool_result = tool_result
-                                    _conf = None
-                                    _rec_preview = ""
-                                    if isinstance(tool_result.output, Mapping):
-                                        _conf = tool_result.output.get("confidence_score")
-                                        _rec_preview = self._truncate(
-                                            str(tool_result.output.get("answer_recommendation") or ""), 80
+                                    payload_signature_src = f"{tool_name}|{str(payload_map)}"
+                                    payload_signature = hashlib.sha1(
+                                        payload_signature_src.encode("utf-8")
+                                    ).hexdigest()
+                                    if payload_signature in self._executed_tool_payloads:
+                                        duplicate_observation = (
+                                            "Observation: Tool already executed with this exact payload. "
+                                            "Proceed with primitive actions or use a different tool/payload."
                                         )
-                                    self._append_loop_log(
-                                        f"  tool_exec: success={tool_result.success} "
-                                        f"confidence={_conf} "
-                                        f"rec={_rec_preview or '-'}"
-                                    )
+                                        tool_error = "duplicate_tool_payload_suppressed"
+                                        self._append_loop_log(
+                                            f"  tool_exec: skipped duplicate payload for {tool_name}"
+                                        )
+                                        self._log_failed_invoke_event(
+                                            tool_name=tool_name,
+                                            reason=tool_error,
+                                        )
+                                        solver_sidecar.append(duplicate_observation)
+                                        tool_result = ToolResult.failure(tool_error)
+                                        tool_result_injected = True
+                                    else:
+                                        self._executed_tool_payloads.add(payload_signature)
+                                        self._log_flow_event(
+                                            "tool_agent_input",
+                                            chat_history=working_history,
+                                            tool_name=tool_name,
+                                            tool_args=tool_args,
+                                            reason="tool_invoker",
+                                        )
+                                        # Now invoke
+                                        tool_result = self._invoke_tool_by_payload(
+                                            tool_name,
+                                            tool_args,
+                                            reason="tool_invoker",
+                                            chat_history=working_history,
+                                            args_auto_built=args_auto_built,
+                                            decision_action=tool_action,
+                                        )
+                                        last_tool_result = tool_result
+                                        _conf = None
+                                        _rec_preview = ""
+                                        if isinstance(tool_result.output, Mapping):
+                                            _conf = tool_result.output.get("confidence_score")
+                                            _rec_preview = self._truncate(
+                                                str(tool_result.output.get("answer_recommendation") or ""), 80
+                                            )
+                                        self._append_loop_log(
+                                            f"  tool_exec: success={tool_result.success} "
+                                            f"confidence={_conf} "
+                                            f"rec={_rec_preview or '-'}"
+                                        )
 
                             if not tool_result_injected:
                                 self._log_flow_event(

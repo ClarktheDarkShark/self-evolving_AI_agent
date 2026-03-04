@@ -31,6 +31,10 @@ class TaskResponse:
     class CalculateMetric(BaseModel):
         metric: MetricDict
 
+    class EvaluateGeneratedMacro(BaseModel):
+        # JSON-encoded result dict (or error description string).
+        result_json: str
+
 
 class ChatHistoryItemFactoryResponse:
     class Construct(BaseModel):
