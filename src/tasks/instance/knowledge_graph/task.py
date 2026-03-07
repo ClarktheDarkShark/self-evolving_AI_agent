@@ -32,6 +32,7 @@ from src.factories.chat_history_item import ChatHistoryItemFactory
 from src.utils.struct_coercion import coerce_struct
 from .api import KnowledgeGraphAPI, Variable, KnowledgeGraphAPIException
 from .utils.sparql_executor import SparqlExecutor
+from src.self_evolving_agent import kg_utils as _kg_utils
 
 
 class KnowledgeGraphSkillUtility(SkillUtility):
@@ -592,6 +593,26 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             except Exception as exc:
                 return f"Error: {_safe_msg(str(exc), [str(var1), str(var2)])}"
 
+        def union_fn(var1, var2):
+            r1, r2 = _resolve_arg(var1), _resolve_arg(var2)
+            try:
+                new_var, msg = self.knowledge_graph_api.union(r1, r2)
+                msg = _safe_msg(msg, [str(var1), str(var2)])
+                msg = msg.replace("<<API_STR>>", f"union({var1}, {var2})")
+                return _track_variable(new_var, msg)
+            except Exception as exc:
+                return f"Error: {_safe_msg(str(exc), [str(var1), str(var2)])}"
+
+        def difference_fn(var1, var2):
+            r1, r2 = _resolve_arg(var1), _resolve_arg(var2)
+            try:
+                new_var, msg = self.knowledge_graph_api.difference(r1, r2)
+                msg = _safe_msg(msg, [str(var1), str(var2)])
+                msg = msg.replace("<<API_STR>>", f"difference({var1}, {var2})")
+                return _track_variable(new_var, msg)
+            except Exception as exc:
+                return f"Error: {_safe_msg(str(exc), [str(var1), str(var2)])}"
+
         def get_attributes_fn(var):
             resolved = _resolve_arg(var)
             try:
@@ -635,6 +656,8 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             "get_relations": get_relations_fn,
             "get_neighbors": get_neighbors_fn,
             "intersection": intersection_fn,
+            "union": union_fn,
+            "difference": difference_fn,
             "get_attributes": get_attributes_fn,
             "argmax": argmax_fn,
             "argmin": argmin_fn,
@@ -644,6 +667,8 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             "get_relations": self.knowledge_graph_api.get_relations,
             "get_neighbors": self.knowledge_graph_api.get_neighbors,
             "intersection": self.knowledge_graph_api.intersection,
+            "union": self.knowledge_graph_api.union,
+            "difference": self.knowledge_graph_api.difference,
             "get_attributes": self.knowledge_graph_api.get_attributes,
             "argmax": self.knowledge_graph_api.argmax,
             "argmin": self.knowledge_graph_api.argmin,
@@ -672,10 +697,18 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             JSON string of the run() result dict, or an error-description JSON.
         """
         logger = logging.getLogger(__name__)
+        def _ssot_crash(exc: Exception) -> str:
+            return json.dumps(
+                {
+                    "status": "ERROR",
+                    "final_variable": None,
+                    "observation": f"Crash: {str(exc)}",
+                }
+            )
         try:
             base_payload: dict = json.loads(execution_payload_json)
         except Exception as exc:
-            return json.dumps({"status": "error", "error": f"payload_parse_error: {exc}"})
+            return _ssot_crash(exc)
 
         kg_api = self.knowledge_graph_api
         real_var_list = self.variable_list or []
@@ -778,6 +811,28 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             except Exception as exc:
                 return f"Error: {_sub(str(exc), [str(var1), str(var2)])}"
 
+        def proxy_union(var1: Any, var2: Any) -> str:
+            _check_tripwire()
+            try:
+                new_var, msg = kg_api.union(_resolve(var1), _resolve(var2))
+                msg = _sub(msg, [str(var1), str(var2)]).replace(
+                    "<<API_STR>>", f"union({var1}, {var2})"
+                )
+                return _track(new_var, msg)
+            except Exception as exc:
+                return f"Error: {_sub(str(exc), [str(var1), str(var2)])}"
+
+        def proxy_difference(var1: Any, var2: Any) -> str:
+            _check_tripwire()
+            try:
+                new_var, msg = kg_api.difference(_resolve(var1), _resolve(var2))
+                msg = _sub(msg, [str(var1), str(var2)]).replace(
+                    "<<API_STR>>", f"difference({var1}, {var2})"
+                )
+                return _track(new_var, msg)
+            except Exception as exc:
+                return f"Error: {_sub(str(exc), [str(var1), str(var2)])}"
+
         def proxy_get_attributes(var: Any) -> str:
             _check_tripwire()
             try:
@@ -822,6 +877,8 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             "get_relations": proxy_get_relations,
             "get_neighbors": proxy_get_neighbors,
             "intersection": proxy_intersection,
+            "union": proxy_union,
+            "difference": proxy_difference,
             "get_attributes": proxy_get_attributes,
             "argmax": proxy_argmax,
             "argmin": proxy_argmin,
@@ -833,88 +890,57 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         payload["actions_spec"] = proxy_actions_spec
 
         result: dict = {}
-        allowed_modules = {
-            "os",
-            "json",
-            "re",
-            "math",
-            "statistics",
-            "itertools",
-            "functools",
-            "collections",
-            "datetime",
-            "typing",
-        }
-
-        def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name in allowed_modules:
-                return __import__(name, globals, locals, fromlist, level)
-            raise ImportError(f"module '{name}' is not allowed in execute_macro")
-
-        safe_builtins = {
-            "__import__": _safe_import,
-            "len": len,
-            "range": range,
-            "min": min,
-            "max": max,
-            "sum": sum,
-            "sorted": sorted,
-            "enumerate": enumerate,
-            "iter": iter,
-            "next": next,
-            "float": float,
-            "int": int,
-            "str": str,
-            "dict": dict,
-            "list": list,
-            "set": set,
-            "tuple": tuple,
-            "abs": abs,
-            "all": all,
-            "any": any,
-            "zip": zip,
-            "bool": bool,
-            "type": type,
-            "isinstance": isinstance,
-            "hasattr": hasattr,
-            "getattr": getattr,
-            "setattr": setattr,
-            "print": print,
-            "map": map,
-            "filter": filter,
-            "round": round,
-            "callable": callable,
-            "Exception": Exception,
-        }
         safe_globals = {
-            "__builtins__": safe_builtins,
+            "__builtins__": __builtins__,
             "json": json,
             "re": re,
             "os": os,
+            "kg_utils": _kg_utils,
         }
         try:
             exec(tool_code, safe_globals)  # noqa: S102
             run_fn = safe_globals.get("run")
             if not callable(run_fn):
-                return json.dumps(
-                    {"status": "error", "error": "run() not found in generated tool"}
-                )
+                return _ssot_crash(RuntimeError("run() not found in generated tool"))
             # Run in a thread with a generous timeout. The tripwire (15 calls)
             # is the primary safeguard; the timeout is the backstop for pure
             # CPU-bound runaway loops.
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(run_fn, payload)
                 result = future.result(timeout=20.0)
+            # Shape Verifier: catch pointer/count type mismatches before they
+            # propagate to the Validator or Orchestrator.
+            if isinstance(result, dict) and result.get("status") == "SUCCESS":
+                archetype_upper = str(payload.get("target_archetype", "")).upper()
+                is_count_task = "COUNT" in archetype_upper
+                is_extractor = "EXTRACTOR" in archetype_upper
+                var_val = str(result.get("final_variable", "")).strip()
+                is_pointer = var_val.startswith("#")
+                if is_count_task and is_pointer:
+                    result["status"] = "ERROR"
+                    result["final_variable"] = None
+                    result["observation"] = (
+                        "Shape Mismatch: Task archetype requires a COUNT (number), "
+                        "but the tool returned an entity pointer."
+                    )
+                elif not is_count_task and not is_extractor and not is_pointer:
+                    result["status"] = "ERROR"
+                    result["final_variable"] = None
+                    result["observation"] = (
+                        "Shape Mismatch: Task requires an entity node, "
+                        "but the tool returned a numeric count."
+                    )
         except FutureTimeoutError:
             result = {
-                "status": "error",
-                "error": "evaluate_generated_macro: run() exceeded 20s server-side timeout",
+                "status": "ERROR",
+                "final_variable": None,
+                "observation": "Crash: run() exceeded 20s server-side timeout",
             }
         except Exception as exc:
             result = {
-                "status": "error",
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
+                "status": "ERROR",
+                "final_variable": None,
+                "observation": f"Crash: {str(exc)}",
             }
         finally:
             # Purge shadow cache entries to keep kg_api.variable_to_relations_cache clean.
@@ -937,7 +963,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             return json.dumps(result, default=str)
         except Exception as exc:
             logger.warning("evaluate_generated_macro: result serialization failed: %s", exc)
-            return json.dumps({"status": "error", "error": f"result_serialization_failed: {exc}"})
+            return _ssot_crash(exc)
 
     def _execute_macro(
         self,
@@ -983,8 +1009,19 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                         matches.append(os.path.join(dirpath, filename))
             if not matches:
                 return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
+            # TOCTOU guard: Reflection Forge may delete files between the
+            # os.walk and this getmtime call.  Filter out any path that has
+            # already disappeared rather than letting sort() throw.
+            surviving: list[tuple[float, str]] = []
+            for p in matches:
+                try:
+                    surviving.append((os.path.getmtime(p), p))
+                except FileNotFoundError:
+                    pass
+            if not surviving:
+                return None
+            surviving.sort(key=lambda x: x[0], reverse=True)
+            return surviving[0][1]
 
         tool_path = _resolve_macro_tool_path(tool_name, state_dir_value)
         if not tool_path:
@@ -1034,64 +1071,12 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         if not payload_map.get("entities"):
             payload_map["entities"] = entity_list
 
-        allowed_modules = {
-            "os",
-            "json",
-            "re",
-            "math",
-            "statistics",
-            "itertools",
-            "functools",
-            "collections",
-            "datetime",
-            "typing",
-        }
-
-        def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name in allowed_modules:
-                return __import__(name, globals, locals, fromlist, level)
-            raise ImportError(f"module '{name}' is not allowed in execute_macro")
-
-        safe_builtins = {
-            "__import__": _safe_import,
-            "len": len,
-            "range": range,
-            "min": min,
-            "max": max,
-            "sum": sum,
-            "sorted": sorted,
-            "enumerate": enumerate,
-            "iter": iter,
-            "next": next,
-            "float": float,
-            "int": int,
-            "str": str,
-            "dict": dict,
-            "list": list,
-            "set": set,
-            "tuple": tuple,
-            "abs": abs,
-            "all": all,
-            "any": any,
-            "zip": zip,
-            "bool": bool,
-            "type": type,
-            "isinstance": isinstance,
-            "hasattr": hasattr,
-            "getattr": getattr,
-            "setattr": setattr,
-            "print": print,
-            "map": map,
-            "filter": filter,
-            "round": round,
-            "callable": callable,
-            "Exception": Exception,
-        }
         safe_globals = {
-            "__builtins__": safe_builtins,
+            "__builtins__": __builtins__,
             "json": json,
             "re": re,
             "os": os,
+            "kg_utils": _kg_utils,
         }
         logger.info(
             f"[MACRO EXEC] Tool: {tool_name} | Concept: {payload_map.get('target_concept')} | Hints: {payload_map.get('domain_hints')}"
@@ -1111,26 +1096,39 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             )
             return
 
-        observation = None
-        if isinstance(result, dict):
-            for key in (
-                "final_var",
-                "result_var",
-                "answer",
-                "final_answer",
-                "answer_recommendation",
-                "result",
-                "output",
-            ):
-                if key in result:
-                    observation = result.get(key)
-                    break
-            if observation is None:
-                observation = json.dumps(result, ensure_ascii=True, default=str)
-        elif result is None:
-            observation = "Macro executed."
+        if not isinstance(result, dict):
+            session.chat_history.inject(
+                {
+                    "role": Role.USER,
+                    "content": (
+                        f"Error in executing '{api_str}'. Error: "
+                        "macro_invalid_output_schema: expected SSOT dict"
+                    ),
+                }
+            )
+            return
+
+        ssot_keys = {"status", "final_variable", "observation"}
+        if set(result.keys()) != ssot_keys:
+            session.chat_history.inject(
+                {
+                    "role": Role.USER,
+                    "content": (
+                        f"Error in executing '{api_str}'. Error: "
+                        "macro_invalid_output_schema: expected exact keys "
+                        "['status','final_variable','observation']"
+                    ),
+                }
+            )
+            return
+
+        status = str(result.get("status") or "")
+        final_variable = result.get("final_variable")
+        if status == "SUCCESS" and final_variable not in (None, ""):
+            obs_text = result.get("observation", "")
+            observation = f"{final_variable} - {obs_text}" if obs_text else str(final_variable)
         else:
-            observation = str(result)
+            observation = json.dumps(result, ensure_ascii=True, default=str)
 
         execution_message = KnowledgeGraphAPI._construct_execution_message(
             str(observation)
@@ -1257,6 +1255,10 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                         api = self.knowledge_graph_api.get_neighbors
                     case "intersection":
                         api = self.knowledge_graph_api.intersection
+                    case "union":
+                        api = self.knowledge_graph_api.union
+                    case "difference":
+                        api = self.knowledge_graph_api.difference
                     case "get_attributes":
                         api = self.knowledge_graph_api.get_attributes
                     case "argmax":

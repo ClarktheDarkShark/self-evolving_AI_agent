@@ -382,6 +382,10 @@ class SelfEvolvingController(
         self._failure_forged: set[str] = set()
         self._executed_tool_payloads: set[str] = set()
         self._executed_tool_payloads_session_key: Optional[tuple[str, str]] = None
+        self._exhausted_macros: set[str] = set()
+        self._exhausted_macros_session_key: Optional[tuple[str, str]] = None
+        self._called_tool_signatures: set[str] = set()
+        self._called_tool_signatures_session_key: Optional[tuple[str, str]] = None
         self._run_task_metadata: Optional[dict[str, Any]] = None
         self._last_solver_output: Optional[str] = None
         self._last_solver_context_key: Optional[str] = None
@@ -1052,6 +1056,15 @@ class SelfEvolvingController(
             "'payload[\"asked_for\"]' and execute the search abstractly. "
             "Give the tool a generic, descriptive name "
             "(e.g., 'multi_entity_intersection_macro_tool').\n"
+            "DOMAIN ABSTRACTION & MECHANICAL SPECIALIZATION: When analyzing "
+            "a failure and proposing an 'upgrade_goal' or a new tool, you "
+            "MUST abstract away all specific entities. Never use domain nouns "
+            "(e.g., 'milk', 'cheese', 'drug', 'breed') in the tool name or "
+            "upgrade_goal. You must describe the missing *graph mechanics* "
+            "(e.g., 'multi-hop attribute filter', 'three-way origin "
+            "intersector'). Tool names MUST be domain-agnostic structural "
+            "descriptors (e.g., 'multi_source_attribute_filter_macro_tool', "
+            "not 'milk_texture_intersector').\n"
             "============================\n\n"
             + catalog_block
         )
@@ -1233,6 +1246,12 @@ class SelfEvolvingController(
             if self._executed_tool_payloads_session_key != session_key:
                 self._executed_tool_payloads.clear()
                 self._executed_tool_payloads_session_key = session_key
+            if self._exhausted_macros_session_key != session_key:
+                self._exhausted_macros.clear()
+                self._exhausted_macros_session_key = session_key
+            if self._called_tool_signatures_session_key != session_key:
+                self._called_tool_signatures.clear()
+                self._called_tool_signatures_session_key = session_key
         except Exception:
             pass
         self._apply_outcome_penalties()
@@ -1472,15 +1491,20 @@ class SelfEvolvingController(
                 flush=True,
             )
             action = decision.get("action", "no_tool")
-            if action == "request_new_tool":
-                decision["tool_name"] = "request_new_tool"
-                action = "use_tool"
             if (
                 self._toolgen_off
                 and not self._force_toolgen_always_on
                 and action in {"create_tool", "request_new_tool"}
             ):
                 action = "use_tool"
+            # Hard blacklist: never re-invoke a macro that already returned MACRO EXHAUSTED
+            # in this sample, regardless of what the Orchestrator or size_trigger decided.
+            if action == "use_tool" and decision.get("tool_name") in self._exhausted_macros:
+                self._append_loop_log(
+                    f"  [BLACKLIST] Suppressed use_tool for exhausted macro: "
+                    f"{decision.get('tool_name')} → forcing no_tool"
+                )
+                action = "no_tool"
             if isinstance(self._last_turn_data, dict):
                 decision_record = dict(decision)
                 decision_record["action"] = action
@@ -1492,87 +1516,130 @@ class SelfEvolvingController(
             self._append_loop_log(
                 f"  orchestrator: action={action} "
                 f"tool={decision.get('tool_name') or '-'} "
-                f"reason={self._truncate(str(decision.get('reason') or ''), 80)}"
+                f"reason={self._truncate(str(decision.get('reason') or ''), 1000)}"
             )
 
             # Phase 4: Escape hatch intercept — request_new_tool
-            if (
-                action == "use_tool"
-                and str(decision.get("tool_name") or "").strip() == "request_new_tool"
-            ):
-                print(
-                    f"[LATM_FLOW] Forge reason: "
-                    f"{decision.get('reason')}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                self._append_loop_log("  >>> ESCAPE HATCH TRIGGERED <<<")
-                escape_result = self._handle_escape_hatch(
-                    decision, task_query, working_history
-                )
-                escape_message = ""
-                if isinstance(escape_result, Mapping):
-                    escape_message = str(escape_result.get("observation") or "")
-                if not escape_message:
-                    escape_message = str(escape_result)
-                escape_status = "success" if "successfully created" in escape_message else "failure"
-                self._append_loop_log(
-                    {
-                        "event": "escape_hatch_complete",
-                        "turn": turn_id,
-                        "status": escape_status,
-                        "message": escape_message,
-                    }
-                )
-                self._append_loop_log(
-                    f"  escape_hatch: success={escape_result.get('success')} "
-                    f"new_tool={escape_result.get('tool_name') or '-'}"
-                )
-                # Re-run the Orchestrator with the ToolGen observation so it
-                # can see the refreshed catalog and select the new tool.
-                print(
-                    "\n[DEBUG] Entering Orchestrator Decision Phase (post-escape)",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                decision = self._orchestrate_decision(
-                    task_query,
-                    working_history,
-                    solver_recommendation=escape_result["observation"],
-                    observation_triggers=observation_triggers,
-                    last_observation=pre_orch_obs,
-                    stagnation_count=stagnation_count,
-                )
-                print(
-                    f"[DEBUG] Orchestrator Decision (post-escape): {decision}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                action = decision.get("action", "no_tool")
-                if action == "request_new_tool":
-                    decision["tool_name"] = "request_new_tool"
-                    action = "use_tool"
-                if (
-                    self._toolgen_off
-                    and not self._force_toolgen_always_on
-                    and action in {"create_tool", "request_new_tool"}
-                ):
-                    action = "use_tool"
-                if isinstance(self._last_turn_data, dict):
-                    decision_record = dict(decision)
-                    decision_record["action"] = action
-                    decision_record["_stage"] = "post_escape"
-                    self._last_turn_data["orchestrator_decision"] = decision_record
-                    if isinstance(
-                        self._last_turn_data.get("orchestrator_decisions"), list
-                    ):
-                        self._last_turn_data["orchestrator_decisions"].append(
-                            decision_record
+            if action == "request_new_tool":
+                # TURN-0 GATE: Tool generation is only permitted at the very start of
+                # a task (Turn 0), before any KG actions have been executed.
+                # pre_orch_trace holds every action taken so far in this task.
+                # A non-empty trace means we are mid-task — block the Forge entirely
+                # and fall back to the manual Solver instead.
+                if pre_orch_trace:
+                    print(
+                        "[TURN-0 GATE] Mid-task tool generation blocked. "
+                        f"Trace has {len(pre_orch_trace)} step(s). "
+                        "Forcing fallback to manual solver.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._append_loop_log(
+                        f"  [TURN-0 GATE] request_new_tool blocked mid-task "
+                        f"(trace has {len(pre_orch_trace)} steps). Forcing no_tool."
+                    )
+                    action = "no_tool"
+                else:
+                    # Turn 0: no actions taken yet — Forge is allowed.
+                    # Graceful Degradation gate: if the triggering observation was
+                    # a macro that returned MACRO EXHAUSTED but still minted a
+                    # valid partial Variable (e.g., #4), the Solver can use that
+                    # variable directly.  Firing the Forge here would overfit on a
+                    # task where the tool actually did useful work — skip it.
+                    _last_obs_text = ""
+                    if pre_orch_obs is not None:
+                        _last_obs_text = str(pre_orch_obs.get("output") or "")
+                    if not _last_obs_text and pre_orch_trace:
+                        _last_obs_text = str(pre_orch_trace[-1].get("output") or "")
+                    _is_graceful_degradation = (
+                        "MACRO EXHAUSTED" in _last_obs_text
+                        and bool(re.search(r"#\d+", _last_obs_text))
+                    )
+                    if _is_graceful_degradation:
+                        self._append_loop_log(
+                            "  [GRACEFUL DEGRADATION] Macro returned MACRO EXHAUSTED "
+                            "with a valid partial Variable — skipping Forge. "
+                            "Solver will use the partial result directly."
                         )
-                self._append_loop_log(
-                    f"  orchestrator (post-escape): action={action} "
-                    f"tool={decision.get('tool_name') or '-'}"
-                )
+                        action = "no_tool"
+                    else:
+                        print(
+                            f"[LATM_FLOW] Forge reason: "
+                            f"{decision.get('reason')}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        self._append_loop_log("  >>> ESCAPE HATCH TRIGGERED <<<")
+                        escape_result = self._handle_escape_hatch(
+                            decision, task_query, working_history
+                        )
+                        escape_message = ""
+                        if isinstance(escape_result, Mapping):
+                            escape_message = str(escape_result.get("observation") or "")
+                        if not escape_message:
+                            escape_message = str(escape_result)
+                        escape_status = "success" if "successfully created" in escape_message else "failure"
+                        self._append_loop_log(
+                            {
+                                "event": "escape_hatch_complete",
+                                "turn": turn_id,
+                                "status": escape_status,
+                                "message": escape_message,
+                            }
+                        )
+                        self._append_loop_log(
+                            f"  escape_hatch: success={escape_result.get('success')} "
+                            f"new_tool={escape_result.get('tool_name') or '-'}"
+                        )
+                        # Re-run the Orchestrator with the ToolGen observation so it
+                        # can see the refreshed catalog and select the new tool.
+                        print(
+                            "\n[DEBUG] Entering Orchestrator Decision Phase (post-escape)",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        decision = self._orchestrate_decision(
+                            task_query,
+                            working_history,
+                            solver_recommendation=escape_result["observation"],
+                            observation_triggers=observation_triggers,
+                            last_observation=pre_orch_obs,
+                            stagnation_count=stagnation_count,
+                        )
+                        print(
+                            f"[DEBUG] Orchestrator Decision (post-escape): {decision}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        action = decision.get("action", "no_tool")
+                        if (
+                            self._toolgen_off
+                            and not self._force_toolgen_always_on
+                            and action in {"create_tool", "request_new_tool"}
+                        ):
+                            action = "use_tool"
+                        # Hard blacklist: suppress re-invocation of exhausted macros post-escape too.
+                        if action == "use_tool" and decision.get("tool_name") in self._exhausted_macros:
+                            self._append_loop_log(
+                                f"  [BLACKLIST] Suppressed use_tool (post-escape) for exhausted macro: "
+                                f"{decision.get('tool_name')} → forcing no_tool"
+                            )
+                            action = "no_tool"
+                        if isinstance(self._last_turn_data, dict):
+                            decision_record = dict(decision)
+                            decision_record["action"] = action
+                            decision_record["_stage"] = "post_escape"
+                            self._last_turn_data["orchestrator_decision"] = decision_record
+                            if isinstance(
+                                self._last_turn_data.get("orchestrator_decisions"), list
+                            ):
+                                self._last_turn_data["orchestrator_decisions"].append(
+                                    decision_record
+                                )
+                        self._append_loop_log(
+                            f"  orchestrator (post-escape): action={action} "
+                            f"tool={decision.get('tool_name') or '-'}"
+                        )
 
             if action == "no_tool":
                 if not init_solver:
@@ -1838,57 +1905,108 @@ class SelfEvolvingController(
                                     ):
                                         args = [dict(args[0].get("payload") or {})]
                                     tool_args = {"args": args, "kwargs": kwargs}
-                                    payload_signature_src = f"{tool_name}|{str(payload_map)}"
-                                    payload_signature = hashlib.sha1(
-                                        payload_signature_src.encode("utf-8")
-                                    ).hexdigest()
-                                    if payload_signature in self._executed_tool_payloads:
-                                        duplicate_observation = (
-                                            "Observation: Tool already executed with this exact payload. "
-                                            "Proceed with primitive actions or use a different tool/payload."
-                                        )
-                                        tool_error = "duplicate_tool_payload_suppressed"
+                                    # ── Layer 1: Deterministic signature blacklist ──
+                                    # Catches loops where the Orchestrator re-invokes the
+                                    # same tool with the same entities even though the trace
+                                    # changes each turn (which defeats the SHA1 hash below).
+                                    _entities_for_sig = payload_map.get("entities") or []
+                                    _entities_sig = "|".join(
+                                        sorted(str(e) for e in _entities_for_sig)
+                                    )
+                                    _tool_sig = f"{tool_name}::{_entities_sig}"
+                                    if _tool_sig in self._called_tool_signatures:
                                         self._append_loop_log(
-                                            f"  tool_exec: skipped duplicate payload for {tool_name}"
+                                            f"  [SIG_BLACKLIST] Duplicate tool+entities suppressed: "
+                                            f"{_tool_sig[:120]}"
                                         )
                                         self._log_failed_invoke_event(
                                             tool_name=tool_name,
-                                            reason=tool_error,
+                                            reason="duplicate_tool_signature_suppressed",
                                         )
-                                        solver_sidecar.append(duplicate_observation)
-                                        tool_result = ToolResult.failure(tool_error)
+                                        solver_sidecar.append(
+                                            "Observation: This exact tool has already been called "
+                                            "with these entities in this task. The Orchestrator is "
+                                            "looping. Proceed with primitive actions or a different "
+                                            "approach — do NOT call this tool again."
+                                        )
+                                        tool_result = ToolResult.failure(
+                                            "duplicate_tool_signature_suppressed"
+                                        )
                                         tool_result_injected = True
                                     else:
-                                        self._executed_tool_payloads.add(payload_signature)
-                                        self._log_flow_event(
-                                            "tool_agent_input",
-                                            chat_history=working_history,
-                                            tool_name=tool_name,
-                                            tool_args=tool_args,
-                                            reason="tool_invoker",
-                                        )
-                                        # Now invoke
-                                        tool_result = self._invoke_tool_by_payload(
-                                            tool_name,
-                                            tool_args,
-                                            reason="tool_invoker",
-                                            chat_history=working_history,
-                                            args_auto_built=args_auto_built,
-                                            decision_action=tool_action,
-                                        )
-                                        last_tool_result = tool_result
-                                        _conf = None
-                                        _rec_preview = ""
-                                        if isinstance(tool_result.output, Mapping):
-                                            _conf = tool_result.output.get("confidence_score")
-                                            _rec_preview = self._truncate(
-                                                str(tool_result.output.get("answer_recommendation") or ""), 80
+                                        # First-time call: register the signature, then
+                                        # run the SHA1 full-payload dedup (layer 2).
+                                        self._called_tool_signatures.add(_tool_sig)
+                                        # ── Layer 2: SHA1 full-payload dedup ──
+                                        payload_signature_src = f"{tool_name}|{str(payload_map)}"
+                                        payload_signature = hashlib.sha1(
+                                            payload_signature_src.encode("utf-8")
+                                        ).hexdigest()
+                                        if payload_signature in self._executed_tool_payloads:
+                                            duplicate_observation = (
+                                                "Observation: Tool already executed with this exact payload. "
+                                                "Proceed with primitive actions or use a different tool/payload."
                                             )
-                                        self._append_loop_log(
-                                            f"  tool_exec: success={tool_result.success} "
-                                            f"confidence={_conf} "
-                                            f"rec={_rec_preview or '-'}"
-                                        )
+                                            tool_error = "duplicate_tool_payload_suppressed"
+                                            self._append_loop_log(
+                                                f"  tool_exec: skipped duplicate payload for {tool_name}"
+                                            )
+                                            self._log_failed_invoke_event(
+                                                tool_name=tool_name,
+                                                reason=tool_error,
+                                            )
+                                            solver_sidecar.append(duplicate_observation)
+                                            tool_result = ToolResult.failure(tool_error)
+                                            tool_result_injected = True
+                                        else:
+                                            self._executed_tool_payloads.add(payload_signature)
+                                            self._log_flow_event(
+                                                "tool_agent_input",
+                                                chat_history=working_history,
+                                                tool_name=tool_name,
+                                                tool_args=tool_args,
+                                                reason="tool_invoker",
+                                            )
+                                            # Now invoke
+                                            tool_result = self._invoke_tool_by_payload(
+                                                tool_name,
+                                                tool_args,
+                                                reason="tool_invoker",
+                                                chat_history=working_history,
+                                                args_auto_built=args_auto_built,
+                                                decision_action=tool_action,
+                                            )
+                                            last_tool_result = tool_result
+                                            _conf = None
+                                            _rec_preview = ""
+                                            if isinstance(tool_result.output, Mapping):
+                                                _conf = tool_result.output.get("confidence_score")
+                                                _rec_preview = self._truncate(
+                                                    str(tool_result.output.get("answer_recommendation") or ""), 80
+                                                )
+                                            self._append_loop_log(
+                                                f"  tool_exec: success={tool_result.success} "
+                                                f"confidence={_conf} "
+                                                f"rec={_rec_preview or '-'}"
+                                            )
+                                            # Trap MACRO EXHAUSTED: blacklist this macro for the
+                                            # remainder of the sample so no further use_tool
+                                            # decisions (including size_trigger re-evaluations)
+                                            # can re-invoke it.
+                                            if tool_name:
+                                                _obs_str = ""
+                                                if isinstance(tool_result.output, Mapping):
+                                                    _obs_str = str(
+                                                        tool_result.output.get("macro_observation")
+                                                        or tool_result.output.get("answer_recommendation")
+                                                        or ""
+                                                    )
+                                                if "MACRO EXHAUSTED" in _obs_str:
+                                                    self._exhausted_macros.add(tool_name)
+                                                    self._append_loop_log(
+                                                        f"  [BLACKLIST] Added '{tool_name}' to "
+                                                        f"exhausted_macros (MACRO EXHAUSTED detected)"
+                                                    )
 
                             if not tool_result_injected:
                                 self._log_flow_event(

@@ -6,6 +6,7 @@ import sys
 from typing import Any, Mapping, Optional
 
 from src.typings import ChatHistory, ChatHistoryItem, Role
+from .controller_prompts import ARCHETYPE_REGISTRY
 
 
 class ControllerOrchestratorMixin:
@@ -127,7 +128,7 @@ class ControllerOrchestratorMixin:
     # ------------------------------------------------------------------
     _REQUEST_NEW_TOOL_ENTRY = {
         "name": "request_new_tool",
-        "signature": "request_new_tool(tool_type, reason)",
+        "signature": "request_new_tool(tool_type, reason, target_archetype)",
         "docstring": (
             "CRITICAL: Trigger this ONLY when the Actor Agent is stuck in a loop, "
             "experiences a database timeout (node explosion), or lacks an existing "
@@ -139,7 +140,7 @@ class ControllerOrchestratorMixin:
         ),
         "input_schema": {
             "type": "object",
-            "required": ["tool_type", "reason"],
+            "required": ["tool_type", "reason", "target_archetype"],
             "properties": {
                 "tool_type": {
                     "type": "string",
@@ -150,13 +151,18 @@ class ControllerOrchestratorMixin:
                     "type": "string",
                     "description": "Must follow the template: INPUT: [raw data/variables in trace]. GOAL: [exact transformation or execution needed].",
                 },
+                "target_archetype": {
+                    "type": "string",
+                    "enum": list(ARCHETYPE_REGISTRY.keys()),
+                },
             },
         },
-        "required_keys": ["tool_type", "reason"],
+        "required_keys": ["tool_type", "reason", "target_archetype"],
         "optional_keys": [],
         "property_types": {
             "tool_type": "string",
             "reason": "string",
+            "target_archetype": "string",
         },
         "invoke_with": None,
         "run_payload_required": [],
@@ -401,6 +407,54 @@ class ControllerOrchestratorMixin:
             except Exception:
                 pass
         print(f"[ORCHESTRATOR] Found {len(tools)} active tools for environment '{current_env}'")
+
+        def _extract_tool_archetype(tool) -> str:
+            """Extract archetype label from a tool's input_schema or description/docstring."""
+            # 1. Check explicit metadata first.
+            for attr_name in ("target_archetype", "archetype"):
+                try:
+                    attr_val = getattr(tool, attr_name, None)
+                except Exception:
+                    attr_val = None
+                if attr_val:
+                    candidate = str(attr_val).strip().upper()
+                    if candidate in ARCHETYPE_REGISTRY:
+                        return candidate
+
+            # 2. Check input_schema.properties.target_archetype for const/default/enum
+            schema = tool.input_schema if isinstance(tool.input_schema, dict) else {}
+            props = schema.get("properties", {})
+            arch_prop = props.get("target_archetype", {}) if isinstance(props, dict) else {}
+            if isinstance(arch_prop, dict):
+                const_val = arch_prop.get("const")
+                if const_val and str(const_val).upper() in ARCHETYPE_REGISTRY:
+                    return str(const_val).upper()
+                enum_vals = arch_prop.get("enum")
+                if isinstance(enum_vals, list) and len(enum_vals) == 1:
+                    return str(enum_vals[0]).upper()
+                default_val = arch_prop.get("default")
+                if default_val:
+                    return str(default_val).upper()
+            # 3. Fall back to registry key scan in name/description/docstring
+            scan_sources = [
+                getattr(tool, "name", "") or "",
+                tool.docstring or "",
+                tool.description or "",
+            ]
+            for src in scan_sources:
+                src_upper = src.upper()
+                # Prefer exact token boundaries where possible.
+                for arch_key in ARCHETYPE_REGISTRY.keys():
+                    pattern = r"(?<![A-Z0-9_])" + re.escape(arch_key) + r"(?![A-Z0-9_])"
+                    if re.search(pattern, src_upper):
+                        return arch_key
+            for src in (tool.docstring or "", tool.description or ""):
+                src_upper = src.upper()
+                for arch_key in ARCHETYPE_REGISTRY.keys():
+                    if arch_key in src_upper:
+                        return arch_key
+            return "UNKNOWN"
+
         compact: list[dict[str, Any]] = []
         for t in tools:
             contract = self._parse_tool_invoke_contract(t.name)
@@ -413,11 +467,19 @@ class ControllerOrchestratorMixin:
                 run_payload_required = list(t.required_keys or [])
             if not run_payload_optional:
                 run_payload_optional = list(t.optional_keys or [])
+            archetype_label = _extract_tool_archetype(t)
+            base_docstring = self._format_orchestrator_docstring(t)
+            docstring_clean = base_docstring.strip()
+            if docstring_clean.startswith("[ARCHETYPE:"):
+                docstring_with_archetype = docstring_clean
+            else:
+                docstring_with_archetype = f"[ARCHETYPE: {archetype_label}] {docstring_clean}"
             compact.append(
                 {
                     "name": t.name,
+                    "archetype": archetype_label,
                     "signature": t.signature,
-                    "docstring": self._format_orchestrator_docstring(t),
+                    "docstring": docstring_with_archetype,
                     "input_schema": t.input_schema,
                     "required_keys": t.required_keys,
                     "optional_keys": t.optional_keys,
@@ -459,9 +521,12 @@ class ControllerOrchestratorMixin:
         cleaned_query = self._truncate((query or ""), 1200)
 
         output_schema: dict[str, Any] = {
-            "action": "use_tool|create_tool|no_tool",
-            "tool_name": "only if use_tool",
-            "reason": "short reason",
+            "action": "use_tool|request_new_tool|no_tool",
+            "tool_name": "only if action=use_tool",
+            "tool_type": "advisory|macro (only if action=request_new_tool)",
+            "archetype_reasoning": "chain-of-thought: logical shape of the question (only if action=request_new_tool)",
+            "target_archetype": "e.g. COUNTER (only if action=request_new_tool AND tool_type=macro)",
+            "reason": "short reason (INPUT:...GOAL:... format if request_new_tool)",
         }
         if getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
             output_schema["insufficiency"] = "why existing tools fail the gate"
@@ -674,68 +739,24 @@ class ControllerOrchestratorMixin:
             obs_text = ""
         retrieval_query = "\n".join([query or "", obs_text]).strip()
 
-        # Trigger-based fast path: auto-decide based on observation characteristics
-        if observation_triggers:
-            try:
-                tools = self._orchestrator_compact_existing_tools(
-                    query_text=retrieval_query
-                )
-            except Exception:
-                tools = []
-            for trigger in observation_triggers:
-                trigger_type = trigger.get("type")
-                if trigger_type in {"size_trigger", "error_trigger"}:
-                    # Find an existing generated tool for this environment
-                    filter_tool = next(
-                        (
-                            t
-                            for t in tools
-                            if isinstance(t.get("name"), str)
-                            and t["name"].endswith("_generated_tool")
-                        ),
-                        None,
-                    )
-                    if filter_tool:
-                        return {
-                            "action": "use_tool",
-                            "tool_name": filter_tool["name"],
-                            "reason": f"{trigger_type}: {trigger.get('reason', '')}",
-                        }
-                    else:
-                        return {
-                            "action": "request_new_tool",
-                            "reason": f"{trigger_type}_no_tool: {trigger.get('reason', '')}",
-                        }
-                if trigger_type == "derailment_trigger":
-                    severity = trigger.get("severity", "medium")
-                    filter_tool = next(
-                        (
-                            t
-                            for t in tools
-                            if isinstance(t.get("name"), str)
-                            and t["name"].endswith("_generated_tool")
-                        ),
-                        None,
-                    )
-                    if severity == "high":
-                        # High severity: skip straight to new tool generation
-                        return {
-                            "action": "request_new_tool",
-                            "reason": f"derailment_high: {trigger.get('reason', '')}",
-                        }
-                    else:
-                        # Medium severity: prefer existing tool, else request new
-                        if filter_tool:
-                            return {
-                                "action": "use_tool",
-                                "tool_name": filter_tool["name"],
-                                "reason": f"derailment_medium: {trigger.get('reason', '')}",
-                            }
-                        else:
-                            return {
-                                "action": "request_new_tool",
-                                "reason": f"derailment_medium_no_tool: {trigger.get('reason', '')}",
-                            }
+        # FAST-PATH DISABLED: The blind trigger-based fast path (auto-selecting the
+        # first _generated_tool on size_trigger/error_trigger/derailment_trigger) caused
+        # Catalog Bias — the Orchestrator LLM was never asked to evaluate archetype fit.
+        # The Orchestrator LLM must always run a full evaluation so that exact archetype
+        # matching (COUNTER vs INTERSECTOR vs other specialized archetypes) drives tool selection.
+        # Original fast-path block commented out below for reference:
+        #
+        # if observation_triggers:
+        #     for trigger in observation_triggers:
+        #         trigger_type = trigger.get("type")
+        #         if trigger_type in {"size_trigger", "error_trigger"}:
+        #             filter_tool = next(...)
+        #             if filter_tool:
+        #                 return {"action": "use_tool", "tool_name": filter_tool["name"], ...}
+        #             else:
+        #                 return {"action": "request_new_tool", ...}
+        #         if trigger_type == "derailment_trigger":
+        #             ...high/medium severity returns...
 
         forced_tool_name = getattr(self, "_just_generated_tool", None)
         prompt = self._orchestrator_request_prompt(
@@ -745,6 +766,15 @@ class ControllerOrchestratorMixin:
             stagnation_count=stagnation_count,
             forced_tool_name=forced_tool_name,
         )
+        # Inject trigger context so the Orchestrator LLM is aware of why it was
+        # called (e.g., size explosion, error, derailment) without the backend
+        # making a blind archetype-unaware decision on its behalf.
+        if observation_triggers:
+            trigger_summary = "; ".join(
+                f"{t.get('type', '?')}: {t.get('reason', '')}"
+                for t in observation_triggers
+            )
+            prompt = f"[SYSTEM TRIGGERS: {trigger_summary}]\n\n" + prompt
         if forced_tool_name:
             setattr(self, "_just_generated_tool", None)
         try:
@@ -807,42 +837,22 @@ class ControllerOrchestratorMixin:
             and not str(tool_name).endswith("_generated_tool")
         ):
             tool_name = None
-        has_agent_action = False
-        try:
-            for item in self._history_items(chat_history):
-                if item.role != Role.AGENT:
-                    continue
-                content = (item.content or "").strip()
-                if content.startswith("Action:") or content.startswith("Final Answer:"):
-                    has_agent_action = True
-                    break
-        except Exception:
-            has_agent_action = False
-        if action == "request_new_tool" and not has_agent_action:
-            candidates = [
-                t
-                for t in tools
-                if isinstance(t.get("name"), str)
-                and t["name"].endswith("_generated_tool")
-            ]
-            if candidates:
-                best = max(
-                    candidates,
-                    key=lambda t: (
-                        float(t.get("reliability_score") or 0.0),
-                        int(t.get("success") or 0),
-                        -int(t.get("failure") or 0),
-                    ),
-                )
-                action = "use_tool"
-                tool_name = best.get("name")
-                payload = dict(payload)
-                payload["reason"] = "bootstrap_tool_available_use_tool"
+        upgrade_goal = payload.get("upgrade_goal")
+        if action == "request_new_tool":
+            if not isinstance(upgrade_goal, str) or not upgrade_goal.strip():
+                # Backward-compat fallback: older orchestrator prompts encode
+                # the upgrade instruction directly in reason.
+                upgrade_goal = str(payload.get("reason") or "")
+        else:
+            upgrade_goal = ""
+
         return {
             "action": action,
             "tool_name": str(tool_name).strip() if tool_name else None,
             "reason": payload.get("reason"),
             "tool_type": payload.get("tool_type"),
+            "target_archetype": payload.get("target_archetype", ""),
+            "upgrade_goal": upgrade_goal,
             "insufficiency": payload.get("insufficiency"),
             "needed_capabilities": payload.get("needed_capabilities"),
             "evidence": payload.get("evidence"),

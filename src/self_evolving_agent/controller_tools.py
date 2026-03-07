@@ -103,6 +103,22 @@ class ControllerToolsMixin:
                 pass
             return ToolResult.failure(f"macro_execution_failed:{exc}")
 
+        # Guard: task.interact() swallows ALL exceptions internally and returns
+        # normally even on failure (task.py:412).  When it fails, it does NOT
+        # append a USER observation — the last item is still the AGENT action we
+        # injected above.  Detect this silent failure, roll back, and return a
+        # failure result so agent.inference:58 does not crash with AssertionError
+        # (it would try to inject a second AGENT item into a history ending in AGENT).
+        try:
+            last_item = session.chat_history.get_item_deep_copy(-1)
+            if last_item.role == Role.AGENT:
+                session.chat_history.pop(-1)
+                return ToolResult.failure(
+                    "macro_execution_failed:task_interact_silent_failure"
+                )
+        except Exception:
+            pass
+
         # The server appends the observation as the last USER message.
         try:
             obs_item = session.chat_history.get_item_deep_copy(-1)

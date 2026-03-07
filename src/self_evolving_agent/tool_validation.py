@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
+from . import kg_utils as _kg_utils
+
 
 @dataclass
 class ToolValidationResult:
@@ -115,6 +117,9 @@ def validate_tool_code(
         return ToolValidationResult(success=False, error=f"compile failed: {exc}")
 
     module = types.ModuleType("generated_tool")
+    # Pre-inject kg_utils so generated code can reference it as a global
+    # without an import statement (mirrors the task.py safe_globals injection).
+    module.__dict__["kg_utils"] = _kg_utils
     try:
         exec(compiled, module.__dict__)
     except Exception as exc:
@@ -155,6 +160,13 @@ def validate_tool_code(
     # may declare as required, to avoid false-negative failures during smoke
     # testing.  The payload must be a superset of what real Orchestrator
     # payloads provide.
+    def _mock_intersection(var1, var2):
+        if not isinstance(var1, str) or not isinstance(var2, str):
+            raise ValueError("intersection arguments must be strings")
+        if var1 == var2:
+            raise ValueError("intersection requires two distinct variables")
+        return f"Variable #100 = intersection({var1}, {var2})"
+
     smoke_payload: dict = {
         "_smoke": True,
         "task_text": "smoke test",
@@ -165,10 +177,14 @@ def validate_tool_code(
         "entities": [],
         "env_observation": "",
         "constraints": {},
+        "target_archetype": "UNKNOWN",
+        "upgrade_goal": "",
         "actions_spec": {
             "get_relations": lambda *_args: "Relations of mock: [mock.rel]",
             "get_neighbors": lambda *_args: "Variable #99 = get_neighbors(mock, mock.rel)",
-            "intersection": lambda *_args: "Variable #100 = intersection(#98, #99)",
+            "intersection": _mock_intersection,
+            "union": lambda *_args: "Variable #103 = union(#98, #99)",
+            "difference": lambda *_args: "Variable #104 = difference(#98, #99)",
             "get_attributes": lambda *_args: "Attributes of #99: [mock.attr]",
             "argmax": lambda *_args: "Variable #101 = argmax(#99, mock.attr)",
             "argmin": lambda *_args: "Variable #102 = argmin(#99, mock.attr)",
@@ -189,33 +205,59 @@ def validate_tool_code(
             success=False,
             error="run() must return a dict",
         )
-    advisory_keys = {"pruned_observation", "answer_recommendation", "confidence_score"}
-    legacy_keys = {"next_action", "next_action_candidates", "why_stuck"}
-    has_advisory = any(k in result for k in advisory_keys)
-    has_legacy = any(k in result for k in legacy_keys)
-    if has_advisory:
-        missing = [k for k in advisory_keys if k not in result]
-        if missing:
+    # --- SSOT schema check (primary — new tools must use this) ---
+    # Keys: status (str), final_variable (str|None), observation (str)
+    ssot_keys = {"status", "final_variable", "observation"}
+    has_ssot = all(k in result for k in ssot_keys)
+    if has_ssot:
+        valid_statuses = {"SUCCESS", "MACRO EXHAUSTED", "ERROR"}
+        status_val = result.get("status")
+        if status_val not in valid_statuses:
             return ToolValidationResult(
                 success=False,
-                error=f"missing_advisory_keys:{','.join(missing)}",
+                error=f"ssot_status_invalid: '{status_val}' must be one of {sorted(valid_statuses)}",
             )
-        if not isinstance(result.get("answer_recommendation"), str):
+        if not isinstance(result.get("observation"), str):
             return ToolValidationResult(
                 success=False,
-                error="answer_recommendation must be str",
+                error="ssot_observation must be str",
             )
-        confidence = result.get("confidence_score")
-        if not isinstance(confidence, (int, float)):
+        fv = result.get("final_variable")
+        if fv is not None and not isinstance(fv, (str, int)):
             return ToolValidationResult(
                 success=False,
-                error="confidence_score must be float",
+                error="ssot_final_variable must be str, int, or None",
             )
-    elif not has_legacy:
-        return ToolValidationResult(
-            success=False,
-            error="missing_output_schema_keys",
-        )
+        # SSOT schema is fully valid — skip legacy/advisory checks.
+    else:
+        # --- Legacy advisory schema (backward compat for existing tools) ---
+        advisory_keys = {"pruned_observation", "answer_recommendation", "confidence_score"}
+        legacy_keys = {"next_action", "next_action_candidates", "why_stuck"}
+        has_advisory = any(k in result for k in advisory_keys)
+        has_legacy = any(k in result for k in legacy_keys)
+        if has_advisory:
+            missing = [k for k in advisory_keys if k not in result]
+            if missing:
+                return ToolValidationResult(
+                    success=False,
+                    error=f"missing_advisory_keys:{','.join(missing)}",
+                )
+            if not isinstance(result.get("answer_recommendation"), str):
+                return ToolValidationResult(
+                    success=False,
+                    error="answer_recommendation must be str",
+                )
+            confidence = result.get("confidence_score")
+            if not isinstance(confidence, (int, float)):
+                return ToolValidationResult(
+                    success=False,
+                    error="confidence_score must be float",
+                )
+        elif not has_legacy:
+            return ToolValidationResult(
+                success=False,
+                error="missing_output_schema_keys",
+            )
 
     self_test_passed = False
     try:

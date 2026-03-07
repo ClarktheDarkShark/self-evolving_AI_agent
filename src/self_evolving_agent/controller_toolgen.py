@@ -22,6 +22,7 @@ from .tool_registry import ToolMetadata
 from .tool_spec import ToolSpec
 from .tool_validation import validate_tool_code
 from .tool_retrieval import retrieve_tools
+from . import kg_utils as _kg_utils
 from .toolgen_debug_logger import toolgen_debug_enabled
 from .controller_prompts import (
     TOOLGEN_DEBUG_APPENDIX,
@@ -29,6 +30,9 @@ from .controller_prompts import (
     TOOLGEN_VALIDATOR_SYSTEM_PROMPT,
     AGG_TOOLGEN_USER_KG,
     MACRO_TOOLGEN_USER_KG,
+    ARCHETYPE_REGISTRY,
+    ARCHETYPE_INSTRUCTIONS,
+    _ARCHETYPE_INSTRUCTIONS_DEFAULT,
 )
 from .toolgen_contracts import TOOL_START, TOOL_END, validate_toolgen_output
 from src.toolgen.prompts import get_toolgen_system_prompt
@@ -82,9 +86,9 @@ class ControllerToolgenMixin:
     _HARDENED_STATIC_FEEDBACK: dict[str, str] = {
         "G:schema_echo_missing": (
             "CRITICAL: You are missing required metadata headers. "
-            "ALL FIVE metadata headers must appear in the first 80 lines as "
+            "ALL FOUR metadata headers must appear in the first 80 lines as "
             "Python comments: # INVOKE_WITH:, # RUN_PAYLOAD_REQUIRED:, "
-            "# RUN_PAYLOAD_OPTIONAL:, # INVOKE_EXAMPLE:, and # Example:. "
+            "# RUN_PAYLOAD_OPTIONAL:, and # INVOKE_EXAMPLE:. "
             "Copy them exactly from the template."
         ),
         "B:docstring_start_missing": (
@@ -775,6 +779,39 @@ class ControllerToolgenMixin:
                 candidate_doc = match.group(1).strip()
         if not candidate_doc:
             return None
+
+        # Resolve the candidate's target_archetype from the current execution payload.
+        candidate_archetype = ""
+        exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        if isinstance(exec_payload, Mapping):
+            candidate_archetype = str(exec_payload.get("target_archetype") or "").strip().upper()
+        # If not in payload, scan candidate doc for a known registry key.
+        if not candidate_archetype:
+            candidate_doc_upper = candidate_doc.upper()
+            for arch_key in ARCHETYPE_REGISTRY.keys():
+                if arch_key in candidate_doc_upper:
+                    candidate_archetype = arch_key
+                    break
+
+        def _get_existing_tool_archetype(tool) -> str:
+            """Extract archetype from an existing tool's input_schema or description."""
+            schema = tool.input_schema if isinstance(tool.input_schema, dict) else {}
+            props = schema.get("properties", {})
+            arch_prop = props.get("target_archetype", {}) if isinstance(props, dict) else {}
+            if isinstance(arch_prop, dict):
+                enum_vals = arch_prop.get("enum")
+                if isinstance(enum_vals, list) and enum_vals:
+                    return str(enum_vals[0]).upper()
+                default_val = arch_prop.get("default")
+                if default_val:
+                    return str(default_val).upper()
+            for src in (tool.docstring or "", tool.description or ""):
+                src_upper = src.upper()
+                for arch_key in ARCHETYPE_REGISTRY.keys():
+                    if arch_key in src_upper:
+                        return arch_key
+            return ""
+
         current_env = self._resolved_environment_label()
         tools = (
             self._registry.list_latest_tools(environment=current_env)
@@ -787,6 +824,12 @@ class ControllerToolgenMixin:
                 continue
             similarity = difflib.SequenceMatcher(None, candidate_doc, existing_desc).ratio()
             if similarity > threshold:
+                # Archetype bypass: if both archetypes are known and explicitly different,
+                # the structural similarity is acceptable — do not abort.
+                if candidate_archetype:
+                    existing_archetype = _get_existing_tool_archetype(tool)
+                    if existing_archetype and existing_archetype != candidate_archetype:
+                        continue
                 return tool.name, similarity
         return None
 
@@ -799,6 +842,10 @@ class ControllerToolgenMixin:
         exec_payload = getattr(self, "_toolgen_execution_payload", None)
         if not isinstance(exec_payload, Mapping):
             return False, ""
+
+        explicit_upgrade_goal = str(exec_payload.get("upgrade_goal") or "").strip()
+        if explicit_upgrade_goal:
+            return True, "UPGRADE_GOAL_PRESENT"
 
         context_blobs: list[str] = []
         for key in ("upgrade_goal", "env_observation", "failure_context"):
@@ -857,14 +904,29 @@ class ControllerToolgenMixin:
                 # Clean run — no crash, no note needed.
                 pass
             else:
+                ev_status = execution_validation.get("status", "")
                 first_issue = str((execution_validation.get("issues") or [""])[0])
                 is_crash = any(first_issue.startswith(p) for p in _CRASH_ISSUE_PREFIXES)
-                if is_crash:
+                if ev_status == "SUCCESS":
+                    fv = execution_validation.get("final_variable", "")
+                    obs = execution_validation.get("observation", "")
+                    live_test_str = f"LIVE_TEST_RESULTS (success): final_variable={fv}, observation={obs}"
+                elif ev_status == "MACRO EXHAUSTED":
+                    obs = execution_validation.get("observation", "")
+                    live_test_str = (
+                        f"LIVE_TEST_RESULTS (exhausted): The tool ran without Python errors "
+                        f"but failed to solve the task. It returned MACRO EXHAUSTED. Observation: {obs}"
+                    )
+                elif ev_status == "SHAPE_MISMATCH":
+                    msg = execution_validation.get("msg", "")
+                    live_test_str = f"LIVE_TEST_RESULTS (shape mismatch): {msg}"
+                elif is_crash or ev_status == "ERROR":
                     try:
                         result_json = json.dumps(execution_validation, ensure_ascii=True, default=str, indent=2)
                     except Exception:
                         result_json = str(execution_validation)
-                    live_test_str = f"LIVE_TEST_RESULTS (crash detected):\n{result_json}"
+                    msg = execution_validation.get("msg", result_json)
+                    live_test_str = f"LIVE_TEST_RESULTS (error/crash detected): {msg}"
                 # else: functional dead-end — drop silently, grade on logic only
         # Aggressively truncate to avoid flooding the Validator LLM context.
         if len(live_test_str) > 2000:
@@ -923,15 +985,14 @@ class ControllerToolgenMixin:
             "# RUN_PAYLOAD_REQUIRED:",
             "# RUN_PAYLOAD_OPTIONAL:",
             "# INVOKE_EXAMPLE:",
-            "# Example:",
         ]
         missing = [h for h in required_headers if h not in head]
         if missing:
             issues.append(
                 "CRITICAL: You are missing required metadata headers. "
-                "ALL FIVE metadata headers must appear in the first 80 lines as "
+                "ALL FOUR metadata headers must appear in the first 80 lines as "
                 "Python comments: # INVOKE_WITH:, # RUN_PAYLOAD_REQUIRED:, "
-                "# RUN_PAYLOAD_OPTIONAL:, # INVOKE_EXAMPLE:, and # Example:. "
+                "# RUN_PAYLOAD_OPTIONAL:, and # INVOKE_EXAMPLE:. "
                 "Copy them exactly from the template."
             )
 
@@ -954,51 +1015,11 @@ class ControllerToolgenMixin:
                     "3) inside try: payload = payload or {}."
                 )
 
-        # -- undefined bare function calls --
-        # Use AST to detect calls like clean_env_output(...) where the function
-        # is not defined anywhere in the file and is not a builtin or import.
-        try:
-            import builtins as _builtins_mod
-            _builtin_names = set(dir(_builtins_mod))
-            tree = ast.parse(code)
-            _defined: set[str] = set()
-            _imported: set[str] = set()
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    _defined.add(node.name)
-                elif isinstance(node, ast.ClassDef):
-                    _defined.add(node.name)
-                elif isinstance(node, ast.Import):
-                    for alias in node.names:
-                        _imported.add(alias.asname or alias.name.split(".")[0])
-                elif isinstance(node, ast.ImportFrom):
-                    for alias in node.names:
-                        if alias.name != "*":
-                            _imported.add(alias.asname or alias.name)
-                elif isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            _defined.add(target.id)
-                elif isinstance(node, ast.AnnAssign):
-                    if isinstance(node.target, ast.Name):
-                        _defined.add(node.target.id)
-            _known = _defined | _imported | _builtin_names
-            _undef_calls: set[str] = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                    if node.func.id not in _known:
-                        _undef_calls.add(node.func.id)
-            if _undef_calls:
-                issues.append(
-                    "CRITICAL: The following functions are called but never defined "
-                    f"in this file: {sorted(_undef_calls)}. You MUST define each "
-                    "helper function inline (e.g., 'def clean_env_output(...):') "
-                    "before calling it, or remove the call entirely."
-                )
-        except SyntaxError:
-            pass  # syntax errors are caught by the AST static check
-        except Exception:
-            pass
+        # -- undefined bare function calls: DISABLED --
+        # This check falsely flags dynamic callbacks extracted from payload
+        # (e.g., get_relations_fn = actions_spec.get("get_relations")) as undefined.
+        # Genuine NameErrors are caught by the live runtime execution instead.
+        pass
 
         return issues
 
@@ -1021,6 +1042,8 @@ class ControllerToolgenMixin:
             "get_relations": lambda *args: "Relations of mock_entity: [mock.relation.one, mock.relation.two]",
             "get_neighbors": lambda *args: "Variable #99 = get_neighbors(mock_entity, mock.relation.one)",
             "intersection": lambda *args: "Variable #100 = intersection(#98, #99)",
+            "union": lambda *args: "Variable #103 = union(#98, #99)",
+            "difference": lambda *args: "Variable #104 = difference(#98, #99)",
             "get_attributes": lambda *args: "The attributes of Variable #99 are: [mock.attr]",
             "argmax": lambda *args: "Variable #101 = argmax(#99, mock.attr)",
             "argmin": lambda *args: "Variable #102 = argmin(#99, mock.attr)",
@@ -1033,6 +1056,7 @@ class ControllerToolgenMixin:
         task_text: str,
         trace: Optional[Sequence[Mapping[str, Any]]],
         failure_context: str = "",
+        upgrade_goal: str = "",
         active_variables: Optional[Sequence[Any]] = None,
         target_archetype_hint: str = "",
     ) -> dict[str, Any]:
@@ -1077,22 +1101,23 @@ class ControllerToolgenMixin:
         # This ensures we have a non-empty archetype even on the very first
         # generation turn when no prior failure has occurred.
         target_archetype = ""
-        _ARCH_RE = re.compile(
-            r"\b(COUNTER|INTERSECTOR|SINGLE-HOP PATHFINDER|PATHFINDER)\b",
-            re.IGNORECASE,
-        )
         for _src in (target_archetype_hint, failure_context, task_text):
             if _src:
-                _m = _ARCH_RE.search(_src)
-                if _m:
-                    target_archetype = _m.group(1).upper()
+                _src_upper = _src.upper()
+                for _arch_key in ARCHETYPE_REGISTRY.keys():
+                    if _arch_key in _src_upper:
+                        target_archetype = _arch_key
+                        break
+                if target_archetype:
                     break
         # If an explicit hint was provided but didn't match the regex pattern
         # (e.g., a novel archetype string), use it verbatim so we don't lose it.
         if not target_archetype and target_archetype_hint:
             target_archetype = target_archetype_hint.strip().upper()
-        # upgrade_goal is the full Orchestrator reason string passed as failure_context.
-        upgrade_goal = failure_context
+        # upgrade_goal is an explicit upgrade/evolution instruction coming
+        # from the Orchestrator. Fall back to failure_context for backward
+        # compatibility with older callers.
+        explicit_upgrade_goal = str(upgrade_goal or "").strip() or failure_context
 
         payload: dict[str, Any] = {
             "task_text": task_text,
@@ -1104,7 +1129,7 @@ class ControllerToolgenMixin:
             "env_observation": failure_context,
             "entities": entities,
             "target_archetype": target_archetype,
-            "upgrade_goal": upgrade_goal,
+            "upgrade_goal": explicit_upgrade_goal,
             "constraints": {
                 "active_variables": list(active_variables or []),
                 "failure_context": failure_context,
@@ -1129,6 +1154,9 @@ class ControllerToolgenMixin:
                 "traceback": tb,
             }
         module = types.ModuleType("generated_tool_exec")
+        # Pre-inject kg_utils so generated code can reference it as a global
+        # without an import statement (mirrors the task.py safe_globals injection).
+        module.__dict__["kg_utils"] = _kg_utils
         try:
             exec(compiled, module.__dict__)
         except Exception as exc:
@@ -1217,96 +1245,147 @@ class ControllerToolgenMixin:
                 "fixes": ["Ensure run() returns a dict with required keys."],
                 "summary": "Execution failed: output not dict.",
             }
-        status = str(result.get("status") or "").lower()
-        recommendation = str(result.get("answer_recommendation") or "").strip()
-        pruned = result.get("pruned_observation")
-        rec_lower = recommendation.lower()
-        # Specific handling for blocked status — surface the real exception.
-        # Macro tools may legitimately return status='blocked' if they detect
-        # missing live environment functions during smoke testing; that is
-        # acceptable behavior and not a failure.
-        if status in {"blocked", "error"}:
-            # Build a detailed error message from ALL available fields so the
-            # LLM generator can actually diagnose what went wrong instead of
-            # seeing an opaque "Unknown exception".
-            error_field = result.get("error")
-            errors_list = result.get("errors") or []
-            answer_rec = str(result.get("answer_recommendation") or "").strip()
 
-            # Only grant the pass-through when the tool legitimately had no
-            # callable actions_spec to work with.  When the server-side proxy
-            # was used (_server_eval_used), the tool DID receive real callable
-            # functions on the server, so missing_actions_spec is a genuine bug.
+        # ── Strict SSOT schema validation ────────────────────────────────────
+        _SSOT_KEYS = {"status", "final_variable", "observation"}
+        if set(result.keys()) != _SSOT_KEYS:
+            return {
+                "grade": 0,
+                "issues": [
+                    "execution_output_schema_invalid: run() must return EXACT keys "
+                    "['status', 'final_variable', 'observation'] only."
+                ],
+                "fixes": [
+                    "Return a strict SSOT dict with exactly three keys: "
+                    "status, final_variable, observation."
+                ],
+                "summary": "Execution failed: non-SSOT output schema.",
+            }
+
+        raw_status = str(result.get("status") or "")
+        observation_val = str(result.get("observation") or "")
+        _VALID_SSOT_STATUSES = {"SUCCESS", "MACRO EXHAUSTED", "ERROR"}
+
+        # Crash-string detection on observation field.
+        _CRASH_STRINGS = ("Macro execution failed", "NameError", "is not defined")
+        _semantic_crash = any(s in observation_val for s in _CRASH_STRINGS)
+        if _semantic_crash:
+            matched = next(s for s in _CRASH_STRINGS if s in observation_val)
+            return {
+                "grade": 0,
+                "issues": [
+                    f"execution_semantic_crash: status='{raw_status}' but observation "
+                    f"contains crash signal '{matched}'. Fix the root cause; do NOT "
+                    "hide errors behind status='SUCCESS'."
+                ],
+                "fixes": [
+                    "Return status='ERROR' with the actual exception in 'observation'."
+                ],
+                "summary": f"execution_semantic_crash: '{matched}' in observation.",
+            }
+
+        if raw_status not in _VALID_SSOT_STATUSES:
+            return {
+                "grade": 0,
+                "issues": [
+                    f"execution_ssot_invalid_status: '{raw_status}' is not a valid SSOT status. "
+                    f"Must be one of: {sorted(_VALID_SSOT_STATUSES)}."
+                ],
+                "fixes": ["Return status='SUCCESS', 'MACRO EXHAUSTED', or 'ERROR'."],
+                "summary": f"Execution failed: invalid SSOT status '{raw_status}'.",
+            }
+
+        if raw_status == "ERROR":
+            # Only grant the pass-through when tool had no callable actions_spec.
             _spec = payload.get("actions_spec") or {}
             _proxy_active = _server_eval_used or any(callable(v) for v in _spec.values())
-            if not _proxy_active and isinstance(errors_list, list) and any(
-                "missing_actions_spec" in str(e) for e in errors_list
-            ):
-                # Macro correctly detected mock/missing actions_spec — pass.
+            if not _proxy_active and "missing_actions_spec" in observation_val:
                 return None
-
-            # Assemble the most informative description available.
-            detail_parts: list[str] = []
-            if error_field:
-                detail_parts.append(f"error={error_field}")
-            if isinstance(errors_list, list) and errors_list:
-                detail_parts.append(
-                    f"errors={errors_list!r}"
-                )
-            if answer_rec:
-                detail_parts.append(
-                    f"answer_recommendation={answer_rec!r}"
-                )
-            actual_error = "; ".join(detail_parts) if detail_parts else "Unknown exception"
-
             return {
                 "grade": 0,
                 "issues": [
-                    f"execution_blocked: Your code returned status='{status}' during "
-                    f"dummy-payload testing. Details: {actual_error}. "
-                    f"The dummy payload does NOT contain an 'entities' key — your "
-                    f"tool must tolerate its absence (extract entities from "
-                    f"'task_text' and 'asked_for' instead, or return a safe "
-                    f"default). Fix the bug."
+                    f"execution_ssot_error: tool returned status='ERROR'. "
+                    f"observation={observation_val!r}"
                 ],
                 "fixes": [
-                    "Do NOT require non-standard payload keys like 'entities'. "
-                    "The execution harness only guarantees: task_text, asked_for, "
-                    "trace, actions_spec, run_id, state_dir, env_observation, "
-                    "constraints. Extract entities from task_text/asked_for at "
-                    "runtime. Use .get() with fallbacks for all payload access "
-                    "and return a valid dict with status='done'."
+                    "Fix the root cause. Return status='SUCCESS' or 'MACRO EXHAUSTED'. "
+                    "Use .get() with fallbacks for all payload access."
                 ],
-                "summary": f"Execution failed: {actual_error}",
+                "summary": f"Execution failed: SSOT ERROR — {observation_val}",
             }
-        dead_end = False
-        if not recommendation and status != "done":
-            dead_end = True
-        if (
-            isinstance(pruned, (dict, list))
-            and not pruned
-            and status != "done"
-            and not recommendation
-        ):
-            dead_end = True
-        if "dead end" in rec_lower or "empty set" in rec_lower or "empty variable" in rec_lower:
-            dead_end = True
-        if dead_end:
-            error_msg = result.get("error") or ""
-            error_detail = f" Exception: {error_msg}" if error_msg else ""
-            rec_detail = f" answer_recommendation={recommendation!r}" if recommendation else ""
+
+        # Behavioral validation bypass: auto-pass when SSOT + SUCCESS + no hardcoding.
+        # If the tool succeeded but contains quoted entity strings from the payload,
+        # it is semantically contaminated (overfitting to the current task).
+        if raw_status == "SUCCESS":
+            _entity_candidates = [
+                e for e in (payload.get("entities") or [])
+                if isinstance(e, str) and len(e) > 3
+            ]
+            if _entity_candidates:
+                _hardcoded = [
+                    ent for ent in _entity_candidates
+                    if re.search(
+                        r'["\']' + re.escape(ent) + r'["\']',
+                        tool_code,
+                        re.IGNORECASE,
+                    )
+                ]
+                if _hardcoded:
+                    return {
+                        "grade": 0,
+                        "issues": [
+                            f"execution_hardcoded_entity: tool returned status='SUCCESS' but "
+                            f"contains hardcoded entity strings as quoted literals: {_hardcoded}. "
+                            f"This is SEMANTIC CONTAMINATION — the tool will break on "
+                            "any task that uses different entities."
+                        ],
+                        "fixes": [
+                            "NEVER hardcode entity strings from task_text or the entities list. "
+                            "Extract them dynamically at runtime: "
+                            "entities = payload.get('entities', []) or "
+                            "kg_utils.parse_entities(payload.get('task_text', '')). "
+                            "Pass entities[0], entities[1], etc. as arguments to KG calls. "
+                            "Score and select relations dynamically using "
+                            "kg_utils.score_relations(task_text, relations, domain_hints) — "
+                            "do NOT hardcode relation names."
+                        ],
+                        "summary": f"Execution failed: hardcoded entity strings {_hardcoded} detected.",
+                    }
+
+        # Shape Verifier + SUCCESS result packaging.
+        if raw_status == "SUCCESS":
+            fv = str(result.get("final_variable", "")).strip()
+            archetype = str(payload.get("target_archetype", "")).upper()
+            is_count = "COUNT" in archetype
+            is_extractor = "EXTRACTOR" in archetype
+            is_pointer = fv.startswith("#")
+            if is_count and is_pointer:
+                return {
+                    "status": "SHAPE_MISMATCH",
+                    "msg": "Task requires a COUNT (integer), but tool returned an entity pointer.",
+                }
+            if not is_count and not is_extractor and not is_pointer:
+                return {
+                    "status": "SHAPE_MISMATCH",
+                    "msg": "Task requires an entity pointer (#ID), but tool returned a scalar.",
+                }
+            if fv in ("", "None"):
+                return {
+                    "status": "ERROR",
+                    "msg": "Tool returned SUCCESS but final_variable is missing or None.",
+                }
             return {
-                "grade": 0,
-                "issues": [
-                    f"execution_dead_end: tool returned empty output.{error_detail}{rec_detail}"
-                ],
-                "fixes": [
-                    "Ensure the tool returns a non-empty answer_recommendation string "
-                    "and a populated pruned_observation dict. "
-                    "Handle empty traces and mocked payloads gracefully."
-                ],
-                "summary": f"Execution failed: dead-end output.{error_detail}",
+                "status": "SUCCESS",
+                "final_variable": fv,
+                "observation": observation_val,
+                "issues": [],
             }
+
+        # MACRO EXHAUSTED: explicitly surface to caller so Validator is informed.
+        if raw_status == "MACRO EXHAUSTED":
+            return {"status": "MACRO EXHAUSTED", "observation": observation_val}
+
         return None
 
     def _run_escape_hatch_toolgen(
@@ -1323,6 +1402,10 @@ class ControllerToolgenMixin:
             return str(value)
 
         reason = _stringify(decision.get("reason"))
+        upgrade_goal = _stringify(decision.get("upgrade_goal")).strip()
+        if not upgrade_goal:
+            # Backward compat: old orchestrator payloads only supplied reason.
+            upgrade_goal = reason
         tool_type = _stringify(decision.get("tool_type"))
         catalog_summary = ""
         try:
@@ -1342,6 +1425,7 @@ class ControllerToolgenMixin:
             "=== ORCHESTRATOR BLUEPRINT ===\n"
             f"TOOL TYPE REQUIRED: {tool_type}\n"
             f"FORGE CONTEXT: {reason}\n"
+            f"UPGRADE GOAL: {upgrade_goal}\n"
             "CRITICAL ABSTRACTION RULE: You are generating a tool for a class "
             "of problems, not a specific task. You MUST write PARAMETRIC code. "
             "Do NOT hardcode entities (like 'Naloxone', 'goats', 'cows') into "
@@ -1356,6 +1440,8 @@ class ControllerToolgenMixin:
         parts = [query]
         if reason:
             parts.append(f"FORGE CONTEXT: {reason}")
+        if upgrade_goal:
+            parts.append(f"UPGRADE GOAL: {upgrade_goal}")
         toolgen_query = "\n".join(parts)
 
         env_name = self._resolved_environment_label()
@@ -1374,6 +1460,9 @@ class ControllerToolgenMixin:
 
         user_prompt = build_task_pack(env_name, env_contract, [toolgen_query])
         final_user_prompt = blueprint_header + user_prompt
+        target_archetype_hint = _stringify(
+            decision.get("target_archetype") or decision.get("archetype") or ""
+        )
         requested_tool_type = tool_type.strip().lower()
         if env_name == "knowledge_graph":
             system_prompt = (
@@ -1386,6 +1475,20 @@ class ControllerToolgenMixin:
                 if requested_tool_type == "macro"
                 else "AGG_TOOLGEN_USER_KG"
             )
+            # Inject archetype-specific instructions into the macro prompt template.
+            if requested_tool_type == "macro":
+                arch_key = target_archetype_hint.strip().upper()
+                arch_instructions = ARCHETYPE_INSTRUCTIONS.get(
+                    arch_key, _ARCHETYPE_INSTRUCTIONS_DEFAULT
+                )
+                # Use literal placeholder replacement instead of str.format().
+                # The macro prompt contains many JSON/code examples with braces,
+                # and str.format would treat them as format fields (KeyError).
+                system_prompt = system_prompt.replace(
+                    "{target_archetype}", arch_key or "UNKNOWN"
+                ).replace(
+                    "{target_archetype_instructions}", arch_instructions
+                )
         else:
             system_prompt = get_toolgen_system_prompt(
                 getattr(self, "_toolgen_pipeline_name", "baseline"),
@@ -1399,13 +1502,11 @@ class ControllerToolgenMixin:
             trace_steps, _ = self._build_structured_trace(chat_history)
         except Exception:
             trace_steps = []
-        target_archetype_hint = _stringify(
-            decision.get("target_archetype") or decision.get("archetype") or ""
-        )
         exec_payload = self._build_toolgen_execution_payload(
             task_text=toolgen_query,
             trace=trace_steps[-10:] if trace_steps else [],
             failure_context=reason,
+            upgrade_goal=upgrade_goal,
             active_variables=[],
             target_archetype_hint=target_archetype_hint,
         )
@@ -1453,6 +1554,11 @@ class ControllerToolgenMixin:
         best_candidate: Optional[Mapping[str, Any]] = None
         round_history: list[dict] = []  # compact per-round memory (no code)
         is_upgrade_attempt, upgrade_trigger = self._toolgen_is_upgrade_attempt()
+        exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        upgrade_goal_present = bool(
+            isinstance(exec_payload, Mapping)
+            and str(exec_payload.get("upgrade_goal") or "").strip()
+        )
         try:
             self._append_generated_tools_log(
                 {
@@ -1651,7 +1757,23 @@ class ControllerToolgenMixin:
                 )
                 continue
 
-            duplicate_hit = self._toolgen_duplicate_abort_check(tool_code)
+            duplicate_hit: Optional[tuple[str, float]] = None
+            if not upgrade_goal_present:
+                duplicate_hit = self._toolgen_duplicate_abort_check(tool_code)
+            else:
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_duplicate_bypass",
+                            "mode": mode,
+                            "round": round_idx,
+                            "tool_name": tool_spec.get("name"),
+                            "upgrade_trigger": "UPGRADE_GOAL_PRESENT",
+                            "note": "SequenceMatcher skipped because upgrade_goal is non-empty.",
+                        }
+                    )
+                except Exception:
+                    pass
             if duplicate_hit:
                 dup_name, dup_score = duplicate_hit
                 if is_upgrade_attempt:
@@ -2014,7 +2136,7 @@ class ControllerToolgenMixin:
                 spec_obj = ToolSpec.from_payload(dict(tool_spec))
             except Exception:
                 spec_obj = None
-            self._write_failed_tool_artifact(
+            failed_artifact_paths = self._write_failed_tool_artifact(
                 stage="validator",
                 error=f"grade={grade}",
                 spec=spec_obj,
@@ -2022,6 +2144,7 @@ class ControllerToolgenMixin:
                 raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
                 raw_output=validation,
             )
+            self._cleanup_failed_draft_files(failed_artifact_paths)
             try:
                 self._append_generated_tools_log(
                     {
@@ -2965,6 +3088,16 @@ class ControllerToolgenMixin:
         raw = f"{task_name}|{sample_index}|{run_id}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
+    def _cleanup_failed_draft_files(self, filepaths: Optional[Sequence[Path]]) -> None:
+        if not filepaths:
+            return
+        for filepath in filepaths:
+            try:
+                if isinstance(filepath, Path) and filepath.suffix == ".py" and filepath.exists():
+                    os.remove(filepath)
+            except Exception:
+                continue
+
     def _write_failed_tool_artifact(
         self,
         *,
@@ -2974,7 +3107,7 @@ class ControllerToolgenMixin:
         code: Optional[str] = None,
         raw_spec: Optional[Mapping[str, Any]] = None,
         raw_output: Optional[str] = None,
-    ) -> None:
+    ) -> list[Path]:
         try:
             tool_name = (spec.name if spec else None) or "unknown_tool"
             ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -2998,11 +3131,15 @@ class ControllerToolgenMixin:
                     "raw_output": raw_output,
                 }
                 content = header + "\n" + json.dumps(meta, ensure_ascii=True, default=str, indent=2)
+            written_paths: list[Path] = []
             for out_dir in (self._failed_tool_log_dir(), self._failed_tool_calling_dir()):
                 out_dir.mkdir(parents=True, exist_ok=True)
-                (out_dir / filename).write_text(content, encoding="utf-8")
+                filepath = out_dir / filename
+                filepath.write_text(content, encoding="utf-8")
+                written_paths.append(filepath)
+            return written_paths
         except Exception:
-            return
+            return []
 
     def _validate_and_register_tool(
         self,

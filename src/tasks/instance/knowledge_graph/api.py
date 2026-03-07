@@ -9,6 +9,7 @@ import inspect
 from enum import StrEnum
 
 from .utils.logic_form_util import LogicFormUtil
+from .utils.semantic_parser_util import SemanticParserUtil
 from .utils.sparql_executor import SparqlExecutor
 
 
@@ -216,9 +217,9 @@ class KnowledgeGraphAPI:
             )
         if error_message is not None:
             error_message += (
-                f" Remember, Variables (<<CALLABLE_VARIABLE_LIST_STR>>) returned by get_relations, get_neighbors, intersection, get_attributes "
+                f" Remember, Variables (<<CALLABLE_VARIABLE_LIST_STR>>) returned by get_relations, get_neighbors, intersection, union, difference, get_attributes "
                 f"can be used as inputs for subsequent actions or as final answers, "
-                f"and Variables (<<NOT_CALLABLE_VARIABLE_LIST_STR>>) returned by get_relations, get_neighbors, intersection, get_attributes "
+                f"and Variables (<<NOT_CALLABLE_VARIABLE_LIST_STR>>) returned by count/argmax/argmin "
                 f"can only be used as final answers."
             )
             raise KnowledgeGraphAPIException(error_message)
@@ -275,14 +276,166 @@ class KnowledgeGraphAPI:
         }
         return [rel for rel in relations if rel not in noise]
 
+    @staticmethod
+    def _contains_set_ops(expression: Any) -> bool:
+        if isinstance(expression, list):
+            if expression and str(expression[0]).upper() in {"OR", "DIFF"}:
+                return True
+            for item in expression[1:]:
+                if KnowledgeGraphAPI._contains_set_ops(item):
+                    return True
+        return False
+
+    @staticmethod
+    def _normalize_entity_list(values: Sequence[Any], cap: int = 200) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            value = KnowledgeGraphAPI._normalize_entity_id(str(raw))
+            if not value or value in seen:
+                continue
+            normalized.append(value)
+            seen.add(value)
+            if len(normalized) >= cap:
+                break
+        return normalized
+
+    def _execute_plain_lisp(self, lisp_program: str) -> list[str]:
+        processed_code = LogicFormUtil.postprocess_raw_code(lisp_program)
+        sparql_query = LogicFormUtil.lisp_to_sparql(processed_code)
+        return self.sparql_executor.execute_query(sparql_query)
+
+    def _query_relations_for_entities(self, entity_ids: Sequence[Any]) -> list[str]:
+        mids = self._normalize_entity_list(entity_ids)
+        if not mids:
+            return []
+        values_clause = " ".join(f"ns:{mid}" for mid in mids)
+        query = (
+            "PREFIX ns: <http://rdf.freebase.com/ns/>\n"
+            "SELECT DISTINCT ?rel\n"
+            "WHERE {\n"
+            f"VALUES ?x {{ {values_clause} }}\n"
+            "?x ?rel ?obj .\n"
+            "}"
+        )
+        out_relations = self.sparql_executor.execute_query(query)
+        out_relations = sorted(list(set(out_relations).intersection(set(self.relations))))
+        return self._filter_noise_relations(out_relations)
+
+    def _query_attributes_for_entities(self, entity_ids: Sequence[Any]) -> list[str]:
+        mids = self._normalize_entity_list(entity_ids)
+        if not mids:
+            return []
+        values_clause = " ".join(f"ns:{mid}" for mid in mids)
+        query = (
+            "PREFIX ns: <http://rdf.freebase.com/ns/>\n"
+            "SELECT DISTINCT ?rel\n"
+            "WHERE {\n"
+            f"VALUES ?x {{ {values_clause} }}\n"
+            "?x ?rel ?obj .\n"
+            "}"
+        )
+        out_relations = self.sparql_executor.execute_query(query)
+        return sorted(list(set(out_relations).intersection(set(self.attributes))))
+
+    def _filter_entities_by_type(
+        self, entity_ids: Sequence[Any], type_name: str
+    ) -> list[str]:
+        mids = self._normalize_entity_list(entity_ids)
+        cls = str(type_name).replace("ns:", "").strip()
+        if not mids or not cls:
+            return []
+        values_clause = " ".join(f"ns:{mid}" for mid in mids)
+        query = (
+            "PREFIX ns: <http://rdf.freebase.com/ns/>\n"
+            "SELECT DISTINCT ?x\n"
+            "WHERE {\n"
+            f"VALUES ?x {{ {values_clause} }}\n"
+            f"?x ns:type.object.type ns:{cls} .\n"
+            "}"
+        )
+        return self.sparql_executor.execute_query(query)
+
+    def _evaluate_set_ops_expression(self, expression: Any) -> list[str]:
+        if not isinstance(expression, list) or not expression:
+            return []
+        op = str(expression[0]).upper()
+
+        if op == "OR" and len(expression) >= 3:
+            left = set(self._evaluate_set_ops_expression(expression[1]))
+            right = set(self._evaluate_set_ops_expression(expression[2]))
+            return sorted(left.union(right))
+
+        if op == "DIFF" and len(expression) >= 3:
+            left = set(self._evaluate_set_ops_expression(expression[1]))
+            right = set(self._evaluate_set_ops_expression(expression[2]))
+            return sorted(left.difference(right))
+
+        if op == "COUNT" and len(expression) >= 2:
+            values = set(self._evaluate_set_ops_expression(expression[1]))
+            return [str(len(values))]
+
+        if op == "JOIN" and len(expression) >= 3:
+            arg = expression[2]
+            if isinstance(arg, list) and self._contains_set_ops(arg):
+                seeds = self._normalize_entity_list(self._evaluate_set_ops_expression(arg))
+                merged: set[str] = set()
+                relation = expression[1]
+                for mid in seeds:
+                    branch_expr = ["JOIN", relation, mid]
+                    branch_lisp = SemanticParserUtil.expression_to_lisp(branch_expr)
+                    merged.update(self._execute_plain_lisp(branch_lisp))
+                return sorted(merged)
+
+        if op == "AND" and len(expression) >= 3:
+            left = expression[1]
+            right = expression[2]
+            left_is_expr = isinstance(left, list)
+            right_is_expr = isinstance(right, list)
+
+            if left_is_expr and right_is_expr and (
+                self._contains_set_ops(left) or self._contains_set_ops(right)
+            ):
+                left_set = set(self._evaluate_set_ops_expression(left))
+                right_set = set(self._evaluate_set_ops_expression(right))
+                return sorted(left_set.intersection(right_set))
+
+            if left_is_expr and self._contains_set_ops(left) and isinstance(right, str):
+                return self._filter_entities_by_type(
+                    self._evaluate_set_ops_expression(left), right
+                )
+
+            if right_is_expr and self._contains_set_ops(right) and isinstance(left, str):
+                return self._filter_entities_by_type(
+                    self._evaluate_set_ops_expression(right), left
+                )
+
+        lisp_program = SemanticParserUtil.expression_to_lisp(expression)
+        return self._execute_plain_lisp(lisp_program)
+
     def final_execute(self, variable: Variable) -> list[str]:
         program = variable.program
-        processed_code = LogicFormUtil.postprocess_raw_code(program)
-        sparql_query = LogicFormUtil.lisp_to_sparql(processed_code)
-        results = self.sparql_executor.execute_query(sparql_query)
-        return results
+        try:
+            expression = SemanticParserUtil.lisp_to_nested_expression(program)
+            if self._contains_set_ops(expression):
+                return self._evaluate_set_ops_expression(expression)
+        except Exception:
+            pass
+        return self._execute_plain_lisp(program)
 
     def get_variable_size(self, variable: Variable) -> Optional[int]:
+        try:
+            expression = SemanticParserUtil.lisp_to_nested_expression(variable.program)
+            if self._contains_set_ops(expression):
+                values = self.final_execute(variable)
+                if variable.type == "type.int" and values:
+                    try:
+                        return int(values[0])
+                    except Exception:
+                        return None
+                return len(set(values))
+        except Exception:
+            pass
         try:
             count_program = f"(COUNT {variable.program})"
             processed_code = LogicFormUtil.postprocess_raw_code(count_program)
@@ -477,7 +630,6 @@ class KnowledgeGraphAPI:
     @staticmethod
     def union(variable1: Variable, variable2: Variable) -> tuple[Variable, str]:
         # region Validate arguments
-        # The function is not included in the prompt
         KnowledgeGraphAPI._ensure_variable("union", [variable1, variable2])
 
         if variable1.type != variable2.type:
@@ -487,6 +639,24 @@ class KnowledgeGraphAPI:
         # endregion
         new_variable = Variable(
             type=variable1.type, program=f"(OR {variable1.program} {variable2.program})"
+        )
+        execution_message = KnowledgeGraphAPI._construct_execution_message(
+            f"Variable <<NEW_VARIABLE>>, which are instances of {variable1.type}"
+        )
+        return new_variable, execution_message
+
+    @staticmethod
+    def difference(variable1: Variable, variable2: Variable) -> tuple[Variable, str]:
+        # region Validate arguments
+        KnowledgeGraphAPI._ensure_variable("difference", [variable1, variable2])
+        if variable1.type != variable2.type:
+            raise KnowledgeGraphAPIException(
+                "difference: Two Variables must have the same type"
+            )
+        # endregion
+        new_variable = Variable(
+            type=variable1.type,
+            program=f"(DIFF {variable1.program} {variable2.program})",
         )
         execution_message = KnowledgeGraphAPI._construct_execution_message(
             f"Variable <<NEW_VARIABLE>>, which are instances of {variable1.type}"
@@ -575,7 +745,8 @@ class KnowledgeGraphAPI:
             "get_relations",
             "get_neighbors",
             "intersection",
-            # "union",
+            "union",
+            "difference",
             "count",
             "get_attributes",
             "argmax",

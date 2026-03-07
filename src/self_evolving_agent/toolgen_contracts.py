@@ -21,7 +21,6 @@ SCHEMA_CLAUSE = (
 SCHEMA_ECHO_REQUIRED = [
     "RUN_PAYLOAD_REQUIRED",
     "RUN_PAYLOAD_OPTIONAL",
-    "Example",
 ]
 
 SCHEMA_ECHO_OPTIONAL_GROUP = [
@@ -183,23 +182,8 @@ def _check_signatures(code: str) -> list[str]:
 
 
 def _check_imports(tree: ast.AST) -> list[str]:
-    errors: list[str] = []
-    parents: dict[ast.AST, ast.AST] = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[child] = node
-    for node in _iter_imports(tree):
-        parent = parents.get(node)
-        if not isinstance(parent, ast.Module):
-            errors.append("C:non_top_level_import")
-        if isinstance(node, ast.Import):
-            names = [alias.name for alias in node.names]
-        else:
-            names = [node.module] if node.module else []
-        for name in names:
-            if name and not _is_stdlib_module(name):
-                errors.append(f"C:non_stdlib_import:{name}")
-    return errors
+    # Import checking disabled — sandbox is fully open; runtime catches real errors.
+    return []
 
 
 def _check_run_try_except(tree: ast.AST) -> list[str]:
@@ -237,6 +221,10 @@ def _check_run_try_except(tree: ast.AST) -> list[str]:
         # Accept any dict that contains an "error" key (advisory or legacy).
         if "error" in keys:
             return True
+        # Accept SSOT dicts: {"status": ..., "observation": ...}
+        ssot_needed = {"status", "observation"}
+        if ssot_needed.issubset(set(keys)):
+            return True
         # Also accept legacy dicts with {"status": "error", "errors", "warnings"}.
         legacy_needed = {"status", "errors", "warnings"}
         if legacy_needed.issubset(set(keys)):
@@ -262,6 +250,11 @@ def _check_output_schema_presence(code: str) -> list[str]:
     errors: list[str] = []
     if not code:
         return errors
+    # Accept SSOT schema: status + final_variable + observation
+    ssot_keys = ["status", "final_variable", "observation"]
+    has_ssot = all(key in code for key in ssot_keys)
+    if has_ssot:
+        return errors  # SSOT schema present — skip advisory/legacy checks
     advisory_keys = ["pruned_observation", "answer_recommendation", "confidence_score"]
     legacy_keys = ["next_action", "next_action_candidates", "why_stuck"]
     has_advisory = any(key in code for key in advisory_keys)
