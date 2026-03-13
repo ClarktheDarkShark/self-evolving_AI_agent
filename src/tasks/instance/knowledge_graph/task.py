@@ -908,22 +908,19 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(run_fn, payload)
                 result = future.result(timeout=20.0)
-            # Shape Verifier: catch pointer/count type mismatches before they
-            # propagate to the Validator or Orchestrator.
+            # Shape Verifier: catch non-COUNT tasks that return a raw scalar instead
+            # of a Variable ID pointer.  COUNT/COUNTING_INTERSECTOR tasks are
+            # explicitly excluded: KnowledgeGraphAPI.count() returns a new
+            # Variable(type="type.int") whose string representation IS a pointer
+            # (e.g. "#5").  Rejecting that pointer as a "shape mismatch" was
+            # incorrect and caused valid counter tools to be silenced.
             if isinstance(result, dict) and result.get("status") == "SUCCESS":
                 archetype_upper = str(payload.get("target_archetype", "")).upper()
                 is_count_task = "COUNT" in archetype_upper
                 is_extractor = "EXTRACTOR" in archetype_upper
                 var_val = str(result.get("final_variable", "")).strip()
                 is_pointer = var_val.startswith("#")
-                if is_count_task and is_pointer:
-                    result["status"] = "ERROR"
-                    result["final_variable"] = None
-                    result["observation"] = (
-                        "Shape Mismatch: Task archetype requires a COUNT (number), "
-                        "but the tool returned an entity pointer."
-                    )
-                elif not is_count_task and not is_extractor and not is_pointer:
+                if not is_count_task and not is_extractor and not is_pointer:
                     result["status"] = "ERROR"
                     result["final_variable"] = None
                     result["observation"] = (
@@ -1070,6 +1067,67 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         # back to the full entity list from the dataset item.
         if not payload_map.get("entities"):
             payload_map["entities"] = entity_list
+
+        # ── Inject semantic keys stripped by the lightweight action string ──
+        # execute_macro("tool", "E1|E2") carries only entity names; the Tool
+        # Invoker's target_concept and domain_hints never reach this point.
+        # Derive them here from the dataset question so score_relations
+        # receives a meaningful answer-type noun rather than None / the full
+        # sentence, which causes wrong-relation selection (e.g., permaculture
+        # over food.cheese_milk_source when target_concept="products").
+        #
+        # Use setdefault throughout: if the Tool Invoker ever starts passing
+        # these keys in the action string, those values will be preserved.
+        if not payload_map.get("target_concept"):
+            _exec_q = current_dataset_item.question or ""
+            _exec_q_part = (
+                _exec_q.split("Entities:")[0].strip()
+                if "Entities:" in _exec_q
+                else _exec_q
+            )
+            _exec_wh_m = re.search(
+                r"(?i)\bwhat\s+(?:\w[\w\-]*\s+){0,8}(\w[\w\-]*)"
+                r"\s+(?:is|are|was|were|does|do|exist\b)",
+                _exec_q_part,
+            )
+            if _exec_wh_m:
+                payload_map["target_concept"] = _exec_wh_m.group(1).strip().lower()
+
+        payload_map.setdefault("domain_hints", [])
+
+        # For ATTRIBUTE_INTERSECTOR: the last entity is the attribute literal
+        # and should be resolved against itself as target_concept.
+        _exec_entities = payload_map.get("entities") or entity_list
+        # The lightweight action string execute_macro("tool", "E1|E2") carries
+        # no target_archetype — infer it from the tool name so the injection
+        # guards below fire correctly.
+        if not payload_map.get("target_archetype") and tool_name:
+            _tn = tool_name.upper()
+            if "ATTRIBUTE_INTERSECTOR" in _tn:
+                payload_map["target_archetype"] = "ATTRIBUTE_INTERSECTOR"
+            elif "COUNTING_INTERSECTOR" in _tn:
+                payload_map["target_archetype"] = "COUNTING_INTERSECTOR"
+            elif "INTERSECT" in _tn:
+                payload_map["target_archetype"] = "INTERSECTOR"
+            elif "SHARED_TRAIT" in _tn or "PIVOT" in _tn:
+                payload_map["target_archetype"] = "SHARED_TRAIT_PIVOT"
+            elif "ATTRIBUTE_EXTRACTOR" in _tn:
+                payload_map["target_archetype"] = "ATTRIBUTE_EXTRACTOR"
+            elif "COUNTER" in _tn:
+                payload_map["target_archetype"] = "COUNTER"
+        _exec_archetype = str(payload_map.get("target_archetype", "")).upper()
+        if (
+            "ATTRIBUTE_INTERSECTOR" in _exec_archetype
+            and _exec_entities
+            and not payload_map.get("attribute_target_concept")
+        ):
+            payload_map["attribute_target_concept"] = (
+                payload_map.get("target_concept") or _exec_entities[-1]
+            )
+        payload_map.setdefault(
+            "attribute_domain_hints", payload_map.get("domain_hints") or []
+        )
+        # ── end semantic key injection ───────────────────────────────────────
 
         safe_globals = {
             "__builtins__": __builtins__,

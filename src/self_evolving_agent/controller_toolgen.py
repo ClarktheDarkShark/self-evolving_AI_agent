@@ -10,6 +10,7 @@ import random
 import re
 import traceback
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 import ast
@@ -359,6 +360,227 @@ class ControllerToolgenMixin:
         except Exception:
             return None
         return obj if isinstance(obj, Mapping) else None
+
+    def _toolgen_patch_mode_enabled(self) -> bool:
+        raw = os.getenv("LIFELONG_TOOLGEN_PATCH_MODE", "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _toolgen_build_patch_prompt(
+        self,
+        *,
+        current_code: str,
+        feedback_note: str,
+        round_history: Sequence[Mapping[str, Any]],
+        base_prompt: str,
+    ) -> str:
+        history_lines: list[str] = []
+        if round_history:
+            history_lines.append("PRIOR_ROUNDS:")
+            for h in round_history[-6:]:
+                history_lines.append(
+                    f"- round={h.get('round')} grade={h.get('grade')} top_issue={h.get('top_issue')}"
+                )
+        history_block = "\n".join(history_lines) if history_lines else "(none)"
+        feedback_block = feedback_note or "(none)"
+        # Keep patch prompts bounded for latency/stability.
+        task_pack_excerpt = base_prompt[-12000:] if isinstance(base_prompt, str) else str(base_prompt)
+        code_excerpt = current_code[-30000:] if isinstance(current_code, str) else str(current_code)
+        return textwrap.dedent(
+            f"""\
+            You are ToolPatch. You must propose SURGICAL patches for an existing Python tool.
+
+            OUTPUT FORMAT (HARD)
+            - Output EXACTLY ONE JSON object and nothing else.
+            - Schema:
+              {{
+                "operations": [
+                  {{
+                    "op": "replace_function" | "replace_text" | "replace_between_markers",
+                    "name": "<function_name_if_replace_function>",
+                    "find": "<old_text_if_replace_text>",
+                    "replace": "<new_text_if_replace_text>",
+                    "start": "<start_marker_if_replace_between_markers>",
+                    "end": "<end_marker_if_replace_between_markers>",
+                    "code": "<python_snippet_for_function_or_marker_replace>"
+                  }}
+                ],
+                "summary": "<short patch summary>"
+              }}
+
+            RULES
+            - Prefer `replace_function` operations.
+            - Do NOT output a full file rewrite.
+            - Keep metadata headers and public function signatures unchanged unless feedback explicitly requires it.
+            - Keep changes minimal and deterministic.
+
+            CONTEXT_TASK_PACK:
+            {task_pack_excerpt}
+
+            PRIOR_HISTORY:
+            {history_block}
+
+            VALIDATOR_FEEDBACK:
+            {feedback_block}
+
+            CURRENT_TOOL_CODE:
+            ```python
+            {code_excerpt}
+            ```
+            """
+        )
+
+    def _toolgen_generate_patch_plan_legacy(
+        self,
+        *,
+        system_prompt: str,
+        current_code: str,
+        feedback_note: str,
+        round_history: Sequence[Mapping[str, Any]],
+        base_prompt: str,
+    ) -> tuple[Optional[Mapping[str, Any]], Optional[str]]:
+        patch_system_prompt = (
+            "Reasoning: low\n"
+            "You are ToolPatch. Return strict JSON only. No markdown."
+        )
+        patch_user_prompt = self._toolgen_build_patch_prompt(
+            current_code=current_code,
+            feedback_note=feedback_note,
+            round_history=round_history,
+            base_prompt=base_prompt,
+        )
+        raw = self._toolgen_call_llm(
+            system_prompt=patch_system_prompt,
+            user_prompt=patch_user_prompt,
+        )
+        payload = self._extract_first_json_object(raw or "")
+        if not payload:
+            stripped = self._strip_code_fences(raw or "")
+            payload = stripped if stripped.startswith("{") else None
+        if not payload:
+            return None, raw
+        try:
+            parsed = json.loads(payload)
+        except Exception:
+            return None, raw
+        if not isinstance(parsed, Mapping):
+            return None, raw
+        ops = parsed.get("operations")
+        if not isinstance(ops, list) or not ops:
+            return None, raw
+        return parsed, raw
+
+    def _toolgen_replace_top_level_function(
+        self,
+        source_code: str,
+        *,
+        name: str,
+        replacement_code: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        if not name:
+            return None, "replace_function missing 'name'"
+        replacement = self._strip_code_fences(str(replacement_code or "")).strip()
+        if not replacement:
+            return None, f"replace_function('{name}') has empty code"
+        if not replacement.endswith("\n"):
+            replacement += "\n"
+        try:
+            replacement_tree = ast.parse(replacement)
+        except Exception as exc:
+            return None, f"replacement for '{name}' is invalid Python: {exc}"
+        replacement_funcs = [
+            node
+            for node in replacement_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        if len(replacement_funcs) != 1 or replacement_funcs[0].name != name:
+            return (
+                None,
+                f"replacement for '{name}' must contain exactly one top-level function named '{name}'",
+            )
+        try:
+            source_tree = ast.parse(source_code)
+        except Exception as exc:
+            return None, f"current source is invalid Python before patch: {exc}"
+        target = None
+        for node in source_tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                target = node
+                break
+        if target is None or target.end_lineno is None:
+            return None, f"function '{name}' not found in current source"
+        lines = source_code.splitlines(keepends=True)
+        start = max(0, int(target.lineno) - 1)
+        end = max(start, int(target.end_lineno))
+        lines[start:end] = [replacement]
+        return "".join(lines), None
+
+    def _toolgen_apply_patch_plan(
+        self,
+        source_code: str,
+        plan: Mapping[str, Any],
+    ) -> tuple[Optional[str], Optional[str]]:
+        operations = plan.get("operations")
+        if not isinstance(operations, list) or not operations:
+            return None, "patch plan missing non-empty operations list"
+        patched = source_code
+        for idx, op in enumerate(operations, start=1):
+            if not isinstance(op, Mapping):
+                return None, f"operation #{idx} is not an object"
+            op_name = str(op.get("op") or "").strip()
+            if op_name == "replace_function":
+                fn_name = str(op.get("name") or "").strip()
+                fn_code = str(op.get("code") or "")
+                patched_next, err = self._toolgen_replace_top_level_function(
+                    patched,
+                    name=fn_name,
+                    replacement_code=fn_code,
+                )
+                if err:
+                    return None, f"operation #{idx} failed: {err}"
+                patched = patched_next or patched
+                continue
+            if op_name == "replace_text":
+                find = str(op.get("find") or "")
+                replace = str(op.get("replace") or "")
+                if not find:
+                    return None, f"operation #{idx} replace_text missing 'find'"
+                if find not in patched:
+                    return None, f"operation #{idx} replace_text target not found"
+                patched = patched.replace(find, replace, 1)
+                continue
+            if op_name == "replace_between_markers":
+                start = str(op.get("start") or "")
+                end = str(op.get("end") or "")
+                code = self._strip_code_fences(str(op.get("code") or "")).strip("\n")
+                if not start or not end:
+                    return None, f"operation #{idx} replace_between_markers missing start/end"
+                start_idx = patched.find(start)
+                if start_idx < 0:
+                    return None, f"operation #{idx} start marker not found"
+                end_idx = patched.find(end, start_idx + len(start))
+                if end_idx < 0:
+                    return None, f"operation #{idx} end marker not found"
+                insertion = "\n" + code + "\n"
+                patched = (
+                    patched[: start_idx + len(start)]
+                    + insertion
+                    + patched[end_idx:]
+                )
+                continue
+            return None, f"operation #{idx} uses unsupported op '{op_name}'"
+        try:
+            ast.parse(patched)
+        except Exception as exc:
+            return None, f"patched code is invalid Python: {exc}"
+        return patched, None
+
+    def _toolgen_format_code_best_effort(self, code: str) -> str:
+        try:
+            import black  # type: ignore
+
+            return black.format_str(code, mode=black.FileMode())
+        except Exception:
+            return code
 
     def _extract_tool_call_arguments(self, response_obj: Any) -> Optional[str]:
         if response_obj is None:
@@ -880,6 +1102,7 @@ class ControllerToolgenMixin:
         tool_code: str,
         *,
         task_pack: str,
+        run_live_execution_check: bool = True,
     ) -> Optional[Mapping[str, Any]]:
         if not tool_code:
             return None
@@ -896,9 +1119,10 @@ class ControllerToolgenMixin:
             "execution_timeout",
             "execution_exception",
             "execution_output_invalid",
+            "execution_ssot_error",  # Surfaces shape mismatches from server-side eval
         )
         live_test_str = ""
-        if isinstance(exec_payload, Mapping):
+        if isinstance(exec_payload, Mapping) and run_live_execution_check:
             execution_validation = self._toolgen_execution_check(tool_code, exec_payload)
             if execution_validation is None:
                 # Clean run — no crash, no note needed.
@@ -928,6 +1152,11 @@ class ControllerToolgenMixin:
                     msg = execution_validation.get("msg", result_json)
                     live_test_str = f"LIVE_TEST_RESULTS (error/crash detected): {msg}"
                 # else: functional dead-end — drop silently, grade on logic only
+        elif isinstance(exec_payload, Mapping):
+            live_test_str = (
+                "LIVE_TEST_RESULTS (deferred): Runtime execution check is intentionally "
+                "deferred until the final patch round."
+            )
         # Aggressively truncate to avoid flooding the Validator LLM context.
         if len(live_test_str) > 2000:
             live_test_str = live_test_str[:1000] + "\n...[TRUNCATED]...\n" + live_test_str[-1000:]
@@ -1119,6 +1348,55 @@ class ControllerToolgenMixin:
         # compatibility with older callers.
         explicit_upgrade_goal = str(upgrade_goal or "").strip() or failure_context
 
+        # ── Derive target_concept and domain_hints ──────────────────────────
+        # The live-test payload must mirror what the Tool Invoker provides in
+        # production.  Without these keys the tool falls back to the full
+        # task_text string as base_target, which causes score_relations to
+        # pick structurally-matching but semantically-wrong relations (e.g.,
+        # "base.permaculture...products" over "food.cheese_milk_source.cheeses").
+        #
+        # Extraction priority:
+        #   1. JSON fragments already embedded in upgrade_goal / failure_context
+        #      (present in later repair rounds after a Tool Invoker turn).
+        #   2. "what … NOUN (is|are|…)" heuristic on the question text.
+        #   3. Empty string / empty list — same as before this patch.
+        _q_text = task_text.split("Entities:")[0].strip() if "Entities:" in task_text else task_text
+
+        # Step 1: try to recover from prior-round JSON context
+        _live_target_concept = ""
+        _live_domain_hints: list[str] = []
+        for _ctx in (upgrade_goal or "", failure_context or ""):
+            if not _live_target_concept:
+                _tc_m = re.search(r'"target_concept"\s*:\s*"([^"]+)"', _ctx)
+                if _tc_m:
+                    _live_target_concept = _tc_m.group(1).strip()
+            if not _live_domain_hints:
+                _dh_m = re.search(r'"domain_hints"\s*:\s*\[([^\]]*)\]', _ctx)
+                if _dh_m:
+                    _live_domain_hints = [
+                        h.strip().strip("'\"")
+                        for h in _dh_m.group(1).split(",")
+                        if h.strip().strip("'\"")
+                    ]
+
+        # Step 2: "what … NOUN (is|are|was|were|does|do|exist)" heuristic
+        if not _live_target_concept:
+            _wh_m = re.search(
+                r"(?i)\bwhat\s+(?:\w[\w\-]*\s+){0,8}(\w[\w\-]*)\s+(?:is|are|was|were|does|do|exist\b)",
+                _q_text,
+            )
+            if _wh_m:
+                _live_target_concept = _wh_m.group(1).strip().lower()
+
+        # Step 3: attribute keys — for ATTRIBUTE_INTERSECTOR the last entity IS
+        # the attribute literal; it should score against itself as target_concept.
+        _attr_target_concept = ""
+        _attr_domain_hints: list[str] = []
+        if target_archetype == "ATTRIBUTE_INTERSECTOR" and entities:
+            _attr_target_concept = entities[-1]
+            _attr_domain_hints = _live_domain_hints
+        # ── end semantic key extraction ─────────────────────────────────────
+
         payload: dict[str, Any] = {
             "task_text": task_text,
             "asked_for": task_text,
@@ -1134,6 +1412,12 @@ class ControllerToolgenMixin:
                 "active_variables": list(active_variables or []),
                 "failure_context": failure_context,
             },
+            # Semantic keys — mirror what the production Tool Invoker provides.
+            # Non-empty values override the tool's fallback to the raw task_text.
+            "target_concept": _live_target_concept,
+            "domain_hints": _live_domain_hints,
+            "attribute_target_concept": _attr_target_concept,
+            "attribute_domain_hints": _attr_domain_hints,
         }
         return payload
 
@@ -1360,11 +1644,9 @@ class ControllerToolgenMixin:
             is_count = "COUNT" in archetype
             is_extractor = "EXTRACTOR" in archetype
             is_pointer = fv.startswith("#")
-            if is_count and is_pointer:
-                return {
-                    "status": "SHAPE_MISMATCH",
-                    "msg": "Task requires a COUNT (integer), but tool returned an entity pointer.",
-                }
+            # COUNT tasks are explicitly excluded: KnowledgeGraphAPI.count() returns a
+            # new Variable(type="type.int") whose string representation IS a pointer (#X).
+            # Rejecting that pointer as a "shape mismatch" was incorrect.
             if not is_count and not is_extractor and not is_pointer:
                 return {
                     "status": "SHAPE_MISMATCH",
@@ -1436,6 +1718,10 @@ class ControllerToolgenMixin:
             "==============================\n\n"
             + catalog_block
         )
+
+        plan_str = _stringify(decision.get("topological_execution_plan"))
+        if plan_str:
+            blueprint_header += f"EXECUTION PLAN:\n{plan_str}\n\n"
 
         parts = [query]
         if reason:
@@ -1541,6 +1827,7 @@ class ControllerToolgenMixin:
         validate = self._toolgen_should_validate()
         max_rounds = force_max_rounds if force_max_rounds is not None else (9 if validate else 1)
         relaxed_mode = False if force_strict else self._toolgen_relaxed_mode_enabled()
+        patch_mode = self._toolgen_patch_mode_enabled() and mode == "legacy" and validate
         base_prompt = user_prompt
         last_candidate: Optional[Mapping[str, Any]] = None
         last_validation: Optional[Mapping[str, Any]] = None
@@ -1552,6 +1839,8 @@ class ControllerToolgenMixin:
         last_smoke_ok = False
         best_grade: int = -1
         best_candidate: Optional[Mapping[str, Any]] = None
+        best_live_grade: int = -1
+        best_live_candidate: Optional[Mapping[str, Any]] = None
         round_history: list[dict] = []  # compact per-round memory (no code)
         is_upgrade_attempt, upgrade_trigger = self._toolgen_is_upgrade_attempt()
         exec_payload = getattr(self, "_toolgen_execution_payload", None)
@@ -1569,6 +1858,7 @@ class ControllerToolgenMixin:
                     "system_prompt_name": prompt_name or "custom",
                     "upgrade_attempt": is_upgrade_attempt,
                     "upgrade_trigger": upgrade_trigger or None,
+                    "patch_mode": patch_mode,
                 }
             )
         except Exception:
@@ -1580,6 +1870,7 @@ class ControllerToolgenMixin:
                         "event": "toolgen_round_start",
                         "mode": mode,
                         "round": round_idx,
+                        "patch_mode": patch_mode,
                     }
                 )
             except Exception:
@@ -1610,7 +1901,76 @@ class ControllerToolgenMixin:
                     + "Implement all requested fixes and refactor the code as necessary "
                     + "to pass the live evaluation."
                 )
-            if mode == "legacy":
+            use_patch_round = (
+                patch_mode
+                and round_idx > 1
+                and isinstance(last_tool_code, str)
+                and isinstance(last_tool_spec, Mapping)
+            )
+            if use_patch_round:
+                patch_plan, patch_raw = self._toolgen_generate_patch_plan_legacy(
+                    system_prompt=system_prompt,
+                    current_code=last_tool_code,
+                    feedback_note=feedback_note or "",
+                    round_history=round_history,
+                    base_prompt=base_prompt,
+                )
+                if not patch_plan:
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "toolgen_round_failed",
+                                "phase": "patch_plan_parse",
+                                "mode": mode,
+                                "round": round_idx,
+                                "reason": "invalid_patch_plan",
+                            }
+                        )
+                    except Exception:
+                        pass
+                    feedback_note = json.dumps(
+                        {
+                            "phase": "patch_plan_parse",
+                            "error": "Patch plan was not valid JSON with a non-empty operations list.",
+                            "raw": (patch_raw or "")[:2000],
+                        },
+                        ensure_ascii=True,
+                        default=str,
+                    )
+                    continue
+                patched_code, patch_err = self._toolgen_apply_patch_plan(
+                    last_tool_code,
+                    patch_plan,
+                )
+                if patch_err or not patched_code:
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "toolgen_round_failed",
+                                "phase": "patch_apply",
+                                "mode": mode,
+                                "round": round_idx,
+                                "reason": patch_err or "unknown_patch_apply_error",
+                            }
+                        )
+                    except Exception:
+                        pass
+                    feedback_note = json.dumps(
+                        {
+                            "phase": "patch_apply",
+                            "error": patch_err or "unknown_patch_apply_error",
+                            "plan": patch_plan,
+                        },
+                        ensure_ascii=True,
+                        default=str,
+                    )
+                    continue
+                candidate = {
+                    "tool_spec": dict(last_tool_spec),
+                    "tool_code": patched_code,
+                    "patch_plan": patch_plan,
+                }
+            elif mode == "legacy":
                 candidate = self._toolgen_generate_from_prompt_legacy(
                     user_prompt=prompt,
                     system_prompt=system_prompt,
@@ -1719,6 +2079,12 @@ class ControllerToolgenMixin:
                         "round": round_idx,
                         "tool_name": tool_spec.get("name"),
                         "code_len": len(tool_code),
+                        "patch_round": use_patch_round,
+                        "patch_ops": (
+                            len(candidate.get("patch_plan", {}).get("operations", []))
+                            if isinstance(candidate, Mapping)
+                            else 0
+                        ),
                     }
                 )
             except Exception:
@@ -1727,9 +2093,16 @@ class ControllerToolgenMixin:
             last_tool_spec = tool_spec
             last_static_ok = False
             last_smoke_ok = False
+            defer_compile_gates = patch_mode and round_idx < max_rounds
+            if patch_mode and round_idx == max_rounds:
+                tool_code = self._toolgen_format_code_best_effort(tool_code)
+                if isinstance(candidate, Mapping):
+                    candidate = dict(candidate)
+                    candidate["tool_code"] = tool_code
+                last_tool_code = tool_code
 
             # ── Quick structural pre-check (fast regex, before heavy AST) ──
-            precheck_issues = self.quick_structural_precheck(tool_code)
+            precheck_issues = [] if defer_compile_gates else self.quick_structural_precheck(tool_code)
             if precheck_issues:
                 precheck_err = " | ".join(precheck_issues)
                 try:
@@ -1758,7 +2131,9 @@ class ControllerToolgenMixin:
                 continue
 
             duplicate_hit: Optional[tuple[str, float]] = None
-            if not upgrade_goal_present:
+            if defer_compile_gates:
+                duplicate_hit = None
+            elif not upgrade_goal_present:
                 duplicate_hit = self._toolgen_duplicate_abort_check(tool_code)
             else:
                 try:
@@ -1836,7 +2211,10 @@ class ControllerToolgenMixin:
                     )
                     return metadata
 
-            static_ok, static_err = self._toolgen_static_check(tool_code)
+            static_ok = True
+            static_err = ""
+            if not defer_compile_gates:
+                static_ok, static_err = self._toolgen_static_check(tool_code)
             if not static_ok:
                 if static_err.startswith("static_check:exception"):
                     self._write_failed_tool_artifact(
@@ -1906,12 +2284,15 @@ class ControllerToolgenMixin:
                         "mode": mode,
                         "round": round_idx,
                         "ok": True,
+                        "deferred": defer_compile_gates,
                     }
                 )
             except Exception:
                 pass
 
-            smoke = validate_tool_code(tool_code)
+            smoke = types.SimpleNamespace(success=True, error="")
+            if not defer_compile_gates:
+                smoke = validate_tool_code(tool_code)
             if not smoke.success:
                 try:
                     self._append_generated_tools_log(
@@ -1961,6 +2342,7 @@ class ControllerToolgenMixin:
                         "mode": mode,
                         "round": round_idx,
                         "ok": True,
+                        "deferred": defer_compile_gates,
                     }
                 )
             except Exception:
@@ -2007,7 +2389,10 @@ class ControllerToolgenMixin:
                 continue
 
             validation = self._toolgen_validate_candidate_tool(
-                tool_spec, tool_code, task_pack=base_prompt
+                tool_spec,
+                tool_code,
+                task_pack=base_prompt,
+                run_live_execution_check=not defer_compile_gates,
             )
             if not validation:
                 print(
@@ -2051,6 +2436,7 @@ class ControllerToolgenMixin:
                         "phase": "validator",
                         "mode": mode,
                         "round": round_idx,
+                        "live_check_deferred": defer_compile_gates,
                         "tool_name": tool_spec.get("name"),
                         "grade": grade,
                         "validation": validation,
@@ -2061,6 +2447,9 @@ class ControllerToolgenMixin:
             if grade > best_grade:
                 best_grade = grade
                 best_candidate = candidate
+            if not defer_compile_gates and grade > best_live_grade:
+                best_live_grade = grade
+                best_live_candidate = candidate
             min_grade = 8
             try:
                 override = os.getenv("LIFELONG_TOOLGEN_MIN_GRADE", "").strip()
@@ -2068,6 +2457,217 @@ class ControllerToolgenMixin:
                     min_grade = max(7, int(override))
             except Exception:
                 min_grade = 8
+            if patch_mode and round_idx < max_rounds:
+                feedback_payload = {
+                    "phase": "validator",
+                    "grade": grade,
+                    "issues": validation.get("issues", []),
+                    "fixes": validation.get("fixes", []),
+                    "summary": validation.get("summary", ""),
+                }
+                # Patch-mode staged gates:
+                # 1) Non-live validator grade must pass.
+                # 2) Then run a live-execution validator pass immediately.
+                # 3) Only then register early; otherwise continue patching.
+                if grade >= min_grade:
+                    live_validation = self._toolgen_validate_candidate_tool(
+                        tool_spec,
+                        tool_code,
+                        task_pack=base_prompt,
+                        run_live_execution_check=True,
+                    )
+                    if not live_validation:
+                        try:
+                            spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                        except Exception:
+                            spec_obj = None
+                        self._write_failed_tool_artifact(
+                            stage="patch_live_gate_validation_missing",
+                            error="no_validation_returned",
+                            spec=spec_obj,
+                            code=tool_code,
+                            raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                        )
+                        feedback_note = json.dumps(
+                            {
+                                "phase": "live_gate_validation",
+                                "error": "no_validation_returned",
+                            },
+                            ensure_ascii=True,
+                            default=str,
+                        )
+                        continue
+                    try:
+                        live_grade = int(live_validation.get("grade"))
+                    except Exception:
+                        live_grade = 0
+                    try:
+                        live_issues = live_validation.get("issues", [])
+                        if not isinstance(live_issues, list):
+                            live_issues = [str(live_issues)]
+                        live_fixes = live_validation.get("fixes", [])
+                        if not isinstance(live_fixes, list):
+                            live_fixes = [str(live_fixes)]
+                        live_summary = str(live_validation.get("summary", "") or "")
+                        top_live_issue = str(live_issues[0]) if live_issues else ""
+                        self._append_generated_tools_log(
+                            {
+                                "event": "toolgen_patch_live_gate",
+                                "mode": mode,
+                                "round": round_idx,
+                                "tool_name": tool_spec.get("name"),
+                                "non_live_grade": grade,
+                                "live_grade": live_grade,
+                                "passed": live_grade >= min_grade,
+                                "live_summary": live_summary,
+                                "live_top_issue": top_live_issue,
+                                "live_issues_count": len(live_issues),
+                                "live_fixes_count": len(live_fixes),
+                                "live_validation": live_validation,
+                            }
+                        )
+                    except Exception:
+                        pass
+                    if live_grade >= min_grade:
+                        if live_grade > best_live_grade:
+                            best_live_grade = live_grade
+                            best_live_candidate = candidate
+                        # Ensure compile/smoke checks run before early registration.
+                        gate_static_ok, gate_static_err = self._toolgen_static_check(tool_code)
+                        try:
+                            self._append_generated_tools_log(
+                                {
+                                    "event": "toolgen_static_check",
+                                    "mode": mode,
+                                    "round": round_idx,
+                                    "ok": bool(gate_static_ok),
+                                    "deferred": False,
+                                    "gate": "patch_live_gate",
+                                    "error": gate_static_err if not gate_static_ok else None,
+                                }
+                            )
+                        except Exception:
+                            pass
+                        if not gate_static_ok:
+                            try:
+                                spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                            except Exception:
+                                spec_obj = None
+                            self._write_failed_tool_artifact(
+                                stage="patch_live_gate_static",
+                                error=gate_static_err,
+                                spec=spec_obj,
+                                code=tool_code,
+                                raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                            )
+                            feedback_note = json.dumps(
+                                {
+                                    "phase": "static_check_live_gate",
+                                    "error": gate_static_err,
+                                },
+                                ensure_ascii=True,
+                                default=str,
+                            )
+                            continue
+                        gate_smoke = validate_tool_code(tool_code)
+                        try:
+                            self._append_generated_tools_log(
+                                {
+                                    "event": "toolgen_smoke_test",
+                                    "mode": mode,
+                                    "round": round_idx,
+                                    "ok": bool(gate_smoke.success),
+                                    "deferred": False,
+                                    "gate": "patch_live_gate",
+                                    "error": str(gate_smoke.error) if not gate_smoke.success else None,
+                                }
+                            )
+                        except Exception:
+                            pass
+                        if not gate_smoke.success:
+                            try:
+                                spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                            except Exception:
+                                spec_obj = None
+                            self._write_failed_tool_artifact(
+                                stage="patch_live_gate_smoke",
+                                error=str(gate_smoke.error),
+                                spec=spec_obj,
+                                code=tool_code,
+                                raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                            )
+                            feedback_note = json.dumps(
+                                {
+                                    "phase": "smoke_test_live_gate",
+                                    "error": str(gate_smoke.error),
+                                },
+                                ensure_ascii=True,
+                                default=str,
+                            )
+                            continue
+                        metadata = self._register_tool_from_payload(tool_spec, chat_history)
+                        if metadata:
+                            self._registry.record_validation_result(metadata.name, success=True)
+                            if hasattr(self._registry, "set_quality_score"):
+                                self._registry.set_quality_score(metadata.name, float(live_grade))
+                            return metadata
+                        try:
+                            spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                        except Exception:
+                            spec_obj = None
+                        self._write_failed_tool_artifact(
+                            stage="patch_live_gate_registration",
+                            error=(
+                                "live_gate_passed_but_registration_failed: "
+                                f"non_live_grade={grade}, live_grade={live_grade}"
+                            ),
+                            spec=spec_obj,
+                            code=tool_code,
+                            raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                            raw_output=live_validation,
+                        )
+                        feedback_note = json.dumps(
+                            {
+                                "phase": "registration",
+                                "error": (
+                                    "Tool passed non-live and live validator gates but failed registration. "
+                                    "Fix required payload schema alignment (especially RUN_PAYLOAD_REQUIRED)."
+                                ),
+                            },
+                            ensure_ascii=True,
+                            default=str,
+                        )
+                        continue
+                    # Live gate failed: feed live-specific feedback into patch loop.
+                    try:
+                        spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                    except Exception:
+                        spec_obj = None
+                    self._write_failed_tool_artifact(
+                        stage="patch_live_gate_validation",
+                        error=(
+                            f"live_grade={live_grade} below_threshold={min_grade}; "
+                            f"non_live_grade={grade}"
+                        ),
+                        spec=spec_obj,
+                        code=tool_code,
+                        raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                        raw_output=live_validation,
+                    )
+                    feedback_note = json.dumps(
+                        {
+                            "phase": "live_gate_validation",
+                            "grade": live_grade,
+                            "issues": live_validation.get("issues", []),
+                            "fixes": live_validation.get("fixes", []),
+                            "summary": live_validation.get("summary", ""),
+                        },
+                        ensure_ascii=True,
+                        default=str,
+                    )
+                    continue
+                feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
+                continue
             if grade >= min_grade:
                 metadata = self._register_tool_from_payload(tool_spec, chat_history)
                 if staged_meta:
@@ -2144,7 +2744,8 @@ class ControllerToolgenMixin:
                 raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
                 raw_output=validation,
             )
-            self._cleanup_failed_draft_files(failed_artifact_paths)
+            # NOTE: Do NOT call _cleanup_failed_draft_files here — failed validator
+            # tools must persist in callback_state for post-run analysis.
             try:
                 self._append_generated_tools_log(
                     {
@@ -2167,7 +2768,42 @@ class ControllerToolgenMixin:
 
             feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
         # Prefer the highest-graded validated candidate over the last one.
-        use_candidate = best_candidate if best_candidate is not None else last_candidate
+        # In patch mode, fallback registration is ONLY allowed for live-gated candidates.
+        effective_best_grade = best_grade
+        if patch_mode:
+            use_candidate = best_live_candidate
+            effective_best_grade = best_live_grade
+            if use_candidate is None:
+                if last_tool_spec and last_tool_code:
+                    try:
+                        spec_obj = ToolSpec.from_payload(dict(last_tool_spec))
+                    except Exception:
+                        spec_obj = None
+                    self._write_failed_tool_artifact(
+                        stage="patch_no_live_pass",
+                        error=(
+                            "no_live_gate_passed_candidate: "
+                            f"best_non_live_grade={best_grade}, best_live_grade={best_live_grade}"
+                        ),
+                        spec=spec_obj,
+                        code=last_tool_code,
+                        raw_spec=last_tool_spec if isinstance(last_tool_spec, Mapping) else None,
+                        raw_output=last_validation,
+                    )
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_patch_no_live_pass",
+                            "mode": mode,
+                            "best_non_live_grade": best_grade,
+                            "best_live_grade": best_live_grade,
+                        }
+                    )
+                except Exception:
+                    pass
+                return None
+        else:
+            use_candidate = best_candidate if best_candidate is not None else last_candidate
         if not use_candidate:
             if relaxed_mode and last_tool_spec and last_tool_code:
                 if (last_grade or 0) < self.MIN_REGISTRATION_GRADE:
@@ -2203,7 +2839,7 @@ class ControllerToolgenMixin:
             except Exception:
                 pass
             return None
-        if best_candidate is None and (not last_static_ok or not last_smoke_ok):
+        if (not patch_mode) and best_candidate is None and (not last_static_ok or not last_smoke_ok):
             if last_tool_spec and last_tool_code:
                 try:
                     spec_obj = ToolSpec.from_payload(dict(last_tool_spec))
@@ -2229,9 +2865,9 @@ class ControllerToolgenMixin:
             except Exception:
                 pass
             return None
-        if best_grade < self.MIN_REGISTRATION_GRADE:
+        if effective_best_grade < self.MIN_REGISTRATION_GRADE:
             print(
-                f"[TOOLGEN] Fallback registration blocked: best_grade={best_grade} "
+                f"[TOOLGEN] Fallback registration blocked: best_grade={effective_best_grade} "
                 f"< MIN_REGISTRATION_GRADE={self.MIN_REGISTRATION_GRADE}",
                 file=sys.stderr,
                 flush=True,

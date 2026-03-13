@@ -98,6 +98,168 @@ def score_relations(target_concept, relations, domain_hints=None):
     return scored
 
 
+def select_top_k_relations(scored_relations, max_k=3):
+    """Select relation names with a safe score-zero fallback.
+
+    Selection policy:
+    1) Keep relations with score > 0, up to ``max_k`` (preserve sorted order).
+    2) If no positive scores exist, return exactly one relation: the first item
+       from the incoming scored list (the "score-zero fallback").
+
+    Notes:
+    - This helper assumes ``scored_relations`` is already sorted descending by
+      score (e.g., output of ``score_relations``).
+    - Python's sort is stable, so ties (including all-zero scores) preserve the
+      incoming raw relation order.
+    """
+    if max_k is None:
+        max_k = 3
+    try:
+        k = max(1, int(max_k))
+    except Exception:
+        k = 3
+
+    normalized = []
+    for item in scored_relations or []:
+        rel = ""
+        score_val = 0.0
+        if isinstance(item, (list, tuple)):
+            if not item:
+                continue
+            rel = str(item[0]).strip()
+            if len(item) >= 2:
+                try:
+                    score_val = float(item[1])
+                except Exception:
+                    score_val = 0.0
+        else:
+            rel = str(item).strip()
+        if rel:
+            normalized.append((rel, score_val))
+    if not normalized:
+        return []
+
+    selected = []
+    seen = set()
+    for rel, score_val in normalized:
+        if score_val > 0 and rel not in seen:
+            selected.append(rel)
+            seen.add(rel)
+        if len(selected) >= k:
+            break
+    if selected:
+        return selected
+
+    # SCORE ZERO FALLBACK: keep progress deterministic and budget-safe.
+    return [normalized[0][0]]
+
+
+def resolve_entity_to_vars(
+    entity: str,
+    target_concept: str,
+    actions_spec: dict,
+    domain_hints: list = None,
+    max_k: int = 1,
+) -> dict:
+    """Resolve an entity string to candidate KG Variable IDs in one call.
+
+    Executes the full entity-resolution pipeline so generated tools never need
+    to hand-roll ``get_relations`` → ``score_relations`` → ``get_neighbors`` loops:
+
+    1. ``get_relations(entity)``
+    2. ``safe_parse_relations`` to clean the raw response.
+    3. ``score_relations(target_concept, rels, domain_hints)`` + sort descending.
+    4. ``select_top_k_relations(scored, max_k)`` — score-zero fallback included.
+    5. ``get_neighbors(entity, rel)`` for each selected relation.
+    6. ``extract_var_ids`` on each neighbor response, normalize pound-sign format.
+    7. Populate ``candidate_map`` and scrape semantic type.
+
+    **Budget:** 1 ``get_relations`` call + up to ``max_k`` ``get_neighbors`` calls
+    = ``1 + max_k`` total proxy calls.  With the default ``max_k=1`` this costs
+    exactly **2 proxy calls** per entity, keeping 3-entity tasks well within the
+    15-call tripwire.
+
+    Args:
+        entity: Entity string name or existing Variable ID string.
+        target_concept: Semantic scoring target (e.g. ``"cheese"``, ``"dosage form"``).
+        actions_spec: Live ``actions_spec`` dict from ``payload``.
+        domain_hints: Optional domain boost hints (e.g. ``["food", "dairy"]``).
+        max_k: Max number of relations to probe with ``get_neighbors``.
+            Use ``1`` (default) for budget-critical tasks; ``2`` or ``3`` when
+            the entity list is small and budget allows.
+
+    Returns:
+        ``{"vars": list[str], "type": str, "candidate_map": dict}``
+
+        * ``vars`` — deduplicated ``"#X"`` Variable ID strings (may be empty).
+        * ``type`` — ontological type scraped from KG response, e.g.
+          ``"food.cheese"``; defaults to ``"unknown_type"``.
+        * ``candidate_map`` — ``{"entity [rel]": "#X"}`` entry per minted var,
+          ready to embed in MACRO EXHAUSTED observations for graceful degradation.
+
+        Always returns the three-key dict; never raises.
+    """
+    get_relations_fn = _get_action(actions_spec, "get_relations")
+    get_neighbors_fn = _get_action(actions_spec, "get_neighbors")
+    empty = {"vars": [], "type": "unknown_type", "candidate_map": {}}
+    if not (get_relations_fn and get_neighbors_fn):
+        return empty
+
+    try:
+        k = max(1, int(max_k))
+    except Exception:
+        k = 1
+
+    entity_str = str(entity).strip()
+
+    # 1. Fetch relations
+    try:
+        rels_raw = get_relations_fn(entity_str)
+    except Exception:
+        return empty
+    rels_text = str(rels_raw or "")
+    if "Error" in rels_text:
+        return empty
+
+    # 2. Parse + score + select (score-zero safe)
+    relations = safe_parse_relations(rels_text)
+    if not relations:
+        return empty
+    scored = score_relations(target_concept or "", relations, domain_hints)
+    top_rels = select_top_k_relations(scored, max_k=k)
+    if not top_rels:
+        return empty
+
+    # 3. Get neighbors for selected relations
+    vars_out = []
+    seen = set()
+    candidate_map = {}
+    last_type = "unknown_type"
+
+    for rel in top_rels:
+        try:
+            nbr_raw = get_neighbors_fn(entity_str, str(rel))
+        except Exception:
+            continue
+        nbr_text = str(nbr_raw or "")
+        if "Error" in nbr_text:
+            continue
+        # Scrape semantic type
+        m = re.search(r'instances of ([\w.]+)', nbr_text)
+        if m:
+            last_type = m.group(1)
+        # Extract + normalize variable IDs
+        for raw_id in extract_var_ids(nbr_text):
+            var_id = raw_id if raw_id.startswith("#") else f"#{raw_id}"
+            if var_id not in seen:
+                seen.add(var_id)
+                vars_out.append(var_id)
+                # First minted var for this relation goes into the candidate map
+                candidate_map.setdefault(f"{entity_str} [{rel}]", var_id)
+
+    return {"vars": vars_out, "type": last_type, "candidate_map": candidate_map}
+
+
 def extract_attribute_value(env_output):
     """Extract a numeric, float, or date scalar from a KG attribute observation string.
 
@@ -301,8 +463,9 @@ def walk_to_target(
     For each base variable, this helper:
     1) calls ``get_relations``,
     2) scores relations with ``score_relations``,
-    3) calls ``get_neighbors`` on positively-scored relations,
-    4) collects resulting variable IDs.
+    3) selects top relations with ``select_top_k_relations`` (score-zero safe),
+    4) calls ``get_neighbors`` on selected relations,
+    5) collects resulting variable IDs.
 
     Args:
         actions_spec: Dict containing ``get_relations`` and ``get_neighbors``.
@@ -350,11 +513,11 @@ def walk_to_target(
         if not relations:
             continue
         scored = score_relations(target_concept or "", relations, hints)
-        positive = [item for item in scored if len(item) >= 2 and int(item[1]) > 0]
-        if not positive:
+        top_relations = select_top_k_relations(scored, max_k=3)
+        if not top_relations:
             continue
 
-        for relation, _score in positive:
+        for relation in top_relations:
             if calls >= call_budget:
                 break
             try:

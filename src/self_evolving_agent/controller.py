@@ -1491,6 +1491,7 @@ class SelfEvolvingController(
                 flush=True,
             )
             action = decision.get("action", "no_tool")
+            _raw_action = action  # preserve original before any override
             if (
                 self._toolgen_off
                 and not self._force_toolgen_always_on
@@ -1513,10 +1514,15 @@ class SelfEvolvingController(
                 if isinstance(self._last_turn_data.get("orchestrator_decisions"), list):
                     self._last_turn_data["orchestrator_decisions"].append(decision_record)
 
+            _action_display = (
+                f"{_raw_action}→{action}(toolgen_off)"
+                if _raw_action != action
+                else action
+            )
             self._append_loop_log(
-                f"  orchestrator: action={action} "
+                f"  orchestrator: action={_action_display} "
                 f"tool={decision.get('tool_name') or '-'} "
-                f"reason={self._truncate(str(decision.get('reason') or ''), 1000)}"
+                f"reason={self._truncate(str(decision.get('reason') or ''), 2500)}"
             )
 
             # Phase 4: Escape hatch intercept — request_new_tool
@@ -1644,6 +1650,28 @@ class SelfEvolvingController(
             if action == "no_tool":
                 if not init_solver:
                     solver_prompt = self._solver_prompt_no_tools()
+                    # Wire Orchestrator "Hint to Solver:" into the solver system
+                    # prompt so the GRACEFUL RECOVERY PROTOCOL's pairing guidance
+                    # actually reaches the Solver (previously it was only logged).
+                    _orch_reason = (
+                        decision.get("reason") or ""
+                        if isinstance(decision, dict)
+                        else ""
+                    )
+                    _hint_marker = "Hint to Solver:"
+                    if _hint_marker in _orch_reason:
+                        _hint_text = _orch_reason[
+                            _orch_reason.index(_hint_marker) + len(_hint_marker):
+                        ].strip()
+                        if _hint_text:
+                            solver_prompt = (
+                                solver_prompt
+                                + "\n\n[MACRO HINT]: "
+                                + _hint_text
+                            )
+                            self._append_loop_log(
+                                f"  [HINT INJECTED] Solver received: {_hint_text[:120]}"
+                            )
                     self._write_agent_system_prompt("solver", solver_prompt)
                     history_text = self._toolgen_render_history(
                         working_history,

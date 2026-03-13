@@ -858,6 +858,7 @@ class ControllerOrchestratorMixin:
             "evidence": payload.get("evidence"),
             "must_differ_from_existing": payload.get("must_differ_from_existing"),
             "self_test_cases": payload.get("self_test_cases"),
+            "topological_execution_plan": payload.get("topological_execution_plan", ""),
         }
 
     def _tool_orchestrate_decision(

@@ -43,6 +43,87 @@ from src.callbacks import (
 # (request_new_tool) remains fully operational regardless of this flag.
 ENABLE_POST_TASK_REFLECTION = False
 
+# ---------------------------------------------------------------------------
+# HTML Trace Viewer
+# ---------------------------------------------------------------------------
+_HTML_TRACE_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Trace Viewer</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',Consolas,monospace;display:flex;height:100vh;overflow:hidden;background:#1a1a2e;color:#e0e0e0}
+#sidebar{width:260px;overflow-y:auto;background:#16213e;border-right:1px solid #0f3460;flex-shrink:0}
+#sidebar h2{padding:12px 16px;font-size:13px;color:#a0a0b0;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid #0f3460;position:sticky;top:0;background:#16213e;z-index:1}
+.si{padding:10px 14px;cursor:pointer;border-bottom:1px solid #0f3460;transition:background .15s}
+.si:hover{background:#0f3460}.si.active{background:#0f3460;border-left:3px solid #e94560}
+.si .idx{font-size:11px;color:#808090}.si .oc{font-size:12px;font-weight:bold;margin-top:2px}
+.oc-correct{color:#4caf50}.oc-incorrect{color:#e94560}.oc-unset{color:#9e9e9e}
+#main{flex:1;overflow-y:auto;padding:20px}
+.hdr{display:flex;gap:12px;align-items:center;margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid #0f3460;flex-wrap:wrap}
+.badge{padding:3px 9px;border-radius:4px;font-size:12px;font-weight:bold}
+.bc{background:#1b5e20;color:#a5d6a7}.bi{background:#b71c1c;color:#ffcdd2}.bu{background:#37474f;color:#b0bec5}
+.meta{font-size:12px;color:#808090}
+.sec{margin-bottom:18px}.stitle{font-size:11px;color:#808090;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+.turn{margin-bottom:10px}.turn-user{display:flex}.turn-agent{display:flex;flex-direction:row-reverse}
+.bubble{max-width:88%;padding:9px 13px;border-radius:8px;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.turn-user .bubble{background:#0f3460;color:#d0d8f0;border-bottom-left-radius:2px}
+.turn-agent .bubble{background:#1a3a1a;color:#c8e6c9;border-bottom-right-radius:2px}
+.tlabel{font-size:10px;color:#606070;margin:2px 4px;align-self:flex-end}
+.abox{background:#0f2a3a;border:1px solid #1565c0;border-radius:6px;padding:10px;font-family:monospace;font-size:12px;margin-top:4px;white-space:pre-wrap;word-break:break-word}
+.ebox{background:#1a2a0a;border:1px solid #2e7d32;border-radius:6px;padding:10px;font-family:monospace;font-size:12px;margin-top:4px;white-space:pre-wrap;word-break:break-word}
+#empty{display:flex;align-items:center;justify-content:center;height:100%;color:#505060;font-size:18px}
+</style></head><body>
+<div id="sidebar"><h2>Sessions (<span id="cnt">0</span>)</h2><div id="sl"></div></div>
+<div id="main"><div id="empty">\u2190 Select a session</div></div>
+<script>
+const logData=/*LOG_DATA_PLACEHOLDER*/;
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function ocClass(o){return o==='correct'?'correct':o==='incorrect'?'incorrect':'unset';}
+function badge(o){const c=ocClass(o);return`<span class="badge b${c[0]}">${esc(o||'unset')}</span>`;}
+(function buildSidebar(){
+  document.getElementById('cnt').textContent=logData.length;
+  document.getElementById('sl').innerHTML=logData.map((s,i)=>{
+    const o=s.evaluation_record?.outcome||'unset';
+    return`<div class="si" onclick="show(${i})" id="i${i}"><div class="idx">Sample #${esc(s.sample_index)}</div><div class="oc oc-${ocClass(o)}">${esc(o.toUpperCase())}</div></div>`;
+  }).join('');
+})();
+function show(idx){
+  document.querySelectorAll('.si').forEach(e=>e.classList.remove('active'));
+  const el=document.getElementById('i'+idx);if(el)el.classList.add('active');
+  const s=logData[idx];
+  const o=s.evaluation_record?.outcome||'unset';
+  const turns=s.chat_history?.value||[];
+  const tools=(s.tool_invoked||[]).filter(Boolean).join(', ')||'(none)';
+  const f1=s.evaluation_record?.detail_dict?.f1_score;
+  const f1s=f1!=null?Number(f1).toFixed(3):'N/A';
+  const turnsHtml=turns.map(t=>{
+    const r=t.role==='agent'?'agent':'user';
+    return`<div class="turn turn-${r}"><div class="bubble">${esc(t.content)}</div><div class="tlabel">${esc(t.role)}</div></div>`;
+  }).join('')||'<div style="color:#505060">No turns.</div>';
+  document.getElementById('main').innerHTML=`
+    <div class="hdr">${badge(o)}<span class="meta">Sample ${esc(s.sample_index)}</span><span class="meta">F1: ${esc(f1s)}</span><span class="meta">Status: ${esc(s.sample_status||'')}</span><span class="meta">Tool: <em>${esc(tools)}</em></span></div>
+    <div class="sec"><div class="stitle">Conversation (${turns.length} turns)</div>${turnsHtml}</div>
+    <div class="sec"><div class="stitle">Agent Answer</div><div class="abox">${esc(JSON.stringify(s.task_output,null,2))}</div></div>
+    <div class="sec"><div class="stitle">Expected Answer</div><div class="ebox">${esc(JSON.stringify(s.expected_answer,null,2))}</div></div>`;
+}
+if(logData.length>0)show(0);
+</script></body></html>"""
+
+
+def _export_html_trace(run_dir: str, session_list_data: list) -> None:
+    """Write / refresh the standalone HTML trace viewer alongside runs.json.
+
+    Kept in sync with the JSON dump — called immediately after every
+    json.dump([s.model_dump() ...]) write so both files stay consistent.
+    Creates run_dir/html_traces/trace_viewer.html (one file, all sessions).
+    """
+    html_dir = os.path.join(run_dir, "html_traces")
+    os.makedirs(html_dir, exist_ok=True)
+    payload = json.dumps(session_list_data, indent=2)
+    html = _HTML_TRACE_TEMPLATE.replace("/*LOG_DATA_PLACEHOLDER*/", payload)
+    out_path = os.path.join(html_dir, "trace_viewer.html")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+
 
 class ConfigUtilityCaller(StrEnum):
     CLIENT = "client"
@@ -531,11 +612,18 @@ def main() -> None:
                 f"Sample {sample_index}: Tool quality update failed."
             )
         session_list.append(session)
+        _session_dumps = [s.model_dump() for s in session_list]
         json.dump(
-            [s.model_dump() for s in session_list],
+            _session_dumps,
             open(session_list_output_path, "w"),  # noqa
             indent=2,
         )
+        try:
+            _export_html_trace(
+                os.path.dirname(session_list_output_path), _session_dumps
+            )
+        except Exception:
+            pass  # never block the main experiment loop
         logger.info(
             f"Sample {sample_index} end. Session status: {session.sample_status}. "
             f"Evaluation outcome: {session.evaluation_record.outcome}."
