@@ -93,11 +93,15 @@ STRICT_TOOL_OUTPUT_SCHEMA: dict[str, str] = {
         "Rich result string. On SUCCESS: describe what the final_variable contains AND include a "
         "'minted_variables' JSON dict mapping step labels to Variable IDs "
         "(e.g., 'Variable #3 contains percussionists who are songwriters. {\"percussionists\": \"#1\", \"songwriters\": \"#2\"}')."
-        " On MACRO EXHAUSTED: observation MUST be formatted as "
-        "'MACRO EXHAUSTED: Resulting set is empty. minted_variables: ' + json.dumps(candidate_map) "
-        "where candidate_map is a deterministic semantic dict that YOU build from canonical extracted IDs or minted variables "
-        "(e.g., '{\"resolved_anchor\": \"#0\", \"filtered_set\": \"#1\"}'). "
-        "NEVER list raw IDs without labels (e.g., NOT 'minted_variables: #0, #0; #1')."
+        " On MACRO EXHAUSTED: observation MUST contain (in order): "
+        "(1) 'MACRO EXHAUSTED: Resulting set is empty.' "
+        "(2) A one-line failure summary naming the failed step by entity/concept (not just '#N'), the operation tried, and result cardinality or EMPTY. "
+        "(3) A concrete next-action suggestion: 'Suggested action: Action: get_relations(#N)' or equivalent. "
+        "(4) 'minted_variables: ' + json.dumps(candidate_map) "
+        "where candidate_map uses SOURCE-GROUNDED keys containing the entity or concept name "
+        "(e.g., 'resolved_Goat', 'walk_Goat_to_cheese', NOT 'resolved_entity_1'). "
+        "Values MUST be deduplicated (call list(dict.fromkeys(ids)) before storing). "
+        "NEVER list raw IDs without labels. NEVER use ordinal keys like 'resolved_entity_1'."
     ),
 }
 
@@ -107,8 +111,12 @@ _SSOT_SCHEMA_MANDATE: str = (
     "2. 'final_variable': String ID (e.g., '#4'). None if exhausted or error.\n"
     "3. 'observation': Rich explanation. On SUCCESS: describe what final_variable contains AND include a "
     "'minted_variables' JSON dict (e.g., '{\"step_label\": \"#ID\", ...}'). "
-    "On MACRO EXHAUSTED: MUST be 'MACRO EXHAUSTED: Resulting set is empty. minted_variables: ' + json.dumps(candidate_map) "
-    "using a deterministic semantic candidate_map dict that you build from canonical extracted IDs or minted variables. NEVER dump raw IDs without labels."
+    "On MACRO EXHAUSTED: MUST contain in order: "
+    "(a) 'MACRO EXHAUSTED: Resulting set is empty.' "
+    "(b) One-line failure summary: name the failed step by entity/concept name (not '#N'), operation tried, result cardinality or EMPTY. "
+    "(c) Concrete next-action: 'Suggested action: Action: get_relations(#N)' or equivalent using an available anchor. "
+    "(d) 'minted_variables: ' + json.dumps(candidate_map) with SOURCE-GROUNDED keys "
+    "(e.g., 'resolved_Goat' not 'resolved_entity_1') and DEDUPLICATED values."
 )
 
 # ---------------------------------------------------------------------------
@@ -198,6 +206,8 @@ Structured context fields may appear in the task pack or tool_context (for examp
 ### 1. CORE LEGALITY & SSOT
 - NO PLAN, NO TOOL: If `topological_execution_plan` is missing/empty and the tool still performs KG logic, grade 0.
 - SSOT SCHEMA: The tool must return exactly 3 keys: `status`, `final_variable`, `observation`. Any deviation is grade 0.
+- FORBIDDEN IMPORT (HARD FAIL): If the tool contains `import kg_utils` or `from kg_utils import ...`, grade 0–2 and require `repair_mode="rewrite_code"`. DO NOT `import kg_utils` and DO NOT use `from kg_utils import ...`. `kg_utils` is pre-injected as a module-level global before execution. Importing it is always wrong and will fail validation/runtime. Call `kg_utils.*` directly.
+- Required fix for the forbidden import: remove the import line entirely, call `kg_utils.*` directly as a global, and do NOT replace it with probing, wrapper logic, or helper-shape adaptation.
 - EXHAUSTION FORMAT: On empty-result exhaustion, the tool must return `status="MACRO EXHAUSTED"`, `final_variable=None`, and an observation that starts exactly with:
   `"MACRO EXHAUSTED: Resulting set is empty."`
   The observation must also contain the exact token `minted_variables` followed by a JSON dict.
@@ -297,6 +307,7 @@ CRITICAL:
 - The docstring with `contract guard:`, `prereqs:`, and `limitations:` must be the FIRST statement inside `def run()`.
 - Append this EXACT string to `fixes`:
   `CRITICAL: When rewriting \`def run()\`, you MUST include a \`\"\"\"Module-level docstring\"\"\"\` before your imports. Furthermore, your function-level docstring MUST be the FIRST statement inside \`def run()\` and MUST preserve the exact prefixes \`contract guard:\`, \`prereqs:\`, and \`limitations:\`.`
+- When rewriting, do NOT introduce `import kg_utils` or `from kg_utils import ...`. Preserve stdlib-only imports unless another stdlib import is absolutely necessary.
 - Prefer a compact rewrite: one `run(payload)` plus `self_test()`, unless evidence proves more structure is necessary.
 """)
 
@@ -387,6 +398,11 @@ You are ToolGen. Generate ONE specialized Python macro for the Knowledge-Graph.
 - Small deterministic recovery is allowed only when `recovery_policy` explicitly permits it.
 - Write the SMALLEST correct tool.
 
+CRITICAL HARD FAILURE — `kg_utils` IMPORT BAN
+- DO NOT `import kg_utils` and DO NOT use `from kg_utils import ...`. `kg_utils` is pre-injected as a module-level global before execution. Importing it is always wrong and will fail validation/runtime. Call `kg_utils.*` directly.
+- Importing `kg_utils` will raise `ModuleNotFoundError`.
+- If you add this import, the candidate will be rejected before useful evaluation.
+
 ### 2. RUNTIME / STRUCTURE RULES
 - `kg_utils` is pre-injected. **DO NOT `import kg_utils`**.
 - Call helpers directly using their exact signatures.
@@ -413,17 +429,19 @@ CRITICAL:
 - **NO BRACKET INDEXING:** do not use list indexing like `x[0]` or `x[-1]`. Extract a single item using a loop.
 - **NO TUPLE UNPACKING:** do not use tuple/list unpacking to bypass the index ban.
 - **NO TYPE PROBING:** never use `isinstance()`, `type()`, `hasattr()`, or `getattr()`.
+- **NO `kg_utils` IMPORTS:** DO NOT `import kg_utils` and DO NOT use `from kg_utils import ...`. `kg_utils` is pre-injected as a module-level global before execution. Importing it is always wrong and will fail validation/runtime. Call `kg_utils.*` directly.
 - **NO BROAD EXCEPTIONS:** catch specific errors only (`KeyError`, `TypeError`, `ValueError`).
 - Do not use the banned variable names: `stream`, `streaming`, `bucket`, `running_total`, `batch_candidate_vars`, `max_batches`, `collected_candidate_ids`, `get_inbound_neighbors_batch`, `get_neighbors_stream`.
 
 ### 5. POINTER / CANONICALIZATION RULES
 - After every helper or primitive returning env_output, immediately call `kg_utils.extract_var_ids(env_output)`.
 - Filter extracted IDs so only strings starting with `#` remain.
-- If a required set-producing step has no valid `#` IDs, return `MACRO EXHAUSTED`.
-- Preserve both the raw env_output and the canonical ID list.
+- **DEDUPLICATE** extracted IDs before storing or passing: `ids = list(dict.fromkeys(v for v in raw_ids if isinstance(v, str) and v.startswith("#")))`.
+- If a required set-producing step has no valid `#` IDs after deduplication, return `MACRO EXHAUSTED`.
+- Preserve both the raw env_output and the canonical deduplicated ID list.
 - Do NOT pass raw helper dicts downstream.
 - Do NOT merge raw helper outputs into `candidate_map` / `minted_variables`.
-- Build `candidate_map` explicitly from canonical extracted IDs with deterministic semantic labels.
+- Build `candidate_map` explicitly from canonical deduplicated IDs with **source-grounded** semantic labels: use the entity name or concept name in the key (e.g., `"resolved_Goat"`, `"walk_Goat_to_cheese"`, `"texture_filter"`). NEVER use ordinal keys like `"resolved_entity_1"` or `"resolved_entity_2"`.
 
 ### 6. KG EXECUTION RULES
 - Never pass raw entity strings directly into traversal helpers. Resolve entities first with `kg_utils.resolve_entity_to_vars`.
@@ -451,13 +469,28 @@ CRITICAL:
 If any required filter, walk, or intersection step yields no valid IDs, return:
 - `status="MACRO EXHAUSTED"`
 - `final_variable=None`
-- `observation = "MACRO EXHAUSTED: Resulting set is empty. minted_variables: " + json.dumps(candidate_map)`
+- `observation` built as follows (ALL FOUR parts required):
 
-CRITICAL:
-- `candidate_map` must be a deterministic dict built from canonical extracted IDs.
+```python
+# Part 1: mandatory prefix
+obs = "MACRO EXHAUSTED: Resulting set is empty."
+# Part 2: one-line failure summary — name entities/concepts, not just #N
+obs += " Walk from resolved_<EntityName> (#N) to <target_concept> returned EMPTY."
+# OR: " Intersection of resolved_<A> (#N) and resolved_<B> (#M) returned EMPTY."
+# Part 3: concrete next-action using an available anchor variable
+obs += " Suggested action: Action: get_relations(#N)"
+# Part 4: grounded minted_variables
+obs += " minted_variables: " + json.dumps(candidate_map)
+```
+
+CANDIDATE_MAP RULES (CRITICAL):
+- Keys MUST be source-grounded: embed the entity name or semantic concept in the key.
+  - CORRECT: `"resolved_Goat"`, `"walk_Goat_to_cheese"`, `"texture_filter"`, `"intersect_animals"`
+  - WRONG: `"resolved_entity_1"`, `"resolved_entity_2"`, `"step_1_result"`
+- Values MUST be deduplicated single IDs or short unique lists. Apply dedup before storing (see Section 5).
 - Use `json.dumps({})` when nothing was minted.
-- Never list raw IDs without semantic labels.
-- Never fabricate recovery steps or `next_action` JSON.
+- Only include steps that were actually executed; do NOT fabricate results for steps not reached.
+- The next-action suggestion in Part 3 MUST reference a real available anchor variable (e.g., `#0` if resolved_Goat was successfully minted). Do NOT invent a variable ID that does not exist.
 
 ### 9. OUTPUT CONTRACT
 Return EXACTLY these 3 keys:
@@ -483,6 +516,10 @@ Keep the code as short as possible while preserving:
 - one short module docstring
 - `run(payload)`
 - `self_test()`
+
+REMINDER:
+- Do NOT add `import kg_utils` or `from kg_utils import ...`.
+- Only `import json` is normally needed unless another stdlib import is truly required.
 
 `run()` MUST have a docstring starting with:
 - `contract guard:`

@@ -22,7 +22,6 @@ from src.typings import ChatHistory, ChatHistoryItem, Role
 from .tool_registry import ToolMetadata
 from .tool_spec import ToolSpec
 from .tool_validation import validate_tool_code
-from .tool_retrieval import retrieve_tools
 from . import kg_utils as _kg_utils
 from .toolgen_debug_logger import toolgen_debug_enabled
 from .controller_prompts import (
@@ -32,12 +31,9 @@ from .controller_prompts import (
     AGG_TOOLGEN_USER_KG,
     MACRO_TOOLGEN_USER_KG,
     ARCHETYPE_REGISTRY,
-    ARCHETYPE_INSTRUCTIONS,
     EXECUTION_STYLE_VOCAB,
-    FAILURE_FAMILY_VOCAB,
     PREFERRED_TOOL_MODE_VOCAB,
     STRATEGY_FAMILY_VOCAB,
-    VALUE_DELIVERED_VOCAB,
 )
 from .toolgen_contracts import TOOL_START, TOOL_END, validate_toolgen_output
 from src.toolgen.prompts import get_toolgen_system_prompt
@@ -51,6 +47,7 @@ class ControllerToolgenMixin:
     _GENERIC_TOOL_NAMES = {
         "generated_tool",
         "agg3_generated_tool",
+        "agg3__generated_tool",
         "analysis_tool",
         "analysis_generated_tool",
         "analysis_tool_generated_tool",
@@ -606,19 +603,6 @@ class ControllerToolgenMixin:
         return parsed if isinstance(parsed, dict) else {}
 
     @staticmethod
-    def _toolgen_count_named_matches(
-        labels: Sequence[str],
-        *tokens: str,
-    ) -> int:
-        token_set = {str(token or "").strip().lower() for token in tokens if token}
-        count = 0
-        for label in labels:
-            lowered = str(label or "").lower()
-            if token_set and all(token in lowered for token in token_set):
-                count += 1
-        return count
-
-    @staticmethod
     def _toolgen_code_shape_signature(tool_code: str) -> str:
         if not tool_code:
             return ""
@@ -798,41 +782,6 @@ class ControllerToolgenMixin:
         if target_archetype == "SUPERLATIVE_FINDER":
             return "superlative_finder"
         return "generic_macro"
-
-    def _toolgen_alternate_execution_style(
-        self,
-        tool_plan: Optional[Mapping[str, Any]],
-        current_execution_style: str,
-    ) -> str:
-        tool_plan = tool_plan or {}
-        target_archetype = str(tool_plan.get("target_archetype") or "").strip().upper()
-        if target_archetype == "COUNTING_INTERSECTOR":
-            mapping = {
-                "walk_first": "relation_first",
-                "relation_first": "probe_then_commit",
-                "probe_then_commit": "partial_value_first",
-                "partial_value_first": "diagnostic_first",
-            }
-            return mapping.get(current_execution_style, "relation_first")
-        if target_archetype == "SUPERLATIVE_FINDER":
-            mapping = {
-                "walk_first": "attribute_mapping_first",
-                "attribute_mapping_first": "diagnostic_first",
-            }
-            return mapping.get(current_execution_style, "attribute_mapping_first")
-        if target_archetype == "SHARED_TRAIT_PIVOT":
-            mapping = {
-                "walk_first": "diagnostic_first",
-                "diagnostic_first": "probe_then_commit",
-            }
-            return mapping.get(current_execution_style, "probe_then_commit")
-        mapping = {
-            "walk_first": "relation_first",
-            "relation_first": "probe_then_commit",
-            "probe_then_commit": "partial_value_first",
-            "partial_value_first": "diagnostic_first",
-        }
-        return mapping.get(current_execution_style, "probe_then_commit")
 
     def _toolgen_compute_round_strategy_context(
         self,
@@ -1093,20 +1042,6 @@ class ControllerToolgenMixin:
             if previous
             else None,
         }
-        # Inject archetype-specific generation-time constraints directly into the
-        # round context so they appear in ROUND_STRATEGY_CONTEXT — the block the
-        # ToolGen LLM actually reads.  This is the only path that reliably reaches
-        # the generation prompt; payload["tool_plan"] is a runtime-only channel.
-        _archetype = str(tool_plan.get("target_archetype") or "").strip().upper()
-        if _archetype in {"COUNTER", "COUNTING_INTERSECTOR"}:
-            result["count_variable_constraint"] = (
-                "HARD RULE: final_variable MUST be the Variable ID string returned by "
-                "the count primitive (e.g. '#5'), NOT a numeric integer or string number. "
-                "Call count(set_var) → extract the returned Variable ID with "
-                "kg_utils.extract_var_ids() → return that ID as final_variable in the "
-                "SSOT dict. Returning a raw integer or the set variable itself is WRONG."
-            )
-        return result
 
     def _toolgen_apply_round_strategy_context(
         self,
@@ -1755,9 +1690,6 @@ class ControllerToolgenMixin:
         }
         preagg_envs.add(task_name)
 
-    def _toolgen_output_mode(self) -> str:
-        return "markers"
-
     def _normalize_toolgen_content(self, content: Any) -> str:
         if isinstance(content, str):
             return content
@@ -2228,7 +2160,7 @@ class ControllerToolgenMixin:
             return True
         if base.startswith("generated_tool"):
             return True
-        if base.startswith("agg3_generated_tool"):
+        if base.startswith("agg3_generated_tool") or base.startswith("agg3__"):
             return True
         return False
 
@@ -2515,17 +2447,6 @@ class ControllerToolgenMixin:
             except Exception:
                 return None
         return parsed if isinstance(parsed, Mapping) else None
-
-    def _toolgen_load_tool_code(self, tool: ToolMetadata) -> Optional[str]:
-        tool_path = getattr(self._registry, "_get_tool_path", lambda n, environment=None: None)(
-            tool.name, environment=getattr(tool, "environment", None)
-        )
-        if not tool_path:
-            return None
-        try:
-            return Path(tool_path).read_text(encoding="utf-8")
-        except Exception:
-            return None
 
     def _toolgen_duplicate_abort_check(
         self, tool_code: str, *, threshold: float = 0.80
@@ -3218,6 +3139,33 @@ class ControllerToolgenMixin:
                     else "partial_unverified"
                 )
 
+        # Late policy correction: MACRO EXHAUSTED with opaque/weak delivered value and
+        # no next-action guidance is not meaningful partial progress.
+        #
+        # This runs AFTER the value_delivered upgrade block so it cannot be overridden.
+        #
+        # "none": tool produced no recognized intermediate result.
+        # "resolved_anchor" (single anchor, no guidance): the solver receives only opaque
+        #   variable IDs with no semantic description of what was found or what to do next.
+        #   Also closes the false-positive where key names containing "anchor"
+        #   (e.g., "resolved_texture_anchors") trigger resolved_anchor classification even
+        #   when all values are raw duplicate variable echoes and there is no next-step hint.
+        #
+        # resolved_both_anchors and stronger values remain material_progress=True since
+        # they represent meaningful multi-step KG traversal.
+        _OPAQUE_EXHAUSTION_VALUES = {"none", "resolved_anchor"}
+        if (
+            status == "MACRO EXHAUSTED"
+            and value_delivered in _OPAQUE_EXHAUSTION_VALUES
+            and not has_final
+            and not has_next_action_guidance
+        ):
+            material_progress = False
+            if reason in {"honest_zero", "honest_zero_no_handoff"}:
+                reason = "exhausted_no_classified_value"
+            elif reason not in {"exhausted_no_classified_value"}:
+                reason = "exhausted_no_actionable_handoff"
+
         return {
             "has_live_result": True,
             "plan_step_count": len(plan_steps),
@@ -3698,21 +3646,6 @@ class ControllerToolgenMixin:
             if getattr(tool, "negative_marks", 0) >= 3:
                 return True
         return False
-
-    @staticmethod
-    def _mock_kg_actions_spec() -> dict[str, Any]:
-        """Return mock callable functions for KG actions_spec during smoke tests."""
-        return {
-            "get_relations": lambda *args: "Relations of mock_entity: [mock.relation.one, mock.relation.two]",
-            "get_neighbors": lambda *args: "Variable #99 = get_neighbors(mock_entity, mock.relation.one)",
-            "intersection": lambda *args: "Variable #100 = intersection(#98, #99)",
-            "union": lambda *args: "Variable #103 = union(#98, #99)",
-            "difference": lambda *args: "Variable #104 = difference(#98, #99)",
-            "get_attributes": lambda *args: "The attributes of Variable #99 are: [mock.attr]",
-            "argmax": lambda *args: "Variable #101 = argmax(#99, mock.attr)",
-            "argmin": lambda *args: "Variable #102 = argmin(#99, mock.attr)",
-            "count": lambda *args: "The number of entities in Variable #99 is 42",
-        }
 
     def _build_toolgen_execution_payload(
         self,

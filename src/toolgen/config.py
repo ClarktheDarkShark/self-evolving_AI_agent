@@ -38,7 +38,7 @@ def get_toolgen_pipeline_config(default_registry_root: str) -> ToolgenPipelineCo
         registry_dir = registry_root
     else:
         registry_dir = os.path.join(registry_root, pipeline)
-    name_prefix = "" if pipeline == "baseline" else "agg3__"
+    name_prefix = ""
     return ToolgenPipelineConfig(
         pipeline=pipeline,
         agg_n=agg_n,

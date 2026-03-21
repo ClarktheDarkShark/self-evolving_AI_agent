@@ -101,4 +101,4 @@ def test_toolgen_pipeline_config_registry_paths(tmp_path, monkeypatch) -> None:
     config = get_toolgen_pipeline_config(str(registry_root))
     assert config.pipeline == "aggregate3"
     assert config.registry_dir == os.path.join(str(custom_root), "aggregate3")
-    assert config.name_prefix == "agg3__"
+    assert config.name_prefix == ""

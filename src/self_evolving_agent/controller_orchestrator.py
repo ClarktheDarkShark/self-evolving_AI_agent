@@ -2092,12 +2092,79 @@ class ControllerOrchestratorMixin:
                 )
             except Exception:
                 pass
-            agent._system_prompt = (
-                f"[CRITICAL OVERRIDE] tool_name MUST be \"{_forced_invoker_tool}\". "
-                f"This tool was just generated for this exact query. "
-                f"You MUST use it — selecting any other tool or action is a hard failure.\n\n"
-                + agent._system_prompt
-            ).strip()
+            # ── Primary fix: skip the LLM entirely for forced same-turn invocation ──
+            # The tool name and all payload fields are already known at this point.
+            # Asking the LLM to re-serialize a large nested JSON payload introduces
+            # parse failure risk with zero benefit.  Build the payload deterministically
+            # from controller state and return immediately.
+            agent._system_prompt = original_prompt  # restore before early return
+            _forced_plan: dict[str, Any] = dict(suggestion_tool_plan or {})
+            _forced_payload: dict[str, Any] = {
+                "tool_plan": _forced_plan,
+                "task_text": (query or "").strip(),
+                "asked_for": (query or "").strip(),
+                "run_id": run_id,
+                "state_dir": state_dir,
+                "actions_spec": actions_spec or self._available_actions_spec(),
+                "entities": list(_forced_plan.get("entities") or []),
+                "env_observation": "",
+                "trace": [],
+            }
+            for _fk in (
+                "target_concept",
+                "execution_style",
+                "preferred_tool_mode",
+                "fallback_strategies",
+                "entity_target_concepts",
+                "attribute_target_concept",
+                "intermediate_target_concepts",
+                "topological_execution_plan",
+                "composite_topology",
+                "recovery_policy",
+                "target_archetype",
+                "domain_hints",
+            ):
+                _fv = _forced_plan.get(_fk)
+                if _fv not in (None, "", [], {}):
+                    _forced_payload[_fk] = _fv
+            # Fall back to entity extraction from query when plan has none.
+            if not any(
+                isinstance(e, str) and e.strip()
+                for e in (_forced_payload.get("entities") or [])
+            ):
+                _em = re.search(
+                    r"Entities\s*:\s*\[([^\]]+)\]",
+                    (query or ""),
+                    flags=re.IGNORECASE,
+                )
+                if _em:
+                    _forced_payload["entities"] = [
+                        p.strip().strip("'\"")
+                        for p in _em.group(1).split(",")
+                        if p.strip()
+                    ]
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "tool_invoker_result",
+                        "parse_ok": True,
+                        "reason": "forced_same_turn_deterministic",
+                        "tool_name": _forced_invoker_tool,
+                        "payload_keys_count": len(_forced_payload),
+                        "wrapper_stripped": False,
+                        "environment_label": self._resolved_environment_label(),
+                        "invocation_trigger": invocation_trigger or None,
+                        "created_tool_name": created_tool_name or None,
+                        "forced_invocation": True,
+                    }
+                )
+            except Exception:
+                pass
+            return {
+                "tool_name": _forced_invoker_tool,
+                "payload": _forced_payload,
+                "reason": "forced_same_turn_invocation",
+            }
         try:
             self._append_generated_tools_log(
                 {
