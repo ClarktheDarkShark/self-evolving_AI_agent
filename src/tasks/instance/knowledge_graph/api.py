@@ -265,8 +265,13 @@ class KnowledgeGraphAPI:
         return []
 
     @staticmethod
-    def _filter_noise_relations(relations: list[str]) -> list[str]:
+    def _is_structurally_unsafe_relation(relation: str) -> bool:
+        rel = str(relation or "").strip()
+        if not rel:
+            return False
         noise = {
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://www.w3.org/2000/01/rdf-schema#label",
             "type.object.name",
             "type.object.type",
             "type.object.key",
@@ -274,7 +279,36 @@ class KnowledgeGraphAPI:
             "common.topic.alias",
             "common.topic.description",
         }
-        return [rel for rel in relations if rel not in noise]
+        if rel in noise:
+            return True
+        return rel.startswith(
+            (
+                "http://rdf.freebase.com/key/",
+                "user.",
+                "kg.object_profile.",
+                "freebase.type_profile.",
+                "wikipedia.",
+                "common.topic.notable_types",
+                "base.ontologies.",
+            )
+        )
+
+    @classmethod
+    def _variable_uses_unsafe_relation(cls, variable: Variable) -> bool:
+        program = str(getattr(variable, "program", "") or "")
+        for relation in re.findall(r"\(JOIN\s+([^\s()]+)", program):
+            rel_name = relation[:-4] if relation.endswith("_inv") else relation
+            if cls._is_structurally_unsafe_relation(rel_name):
+                return True
+        return False
+
+    @staticmethod
+    def _filter_noise_relations(relations: list[str]) -> list[str]:
+        return [
+            rel
+            for rel in relations
+            if not KnowledgeGraphAPI._is_structurally_unsafe_relation(rel)
+        ]
 
     @staticmethod
     def _contains_set_ops(expression: Any) -> bool:
@@ -457,6 +491,12 @@ class KnowledgeGraphAPI:
         # region Validate argument
         if isinstance(argument, Variable):
             KnowledgeGraphAPI._validate_variable("get_relations", [argument])
+            if self._variable_uses_unsafe_relation(argument):
+                raise KnowledgeGraphAPIException(
+                    "Error: Structurally unsafe variable. get_relations cannot probe "
+                    "Variables minted from key, authority, external-id, or other "
+                    "metadata relations."
+                )
             MAX_SAFE_CARDINALITY = 50
             var_size = self.get_variable_size(argument)
             if var_size and var_size > MAX_SAFE_CARDINALITY:
@@ -513,7 +553,7 @@ class KnowledgeGraphAPI:
             intersected = sorted(
                 list(set(raw_relations).intersection(set(self.relations)))
             )
-            filtered_relations = intersected
+            filtered_relations = self._filter_noise_relations(intersected)
         else:
             filtered_relations = self._filter_noise_relations(raw_relations)
 
@@ -556,6 +596,12 @@ class KnowledgeGraphAPI:
         # region Validate arguments
         if isinstance(argument, Variable):
             KnowledgeGraphAPI._validate_variable("get_neighbors", [argument])
+            if self._variable_uses_unsafe_relation(argument):
+                raise KnowledgeGraphAPIException(
+                    "Error: Structurally unsafe variable. get_neighbors cannot continue "
+                    "from Variables minted from key, authority, external-id, or other "
+                    "metadata relations."
+                )
         else:
             resolved = self._resolve_entity_ids(argument)
             if not resolved:
@@ -563,6 +609,11 @@ class KnowledgeGraphAPI:
                     "get_neighbors: <<ARGUMENT0>> is neither a Variable nor an entity. "
                     "The first argument of get_neighbors must be a Variable or an entity."
                 )
+        if self._is_structurally_unsafe_relation(relation):
+            raise KnowledgeGraphAPIException(
+                "Error: Structurally unsafe relation. get_neighbors cannot traverse "
+                "key, authority, external-id, or other metadata relations."
+            )
         if argument not in self.variable_to_relations_cache.keys():
             raise KnowledgeGraphAPIException(
                 f"get_neighbors: Execute get_relations for <<ARGUMENT0>> before executing get_neighbors"

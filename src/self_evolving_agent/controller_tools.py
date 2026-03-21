@@ -36,59 +36,47 @@ class ControllerToolsMixin:
                 "macro_route_failed:missing_task_ref_or_session"
             )
 
-        # Extract entities from the payload if present; fall back to
-        # regex extraction from task_text.  Do NOT serialize the full
-        # payload — the server builds its own with live callables, etc.
-        entities: list[str] = []
+        # Drill down to the actual payload dict (unwrap {"args": [payload], "kwargs": {}}
+        # wrapper that _invoke_tool_by_payload may add).
+        payload_dict: dict = {}
         if args and isinstance(args[0], Mapping):
-            # Handle the {"args": [payload], "kwargs": {}} wrapper that
-            # _invoke_tool_by_payload passes.  Drill down to the actual
-            # payload dict when the wrapper structure is detected.
             raw_arg = args[0]
             if "args" in raw_arg and isinstance(raw_arg.get("args"), (list, tuple)):
                 inner_args = raw_arg["args"]
-                payload_dict = inner_args[0] if inner_args and isinstance(inner_args[0], Mapping) else raw_arg
+                payload_dict = dict(inner_args[0]) if inner_args and isinstance(inner_args[0], Mapping) else dict(raw_arg)
             else:
-                payload_dict = raw_arg
+                payload_dict = dict(raw_arg)
 
-            raw_entities = payload_dict.get("entities") or []
-            if isinstance(raw_entities, (list, tuple)):
-                entities = [str(e) for e in raw_entities if e]
-            # Fallback: extract from task_text when LLM omits entities
-            if not entities:
-                task_text = str(payload_dict.get("task_text") or "")
-                ent_match = re.search(
-                    r"Entities\s*:\s*\[([^\]]+)\]", task_text, flags=re.IGNORECASE
-                )
-                if ent_match:
-                    entities = [
-                        e.strip().strip("'\"")
-                        for e in ent_match.group(1).split(",")
-                        if e.strip()
-                    ]
-                if not entities:
-                    ent_match2 = re.search(
-                        r"Entities\s*:\s*([^\n\r;]+)", task_text, flags=re.IGNORECASE
-                    )
-                    if ent_match2:
-                        entities = [
-                            e.strip().strip("'\"")
-                            for e in ent_match2.group(1).split(",")
-                            if e.strip()
-                        ]
         try:
             tool_name_json = json.dumps(str(tool_name), ensure_ascii=True)
-            # BYPASS: Join with pipe to avoid environment comma-splitting
-            entities_str = "|".join([str(e) for e in entities])
-            entities_json = json.dumps(entities_str, ensure_ascii=True)
+            entities = payload_dict.get("entities", [])
+            entities_list = list(entities) if not isinstance(entities, list) else entities
+            entities_json = json.dumps(entities_list, ensure_ascii=True, default=str)
+            # Compact display string — used for chat-history hygiene after execution.
+            # Only carries the entity list; large fields (trace, actions_spec) are
+            # reconstructed server-side and must never appear in the chat window.
+            action_str_for_chat = f"Action: execute_macro({tool_name_json}, {entities_json})"
+            # Full execution string — what the server actually reads via chat history.
+            # Includes all semantic keys that _execute_macro cannot reconstruct:
+            # topological_execution_plan, entity_target_concepts, composite_topology,
+            # attribute_target_concept, target_concept, domain_hints, recovery_policy.
+            # Excludes fields the server builds itself: trace, actions_spec, variable_list.
+            _EXCLUDE_FROM_ENV = frozenset(
+                {"trace", "actions_spec", "actions_spec_raw", "variable_list"}
+            )
+            _env_payload = {k: v for k, v in payload_dict.items() if k not in _EXCLUDE_FROM_ENV}
+            _env_payload.setdefault("entities", entities_list)
+            action_str_for_env = (
+                f"Action: execute_macro({tool_name_json}, "
+                f"{json.dumps(_env_payload, ensure_ascii=True, default=str)})"
+            )
         except Exception as exc:
             return ToolResult.failure(f"macro_route_failed:serialize:{exc}")
-        action_str = f"Action: execute_macro({tool_name_json}, {entities_json})"
 
-        # Inject the lightweight macro action into the live session and let
-        # the server handle payload construction + execution.
+        # Inject the full execution payload so task_ref.interact → _execute_macro
+        # receives all semantic keys (topological_execution_plan etc.).
         session.chat_history.inject(
-            ChatHistoryItem(role=Role.AGENT, content=action_str)
+            ChatHistoryItem(role=Role.AGENT, content=action_str_for_env)
         )
 
         try:
@@ -126,15 +114,58 @@ class ControllerToolsMixin:
         except Exception:
             observation = ""
 
+        # Swap the full-payload AGENT entry for the compact display string so
+        # subsequent LLM context windows are not bloated by large JSON payloads.
+        # History layout after interact: [..., AGENT(env), USER(observation)]
+        # Target layout:                 [..., AGENT(chat), USER(observation)]
+        try:
+            session.chat_history.pop(-1)  # pop USER observation
+            session.chat_history.pop(-1)  # pop AGENT full-payload
+            session.chat_history.inject(ChatHistoryItem(role=Role.AGENT, content=action_str_for_chat))
+            session.chat_history.inject(ChatHistoryItem(role=Role.USER, content=observation))
+        except Exception:
+            pass  # If swap fails history retains the full payload — functionally correct
+
         self._log_flow_event(
             "macro_routed",
             tool_name=tool_name,
             observation_preview=observation[:200],
         )
+        result_payload = {
+            "macro_observation": observation,
+            "tool_name": tool_name,
+            "tool_type": "macro",
+            "action_str_for_env": action_str_for_env,
+        }
+        try:
+            handoff = self._classify_tool_handoff(
+                tool_name, ToolResult.success_result(result_payload)
+            )
+            _is_exhausted = "MACRO EXHAUSTED" in observation
+            _shallow_markers = ("common.topic.article", "type.object", "base.schemastaging")
+            _is_shallow = any(m in observation for m in _shallow_markers)
+            _status = "MACRO EXHAUSTED" if _is_exhausted else "SUCCESS"
+            self._append_tool_value_trace(
+                "tool_runtime_handoff_quality",
+                tool_name=tool_name,
+                status=_status,
+                is_shallow_resolution=_is_shallow if _is_shallow else None,
+                handoff_state=handoff.get("handoff_state"),
+                semantic_trust_level=handoff.get("semantic_trust_level"),
+                trust_classification=handoff.get("trust_classification"),
+                ignore_recommendation=handoff.get("ignore_recommendation"),
+                ignore_reason=handoff.get("ignore_reason"),
+                safe_to_continue=handoff.get("safe_to_continue"),
+                final_operation_safe=handoff.get("final_operation_safe"),
+                recommended_next_action_category=handoff.get(
+                    "recommended_next_action_category"
+                ),
+                observation_preview=observation[:200],
+            )
+        except Exception:
+            pass
 
-        return ToolResult.success_result(
-            {"macro_observation": observation, "tool_name": tool_name, "tool_type": "macro"}
-        )
+        return ToolResult.success_result(result_payload)
 
     def _read_tool_source(self, tool_name: str) -> Optional[str]:
         resolved_name = (

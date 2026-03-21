@@ -14,7 +14,15 @@
       "Bash(# Now check: does the tool registry delete/deregister an existing REGISTERED tool if it fails at runtime? # Look for any logic that removes a tool from the registry after MACRO EXHAUSTED grep -n \"\"unregister\\\\|deregister\\\\|mark.*fail\\\\|mark.*exhaust\\\\|remove.*tool\\\\|tool.*fail\\\\|failure_count\\\\|usage_count\"\" \"\"/Users/christopherclark/Library/Mobile Documents/com~apple~CloudDocs/_Chris_Docs/Coding/LifelongAgentBench/src/self_evolving_agent/tool_registry.py\"\")",
       "Bash(# Check how/when record_task_outcome is called after a macro returns MACRO EXHAUSTED # Also find what the tool_outcome_marks.jsonl shows grep -n \"\"record_task_outcome\\\\|record_negative_mark\\\\|task_outcome\\\\|negative_mark\"\" \"\"/Users/christopherclark/Library/Mobile Documents/com~apple~CloudDocs/_Chris_Docs/Coding/LifelongAgentBench/src/self_evolving_agent/controller_tools.py\"\")",
       "Bash(# Empty! We deleted it. So during the run, the tool WOULD have been there on disk. # Now let''s understand the timing: turn 1 of museum task succeeded \\(file found\\). # The tool_invocations log shows turn 2 failed with not_found. # This happened DURING the original run before our wipe. # Check: is the tool actually saved into PER-SAMPLE state dirs? ls \"\"/Users/christopherclark/Library/Mobile Documents/com~apple~CloudDocs/_Chris_Docs/Coding/LifelongAgentBench/outputs/run_all_2026-03-05-11-29-43/knowledge_graph/standard/tool_state/\"\")",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(python3.11 -m py_compile src/self_evolving_agent/controller_orchestrator.py src/self_evolving_agent/controller_tools.py src/tasks/instance/knowledge_graph/api.py src/self_evolving_agent/kg_utils.py)",
+      "Bash(conda run:*)",
+      "Bash(pip install:*)",
+      "Bash(python3.10 -m py_compile src/self_evolving_agent/controller_prompts.py)",
+      "Bash(echo $OPENAI_API_KEY)",
+      "Bash(echo $OPENAI_BASE_URL)",
+      "Bash(PYTHONPATH=. python src/run_experiment.py --config_path configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/_validation_single.yaml)",
+      "Bash(PYTHONPATH=. timeout 240 python src/run_experiment.py --config_path configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/_validation_single.yaml)"
     ]
   }
 }

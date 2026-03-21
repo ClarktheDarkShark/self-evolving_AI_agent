@@ -453,7 +453,15 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                     if isinstance(second_arg, list):
                         return tool_name, {"entities": second_arg}
                     # Pipe-delimited format: (tool_name, "E1|E2|E3")
+                    # OR full JSON payload passed as a string: (tool_name, "{...}")
                     if isinstance(second_arg, str):
+                        if second_arg.strip().startswith("{"):
+                            try:
+                                parsed_payload = json.loads(second_arg)
+                                if isinstance(parsed_payload, dict):
+                                    return tool_name, parsed_payload
+                            except Exception:
+                                pass
                         entities = [e.strip() for e in second_arg.split("|") if e.strip()]
                         return tool_name, {"entities": entities}
                     # Legacy format: (tool_name, {payload})
@@ -712,6 +720,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
 
         kg_api = self.knowledge_graph_api
         real_var_list = self.variable_list or []
+        proxy_variable_list = list(real_var_list)
 
         # Resolve the canonical entity_dict for this sample so that proxy
         # functions apply the same MID substitution that _interact performs.
@@ -725,7 +734,6 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
 
         # --- Shadow Proxy Interceptor (same design as controller_toolgen.py) ---
         shadow_var_list: list = []
-        shadow_base: int = len(real_var_list)
 
         # Cache key snapshots for cleanup.
         pre_cache_rel_keys: set = set(kg_api.variable_to_relations_cache.keys())
@@ -751,17 +759,15 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             m = re.match(r"^#(\d+)$", s)
             if m:
                 idx = int(m.group(1))
-                shadow_idx = idx - shadow_base
-                if 0 <= shadow_idx < len(shadow_var_list):
-                    return shadow_var_list[shadow_idx]
-                if 0 <= idx < len(real_var_list):
-                    return real_var_list[idx]
+                if 0 <= idx < len(proxy_variable_list):
+                    return proxy_variable_list[idx]
             return arg
 
         def _track(new_var: Any, msg: str) -> str:
             if new_var is not None and "<<NEW_VARIABLE>>" in msg:
-                idx = shadow_base + len(shadow_var_list)
+                idx = len(proxy_variable_list)
                 msg = msg.replace("<<NEW_VARIABLE>>", f"#{idx}")
+                proxy_variable_list.append(new_var)
                 shadow_var_list.append(new_var)
             return msg
 
@@ -888,6 +894,8 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         # Build payload with proxy injected.
         payload = dict(base_payload)
         payload["actions_spec"] = proxy_actions_spec
+        payload["variable_list"] = proxy_variable_list
+        payload["kg_utils"] = _kg_utils.get_macro_helper_facade()
 
         result: dict = {}
         safe_globals = {
@@ -895,7 +903,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             "json": json,
             "re": re,
             "os": os,
-            "kg_utils": _kg_utils,
+            "kg_utils": _kg_utils.get_macro_helper_facade(),
         }
         try:
             exec(tool_code, safe_globals)  # noqa: S102
@@ -1062,6 +1070,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         payload_map["state_dir"] = state_dir_value
         payload_map.setdefault("env_observation", env_observation)
         payload_map["variable_list"] = self.variable_list
+        payload_map["kg_utils"] = _kg_utils.get_macro_helper_facade()
         # Ensure entities are always available. If the lightweight format
         # already provided them via the parser, keep those; otherwise fall
         # back to the full entity list from the dataset item.
@@ -1134,7 +1143,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             "json": json,
             "re": re,
             "os": os,
-            "kg_utils": _kg_utils,
+            "kg_utils": _kg_utils.get_macro_helper_facade(),
         }
         logger.info(
             f"[MACRO EXEC] Tool: {tool_name} | Concept: {payload_map.get('target_concept')} | Hints: {payload_map.get('domain_hints')}"
@@ -1182,18 +1191,45 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
 
         status = str(result.get("status") or "")
         final_variable = result.get("final_variable")
-        if status == "SUCCESS" and final_variable not in (None, ""):
-            obs_text = result.get("observation", "")
-            observation = f"{final_variable} - {obs_text}" if obs_text else str(final_variable)
-        else:
-            observation = json.dumps(result, ensure_ascii=True, default=str)
+        obs_text = str(result.get("observation") or "").strip()
 
-        execution_message = KnowledgeGraphAPI._construct_execution_message(
-            str(observation)
+        # Preserve full result in logs; chat history receives only the compact summary.
+        logger.info(
+            "[MACRO RESULT] tool=%s status=%s final_variable=%s observation=%s",
+            tool_name, status, final_variable, obs_text,
         )
-        execution_message = execution_message.replace("<<API_STR>>", api_str)
+
+        # Extract semantic type from any "instances of <type>" phrase in the observation.
+        _type_m = re.search(r'instances of ([\w.]+)', obs_text)
+        _type_hint = _type_m.group(1) if _type_m else None
+
+        if status == "SUCCESS" and final_variable not in (None, ""):
+            fv_str = str(final_variable)
+            obs_part = f" Observation: {obs_text}" if obs_text else ""
+            if _type_hint:
+                compact = (
+                    f"Macro result: {tool_name} -> SUCCESS. "
+                    f"Final variable: {fv_str} (instances of {_type_hint}).{obs_part}"
+                )
+            else:
+                compact = f"Macro result: {tool_name} -> SUCCESS. Final variable: {fv_str}.{obs_part}"
+        elif "EXHAUSTED" in status.upper():
+            # Preserve candidate list verbatim — solver needs label->var_id mapping.
+            compact = (
+                f"Macro result: {tool_name} -> {status}. {obs_text}"
+                if obs_text
+                else f"Macro result: {tool_name} -> {status}."
+            )
+        else:
+            short_obs = obs_text[:300] if obs_text else ""
+            compact = (
+                f"Macro result: {tool_name} -> {status}. {short_obs}"
+                if short_obs
+                else f"Macro result: {tool_name} -> {status}."
+            )
+
         session.chat_history.inject(
-            {"role": Role.USER, "content": execution_message}
+            {"role": Role.USER, "content": compact}
         )
 
     def _interact(self, session: Session) -> None:

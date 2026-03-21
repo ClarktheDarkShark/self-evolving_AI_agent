@@ -161,9 +161,25 @@ class SelfEvolvingController(
         self._force_toolgen_always_on = (
             os.getenv("FORCE_TOOLGEN_ALWAYS_ON", "0") == "1"
         )
-        self._toolgen_off = os.getenv("TOOLGEN_OFF", "1") != "0"
+        self._toolgen_off_env_value = os.getenv("TOOLGEN_OFF")
+        _toolgen_off_truthy = {"1", "true", "yes", "on"}
+        self._toolgen_off = (
+            str(self._toolgen_off_env_value or "").strip().lower()
+            in _toolgen_off_truthy
+        )
         if self._force_toolgen_always_on:
             self._toolgen_off = False
+        try:
+            print(
+                "[TOOLGEN_POLICY] "
+                f"enabled={not self._toolgen_off} "
+                f"TOOLGEN_OFF={self._toolgen_off_env_value!r} "
+                f"FORCE_TOOLGEN_ALWAYS_ON={self._force_toolgen_always_on}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
 
         base_cfg = dict(inference_config_dict) if inference_config_dict else {}
         for k in ("tools", "tool_choice", "functions", "function_call"):
@@ -386,6 +402,12 @@ class SelfEvolvingController(
         self._exhausted_macros_session_key: Optional[tuple[str, str]] = None
         self._called_tool_signatures: set[str] = set()
         self._called_tool_signatures_session_key: Optional[tuple[str, str]] = None
+        self._failed_tool_semantic_goals: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._failed_tool_semantic_goals_session_key: Optional[tuple[str, str]] = None
+        self._tool_semantic_goal_by_name: dict[str, tuple[str, str, str]] = {}
+        self._tool_semantic_goal_by_name_session_key: Optional[tuple[str, str]] = None
+        self._genuinely_empty_semantic_targets: dict[tuple[str, str], dict[str, Any]] = {}
+        self._genuinely_empty_semantic_targets_session_key: Optional[tuple[str, str]] = None
         self._run_task_metadata: Optional[dict[str, Any]] = None
         self._last_solver_output: Optional[str] = None
         self._last_solver_context_key: Optional[str] = None
@@ -476,6 +498,144 @@ class SelfEvolvingController(
         except Exception:
             pass
         return run_id, state_dir, task_sig
+
+    def _semantic_goal_key_from_decision(
+        self, decision: Optional[Mapping[str, Any]]
+    ) -> Optional[tuple[str, str, str]]:
+        if not isinstance(decision, Mapping):
+            return None
+        current_session = getattr(self, "_current_session", None)
+        sample_index = str(getattr(current_session, "sample_index", "") or "")
+        if not sample_index:
+            meta = self._get_run_task_metadata() or {}
+            sample_index = str(meta.get("sample_index") or "")
+        target_concept = str(decision.get("target_concept") or "").strip().lower()
+        if not sample_index or not target_concept:
+            return None
+        archetype = str(decision.get("target_archetype") or "").strip().upper()
+        if not archetype:
+            topo = decision.get("composite_topology")
+            if isinstance(topo, list):
+                parts = [str(item).strip().upper() for item in topo if str(item).strip()]
+                archetype = "+".join(parts)
+        if not archetype:
+            return None
+        return (sample_index, archetype, target_concept)
+
+    def _semantic_target_key_from_decision(
+        self, decision: Optional[Mapping[str, Any]]
+    ) -> Optional[tuple[str, str]]:
+        semantic_key = self._semantic_goal_key_from_decision(decision)
+        if semantic_key is None:
+            return None
+        sample_index, _, target_concept = semantic_key
+        return (sample_index, target_concept)
+
+    @staticmethod
+    def _is_genuinely_empty_semantic_filter_reason(reason: str) -> bool:
+        reason_lower = str(reason or "").lower()
+        if "semantic_filter" not in reason_lower and "resolve_semantic_filter" not in reason_lower:
+            return False
+        empty_markers = (
+            "0 results",
+            "zero results",
+            "resulting set is empty",
+            "empty set",
+            "\"vars\": []",
+            "'vars': []",
+            "no results",
+            "returned []",
+        )
+        return any(marker in reason_lower for marker in empty_markers)
+
+    def _register_tool_semantic_goal(
+        self,
+        *,
+        tool_name: Optional[str],
+        semantic_key: Optional[tuple[str, str, str]],
+    ) -> None:
+        if tool_name and semantic_key:
+            self._tool_semantic_goal_by_name[str(tool_name)] = semantic_key
+
+    def _mark_genuinely_empty_semantic_target(
+        self,
+        *,
+        semantic_key: Optional[tuple[str, str, str]],
+        tool_name: Optional[str] = None,
+        reason: str = "",
+    ) -> None:
+        if semantic_key is None:
+            return
+        sample_index, _, target_concept = semantic_key
+        empty_key = (sample_index, target_concept)
+        entry = self._genuinely_empty_semantic_targets.setdefault(
+            empty_key,
+            {"count": 0, "tool_names": [], "reasons": [], "genuinely_empty": True},
+        )
+        entry["count"] = int(entry.get("count") or 0) + 1
+        if tool_name:
+            names = entry.setdefault("tool_names", [])
+            if str(tool_name) not in names:
+                names.append(str(tool_name))
+        reason_text = self._truncate(str(reason or ""), 300)
+        if reason_text:
+            reasons = entry.setdefault("reasons", [])
+            if reason_text not in reasons:
+                reasons.append(reason_text)
+
+    def _record_semantic_goal_failure(
+        self,
+        *,
+        semantic_key: Optional[tuple[str, str, str]],
+        tool_name: Optional[str] = None,
+        reason: str = "",
+    ) -> None:
+        if semantic_key is None:
+            return
+        entry = self._failed_tool_semantic_goals.setdefault(
+            semantic_key,
+            {"count": 0, "tool_names": [], "reasons": []},
+        )
+        entry["count"] = int(entry.get("count") or 0) + 1
+        if tool_name:
+            names = entry.setdefault("tool_names", [])
+            if str(tool_name) not in names:
+                names.append(str(tool_name))
+        reason_text = self._truncate(str(reason or ""), 300)
+        if reason_text:
+            reasons = entry.setdefault("reasons", [])
+            if reason_text not in reasons:
+                reasons.append(reason_text)
+        if self._is_genuinely_empty_semantic_filter_reason(reason_text):
+            entry["genuinely_empty"] = True
+            self._mark_genuinely_empty_semantic_target(
+                semantic_key=semantic_key,
+                tool_name=tool_name,
+                reason=reason_text,
+            )
+
+    def _lookup_semantic_goal_failure(
+        self, decision: Optional[Mapping[str, Any]]
+    ) -> tuple[Optional[tuple[str, str, str]], Optional[dict[str, Any]]]:
+        semantic_key = self._semantic_goal_key_from_decision(decision)
+        if semantic_key is None:
+            return None, None
+        entry = self._failed_tool_semantic_goals.get(semantic_key)
+        target_key = self._semantic_target_key_from_decision(decision)
+        empty_entry = (
+            self._genuinely_empty_semantic_targets.get(target_key)
+            if target_key is not None
+            else None
+        )
+        if empty_entry and entry is None:
+            return semantic_key, dict(empty_entry)
+        if empty_entry and entry is not None:
+            merged = dict(entry)
+            merged["genuinely_empty"] = True
+            merged["empty_reasons"] = list(empty_entry.get("reasons") or [])
+            merged["empty_count"] = empty_entry.get("count")
+            return semantic_key, merged
+        return semantic_key, entry
 
 
 
@@ -692,6 +852,47 @@ class SelfEvolvingController(
 
         return None
 
+    def _real_existing_tools_for_query(
+        self, query: str, tool_plan: Optional[Mapping[str, Any]] = None
+    ) -> list[dict[str, Any]]:
+        try:
+            query_entity_count = self._extract_query_entity_count(query)
+            return self._orchestrator_compact_existing_tools(
+                query_text=query,
+                tool_plan=tool_plan,
+                query_entity_count=query_entity_count,
+                include_control_entries=False,
+            )
+        except Exception:
+            return []
+
+    def _blocked_stuck_for_forge(
+        self,
+        *,
+        structured_trace: list[dict[str, Any]],
+        last_obs: Optional[dict[str, Any]],
+        observation_triggers: Sequence[Mapping[str, Any]],
+        stagnation_count: int,
+    ) -> tuple[bool, str]:
+        trigger_types = {
+            str(trigger.get("type") or "").strip().lower()
+            for trigger in (observation_triggers or [])
+            if isinstance(trigger, Mapping)
+        }
+        if "error_trigger" in trigger_types:
+            return True, "error_trigger"
+        if "derailment_trigger" in trigger_types:
+            return True, "derailment_trigger"
+        if last_obs and bool(last_obs.get("loop_detected")):
+            return True, "loop_detected"
+        if last_obs and int(last_obs.get("repeat_count") or 0) >= 2:
+            return True, "repeat_count"
+        if stagnation_count >= 2:
+            return True, "stagnation"
+        if structured_trace and structured_trace[-1].get("ok") is False:
+            return True, "recent_error"
+        return False, "not_blocked"
+
     def _truncate_for_log(
         self, value: Any, max_chars: int = 400, max_list: int = 8
     ) -> Any:
@@ -868,6 +1069,20 @@ class SelfEvolvingController(
                 self._registry.record_task_outcome(tool_name, success=False)
             self._outcome_scored.add(key)
             new_marks.append(key)
+            try:
+                self._append_tool_value_trace(
+                    "task_outcome_attribution",
+                    task_name=task_name,
+                    sample_index=str(sample_index),
+                    tool_name=tool_name,
+                    outcome=outcome,
+                    final_correct=outcome == "correct",
+                    penalized=should_penalize,
+                    confidence=usage_entry.get("confidence_score"),
+                    solver_followed=usage_entry.get("solver_followed_recommendation"),
+                )
+            except Exception:
+                pass
 
         if new_marks:
             try:
@@ -1252,6 +1467,15 @@ class SelfEvolvingController(
             if self._called_tool_signatures_session_key != session_key:
                 self._called_tool_signatures.clear()
                 self._called_tool_signatures_session_key = session_key
+            if self._failed_tool_semantic_goals_session_key != session_key:
+                self._failed_tool_semantic_goals.clear()
+                self._failed_tool_semantic_goals_session_key = session_key
+            if self._tool_semantic_goal_by_name_session_key != session_key:
+                self._tool_semantic_goal_by_name.clear()
+                self._tool_semantic_goal_by_name_session_key = session_key
+            if self._genuinely_empty_semantic_targets_session_key != session_key:
+                self._genuinely_empty_semantic_targets.clear()
+                self._genuinely_empty_semantic_targets_session_key = session_key
         except Exception:
             pass
         self._apply_outcome_penalties()
@@ -1327,33 +1551,12 @@ class SelfEvolvingController(
             file=sys.stderr,
             flush=True,
         )
-        if isinstance(forced_decision, Mapping):
-            action_name = forced_decision.get("action")
-            if action_name == "request_new_tool":
-                print(
-                    f"[LATM_FLOW] Forge reason: "
-                    f"{forced_decision.get('reason')}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                print(
-                    f"[!] ESCAPE HATCH TRIGGERED: tool_type="
-                    f"{forced_decision.get('tool_type', 'advisory')}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                escape_result = self._handle_escape_hatch(
-                    forced_decision, task_query, working_history
-                )
-                if isinstance(escape_result, Mapping):
-                    solver_recommendation = str(
-                        escape_result.get("observation") or ""
-                    )
-                    forced_decision = self._orchestrate_decision(
-                        task_query,
-                        working_history,
-                        solver_recommendation=solver_recommendation,
-                    )
+        if isinstance(forced_decision, Mapping) and forced_decision.get("action") == "request_new_tool":
+            print(
+                "[DEBUG] Deferred request_new_tool until centralized gating phase.",
+                file=sys.stderr,
+                flush=True,
+            )
 
         _loop_start = time.perf_counter()
         turn_start_time = time.time()
@@ -1393,6 +1596,7 @@ class SelfEvolvingController(
         self._last_tool_confidence: Optional[float] = None
         self._last_tool_recommendation: Optional[str] = None
         self._solver_followed_recommendation: Optional[bool] = None
+        self._last_tool_handoff: Optional[dict[str, Any]] = None
         last_structured_trace: list[dict[str, Any]] = []
         last_structured_obs: Optional[dict[str, Any]] = None
 
@@ -1485,6 +1689,13 @@ class SelfEvolvingController(
                 )
             else:
                 decision = dict(forced_decision)
+            tool_plan = (
+                self._build_tool_plan(decision)
+                if isinstance(decision, Mapping)
+                else {}
+            )
+            if isinstance(decision, dict):
+                decision["tool_plan"] = tool_plan
             print(
                 f"[DEBUG] Orchestrator Decision: {decision}",
                 file=sys.stderr,
@@ -1492,12 +1703,40 @@ class SelfEvolvingController(
             )
             action = decision.get("action", "no_tool")
             _raw_action = action  # preserve original before any override
+            toolgen_enabled = not self._toolgen_off
+            real_existing_tools: list[dict[str, Any]] = []
+            real_existing_tools_count = 0
+            if _raw_action in {"create_tool", "request_new_tool"}:
+                real_existing_tools = self._real_existing_tools_for_query(
+                    task_query, tool_plan=tool_plan
+                )
+                real_existing_tools_count = len(real_existing_tools)
+            blocked_stuck_for_forge, blocked_stuck_reason = self._blocked_stuck_for_forge(
+                structured_trace=pre_orch_trace,
+                last_obs=pre_orch_obs,
+                observation_triggers=observation_triggers,
+                stagnation_count=stagnation_count,
+            )
+            forge_allowed = False
+            forge_denied_reason: Optional[str] = None
+            _rewritten_from_toolgen_off = False
             if (
                 self._toolgen_off
                 and not self._force_toolgen_always_on
                 and action in {"create_tool", "request_new_tool"}
             ):
-                action = "use_tool"
+                _rewritten_from_toolgen_off = True
+                if real_existing_tools_count > 0:
+                    action = "use_tool"
+                    forge_denied_reason = "toolgen_off"
+                else:
+                    self._append_loop_log(
+                        "  [TOOLGEN_OFF FALLBACK] request_new_tool/create_tool was "
+                        "rewritten to use_tool, but no real eligible registry tools "
+                        "exist. Skipping Tool Invoker and forcing no_tool."
+                    )
+                    action = "no_tool"
+                    forge_denied_reason = "toolgen_off"
             # Hard blacklist: never re-invoke a macro that already returned MACRO EXHAUSTED
             # in this sample, regardless of what the Orchestrator or size_trigger decided.
             if action == "use_tool" and decision.get("tool_name") in self._exhausted_macros:
@@ -1519,133 +1758,245 @@ class SelfEvolvingController(
                 if _raw_action != action
                 else action
             )
+            recovery_policy = decision.get("recovery_policy") or ""
             self._append_loop_log(
                 f"  orchestrator: action={_action_display} "
                 f"tool={decision.get('tool_name') or '-'} "
-                f"reason={self._truncate(str(decision.get('reason') or ''), 2500)}"
+                f"reason={self._truncate(str(decision.get('reason') or ''), 2500)} "
+                f"recovery_policy={recovery_policy or '-'}"
             )
+            if tool_plan:
+                self._append_loop_log(
+                    f"  tool_plan: target={tool_plan.get('target_concept') or '-'} "
+                    f"steps={len(tool_plan.get('topological_execution_plan_steps') or [])} "
+                    f"composite={tool_plan.get('composite_topology') or []}"
+                )
+            if _raw_action in {"create_tool", "request_new_tool"} and action != "request_new_tool":
+                self._append_loop_log(
+                    {
+                        "event": "forge_policy",
+                        "raw_action": _raw_action,
+                        "final_action": action,
+                        "toolgen_enabled": toolgen_enabled,
+                        "real_existing_tools_count": real_existing_tools_count,
+                        "blocked_stuck_for_forge": blocked_stuck_for_forge,
+                        "blocked_stuck_reason": blocked_stuck_reason,
+                        "forge_allowed": forge_allowed,
+                        "forge_denied_reason": forge_denied_reason,
+                    }
+                )
 
             # Phase 4: Escape hatch intercept — request_new_tool
             if action == "request_new_tool":
-                # TURN-0 GATE: Tool generation is only permitted at the very start of
-                # a task (Turn 0), before any KG actions have been executed.
-                # pre_orch_trace holds every action taken so far in this task.
-                # A non-empty trace means we are mid-task — block the Forge entirely
-                # and fall back to the manual Solver instead.
-                if pre_orch_trace:
+                semantic_goal_key, semantic_goal_failure = self._lookup_semantic_goal_failure(
+                    decision
+                )
+                _last_obs_text = ""
+                if pre_orch_obs is not None:
+                    _last_obs_text = str(pre_orch_obs.get("output") or "")
+                if not _last_obs_text and pre_orch_trace:
+                    _last_obs_text = str(pre_orch_trace[-1].get("output") or "")
+                _is_graceful_degradation = (
+                    "MACRO EXHAUSTED" in _last_obs_text
+                    and bool(re.search(r"#\d+", _last_obs_text))
+                )
+                _mid_task = bool(pre_orch_trace)
+
+                if real_existing_tools_count > 0:
+                    action = "use_tool"
+                    forge_denied_reason = "real_tools_available"
+                    self._append_loop_log(
+                        f"  [FORGE POLICY] Skipping Forge because {real_existing_tools_count} "
+                        "real eligible tool(s) already exist. Falling back to use_tool."
+                    )
+                elif _is_graceful_degradation:
+                    action = "no_tool"
+                    forge_denied_reason = "graceful_degradation"
+                    self._append_loop_log(
+                        "  [GRACEFUL DEGRADATION] Macro returned MACRO EXHAUSTED "
+                        "with a valid partial Variable — skipping Forge. "
+                        "Solver will use the partial result directly."
+                    )
+                elif semantic_goal_failure:
+                    action = "no_tool"
+                    forge_denied_reason = (
+                        "genuinely_empty" if semantic_goal_failure.get("genuinely_empty")
+                        else "circuit_breaker"
+                    )
+                    if semantic_goal_failure.get("genuinely_empty"):
+                        self._append_loop_log(
+                            "  [GENUINELY EMPTY CIRCUIT BREAKER] Blocking Forge retry for "
+                            f"sample/target={self._semantic_target_key_from_decision(decision)}. "
+                            "resolve_semantic_filter already confirmed zero results."
+                        )
+                        solver_sidecar.append(
+                            "Observation: resolve_semantic_filter already confirmed that this "
+                            "target_concept yields zero results in this sample. This is a graph fact, "
+                            "not a tool failure. Do NOT request an upgrade or a new tool for this "
+                            "concept. Provide the Final Answer using the existing empty/zero result."
+                        )
+                    else:
+                        self._append_loop_log(
+                            "  [SEMANTIC CIRCUIT BREAKER] Blocking Forge retry for "
+                            f"sample/archetype/target={semantic_goal_key}. "
+                            f"prior_failures={semantic_goal_failure.get('count')}"
+                        )
+                        solver_sidecar.append(
+                            "Observation: Tool generation blocked by semantic circuit breaker. "
+                            "A tool for this exact sample/archetype/target_concept already failed. "
+                            "Backtrack manually or try a different candidate path; do NOT trigger ToolGen again."
+                        )
+                elif _mid_task and not blocked_stuck_for_forge:
+                    action = "no_tool"
+                    forge_denied_reason = "not_blocked"
+                    self._append_loop_log(
+                        "  [FORGE POLICY] Mid-task Forge denied because the agent is not "
+                        "currently blocked/stuck enough to justify generation."
+                    )
+                else:
+                    forge_allowed = True
+                    forge_denied_reason = None
+                    if _mid_task:
+                        self._append_loop_log(
+                            f"  [FORGE POLICY] Mid-task Forge allowed "
+                            f"(blocked/stuck reason={blocked_stuck_reason})."
+                        )
+                    else:
+                        self._append_loop_log(
+                            "  [FORGE POLICY] Turn-0 Forge allowed."
+                        )
+                    self._append_loop_log(
+                        {
+                            "event": "forge_policy",
+                            "raw_action": _raw_action,
+                            "final_action": action,
+                            "toolgen_enabled": toolgen_enabled,
+                            "real_existing_tools_count": real_existing_tools_count,
+                            "blocked_stuck_for_forge": blocked_stuck_for_forge,
+                            "blocked_stuck_reason": blocked_stuck_reason,
+                            "forge_allowed": forge_allowed,
+                            "forge_denied_reason": forge_denied_reason,
+                        }
+                    )
                     print(
-                        "[TURN-0 GATE] Mid-task tool generation blocked. "
-                        f"Trace has {len(pre_orch_trace)} step(s). "
-                        "Forcing fallback to manual solver.",
+                        f"[LATM_FLOW] Forge reason: "
+                        f"{decision.get('reason')}",
                         file=sys.stderr,
                         flush=True,
                     )
+                    self._append_loop_log("  >>> ESCAPE HATCH TRIGGERED <<<")
+                    escape_result = self._handle_escape_hatch(
+                        decision, task_query, working_history
+                    )
+                    escape_message = ""
+                    if isinstance(escape_result, Mapping):
+                        escape_message = str(escape_result.get("observation") or "")
+                    if not escape_message:
+                        escape_message = str(escape_result)
+                    if isinstance(escape_result, Mapping) and escape_result.get("success"):
+                        self._register_tool_semantic_goal(
+                            tool_name=escape_result.get("tool_name"),
+                            semantic_key=semantic_goal_key,
+                        )
+                    else:
+                        self._record_semantic_goal_failure(
+                            semantic_key=semantic_goal_key,
+                            tool_name=(
+                                escape_result.get("tool_name")
+                                if isinstance(escape_result, Mapping)
+                                else None
+                            ),
+                            reason=escape_message,
+                        )
+                    escape_status = "success" if "successfully created" in escape_message else "failure"
                     self._append_loop_log(
-                        f"  [TURN-0 GATE] request_new_tool blocked mid-task "
-                        f"(trace has {len(pre_orch_trace)} steps). Forcing no_tool."
+                        {
+                            "event": "escape_hatch_complete",
+                            "turn": turn_id,
+                            "status": escape_status,
+                            "message": escape_message,
+                        }
                     )
-                    action = "no_tool"
-                else:
-                    # Turn 0: no actions taken yet — Forge is allowed.
-                    # Graceful Degradation gate: if the triggering observation was
-                    # a macro that returned MACRO EXHAUSTED but still minted a
-                    # valid partial Variable (e.g., #4), the Solver can use that
-                    # variable directly.  Firing the Forge here would overfit on a
-                    # task where the tool actually did useful work — skip it.
-                    _last_obs_text = ""
-                    if pre_orch_obs is not None:
-                        _last_obs_text = str(pre_orch_obs.get("output") or "")
-                    if not _last_obs_text and pre_orch_trace:
-                        _last_obs_text = str(pre_orch_trace[-1].get("output") or "")
-                    _is_graceful_degradation = (
-                        "MACRO EXHAUSTED" in _last_obs_text
-                        and bool(re.search(r"#\d+", _last_obs_text))
+                    self._append_loop_log(
+                        f"  escape_hatch: success={escape_result.get('success')} "
+                        f"new_tool={escape_result.get('tool_name') or '-'}"
                     )
-                    if _is_graceful_degradation:
+                    # Re-run the Orchestrator with the ToolGen observation so it
+                    # can see the refreshed catalog and select the new tool.
+                    print(
+                        "\n[DEBUG] Entering Orchestrator Decision Phase (post-escape)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    decision = self._orchestrate_decision(
+                        task_query,
+                        working_history,
+                        solver_recommendation=escape_result["observation"],
+                        observation_triggers=observation_triggers,
+                        last_observation=pre_orch_obs,
+                        stagnation_count=stagnation_count,
+                    )
+                    tool_plan = (
+                        self._build_tool_plan(decision)
+                        if isinstance(decision, Mapping)
+                        else {}
+                    )
+                    if isinstance(decision, dict):
+                        decision["tool_plan"] = tool_plan
+                    print(
+                        f"[DEBUG] Orchestrator Decision (post-escape): {decision}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    action = decision.get("action", "no_tool")
+                    if (
+                        self._toolgen_off
+                        and not self._force_toolgen_always_on
+                        and action in {"create_tool", "request_new_tool"}
+                    ):
+                        action = "use_tool"
+                    # Hard blacklist: suppress re-invocation of exhausted macros post-escape too.
+                    if action == "use_tool" and decision.get("tool_name") in self._exhausted_macros:
                         self._append_loop_log(
-                            "  [GRACEFUL DEGRADATION] Macro returned MACRO EXHAUSTED "
-                            "with a valid partial Variable — skipping Forge. "
-                            "Solver will use the partial result directly."
+                            f"  [BLACKLIST] Suppressed use_tool (post-escape) for exhausted macro: "
+                            f"{decision.get('tool_name')} → forcing no_tool"
                         )
                         action = "no_tool"
-                    else:
-                        print(
-                            f"[LATM_FLOW] Forge reason: "
-                            f"{decision.get('reason')}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        self._append_loop_log("  >>> ESCAPE HATCH TRIGGERED <<<")
-                        escape_result = self._handle_escape_hatch(
-                            decision, task_query, working_history
-                        )
-                        escape_message = ""
-                        if isinstance(escape_result, Mapping):
-                            escape_message = str(escape_result.get("observation") or "")
-                        if not escape_message:
-                            escape_message = str(escape_result)
-                        escape_status = "success" if "successfully created" in escape_message else "failure"
-                        self._append_loop_log(
-                            {
-                                "event": "escape_hatch_complete",
-                                "turn": turn_id,
-                                "status": escape_status,
-                                "message": escape_message,
-                            }
-                        )
-                        self._append_loop_log(
-                            f"  escape_hatch: success={escape_result.get('success')} "
-                            f"new_tool={escape_result.get('tool_name') or '-'}"
-                        )
-                        # Re-run the Orchestrator with the ToolGen observation so it
-                        # can see the refreshed catalog and select the new tool.
-                        print(
-                            "\n[DEBUG] Entering Orchestrator Decision Phase (post-escape)",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        decision = self._orchestrate_decision(
-                            task_query,
-                            working_history,
-                            solver_recommendation=escape_result["observation"],
-                            observation_triggers=observation_triggers,
-                            last_observation=pre_orch_obs,
-                            stagnation_count=stagnation_count,
-                        )
-                        print(
-                            f"[DEBUG] Orchestrator Decision (post-escape): {decision}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        action = decision.get("action", "no_tool")
-                        if (
-                            self._toolgen_off
-                            and not self._force_toolgen_always_on
-                            and action in {"create_tool", "request_new_tool"}
+                    if isinstance(self._last_turn_data, dict):
+                        decision_record = dict(decision)
+                        decision_record["action"] = action
+                        decision_record["_stage"] = "post_escape"
+                        self._last_turn_data["orchestrator_decision"] = decision_record
+                        if isinstance(
+                            self._last_turn_data.get("orchestrator_decisions"), list
                         ):
-                            action = "use_tool"
-                        # Hard blacklist: suppress re-invocation of exhausted macros post-escape too.
-                        if action == "use_tool" and decision.get("tool_name") in self._exhausted_macros:
-                            self._append_loop_log(
-                                f"  [BLACKLIST] Suppressed use_tool (post-escape) for exhausted macro: "
-                                f"{decision.get('tool_name')} → forcing no_tool"
+                            self._last_turn_data["orchestrator_decisions"].append(
+                                decision_record
                             )
-                            action = "no_tool"
-                        if isinstance(self._last_turn_data, dict):
-                            decision_record = dict(decision)
-                            decision_record["action"] = action
-                            decision_record["_stage"] = "post_escape"
-                            self._last_turn_data["orchestrator_decision"] = decision_record
-                            if isinstance(
-                                self._last_turn_data.get("orchestrator_decisions"), list
-                            ):
-                                self._last_turn_data["orchestrator_decisions"].append(
-                                    decision_record
-                                )
+                    self._append_loop_log(
+                        f"  orchestrator (post-escape): action={action} "
+                        f"tool={decision.get('tool_name') or '-'}"
+                    )
+                    if tool_plan:
                         self._append_loop_log(
-                            f"  orchestrator (post-escape): action={action} "
-                            f"tool={decision.get('tool_name') or '-'}"
+                            f"  tool_plan (post-escape): target={tool_plan.get('target_concept') or '-'} "
+                            f"steps={len(tool_plan.get('topological_execution_plan_steps') or [])} "
+                            f"composite={tool_plan.get('composite_topology') or []}"
                         )
+                if not forge_allowed:
+                    self._append_loop_log(
+                        {
+                            "event": "forge_policy",
+                            "raw_action": _raw_action,
+                            "final_action": action,
+                            "toolgen_enabled": toolgen_enabled,
+                            "real_existing_tools_count": real_existing_tools_count,
+                            "blocked_stuck_for_forge": blocked_stuck_for_forge,
+                            "blocked_stuck_reason": blocked_stuck_reason,
+                            "forge_allowed": forge_allowed,
+                            "forge_denied_reason": forge_denied_reason,
+                        }
+                    )
 
             if action == "no_tool":
                 if not init_solver:
@@ -1732,12 +2083,29 @@ class SelfEvolvingController(
             if action in {"use_tool", "create_tool"}:
                 tool_agent_traced = True
                 tool_action = action
+                created_tool_name: Optional[str] = None
+                semantic_goal_key = self._semantic_goal_key_from_decision(decision)
                 self._toolgen_last_orchestrator_reason = decision.get("reason")
                 self._toolgen_last_orchestrator_gap = decision.get("insufficiency")
                 self._toolgen_last_orchestrator_needed = decision.get("needed_capabilities")
                 tool_suggestion = {
                     "tool_name": decision.get("tool_name"),
                     "reason": decision.get("reason"),
+                    "tool_plan": tool_plan,
+                    "target_concept": tool_plan.get("target_concept"),
+                    "execution_style": tool_plan.get("execution_style"),
+                    "preferred_tool_mode": tool_plan.get("preferred_tool_mode"),
+                    "fallback_strategies": tool_plan.get("fallback_strategies"),
+                    "entity_target_concepts": tool_plan.get("entity_target_concepts"),
+                    "recovery_policy": tool_plan.get("recovery_policy"),
+                    "topological_execution_plan": tool_plan.get("topological_execution_plan"),
+                    "composite_topology": tool_plan.get("composite_topology"),
+                    "attribute_target_concept": tool_plan.get("attribute_target_concept"),
+                    "intermediate_target_concepts": tool_plan.get(
+                        "intermediate_target_concepts"
+                    ),
+                    "target_archetype": tool_plan.get("target_archetype"),
+                    "domain_hints": tool_plan.get("domain_hints"),
                 }
 
                 if tool_action == "create_tool":
@@ -1746,10 +2114,30 @@ class SelfEvolvingController(
                     selected_tool = self._maybe_generate_tool_for_query(
                         task_query, working_history, allow_reuse=False, force=True
                     )
+                    if isinstance(selected_tool, Mapping) and selected_tool.get("error"):
+                        tool_error = str(
+                            selected_tool.get("observation")
+                            or selected_tool.get("error")
+                            or "tool generation failed"
+                        )
+                        if selected_tool.get("error") == "flawed_plan_requires_reorchestration":
+                            self._append_loop_log(
+                                {
+                                    "event": "toolgen_reorchestrate_requested",
+                                    "stage": "create_tool",
+                                    "reason": "flawed_plan",
+                                    "message": tool_error,
+                                }
+                            )
+                        selected_tool = None
                     if selected_tool is None:
                         self._trace("registry_add_failed", "tool generation failed")
-                        self._append_loop_log("  create_tool: FAILED (toolgen returned None)")
+                        self._append_loop_log("  create_tool: FAILED (toolgen returned no registrable tool)")
                         tool_error = tool_error or "tool generation failed"
+                        self._record_semantic_goal_failure(
+                            semantic_key=semantic_goal_key,
+                            reason=tool_error,
+                        )
                         _record_tool_error("create_tool", tool_error)
                         tool_result = ToolResult.failure(tool_error)
                         solver_sidecar.append(
@@ -1759,18 +2147,77 @@ class SelfEvolvingController(
                     else:
                         self._trace("registry_add", selected_tool.name)
                         self._append_loop_log(f"  create_tool: OK → {selected_tool.name}")
+                        created_tool_name = selected_tool.name
+                        # Engage the forced same-turn invocation bypass so the
+                        # just-created tool is guaranteed to reach _tool_invoker_decision
+                        # with force_include_tool_name set (identical to the escape-hatch path).
+                        setattr(self, "_forced_invoker_tool", selected_tool.name)
+                        self._register_tool_semantic_goal(
+                            tool_name=selected_tool.name,
+                            semantic_key=semantic_goal_key,
+                        )
                         tool_suggestion["tool_name"] = selected_tool.name
+                        tool_suggestion["created_tool_name"] = selected_tool.name
+                        tool_suggestion["invocation_trigger"] = "post_create"
+                        try:
+                            self._append_generated_tools_log(
+                                {
+                                    "event": "tool_create_success",
+                                    "tool_name": selected_tool.name,
+                                    "invocation_trigger": "post_create",
+                                    "immediate_invoke_expected": True,
+                                    "environment_label": self._resolved_environment_label(),
+                                    "execution_style": tool_plan.get("execution_style"),
+                                    "preferred_tool_mode": tool_plan.get("preferred_tool_mode"),
+                                    "target_archetype": tool_plan.get("target_archetype"),
+                                }
+                            )
+                        except Exception:
+                            pass
 
                 if not tool_result_injected:
+                    if tool_action == "create_tool" and created_tool_name:
+                        try:
+                            self._append_generated_tools_log(
+                                {
+                                    "event": "tool_immediate_invoke_attempt",
+                                    "tool_name": created_tool_name,
+                                    "invocation_trigger": "post_create",
+                                    "environment_label": self._resolved_environment_label(),
+                                }
+                            )
+                        except Exception:
+                            pass
                     tool_invoker = self._tool_invoker_decision(
                         task_query, working_history, suggestion=tool_suggestion
                     )
                     tool_name = tool_invoker.get("tool_name")
                     payload = tool_invoker.get("payload")
+                    tool_invoker_reason = str(tool_invoker.get("reason") or "").strip()
+                    if tool_action == "create_tool" and created_tool_name:
+                        try:
+                            self._append_generated_tools_log(
+                                {
+                                    "event": "tool_immediate_invoke_selection",
+                                    "tool_name": tool_name,
+                                    "created_tool_name": created_tool_name,
+                                    "selected_created_tool": bool(
+                                        tool_name and str(tool_name) == created_tool_name
+                                    ),
+                                    "selection_reason": tool_invoker_reason or None,
+                                    "environment_label": self._resolved_environment_label(),
+                                }
+                            )
+                        except Exception:
+                            pass
                     self._append_loop_log(
                         f"  tool_invoker: selected={tool_name or '-'}"
                     )
                     if tool_name:
+                        self._register_tool_semantic_goal(
+                            tool_name=tool_name,
+                            semantic_key=semantic_goal_key,
+                        )
                         args_auto_built = False
                         if not tool_result_injected:
                             contract = self._parse_tool_invoke_contract(tool_name)
@@ -1805,7 +2252,27 @@ class SelfEvolvingController(
                             payload_map.setdefault("run_id", _inv_run_id)
                             payload_map.setdefault("state_dir", _inv_state_dir)
                             payload_map.setdefault("actions_spec", self._available_actions_spec())
-                            payload_map.setdefault("entities", [])
+                            payload_map.setdefault(
+                                "entities",
+                                list((tool_plan or {}).get("entities") or []),
+                            )
+                            payload_map.setdefault("tool_plan", tool_plan)
+                            for _plan_key in (
+                                "target_concept",
+                                "execution_style",
+                                "preferred_tool_mode",
+                                "fallback_strategies",
+                                "entity_target_concepts",
+                                "attribute_target_concept",
+                                "intermediate_target_concepts",
+                                "topological_execution_plan",
+                                "composite_topology",
+                                "recovery_policy",
+                                "target_archetype",
+                                "domain_hints",
+                            ):
+                                if tool_plan.get(_plan_key) not in (None, "", [], {}):
+                                    payload_map.setdefault(_plan_key, tool_plan.get(_plan_key))
                             # Fallback: extract entities from task_query
                             # when the Tool Invoker LLM omits them.
                             _ent_val = payload_map.get("entities")
@@ -1846,6 +2313,14 @@ class SelfEvolvingController(
                             payload_map["trace"] = structured_trace
                             if last_obs is not None:
                                 payload_map["env_observation"] = last_obs
+                            elif not structured_trace:
+                                # Fallback: no structured trace steps found (e.g. no solver
+                                # primitive actions yet, or actions not in Action:xxx() format).
+                                # Use the raw last USER observation from history so the tool
+                                # receives the most recent environment context available.
+                                _raw_last_obs = self._get_last_env_observation(working_history)
+                                if _raw_last_obs:
+                                    payload_map["env_observation"] = _raw_last_obs
                             if isinstance(payload_map.get("actions_spec"), Mapping):
                                 last_tool_actions_spec = payload_map.get("actions_spec")
                             payload_keys = sorted(str(k) for k in payload_map.keys())
@@ -1857,7 +2332,7 @@ class SelfEvolvingController(
                                         "run_id": payload_map.get("run_id"),
                                         "trace_len": len(structured_trace),
                                         "trace_tail": self._truncate_for_log(structured_trace[-3:]),
-                                        "env_observation": self._truncate_for_log(last_obs),
+                                        "env_observation": self._truncate_for_log(payload_map.get("env_observation")),
                                     }
                                 )
                             except Exception:
@@ -1872,6 +2347,26 @@ class SelfEvolvingController(
                             for key in optional_keys:
                                 if key in payload_map:
                                     payload_for_tool[key] = payload_map[key]
+                            # Force-overwrite: the Orchestrator's decision is the
+                            # authoritative source for semantic routing keys and always
+                            # takes precedence over the Invoker's (potentially hallucinated) output.
+                            payload_for_tool["tool_plan"] = tool_plan
+                            for _skey in (
+                                "target_concept",
+                                "execution_style",
+                                "preferred_tool_mode",
+                                "fallback_strategies",
+                                "entity_target_concepts",
+                                "attribute_target_concept",
+                                "intermediate_target_concepts",
+                                "recovery_policy",
+                                "topological_execution_plan",
+                                "composite_topology",
+                                "target_archetype",
+                                "domain_hints",
+                            ):
+                                if tool_plan.get(_skey) not in (None, "", [], {}):
+                                    payload_for_tool[_skey] = tool_plan.get(_skey)
                             try:
                                 self._append_generated_tools_log(
                                     {
@@ -1899,6 +2394,7 @@ class SelfEvolvingController(
                                 self._log_failed_invoke_event(
                                     tool_name=tool_name,
                                     reason=tool_error,
+                                    decision_action=tool_action,
                                 )
                                 _record_tool_error("tool_invoker", tool_error)
                                 tool_result = ToolResult.failure(tool_error)
@@ -1915,6 +2411,7 @@ class SelfEvolvingController(
                                     self._log_failed_invoke_event(
                                         tool_name=tool_name,
                                         reason=tool_error,
+                                        decision_action=tool_action,
                                     )
                                     _record_tool_error("tool_invoker", tool_error)
                                     tool_result = ToolResult.failure(tool_error)
@@ -1950,6 +2447,7 @@ class SelfEvolvingController(
                                         self._log_failed_invoke_event(
                                             tool_name=tool_name,
                                             reason="duplicate_tool_signature_suppressed",
+                                            decision_action=tool_action,
                                         )
                                         solver_sidecar.append(
                                             "Observation: This exact tool has already been called "
@@ -1982,6 +2480,7 @@ class SelfEvolvingController(
                                             self._log_failed_invoke_event(
                                                 tool_name=tool_name,
                                                 reason=tool_error,
+                                                decision_action=tool_action,
                                             )
                                             solver_sidecar.append(duplicate_observation)
                                             tool_result = ToolResult.failure(tool_error)
@@ -2029,11 +2528,41 @@ class SelfEvolvingController(
                                                         or tool_result.output.get("answer_recommendation")
                                                         or ""
                                                     )
+                                                if self._is_genuinely_empty_semantic_filter_reason(_obs_str):
+                                                    self._record_semantic_goal_failure(
+                                                        semantic_key=(
+                                                            self._tool_semantic_goal_by_name.get(tool_name)
+                                                            or semantic_goal_key
+                                                        ),
+                                                        tool_name=tool_name,
+                                                        reason=_obs_str,
+                                                    )
                                                 if "MACRO EXHAUSTED" in _obs_str:
                                                     self._exhausted_macros.add(tool_name)
+                                                    self._record_semantic_goal_failure(
+                                                        semantic_key=(
+                                                            self._tool_semantic_goal_by_name.get(tool_name)
+                                                            or semantic_goal_key
+                                                        ),
+                                                        tool_name=tool_name,
+                                                        reason=_obs_str,
+                                                    )
                                                     self._append_loop_log(
                                                         f"  [BLACKLIST] Added '{tool_name}' to "
                                                         f"exhausted_macros (MACRO EXHAUSTED detected)"
+                                                    )
+                                                elif not tool_result.success:
+                                                    self._record_semantic_goal_failure(
+                                                        semantic_key=(
+                                                            self._tool_semantic_goal_by_name.get(tool_name)
+                                                            or semantic_goal_key
+                                                        ),
+                                                        tool_name=tool_name,
+                                                        reason=str(
+                                                            tool_result.error
+                                                            or tool_result.output
+                                                            or "tool_invoke_failed"
+                                                        ),
                                                     )
 
                             if not tool_result_injected:
@@ -2095,6 +2624,17 @@ class SelfEvolvingController(
                                         result=tool_result,
                                     )
                                 )
+                                handoff = self._classify_tool_handoff(tool_name, tool_result)
+                                self._last_tool_handoff = handoff
+                                self._append_loop_log(
+                                    f"  tool_handoff: state={handoff.get('handoff_state')} "
+                                    f"status={handoff.get('tool_status')} "
+                                    f"trust={handoff.get('semantic_trust_level')} "
+                                    f"class={handoff.get('trust_classification')} "
+                                    f"safe={handoff.get('safe_to_continue')} "
+                                    f"final_safe={handoff.get('final_operation_safe')} "
+                                    f"next={handoff.get('recommended_next_action_category')}"
+                                )
                                 # Route to advisory formatter if tool uses advisory schema
                                 if self._is_advisory_result(tool_result):
                                     solver_sidecar.append(
@@ -2105,12 +2645,41 @@ class SelfEvolvingController(
                                         self._format_tool_result(tool_name, tool_result)
                                     )
                                 tool_result_injected = True
+                    elif tool_invoker_reason == "no_compatible_tool":
+                        if tool_action == "create_tool" and created_tool_name:
+                            try:
+                                self._append_generated_tools_log(
+                                    {
+                                        "event": "tool_immediate_invoke_skipped",
+                                        "tool_name": created_tool_name,
+                                        "reason": "no_compatible_tool",
+                                        "environment_label": self._resolved_environment_label(),
+                                    }
+                                )
+                            except Exception:
+                                pass
+                        self._append_loop_log(
+                            "  tool_invoker: no compatible registry tool selected; continuing without tool"
+                        )
                     else:
                         tool_error = "tool_invoker_missing_tool_name"
                         self._log_failed_invoke_event(
                             tool_name=None,
                             reason=tool_error,
+                            decision_action=tool_action,
                         )
+                        if tool_action == "create_tool" and created_tool_name:
+                            try:
+                                self._append_generated_tools_log(
+                                    {
+                                        "event": "tool_immediate_invoke_skipped",
+                                        "tool_name": created_tool_name,
+                                        "reason": tool_error,
+                                        "environment_label": self._resolved_environment_label(),
+                                    }
+                                )
+                            except Exception:
+                                pass
                         _record_tool_error("tool_invoker", tool_error)
                         tool_result = ToolResult.failure(tool_error)
                         solver_sidecar.append(
@@ -2161,21 +2730,50 @@ class SelfEvolvingController(
                     "TOOL_ADVISORY" in s or "Recommendation:" in s or "Confidence:" in s
                     for s in solver_sidecar
                 )
+                last_handoff = (
+                    self._last_tool_handoff
+                    if isinstance(self._last_tool_handoff, Mapping)
+                    else {}
+                )
+                trust_classification = str(
+                    last_handoff.get("trust_classification") or ""
+                )
+                low_trust_tool = trust_classification in {
+                    "low_trust_ignore",
+                    "blocked_exhausted_ignore",
+                }
                 if has_advisory:
-                    solver_prompt = (
-                        solver_prompt
-                        + "\n\n### TOOL ADVISORY (CRITICAL)\n"
-                        + "A helper tool analyzed the data and provided this recommendation.\n"
-                        + "You MUST prioritize this recommendation when choosing your next action.\n\n"
-                        + sidecar_joined
-                    )
+                    if low_trust_tool:
+                        solver_prompt = (
+                            solver_prompt
+                            + "\n\n### LOW-TRUST TOOL ADVISORY\n"
+                            + "A helper tool returned low-trust or non-actionable output.\n"
+                            + "Do NOT prioritize it. Use it only as weak supplemental evidence if still relevant.\n\n"
+                            + sidecar_joined
+                        )
+                    else:
+                        solver_prompt = (
+                            solver_prompt
+                            + "\n\n### TOOL ADVISORY (CRITICAL)\n"
+                            + "A helper tool analyzed the data and provided this recommendation.\n"
+                            + "You MUST prioritize this recommendation when choosing your next action.\n\n"
+                            + sidecar_joined
+                        )
                 else:
-                    solver_prompt = (
-                        solver_prompt
-                        + "\n\nINTERNAL TOOL CONTEXT:\n"
-                        + "Tool results may include 'recommended_next_action' with args; consider using it if it fits.\n\n"
-                        + sidecar_joined
-                    )
+                    if low_trust_tool:
+                        solver_prompt = (
+                            solver_prompt
+                            + "\n\nINTERNAL TOOL CONTEXT:\n"
+                            + "The latest tool result is low trust. Do NOT submit from it directly; backtrack quickly unless the HANDOFF shows clearly useful partial context.\n\n"
+                            + sidecar_joined
+                        )
+                    else:
+                        solver_prompt = (
+                            solver_prompt
+                            + "\n\nINTERNAL TOOL CONTEXT:\n"
+                            + "Tool results may include 'recommended_next_action' with args; consider using it if it fits.\n\n"
+                            + sidecar_joined
+                        )
             history_text = self._toolgen_render_history(
                 working_history,
                 max_chars_per_item=1200,
@@ -2346,6 +2944,39 @@ class SelfEvolvingController(
                         run_id=last_tool_run_id,
                         state_dir=last_tool_state_dir,
                     )
+                try:
+                    last_handoff = (
+                        self._last_tool_handoff
+                        if isinstance(self._last_tool_handoff, Mapping)
+                        else {}
+                    )
+                    trust_classification = str(
+                        last_handoff.get("trust_classification") or ""
+                    )
+                    downstream_treatment = (
+                        "ignored_low_trust"
+                        if trust_classification in {
+                            "low_trust_ignore",
+                            "blocked_exhausted_ignore",
+                        }
+                        else "usable"
+                    )
+                    self._append_tool_value_trace(
+                        "solver_tool_follow_or_ignore",
+                        tool_name=last_tool_name,
+                        recommendation=self._last_tool_recommendation,
+                        confidence=self._last_tool_confidence,
+                        executed_action=executed_action,
+                        followed_recommendation=self._solver_followed_recommendation,
+                        trust_classification=trust_classification,
+                        handoff_state=last_handoff.get("handoff_state"),
+                        semantic_trust_level=last_handoff.get("semantic_trust_level"),
+                        final_operation_safe=last_handoff.get("final_operation_safe"),
+                        downstream_treatment=downstream_treatment,
+                        ignore_reason=last_handoff.get("ignore_reason"),
+                    )
+                except Exception:
+                    pass
             self._log_flow_event(
                 "final_response",
                 chat_history=working_history,

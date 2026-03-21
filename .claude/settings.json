@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/christopherclark/**)",
+      "Read(//opt/anaconda3/envs/lifelong/etc/conda/**)",
+      "Read(//dev/**)",
+      "Bash(curl -s http://127.0.0.1:3001/kb/sparql)",
+      "Bash(echo \"exit:$?\")"
+    ]
+  }
+}

@@ -154,6 +154,90 @@ class ControllerLoggingMixin:
             return None
         return self._generated_tools_log_path.parent / prefix_filename("tool_invoker_io.log")
 
+    def _tool_value_trace_log_path(self) -> Optional[Path]:
+        if not self._generated_tools_log_path:
+            return None
+        return self._generated_tools_log_path.parent / prefix_filename("tool_value_trace.jsonl")
+
+    def _orchestrator_plan_trace_log_path(self) -> Optional[Path]:
+        if not self._generated_tools_log_path:
+            return None
+        return self._generated_tools_log_path.parent / prefix_filename("orchestrator_plan_trace.jsonl")
+
+    def _append_orchestrator_plan_trace(self, **fields: Any) -> None:
+        """Append one entry to orchestrator_plan_trace.jsonl.
+
+        Purely observational — never raises, never changes behaviour.
+        Emitted after the final orchestrator tool_plan is built, before ToolGen
+        or the Tool Invoker consumes it.
+        """
+        log_path = self._orchestrator_plan_trace_log_path()
+        if log_path is None:
+            return
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            meta = self._get_run_task_metadata()
+            plan_steps = fields.get("topological_execution_plan") or []
+            plan_text_compact = " | ".join(
+                str(s).replace("\n", " ").strip()
+                for s in (plan_steps if isinstance(plan_steps, list) else [plan_steps])
+                if s
+            )[:400]
+            data: dict[str, Any] = {
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "event": "orchestrator_plan_trace",
+                "task_name": meta.get("task_name"),
+                "sample_index": meta.get("sample_index"),
+            }
+            data.update({k: v for k, v in fields.items() if v is not None})
+            # Convenience diagnostics
+            etc = fields.get("entity_target_concepts") or []
+            dh = fields.get("domain_hints") or []
+            itc = fields.get("intermediate_target_concepts") or []
+            atc = fields.get("attribute_target_concept") or ""
+            data["entity_count"] = len(fields.get("entities") or [])
+            data["plan_step_count"] = len(plan_steps) if isinstance(plan_steps, list) else 0
+            data["has_entity_target_concepts"] = bool(etc)
+            data["has_domain_hints"] = bool(dh)
+            data["has_intermediate_target_concepts"] = bool(itc)
+            data["has_attribute_target_concept"] = bool(atc)
+            data["plan_text_compact"] = plan_text_compact
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(data, ensure_ascii=True, default=str) + "\n")
+        except Exception:
+            return
+
+    def _append_tool_value_trace(self, event: str, **fields: Any) -> None:
+        log_path = self._tool_value_trace_log_path()
+        if log_path is None:
+            return
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            meta = self._get_run_task_metadata()
+            data: dict[str, Any] = {
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "event": event,
+                "task_name": meta.get("task_name"),
+                "sample_index": meta.get("sample_index"),
+            }
+            data.update({k: v for k, v in fields.items() if v is not None})
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(data, ensure_ascii=True, default=str) + "\n")
+        except Exception:
+            return
+
+    def _append_toolgen_strategy_classification(self, **fields: Any) -> None:
+        self._append_tool_value_trace("toolgen_strategy_classification", **fields)
+
+    def _append_toolgen_failure_classification(self, **fields: Any) -> None:
+        self._append_tool_value_trace("toolgen_failure_classification", **fields)
+
+    def _append_toolgen_value_delivered(self, **fields: Any) -> None:
+        self._append_tool_value_trace("toolgen_value_delivered", **fields)
+
+    def _append_toolgen_strategy_pivot(self, **fields: Any) -> None:
+        self._append_tool_value_trace("toolgen_strategy_pivot", **fields)
+
     def _append_solver_io_log(self, payload: Mapping[str, Any]) -> None:
         log_path = self._solver_io_log_path()
         if log_path is None:
@@ -751,8 +835,6 @@ class ControllerLoggingMixin:
         args_auto_built: bool = False,
         decision_action: Optional[str] = None,
     ) -> None:
-        if os.getenv("GENERATED_TOOLS_LOG_SOURCE", "registry") == "registry":
-            return
         payload: dict[str, Any] = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "event": "invoke",
@@ -776,9 +858,8 @@ class ControllerLoggingMixin:
         *,
         tool_name: Optional[str],
         reason: str,
+        decision_action: Optional[str] = None,
     ) -> None:
-        if os.getenv("GENERATED_TOOLS_LOG_SOURCE", "registry") == "registry":
-            return
         payload: dict[str, Any] = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "event": "failed_invoke",
@@ -787,6 +868,8 @@ class ControllerLoggingMixin:
             "environment_label": self._resolved_environment_label(),
             "source": "controller",
         }
+        if decision_action:
+            payload["decision_action"] = decision_action
         payload.update(self._get_run_task_metadata())
         self._append_generated_tools_log(payload)
 

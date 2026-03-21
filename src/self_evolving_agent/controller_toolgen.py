@@ -33,7 +33,11 @@ from .controller_prompts import (
     MACRO_TOOLGEN_USER_KG,
     ARCHETYPE_REGISTRY,
     ARCHETYPE_INSTRUCTIONS,
-    _ARCHETYPE_INSTRUCTIONS_DEFAULT,
+    EXECUTION_STYLE_VOCAB,
+    FAILURE_FAMILY_VOCAB,
+    PREFERRED_TOOL_MODE_VOCAB,
+    STRATEGY_FAMILY_VOCAB,
+    VALUE_DELIVERED_VOCAB,
 )
 from .toolgen_contracts import TOOL_START, TOOL_END, validate_toolgen_output
 from src.toolgen.prompts import get_toolgen_system_prompt
@@ -112,6 +116,1534 @@ class ControllerToolgenMixin:
             '"actions_spec", "run_id", "state_dir", "entities"]'
         ),
     }
+
+    @staticmethod
+    def _normalize_vocab_value(
+        value: Any,
+        allowed: tuple[str, ...],
+        *,
+        default: str = "",
+    ) -> str:
+        text = str(value or "").strip()
+        if text in allowed:
+            return text
+        return default
+
+    @staticmethod
+    def _normalize_vocab_list(
+        values: Any,
+        allowed: tuple[str, ...],
+        *,
+        max_len: Optional[int] = 3,
+    ) -> list[str]:
+        if isinstance(values, str):
+            items = [values]
+        elif isinstance(values, Sequence):
+            items = [str(item or "").strip() for item in values]
+        else:
+            items = []
+        normalized: list[str] = []
+        for item in items:
+            if item in allowed and item not in normalized:
+                normalized.append(item)
+            if max_len is not None and len(normalized) >= max_len:
+                break
+        return normalized
+
+    @staticmethod
+    def _toolgen_default_preferred_tool_mode_for_execution_style(
+        execution_style: str,
+    ) -> str:
+        if execution_style == "diagnostic_first":
+            return "diagnostic_probe"
+        if execution_style == "partial_value_first":
+            return "progress_tool"
+        return "full_solve"
+
+    def _toolgen_strategy_sequence(
+        self,
+        primary_strategy: str,
+        fallback_strategies: Any,
+    ) -> list[str]:
+        sequence: list[str] = []
+        for item in [primary_strategy] + self._normalize_vocab_list(
+            fallback_strategies,
+            STRATEGY_FAMILY_VOCAB,
+            max_len=None,
+        ):
+            if item in STRATEGY_FAMILY_VOCAB and item not in sequence:
+                sequence.append(item)
+        if not sequence:
+            sequence.append("generic_macro")
+        return sequence
+
+    def _toolgen_strategy_defaults(
+        self,
+        strategy_family: str,
+        *,
+        current_execution_style: str = "",
+        current_preferred_tool_mode: str = "",
+    ) -> tuple[str, str]:
+        strategy_family = self._normalize_vocab_value(
+            strategy_family,
+            STRATEGY_FAMILY_VOCAB,
+            default="generic_macro",
+        )
+        execution_style = {
+            "direct_relation": "relation_first",
+            "walk_first": "walk_first",
+            "relation_first": "relation_first",
+            "probe_then_commit": "probe_then_commit",
+            "set_builder": "partial_value_first",
+            "intersector_counter": "partial_value_first",
+            "attribute_preparer": "attribute_mapping_first",
+            "shared_trait_pivot": "probe_then_commit",
+            "superlative_finder": "attribute_mapping_first",
+            "partial_handoff": "partial_value_first",
+            "diagnostic_probe": "diagnostic_first",
+            "generic_macro": "walk_first",
+        }.get(
+            strategy_family,
+            self._normalize_vocab_value(
+                current_execution_style,
+                EXECUTION_STYLE_VOCAB,
+                default="walk_first",
+            ),
+        )
+        preferred_tool_mode = {
+            "direct_relation": "progress_tool",
+            "set_builder": "progress_tool",
+            "intersector_counter": "progress_tool",
+            "partial_handoff": "progress_tool",
+            "diagnostic_probe": "diagnostic_probe",
+        }.get(
+            strategy_family,
+            self._normalize_vocab_value(
+                current_preferred_tool_mode,
+                PREFERRED_TOOL_MODE_VOCAB,
+                default="",
+            )
+            or self._toolgen_default_preferred_tool_mode_for_execution_style(
+                execution_style
+            ),
+        )
+        return execution_style, preferred_tool_mode
+
+    @staticmethod
+    def _toolgen_value_delivered_rank(value_delivered: str) -> int:
+        return {
+            "none": 0,
+            "resolved_anchor": 1,
+            "resolved_both_anchors": 1,
+            "built_target_set": 2,
+            "built_both_sets": 2,
+            "built_intersection_set": 2,
+            "built_attribute_context": 2,
+            "identified_relation_candidates": 3,
+            "identified_relation_family": 3,
+            "produced_actionable_handoff": 3,
+            "produced_final_variable": 4,
+        }.get(str(value_delivered or ""), 0)
+
+    @staticmethod
+    def _toolgen_semantic_trust_rank(trust_level: str) -> int:
+        return {
+            "blocked": 0,
+            "fallback_unverified": 1,
+            "partial_unverified": 2,
+            "verified": 3,
+            "trusted": 4,
+        }.get(str(trust_level or ""), 0)
+
+    @staticmethod
+    def _toolgen_failure_bucket_rank(failure_bucket: str) -> int:
+        if str(failure_bucket or "") == "integration_context_invalid":
+            return 0
+        return 1
+
+    @staticmethod
+    def _toolgen_achieved_state_for_value(value_delivered: str) -> str:
+        value = str(value_delivered or "")
+        if value == "produced_final_variable":
+            return "produced_final_variable"
+        if value in {
+            "produced_actionable_handoff",
+            "identified_relation_candidates",
+            "identified_relation_family",
+        }:
+            return "produced_actionable_handoff"
+        if value in {
+            "built_target_set",
+            "built_both_sets",
+            "built_intersection_set",
+            "built_attribute_context",
+        }:
+            return "built_target_set"
+        if value in {"resolved_anchor", "resolved_both_anchors"}:
+            return "resolved_anchors"
+        return "none"
+
+    @staticmethod
+    def _toolgen_achieved_state_rank(state: str) -> int:
+        return {
+            "none": 0,
+            "resolved_anchors": 1,
+            "built_target_set": 2,
+            "produced_actionable_handoff": 3,
+            "produced_final_variable": 4,
+        }.get(str(state or ""), 0)
+
+    @staticmethod
+    def _toolgen_candidate_validation(
+        candidate: Optional[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        if not isinstance(candidate, Mapping):
+            return {}
+        validation = candidate.get("validation")
+        if isinstance(validation, Mapping):
+            return validation
+        return candidate
+
+    def _toolgen_candidate_semantic_code_smells(
+        self,
+        candidate: Optional[Mapping[str, Any]],
+    ) -> list[str]:
+        validation = self._toolgen_candidate_validation(candidate)
+        smells = validation.get("semantic_code_smells")
+        if isinstance(smells, Sequence) and not isinstance(smells, str):
+            return [str(item or "") for item in smells if str(item or "").strip()]
+        if isinstance(candidate, Mapping):
+            tool_code = str(candidate.get("tool_code") or "")
+            if tool_code:
+                return self._toolgen_semantic_code_smells(tool_code)
+        return []
+
+    @staticmethod
+    def _toolgen_adapter_shape_smells(smells: Sequence[str]) -> list[str]:
+        adapter_smells = {
+            "kg_utils_shape_probing",
+            "noncanonical_helper_surface",
+        }
+        return [str(smell or "") for smell in (smells or []) if str(smell or "") in adapter_smells]
+
+    def _toolgen_candidate_grade(
+        self,
+        candidate: Optional[Mapping[str, Any]],
+    ) -> int:
+        validation = self._toolgen_candidate_validation(candidate)
+        try:
+            return int(validation.get("grade") or -1)
+        except Exception:
+            return -1
+
+    def _toolgen_has_cleaner_prior_candidate(
+        self,
+        round_history: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        for entry in round_history:
+            smells = entry.get("semantic_code_smells") or []
+            if isinstance(smells, str):
+                smells = [smells]
+            if self._toolgen_adapter_shape_smells(smells):
+                continue
+            if bool(entry.get("partial_value_usable")) or bool(entry.get("material_progress")):
+                return True
+        return False
+
+    def _toolgen_apply_adapter_regression_guard(
+        self,
+        validation: Mapping[str, Any],
+        *,
+        round_history: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        result = dict(validation)
+        smells = result.get("semantic_code_smells") or []
+        if isinstance(smells, str):
+            smells = [smells]
+        adapter_smells = self._toolgen_adapter_shape_smells(smells)
+        if not adapter_smells or not self._toolgen_has_cleaner_prior_candidate(round_history):
+            return result
+        try:
+            grade = int(result.get("grade") or 0)
+        except Exception:
+            grade = 0
+        result["grade"] = min(grade, 4)
+        result["usefulness_passed"] = False
+        result["usefulness_reason"] = "adapter_shape_regression_after_cleaner_candidate"
+        result["grade_cap_reason"] = "adapter_shape_regression_after_cleaner_candidate"
+        result["repair_mode"] = "rewrite_code"
+        issues = result.get("issues")
+        if not isinstance(issues, list):
+            issues = [str(issues or "")]
+        issues = [str(item or "") for item in issues if str(item or "").strip()]
+        issues.append(
+            "Adapter-style probing regressed after an earlier cleaner candidate. Remove hasattr/getattr/dict-vs-object helper branching."
+        )
+        result["issues"] = issues
+        if not str(result.get("summary") or "").strip():
+            result["summary"] = "adapter_shape_regression_after_cleaner_candidate"
+        return result
+
+    def _toolgen_adapter_feedback_note(
+        self,
+        validation: Optional[Mapping[str, Any]],
+    ) -> str:
+        if not isinstance(validation, Mapping):
+            return ""
+        smells = validation.get("semantic_code_smells") or []
+        if isinstance(smells, str):
+            smells = [smells]
+        if not self._toolgen_adapter_shape_smells(smells):
+            return ""
+        return (
+            "CRITICAL: Remove adapter-style probing. Do not use hasattr/getattr/isinstance "
+            "or dict-vs-object branching around kg_utils or actions_spec."
+        )
+
+    @staticmethod
+    def _toolgen_compact_patch_code_context(current_code: str) -> str:
+        if not current_code:
+            return ""
+        text = str(current_code)
+        lines = text.splitlines()
+        head = "\n".join(lines[:14]).strip()
+
+        def _extract(pattern: str) -> str:
+            match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+            return str(match.group(0) or "").strip() if match else ""
+
+        run_block = _extract(r"^def\s+run\s*\(.*?(?=^def\s+\w+\s*\(|^\S|\Z)")
+        self_test_block = _extract(r"^def\s+self_test\s*\(.*?(?=^\S|\Z)")
+        parts: list[str] = []
+        for chunk in (head, run_block, self_test_block):
+            chunk = str(chunk or "").strip()
+            if chunk and chunk not in parts:
+                parts.append(chunk)
+        compact = "\n\n".join(parts).strip()
+        if not compact:
+            compact = text.strip()
+        return compact[-12000:]
+
+    def _toolgen_candidate_selection_key(
+        self,
+        candidate: Optional[Mapping[str, Any]],
+        *,
+        partial_bank: bool = False,
+    ) -> tuple[int, int, int, int, int, int, int]:
+        validation = self._toolgen_candidate_validation(candidate)
+        value_delivered = str(validation.get("value_delivered") or "none")
+        partial_value_usable = bool(validation.get("partial_value_usable", False))
+        trust_level = str(validation.get("semantic_trust_level") or "")
+        failure_bucket = str(validation.get("failure_bucket") or "")
+        smells = self._toolgen_candidate_semantic_code_smells(candidate)
+        adapter_smells = self._toolgen_adapter_shape_smells(smells)
+        try:
+            grade = int(validation.get("grade") or -1)
+        except Exception:
+            grade = -1
+        full_rank = 1 if value_delivered == "produced_final_variable" else 0
+        partial_rank = 1 if partial_value_usable and full_rank == 0 else 0
+        value_rank = self._toolgen_value_delivered_rank(value_delivered)
+        trust_rank = self._toolgen_semantic_trust_rank(trust_level)
+        bucket_rank = self._toolgen_failure_bucket_rank(failure_bucket)
+        smell_rank = -(len(smells) + (2 * len(adapter_smells)))
+        if partial_bank:
+            return (
+                partial_rank,
+                value_rank,
+                trust_rank,
+                bucket_rank,
+                smell_rank,
+                grade,
+                full_rank,
+            )
+        return (
+            full_rank,
+            partial_rank,
+            value_rank,
+            trust_rank,
+            bucket_rank,
+            smell_rank,
+            grade,
+        )
+
+    def _toolgen_candidate_is_better(
+        self,
+        candidate: Optional[Mapping[str, Any]],
+        incumbent: Optional[Mapping[str, Any]],
+        *,
+        partial_bank: bool = False,
+    ) -> bool:
+        if not isinstance(candidate, Mapping):
+            return False
+        if not isinstance(incumbent, Mapping):
+            return True
+        return self._toolgen_candidate_selection_key(
+            candidate,
+            partial_bank=partial_bank,
+        ) > self._toolgen_candidate_selection_key(
+            incumbent,
+            partial_bank=partial_bank,
+        )
+
+    def _toolgen_candidate_is_partial_progress(
+        self,
+        candidate: Optional[Mapping[str, Any]],
+    ) -> bool:
+        validation = self._toolgen_candidate_validation(candidate)
+        return bool(
+            validation.get("partial_value_usable", False)
+            and str(validation.get("value_delivered") or "none")
+            != "produced_final_variable"
+            and validation.get("usefulness_passed", True)
+        )
+
+    def _toolgen_candidate_is_full_solve(
+        self,
+        candidate: Optional[Mapping[str, Any]],
+    ) -> bool:
+        validation = self._toolgen_candidate_validation(candidate)
+        return bool(
+            validation.get("usefulness_passed", False)
+            and str(validation.get("value_delivered") or "none")
+            == "produced_final_variable"
+        )
+
+    def _toolgen_should_early_stop_progress_tool(
+        self,
+        validation: Optional[Mapping[str, Any]],
+    ) -> bool:
+        if not isinstance(validation, Mapping):
+            return False
+        preferred_tool_mode = str(validation.get("preferred_tool_mode") or "")
+        semantic_trust_level = str(validation.get("semantic_trust_level") or "")
+        return bool(
+            preferred_tool_mode in {"progress_tool", "diagnostic_probe"}
+            and validation.get("usefulness_passed", False)
+            and validation.get("partial_value_usable", False)
+            and semantic_trust_level in {"verified", "trusted"}
+        )
+
+    def _toolgen_best_achieved_state_summary(
+        self,
+        round_history: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        best_entry: Optional[Mapping[str, Any]] = None
+        best_state = "none"
+        best_rank = 0
+        for entry in round_history:
+            state = self._toolgen_achieved_state_for_value(
+                str(entry.get("value_delivered") or "none")
+            )
+            rank = self._toolgen_achieved_state_rank(state)
+            if rank > best_rank:
+                best_rank = rank
+                best_state = state
+                best_entry = entry
+        return {
+            "best_achieved_state": best_state,
+            "best_achieved_round": (
+                (best_entry or {}).get("round") if isinstance(best_entry, Mapping) else None
+            ),
+            "best_achieved_tool_name": (
+                (best_entry or {}).get("tool_name")
+                if isinstance(best_entry, Mapping)
+                else None
+            ),
+            "best_achieved_value_delivered": (
+                str((best_entry or {}).get("value_delivered") or "none")
+                if isinstance(best_entry, Mapping)
+                else "none"
+            ),
+        }
+
+    @staticmethod
+    def _toolgen_integration_context_invalid_result(
+        *,
+        reason: str,
+        summary: str,
+    ) -> dict[str, Any]:
+        issue = f"execution_integration_context_invalid: {reason}"
+        return {
+            "grade": 0,
+            "status": "ERROR",
+            "final_variable": None,
+            "observation": issue,
+            "issues": [issue],
+            "fixes": ["Repair the runtime payload or helper injection before grading tool quality."],
+            "summary": summary,
+            "integration_context_invalid": True,
+            "integration_context_reason": reason,
+        }
+
+    @staticmethod
+    def _toolgen_extract_json_object_after_token(
+        text: str,
+        token: str,
+    ) -> Optional[dict[str, Any]]:
+        raw = str(text or "")
+        idx = raw.lower().find(token.lower())
+        if idx < 0:
+            return None
+        start = raw.find("{", idx)
+        if start < 0:
+            return None
+        decoder = json.JSONDecoder()
+        try:
+            parsed, _ = decoder.raw_decode(raw[start:])
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @classmethod
+    def _toolgen_extract_minted_variables(cls, observation: str) -> dict[str, Any]:
+        parsed = cls._toolgen_extract_json_object_after_token(
+            observation, "minted_variables"
+        )
+        if isinstance(parsed, dict):
+            return parsed
+        parsed = cls._toolgen_extract_json_object_after_token(observation, "candidate_map")
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _toolgen_count_named_matches(
+        labels: Sequence[str],
+        *tokens: str,
+    ) -> int:
+        token_set = {str(token or "").strip().lower() for token in tokens if token}
+        count = 0
+        for label in labels:
+            lowered = str(label or "").lower()
+            if token_set and all(token in lowered for token in token_set):
+                count += 1
+        return count
+
+    @staticmethod
+    def _toolgen_code_shape_signature(tool_code: str) -> str:
+        if not tool_code:
+            return ""
+        helper_tokens = []
+        for helper in (
+            "resolve_entity_to_vars",
+            "get_relations",
+            "resolve_semantic_filter",
+            "walk_to_target",
+            "cross_intersect",
+            "extract_attribute_value",
+            "argmax",
+            "argmin",
+            'actions_spec.get("count")',
+            "count(",
+        ):
+            if helper in tool_code:
+                helper_tokens.append(helper.replace('actions_spec.get("count")', "count"))
+        return ">".join(helper_tokens[:8])
+
+    @classmethod
+    def _toolgen_strategy_equivalent(cls, left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        groups = (
+            {"relation_first", "direct_relation"},
+            {"set_builder", "partial_handoff"},
+            {"diagnostic_probe", "probe_then_commit"},
+        )
+        for group in groups:
+            if left in group and right in group:
+                return True
+        return False
+
+    @staticmethod
+    def _toolgen_failure_equivalent(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        groups = (
+            {"empty_walk", "empty_intersection"},
+            {"runtime_dependency_error", "server_validation_blocked"},
+        )
+        for group in groups:
+            if left in group and right in group:
+                return True
+        return False
+
+    def _toolgen_failure_bucket(
+        self,
+        failure_family: str,
+        *,
+        value_delivered: str = "none",
+        partial_value_usable: bool = False,
+        material_progress: bool = False,
+        plan_diagnosis: str = "",
+    ) -> str:
+        if failure_family == "integration_context_invalid":
+            return "integration_context_invalid"
+        if value_delivered == "produced_final_variable":
+            return "final_value_delivered"
+        if (
+            partial_value_usable
+            or material_progress
+            or value_delivered not in {"", "none"}
+        ):
+            return "partial_value_delivered"
+        if str(plan_diagnosis or "").strip().upper() == "DATA_SPARSE":
+            return "data_sparse_no_progress"
+        if failure_family in {
+            "tool_plan_field_misread",
+            "count_target_wrong",
+            "argmax_input_wrong",
+            "runtime_dependency_error",
+            "server_validation_blocked",
+        }:
+            return "code_local_no_progress"
+        if failure_family in {"variable_list_context_wrong"}:
+            return "context_handling_no_progress"
+        if failure_family in {
+            "empty_intersection",
+            "no_runtime_progress",
+            "wrong_relation_family",
+            "empty_walk",
+            "set_type_mismatch",
+            "attribute_mapping_missing",
+            "anchor_resolution_failed",
+            "unknown_failure",
+        }:
+            return "strategy_mismatch_no_progress"
+        return "strategy_mismatch_no_progress"
+
+    @staticmethod
+    def _toolgen_failure_is_code_local(
+        failure_family: str,
+        *,
+        failure_phase: str = "",
+        issues: Optional[Sequence[Any]] = None,
+        summary: str = "",
+    ) -> bool:
+        if failure_phase in {
+            "precheck",
+            "static_check",
+            "static_check_exception",
+            "smoke_test",
+            "patch_live_gate_static",
+            "patch_live_gate_smoke",
+        }:
+            return True
+        if failure_family in {
+            "count_target_wrong",
+            "argmax_input_wrong",
+            "tool_plan_field_misread",
+            "runtime_dependency_error",
+        }:
+            return True
+        issue_text = " ".join(str(item or "") for item in (issues or []))
+        lowered = f"{issue_text} {summary}".lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "missing import",
+                "compile failed",
+                "wrong count variable",
+                "wrong argmax input",
+                "field extraction",
+                "observation",
+                "formatting",
+            )
+        )
+
+    def _toolgen_infer_strategy_family(
+        self,
+        tool_plan: Optional[Mapping[str, Any]],
+        *,
+        tool_code: str = "",
+        retry_context: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        if isinstance(retry_context, Mapping):
+            ctx_strategy = self._normalize_vocab_value(
+                retry_context.get("active_strategy_family")
+                or retry_context.get("strategy_family"),
+                STRATEGY_FAMILY_VOCAB,
+            )
+            if ctx_strategy:
+                return ctx_strategy
+        tool_plan = tool_plan or {}
+        preferred_tool_mode = self._normalize_vocab_value(
+            tool_plan.get("preferred_tool_mode"),
+            PREFERRED_TOOL_MODE_VOCAB,
+        )
+        execution_style = self._normalize_vocab_value(
+            tool_plan.get("execution_style"),
+            EXECUTION_STYLE_VOCAB,
+        )
+        target_archetype = str(tool_plan.get("target_archetype") or "").strip().upper()
+        lowered_code = (tool_code or "").lower()
+        if "get_relations(" in lowered_code and "walk_to_target" not in lowered_code:
+            return "direct_relation"
+        if preferred_tool_mode == "diagnostic_probe" or execution_style == "diagnostic_first":
+            return "diagnostic_probe"
+        if preferred_tool_mode == "progress_tool":
+            if "cross_intersect" in lowered_code and "count(" in lowered_code:
+                return "intersector_counter"
+            if "extract_attribute_value" in lowered_code or "argmax" in lowered_code or "argmin" in lowered_code:
+                return "attribute_preparer"
+            return "set_builder"
+        if execution_style in {"walk_first", "relation_first", "probe_then_commit"}:
+            return execution_style
+        if execution_style == "attribute_mapping_first":
+            return "attribute_preparer"
+        if target_archetype == "SHARED_TRAIT_PIVOT":
+            return "shared_trait_pivot"
+        if target_archetype == "SUPERLATIVE_FINDER":
+            return "superlative_finder"
+        return "generic_macro"
+
+    def _toolgen_alternate_execution_style(
+        self,
+        tool_plan: Optional[Mapping[str, Any]],
+        current_execution_style: str,
+    ) -> str:
+        tool_plan = tool_plan or {}
+        target_archetype = str(tool_plan.get("target_archetype") or "").strip().upper()
+        if target_archetype == "COUNTING_INTERSECTOR":
+            mapping = {
+                "walk_first": "relation_first",
+                "relation_first": "probe_then_commit",
+                "probe_then_commit": "partial_value_first",
+                "partial_value_first": "diagnostic_first",
+            }
+            return mapping.get(current_execution_style, "relation_first")
+        if target_archetype == "SUPERLATIVE_FINDER":
+            mapping = {
+                "walk_first": "attribute_mapping_first",
+                "attribute_mapping_first": "diagnostic_first",
+            }
+            return mapping.get(current_execution_style, "attribute_mapping_first")
+        if target_archetype == "SHARED_TRAIT_PIVOT":
+            mapping = {
+                "walk_first": "diagnostic_first",
+                "diagnostic_first": "probe_then_commit",
+            }
+            return mapping.get(current_execution_style, "probe_then_commit")
+        mapping = {
+            "walk_first": "relation_first",
+            "relation_first": "probe_then_commit",
+            "probe_then_commit": "partial_value_first",
+            "partial_value_first": "diagnostic_first",
+        }
+        return mapping.get(current_execution_style, "probe_then_commit")
+
+    def _toolgen_compute_round_strategy_context(
+        self,
+        *,
+        round_idx: int,
+        exec_payload: Optional[Mapping[str, Any]],
+        round_history: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        tool_plan = self._build_tool_plan(exec_payload or {})
+        base_execution_style = self._normalize_vocab_value(
+            tool_plan.get("execution_style"),
+            EXECUTION_STYLE_VOCAB,
+            default="walk_first",
+        )
+        base_preferred_tool_mode = self._normalize_vocab_value(
+            tool_plan.get("preferred_tool_mode"),
+            PREFERRED_TOOL_MODE_VOCAB,
+            default="full_solve",
+        )
+        base_strategy_family = self._toolgen_infer_strategy_family(tool_plan)
+        base_strategy_sequence = self._toolgen_strategy_sequence(
+            base_strategy_family,
+            tool_plan.get("fallback_strategies"),
+        )
+        previous = dict(round_history[-1]) if round_history else {}
+        before_previous = dict(round_history[-2]) if len(round_history) >= 2 else {}
+        previous_strategy_family = str(
+            previous.get("active_strategy_family") or previous.get("strategy_family") or ""
+        )
+        previous_failure_family = str(previous.get("failure_family") or "")
+        previous_failure_bucket = str(
+            previous.get("failure_bucket") or previous.get("previous_failure_bucket") or ""
+        )
+        strategy_sequence = self._normalize_vocab_list(
+            previous.get("strategy_sequence"),
+            STRATEGY_FAMILY_VOCAB,
+            max_len=None,
+        ) or list(base_strategy_sequence)
+        chosen_strategy_family = self._normalize_vocab_value(
+            previous.get("active_strategy_family") or previous.get("strategy_family"),
+            STRATEGY_FAMILY_VOCAB,
+            default="",
+        )
+        if not chosen_strategy_family:
+            chosen_strategy_family = strategy_sequence[0]
+        if chosen_strategy_family not in strategy_sequence:
+            strategy_sequence = self._toolgen_strategy_sequence(
+                chosen_strategy_family,
+                strategy_sequence,
+            )
+        try:
+            strategy_index = int(previous.get("strategy_index") or 0) if previous else 0
+        except Exception:
+            strategy_index = 0
+        if chosen_strategy_family in strategy_sequence:
+            strategy_index = max(
+                0,
+                min(strategy_index, len(strategy_sequence) - 1),
+            )
+            strategy_index = strategy_sequence.index(chosen_strategy_family)
+        else:
+            strategy_index = 0
+            chosen_strategy_family = strategy_sequence[0]
+        try:
+            strategy_epoch = int(previous.get("strategy_epoch") or 0) if previous else 0
+        except Exception:
+            strategy_epoch = 0
+        chosen_execution_style = self._normalize_vocab_value(
+            previous.get("active_execution_style") or previous.get("execution_style"),
+            EXECUTION_STYLE_VOCAB,
+            default="",
+        )
+        chosen_preferred_tool_mode = self._normalize_vocab_value(
+            previous.get("active_preferred_tool_mode")
+            or previous.get("preferred_tool_mode"),
+            PREFERRED_TOOL_MODE_VOCAB,
+            default="",
+        )
+        if not chosen_execution_style or not chosen_preferred_tool_mode:
+            default_style, default_mode = self._toolgen_strategy_defaults(
+                chosen_strategy_family,
+                current_execution_style=base_execution_style,
+                current_preferred_tool_mode=base_preferred_tool_mode,
+            )
+            chosen_execution_style = chosen_execution_style or default_style
+            chosen_preferred_tool_mode = (
+                chosen_preferred_tool_mode or default_mode
+            )
+        strategy_source = (
+            "inherited_from_previous_round" if previous else "initial_plan"
+        )
+        pivot_required = False
+        pivot_reason = ""
+        previous_code_local = self._toolgen_failure_is_code_local(
+            previous_failure_family,
+            failure_phase=str(previous.get("failure_phase") or ""),
+            summary=str(previous.get("summary") or ""),
+        ) if previous else False
+        override_strategy_family = self._normalize_vocab_value(
+            previous.get("validator_override_strategy_family")
+            or previous.get("strategy_override_family"),
+            STRATEGY_FAMILY_VOCAB,
+            default="",
+        )
+        if override_strategy_family:
+            chosen_strategy_family = override_strategy_family
+            if chosen_strategy_family not in strategy_sequence:
+                strategy_sequence = self._toolgen_strategy_sequence(
+                    chosen_strategy_family,
+                    strategy_sequence,
+                )
+            strategy_index = strategy_sequence.index(chosen_strategy_family)
+            chosen_execution_style = self._normalize_vocab_value(
+                previous.get("validator_override_execution_style")
+                or previous.get("strategy_override_execution_style"),
+                EXECUTION_STYLE_VOCAB,
+                default="",
+            )
+            chosen_preferred_tool_mode = self._normalize_vocab_value(
+                previous.get("validator_override_preferred_tool_mode")
+                or previous.get("strategy_override_preferred_tool_mode"),
+                PREFERRED_TOOL_MODE_VOCAB,
+                default="",
+            )
+            default_style, default_mode = self._toolgen_strategy_defaults(
+                chosen_strategy_family,
+                current_execution_style=chosen_execution_style or base_execution_style,
+                current_preferred_tool_mode=(
+                    chosen_preferred_tool_mode or base_preferred_tool_mode
+                ),
+            )
+            chosen_execution_style = chosen_execution_style or default_style
+            chosen_preferred_tool_mode = (
+                chosen_preferred_tool_mode or default_mode
+            )
+            strategy_source = "validator_override"
+        if (
+            round_idx == 2
+            and previous
+            and not previous_code_local
+            and not bool(previous.get("material_progress", False))
+            and previous_failure_bucket != "integration_context_invalid"
+        ):
+            pivot_required = True
+            pivot_reason = "round_2_non_code_local_failure"
+        elif round_idx >= 3 and previous and before_previous:
+            repeated_strategy = self._toolgen_strategy_equivalent(
+                previous_strategy_family,
+                str(
+                    before_previous.get("active_strategy_family")
+                    or before_previous.get("strategy_family")
+                    or ""
+                ),
+            )
+            before_previous_failure_bucket = str(
+                before_previous.get("failure_bucket")
+                or before_previous.get("previous_failure_bucket")
+                or ""
+            )
+            no_progress_pair = (
+                not bool(previous.get("material_progress", False))
+                and not bool(before_previous.get("material_progress", False))
+            )
+            repeated_failure_bucket = bool(
+                previous_failure_bucket
+                and previous_failure_bucket == before_previous_failure_bucket
+            )
+            integration_invalid_pair = (
+                previous_failure_bucket == "integration_context_invalid"
+                or before_previous_failure_bucket == "integration_context_invalid"
+            )
+            if repeated_strategy and (
+                not integration_invalid_pair
+                and ((repeated_failure_bucket and no_progress_pair) or no_progress_pair)
+            ):
+                pivot_required = True
+                pivot_reason = "repeated_no_progress_same_strategy_failure"
+            # Additional pivot: a fresh strategy introduced at round 2 that
+            # immediately fails with no progress should not get a free extra
+            # round.  Fire another pivot if before_previous triggered a pivot
+            # and previous still shows no progress (and is not code-local or
+            # integration-context-invalid).
+            if not pivot_required:
+                before_previous_pivoted = bool(before_previous.get("pivot_required"))
+                if (
+                    before_previous_pivoted
+                    and not bool(previous.get("material_progress", False))
+                    and not previous_code_local
+                    and previous_failure_bucket != "integration_context_invalid"
+                ):
+                    pivot_required = True
+                    pivot_reason = "fresh_pivot_strategy_immediate_failure"
+        if pivot_required:
+            prior_strategy_family = chosen_strategy_family
+            next_index = strategy_index
+            if strategy_index + 1 < len(strategy_sequence):
+                next_index = strategy_index + 1
+            strategy_index = next_index
+            chosen_strategy_family = strategy_sequence[strategy_index]
+            default_style, default_mode = self._toolgen_strategy_defaults(
+                chosen_strategy_family,
+                current_execution_style=chosen_execution_style,
+                current_preferred_tool_mode=chosen_preferred_tool_mode,
+            )
+            chosen_execution_style = default_style
+            if chosen_strategy_family in {
+                "direct_relation",
+                "set_builder",
+                "intersector_counter",
+                "partial_handoff",
+                "diagnostic_probe",
+            }:
+                chosen_preferred_tool_mode = default_mode
+            if chosen_strategy_family != prior_strategy_family:
+                strategy_epoch += 1
+                strategy_source = "pivot_policy"
+        fallback_strategies = strategy_sequence[strategy_index + 1 :]
+        same_failure_as_previous = bool(
+            before_previous
+            and self._toolgen_failure_equivalent(
+                previous_failure_family,
+                str(before_previous.get("failure_family") or ""),
+            )
+        )
+        return {
+            "round": round_idx,
+            "active_strategy_family": chosen_strategy_family,
+            "active_execution_style": chosen_execution_style,
+            "active_preferred_tool_mode": chosen_preferred_tool_mode,
+            "strategy_sequence": list(strategy_sequence),
+            "strategy_index": strategy_index,
+            "strategy_epoch": strategy_epoch,
+            "strategy_source": strategy_source,
+            "previous_failure_bucket": previous_failure_bucket or None,
+            "execution_style": chosen_execution_style,
+            "preferred_tool_mode": chosen_preferred_tool_mode,
+            "strategy_family": chosen_strategy_family,
+            "fallback_strategies": fallback_strategies,
+            "previous_strategy_family": previous_strategy_family or None,
+            "previous_failure_family": previous_failure_family or None,
+            "failure_bucket": previous_failure_bucket or None,
+            "same_strategy_as_previous": bool(
+                previous_strategy_family
+                and self._toolgen_strategy_equivalent(
+                    chosen_strategy_family,
+                    previous_strategy_family,
+                )
+            ),
+            "same_failure_as_previous": bool(same_failure_as_previous),
+            "pivot_required": pivot_required,
+            "pivot_reason": pivot_reason or None,
+            "code_local_retry_allowed": bool(previous_code_local),
+            "disallowed_strategy_families": [previous_strategy_family]
+            if pivot_required and previous_strategy_family
+            else [],
+            "allowed_alternative_strategy_families": fallback_strategies[:3],
+            "material_progress_last_round": bool(previous.get("material_progress", False))
+            if previous
+            else None,
+        }
+        # Inject archetype-specific generation-time constraints directly into the
+        # round context so they appear in ROUND_STRATEGY_CONTEXT — the block the
+        # ToolGen LLM actually reads.  This is the only path that reliably reaches
+        # the generation prompt; payload["tool_plan"] is a runtime-only channel.
+        _archetype = str(tool_plan.get("target_archetype") or "").strip().upper()
+        if _archetype in {"COUNTER", "COUNTING_INTERSECTOR"}:
+            result["count_variable_constraint"] = (
+                "HARD RULE: final_variable MUST be the Variable ID string returned by "
+                "the count primitive (e.g. '#5'), NOT a numeric integer or string number. "
+                "Call count(set_var) → extract the returned Variable ID with "
+                "kg_utils.extract_var_ids() → return that ID as final_variable in the "
+                "SSOT dict. Returning a raw integer or the set variable itself is WRONG."
+            )
+        return result
+
+    def _toolgen_apply_round_strategy_context(
+        self,
+        exec_payload: Optional[Mapping[str, Any]],
+        round_context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        payload = dict(exec_payload or {})
+        tool_plan = self._build_tool_plan(payload)
+        tool_plan["execution_style"] = (
+            round_context.get("active_execution_style")
+            or round_context.get("execution_style")
+            or tool_plan.get("execution_style")
+        )
+        tool_plan["preferred_tool_mode"] = (
+            round_context.get("active_preferred_tool_mode")
+            or round_context.get("preferred_tool_mode")
+            or tool_plan.get("preferred_tool_mode")
+        )
+        tool_plan["fallback_strategies"] = (
+            round_context.get("fallback_strategies")
+            or tool_plan.get("fallback_strategies")
+            or []
+        )
+        payload["execution_style"] = tool_plan.get("execution_style")
+        payload["preferred_tool_mode"] = tool_plan.get("preferred_tool_mode")
+        payload["fallback_strategies"] = tool_plan.get("fallback_strategies")
+        payload["tool_plan"] = tool_plan
+        payload["toolgen_retry_context"] = dict(round_context)
+        return payload
+
+    def _toolgen_round_failure_metadata(
+        self,
+        *,
+        round_context: Optional[Mapping[str, Any]],
+        tool_plan: Optional[Mapping[str, Any]] = None,
+        failure_family: str = "unknown_failure",
+        value_delivered: str = "none",
+        partial_value_usable: bool = False,
+    ) -> dict[str, Any]:
+        plan = self._build_tool_plan(tool_plan or {})
+        context = dict(round_context or {})
+        strategy_family = context.get("strategy_family")
+        if not strategy_family:
+            strategy_family = self._toolgen_infer_strategy_family(
+                plan,
+                retry_context=context,
+            )
+        execution_style = (
+            context.get("active_execution_style")
+            or context.get("execution_style")
+            or plan.get("execution_style")
+        )
+        preferred_tool_mode = (
+            context.get("active_preferred_tool_mode")
+            or context.get("preferred_tool_mode")
+            or plan.get("preferred_tool_mode")
+        )
+        strategy_sequence = context.get("strategy_sequence") or self._toolgen_strategy_sequence(
+            strategy_family,
+            plan.get("fallback_strategies") or context.get("fallback_strategies") or [],
+        )
+        strategy_source = context.get("strategy_source") or (
+            "inherited_from_previous_round"
+            if context.get("previous_strategy_family")
+            else "initial_plan"
+        )
+        failure_bucket = self._toolgen_failure_bucket(
+            failure_family,
+            value_delivered=value_delivered,
+            partial_value_usable=partial_value_usable,
+        )
+        return {
+            "strategy_family": strategy_family,
+            "active_strategy_family": context.get("active_strategy_family")
+            or strategy_family,
+            "active_execution_style": execution_style,
+            "active_preferred_tool_mode": preferred_tool_mode,
+            "execution_style": execution_style,
+            "preferred_tool_mode": preferred_tool_mode,
+            "fallback_strategies": context.get("fallback_strategies")
+            or plan.get("fallback_strategies")
+            or [],
+            "strategy_sequence": list(strategy_sequence),
+            "strategy_index": context.get("strategy_index", 0),
+            "strategy_epoch": context.get("strategy_epoch", 0),
+            "strategy_source": strategy_source,
+            "failure_family": failure_family,
+            "failure_bucket": failure_bucket,
+            "value_delivered": value_delivered,
+            "same_strategy_as_previous": context.get("same_strategy_as_previous"),
+            "same_failure_as_previous": context.get("same_failure_as_previous"),
+            "pivot_required": context.get("pivot_required"),
+            "partial_value_usable": partial_value_usable,
+            "previous_failure_bucket": context.get("previous_failure_bucket"),
+        }
+
+    @staticmethod
+    def _toolgen_round_context_block(round_context: Mapping[str, Any]) -> str:
+        return (
+            "\n\nROUND_STRATEGY_CONTEXT:\n"
+            + json.dumps(dict(round_context), ensure_ascii=True, default=str, indent=2)
+            + "\n"
+            + "Follow this structured retry policy exactly. If pivot_required is true, do not repeat disallowed strategies."
+        )
+
+    def _toolgen_classify_value_delivered(
+        self,
+        *,
+        tool_plan: Optional[Mapping[str, Any]],
+        execution_validation: Optional[Mapping[str, Any]],
+        live_progress_summary: Optional[Mapping[str, Any]],
+    ) -> str:
+        tool_plan = tool_plan or {}
+        summary = dict(live_progress_summary or {})
+        observation = str(
+            (execution_validation or {}).get("observation")
+            or (execution_validation or {}).get("msg")
+            or ""
+        )
+        minted = self._toolgen_extract_minted_variables(observation)
+        labels = [str(key or "") for key in minted.keys()]
+        lowered = observation.lower()
+        preferred_tool_mode = str(tool_plan.get("preferred_tool_mode") or "")
+        if (
+            summary.get("has_final_variable")
+            and str(summary.get("execution_status") or "") == "SUCCESS"
+            and (
+                preferred_tool_mode == "full_solve"
+                or bool(summary.get("final_operation_safe", False))
+            )
+        ):
+            return "produced_final_variable"
+        if any(
+            phrase in lowered
+            for phrase in (
+                "relation candidates",
+                "top relations",
+                "candidate relations",
+                "scored relation families",
+                "relation family",
+            )
+        ):
+            if "family" in lowered:
+                return "identified_relation_family"
+            return "identified_relation_candidates"
+        if summary.get("has_context") and any(
+            token in lowered
+            for token in (
+                "diagnostic",
+                "anchor type",
+                "variable type",
+                "empty walk",
+                "empty intersection",
+                "walk failed",
+                "why a walk failed",
+            )
+        ) and preferred_tool_mode == "diagnostic_probe":
+            return "produced_actionable_handoff"
+        resolved_anchor_count = 0
+        for label in labels:
+            lowered_label = label.lower()
+            if "resolved" in lowered_label and "anchor" in lowered_label:
+                resolved_anchor_count += 1
+        if resolved_anchor_count >= 2:
+            return "resolved_both_anchors"
+        if resolved_anchor_count == 1:
+            return "resolved_anchor"
+        if any("intersection" in str(label or "").lower() for label in labels) or "intersected set" in lowered:
+            return "built_intersection_set"
+        set_like_count = 0
+        for label in labels:
+            lowered_label = label.lower()
+            if any(token in lowered_label for token in ("set", "branch", "vars_", "walked", "filtered")):
+                set_like_count += 1
+        if any(token in lowered for token in ("attribute context", "attribute map", "argmax", "argmin")):
+            return "built_attribute_context"
+        if set_like_count >= 2:
+            return "built_both_sets"
+        if set_like_count == 1:
+            return "built_target_set"
+        if summary.get("has_context") and any(
+            token in lowered
+            for token in (
+                "diagnostic",
+                "anchor type",
+                "variable type",
+                "empty walk",
+                "empty intersection",
+                "walk failed",
+                "why a walk failed",
+            )
+        ):
+            return "produced_actionable_handoff"
+        if preferred_tool_mode == "diagnostic_probe" and summary.get("has_context"):
+            return "produced_actionable_handoff"
+        return "none"
+
+    @staticmethod
+    def _toolgen_partial_value_usable(
+        value_delivered: str,
+        live_progress_summary: Optional[Mapping[str, Any]],
+        *,
+        preferred_tool_mode: str = "",
+    ) -> bool:
+        if value_delivered in {"none", ""}:
+            return False
+        if value_delivered == "produced_final_variable":
+            return True
+        summary = live_progress_summary or {}
+        # Phase 2: honest_zero_no_handoff tools get partial_unverified trust (lower rank
+        # than verified honest_zero) but are not blocked here — value_delivered="none" is
+        # already caught by the guard above, and meaningful values (resolved anchors, relation
+        # families, diagnostic handoffs) should remain usable as partial progress.
+        if preferred_tool_mode == "diagnostic_probe":
+            return bool(summary.get("has_context") or summary.get("material_progress"))
+        return bool(
+            summary.get("material_progress")
+            or summary.get("has_context")
+            or value_delivered in {
+                "resolved_anchor",
+                "resolved_both_anchors",
+                "identified_relation_candidates",
+                "identified_relation_family",
+                "built_target_set",
+                "built_both_sets",
+                "built_intersection_set",
+                "built_attribute_context",
+                "produced_actionable_handoff",
+            }
+        )
+
+    def _toolgen_classify_failure_family(
+        self,
+        *,
+        failure_phase: str,
+        execution_validation: Optional[Mapping[str, Any]],
+        live_progress_summary: Optional[Mapping[str, Any]],
+        validation: Optional[Mapping[str, Any]],
+        tool_plan: Optional[Mapping[str, Any]],
+    ) -> str:
+        issues = validation.get("issues") if isinstance(validation, Mapping) else []
+        summary_text = str(validation.get("summary") or "") if isinstance(validation, Mapping) else ""
+        observation = str(
+            (execution_validation or {}).get("observation")
+            or (execution_validation or {}).get("msg")
+            or ""
+        )
+        if bool((execution_validation or {}).get("integration_context_invalid", False)):
+            return "integration_context_invalid"
+        combined = " ".join(str(item or "") for item in (issues or []))
+        lowered = f"{combined} {summary_text} {observation}".lower()
+        if any(
+            token in lowered
+            for token in (
+                "execution_integration_context_invalid",
+                "missing payload['entities']",
+                "missing payload[\"entities\"]",
+                "non-callable placeholder actions_spec",
+                "kg_utils helper facade missing",
+                "non-callable placeholder",
+                "non_callable_placeholder",
+            )
+        ):
+            return "integration_context_invalid"
+        # Non-callable primitive detected via TypeError during server eval —
+        # classify as integration_context_invalid, not a code logic error, so
+        # it does not drive normal strategy pivot pressure.
+        if "typeerror" in lowered and any(
+            token in lowered for token in ("not callable", "is not callable", "'nonetype' object is not callable")
+        ):
+            return "integration_context_invalid"
+        if any(
+            token in lowered
+            for token in (
+                "server_eval_failed",
+                "server validation",
+                "schema mismatch",
+            )
+        ):
+            return "server_validation_blocked"
+        if any(
+            token in lowered
+            for token in (
+                "compile failed",
+                "missing import",
+                "module not found",
+                "execution_exec_failed",
+                "execution_compile_failed",
+                "nameerror",
+            )
+        ):
+            return "runtime_dependency_error"
+        if "count" in lowered and any(
+            token in lowered for token in ("wrong count", "pre-count", "count variable")
+        ):
+            return "count_target_wrong"
+        if any(token in lowered for token in ("argmax", "argmin")) and "input" in lowered:
+            return "argmax_input_wrong"
+        if "variable_list" in lowered and any(
+            token in lowered for token in ("none", "empty", "[]", "context")
+        ):
+            return "variable_list_context_wrong"
+        if "attribute" in lowered and any(
+            token in lowered for token in ("mapping", "context", "missing")
+        ):
+            return "attribute_mapping_missing"
+        if any(
+            token in lowered
+            for token in ("wrong relation", "target mismatch", "relation family")
+        ):
+            return "wrong_relation_family"
+        if any(
+            token in lowered
+            for token in ("empty intersection", "cross_intersect", "intersected set is empty")
+        ):
+            return "empty_intersection"
+        if any(
+            token in lowered
+            for token in ("empty walk", "walk failed", "walk result is empty", "walk_to_target")
+        ) and "empty" in lowered:
+            return "empty_walk"
+        if any(
+            token in lowered
+            for token in ("set variable", "set type", "member pointer", "count operates on the set")
+        ):
+            return "set_type_mismatch"
+        if any(
+            token in lowered
+            for token in ("tool_plan", "plan field", "rediscover semantics", "run_payload")
+        ):
+            return "tool_plan_field_misread"
+        if any(
+            token in lowered
+            for token in ("resolved only to shallow", "common.topic", "type.object", "anchor")
+        ) and not bool((live_progress_summary or {}).get("has_context")):
+            return "anchor_resolution_failed"
+        if self._toolgen_is_blocked_no_progress(live_progress_summary):
+            return "no_runtime_progress"
+        return "unknown_failure"
+
+    def _toolgen_apply_validation_policy(
+        self,
+        *,
+        validation: Mapping[str, Any],
+        execution_validation: Optional[Mapping[str, Any]],
+        live_progress_summary: Optional[Mapping[str, Any]],
+        round_context: Optional[Mapping[str, Any]],
+        tool_plan: Optional[Mapping[str, Any]],
+        tool_code: str,
+        failure_phase: str = "validator",
+    ) -> dict[str, Any]:
+        result = dict(validation)
+        summary = dict(live_progress_summary or {})
+        round_context = dict(round_context or {})
+        strategy_family = self._normalize_vocab_value(
+            round_context.get("active_strategy_family")
+            or round_context.get("strategy_family"),
+            STRATEGY_FAMILY_VOCAB,
+            default="",
+        ) or self._toolgen_infer_strategy_family(
+            tool_plan,
+            tool_code=tool_code,
+            retry_context=round_context,
+        )
+        execution_style = self._normalize_vocab_value(
+            round_context.get("active_execution_style")
+            or round_context.get("execution_style")
+            or (tool_plan or {}).get("execution_style"),
+            EXECUTION_STYLE_VOCAB,
+            default="walk_first",
+        )
+        preferred_tool_mode = self._normalize_vocab_value(
+            round_context.get("active_preferred_tool_mode")
+            or round_context.get("preferred_tool_mode")
+            or (tool_plan or {}).get("preferred_tool_mode"),
+            PREFERRED_TOOL_MODE_VOCAB,
+            default="full_solve",
+        )
+        value_delivered = self._toolgen_classify_value_delivered(
+            tool_plan=tool_plan,
+            execution_validation=execution_validation,
+            live_progress_summary=summary,
+        )
+        partial_value_usable = self._toolgen_partial_value_usable(
+            value_delivered,
+            summary,
+            preferred_tool_mode=preferred_tool_mode,
+        )
+        failure_family = self._toolgen_classify_failure_family(
+            failure_phase=failure_phase,
+            execution_validation=execution_validation,
+            live_progress_summary=summary,
+            validation=result,
+            tool_plan=tool_plan,
+        )
+        failure_bucket = self._toolgen_failure_bucket(
+            failure_family,
+            value_delivered=value_delivered,
+            partial_value_usable=partial_value_usable,
+            material_progress=bool(summary.get("material_progress", False)),
+            plan_diagnosis=str(result.get("plan_diagnosis") or ""),
+        )
+        result["strategy_family"] = strategy_family
+        result["active_strategy_family"] = strategy_family
+        result["execution_style"] = execution_style
+        result["active_execution_style"] = execution_style
+        result["preferred_tool_mode"] = preferred_tool_mode
+        result["active_preferred_tool_mode"] = preferred_tool_mode
+        result["fallback_strategies"] = list(
+            round_context.get("fallback_strategies")
+            or (tool_plan or {}).get("fallback_strategies")
+            or []
+        )
+        result["strategy_sequence"] = list(
+            round_context.get("strategy_sequence")
+            or self._toolgen_strategy_sequence(
+                strategy_family,
+                result["fallback_strategies"],
+            )
+        )
+        result["strategy_index"] = round_context.get("strategy_index", 0)
+        result["strategy_epoch"] = round_context.get("strategy_epoch", 0)
+        result["strategy_source"] = round_context.get("strategy_source") or (
+            "inherited_from_previous_round"
+            if round_context.get("previous_strategy_family")
+            else "initial_plan"
+        )
+        result["failure_family"] = failure_family
+        result["failure_bucket"] = failure_bucket
+        result["value_delivered"] = value_delivered
+        result["partial_value_usable"] = partial_value_usable
+        result["same_strategy_as_previous"] = bool(
+            round_context.get("previous_strategy_family")
+            and self._toolgen_strategy_equivalent(
+                strategy_family,
+                str(round_context.get("previous_strategy_family") or ""),
+            )
+        )
+        result["same_failure_as_previous"] = bool(
+            round_context.get("previous_failure_family")
+            and self._toolgen_failure_equivalent(
+                failure_family,
+                str(round_context.get("previous_failure_family") or ""),
+            )
+        )
+        previous_round_no_progress = round_context.get("material_progress_last_round")
+        same_failure_bucket_as_previous = bool(
+            round_context.get("previous_failure_bucket")
+            and failure_bucket == str(round_context.get("previous_failure_bucket") or "")
+        )
+        integration_context_invalid = failure_bucket == "integration_context_invalid"
+        result["pivot_required"] = bool(round_context.get("pivot_required"))
+        result["material_progress"] = bool(summary.get("material_progress", False))
+        result["code_shape_signature"] = self._toolgen_code_shape_signature(tool_code)
+        try:
+            grade = int(result.get("grade") or 0)
+        except Exception:
+            grade = 0
+        original_grade = grade
+        repeated_no_progress = bool(
+            result["same_strategy_as_previous"]
+            and previous_round_no_progress is False
+            and not result["material_progress"]
+            and not integration_context_invalid
+            and str(round_context.get("previous_failure_bucket") or "")
+            != "integration_context_invalid"
+        )
+        code_local_failure = self._toolgen_failure_is_code_local(
+            failure_family,
+            failure_phase=failure_phase,
+            issues=result.get("issues"),
+            summary=str(result.get("summary") or ""),
+        )
+        bulky_scaffolding_smells = {
+            "oversized_tool_scaffolding",
+            "helper_proliferation",
+            "comment_scaffolding",
+            "docstring_scaffolding",
+        }
+        semantic_smells = set(self._toolgen_semantic_code_smells(tool_code))
+        bulky_scaffolding = bool(semantic_smells & bulky_scaffolding_smells)
+        if bulky_scaffolding and not partial_value_usable and value_delivered != "produced_final_variable":
+            grade = min(grade, 5)
+            issues = result.get("issues")
+            fixes = result.get("fixes")
+            if not isinstance(issues, list):
+                issues = [str(issues or "")]
+            if not isinstance(fixes, list):
+                fixes = [str(fixes or "")]
+            issues = [str(item or "") for item in issues if str(item or "").strip()]
+            fixes = [str(item or "") for item in fixes if str(item or "").strip()]
+            issues.append(
+                "Tool is oversized for the value delivered: remove extra helpers, long docstrings/comments, and bulky fallback scaffolding."
+            )
+            fixes.append(
+                "Rewrite as a minimal helper-driven translator. Prefer only the required headers, a short module docstring, run(payload), and self_test()."
+            )
+            result["issues"] = issues
+            result["fixes"] = fixes
+            if str(result.get("repair_mode") or "").strip() == "none":
+                result["repair_mode"] = "rewrite_code"
+        if partial_value_usable and value_delivered != "produced_final_variable" and grade < 6:
+            grade = 6
+        if repeated_no_progress:
+            grade = min(grade, 4 if not code_local_failure else 5)
+            result["pivot_required"] = True
+            repair_mode = str(result.get("repair_mode") or "").strip()
+            if repair_mode == "none":
+                result["repair_mode"] = "rewrite_code" if code_local_failure else "rewrite_plan"
+        if integration_context_invalid:
+            result["pivot_required"] = False
+        if (
+            not result["material_progress"]
+            and str(result.get("repair_mode") or "").strip() == "none"
+            and failure_family
+            not in {
+                "runtime_dependency_error",
+                "server_validation_blocked",
+                "integration_context_invalid",
+            }
+        ):
+            result["repair_mode"] = "rewrite_code" if code_local_failure else "rewrite_plan"
+        result["grade"] = grade
+        result["original_grade_before_policy"] = original_grade
+        result["strategy_pivot_recommended"] = bool(
+            result.get("pivot_required") and not integration_context_invalid
+        )
+        if result["strategy_pivot_recommended"]:
+            result["strategy_pivot_reason"] = (
+                str(round_context.get("pivot_reason") or "")
+                or (
+                    "repeated_no_progress_same_strategy_bucket"
+                    if same_failure_bucket_as_previous and repeated_no_progress
+                    else "repeated_no_progress_same_strategy_failure"
+                )
+            )
+        return result
 
     def _toolgen_build_task_prompt(self, env_name: str, dataset_item: Any) -> str:
         if env_name == "knowledge_graph":
@@ -376,15 +1908,15 @@ class ControllerToolgenMixin:
         history_lines: list[str] = []
         if round_history:
             history_lines.append("PRIOR_ROUNDS:")
-            for h in round_history[-6:]:
+            for h in round_history[-4:]:
                 history_lines.append(
                     f"- round={h.get('round')} grade={h.get('grade')} top_issue={h.get('top_issue')}"
                 )
         history_block = "\n".join(history_lines) if history_lines else "(none)"
         feedback_block = feedback_note or "(none)"
         # Keep patch prompts bounded for latency/stability.
-        task_pack_excerpt = base_prompt[-12000:] if isinstance(base_prompt, str) else str(base_prompt)
-        code_excerpt = current_code[-30000:] if isinstance(current_code, str) else str(current_code)
+        task_pack_excerpt = base_prompt[-8000:] if isinstance(base_prompt, str) else str(base_prompt)
+        code_excerpt = self._toolgen_compact_patch_code_context(current_code)
         return textwrap.dedent(
             f"""\
             You are ToolPatch. You must propose SURGICAL patches for an existing Python tool.
@@ -408,10 +1940,18 @@ class ControllerToolgenMixin:
               }}
 
             RULES
-            - Prefer `replace_function` operations.
+            - Prefer replacing only `run`.
             - Do NOT output a full file rewrite.
-            - Keep metadata headers and public function signatures unchanged unless feedback explicitly requires it.
+            - MANDATORY HEADERS (must appear verbatim in the patched file — never remove or rename):
+              # INVOKE_WITH: ...
+              # RUN_PAYLOAD_REQUIRED: ...
+              # RUN_PAYLOAD_OPTIONAL: ...
+              # INVOKE_EXAMPLE: ...
+            - MANDATORY DOCSTRINGS: `def run` must have a docstring starting with `contract guard:`, `prereqs:`, `limitations:`.  Do NOT delete or replace these lines.
             - Keep changes minimal and deterministic.
+            - Delete dead helpers, unused fallback branches, and explanatory comments instead of preserving them.
+            - Keep the tool as short as possible while preserving the required SSOT behavior and required docstrings.
+            - Do NOT expand docstrings or add new helper layers unless the feedback proves they are necessary.
 
             CONTEXT_TASK_PACK:
             {task_pack_excerpt}
@@ -1002,38 +2542,6 @@ class ControllerToolgenMixin:
         if not candidate_doc:
             return None
 
-        # Resolve the candidate's target_archetype from the current execution payload.
-        candidate_archetype = ""
-        exec_payload = getattr(self, "_toolgen_execution_payload", None)
-        if isinstance(exec_payload, Mapping):
-            candidate_archetype = str(exec_payload.get("target_archetype") or "").strip().upper()
-        # If not in payload, scan candidate doc for a known registry key.
-        if not candidate_archetype:
-            candidate_doc_upper = candidate_doc.upper()
-            for arch_key in ARCHETYPE_REGISTRY.keys():
-                if arch_key in candidate_doc_upper:
-                    candidate_archetype = arch_key
-                    break
-
-        def _get_existing_tool_archetype(tool) -> str:
-            """Extract archetype from an existing tool's input_schema or description."""
-            schema = tool.input_schema if isinstance(tool.input_schema, dict) else {}
-            props = schema.get("properties", {})
-            arch_prop = props.get("target_archetype", {}) if isinstance(props, dict) else {}
-            if isinstance(arch_prop, dict):
-                enum_vals = arch_prop.get("enum")
-                if isinstance(enum_vals, list) and enum_vals:
-                    return str(enum_vals[0]).upper()
-                default_val = arch_prop.get("default")
-                if default_val:
-                    return str(default_val).upper()
-            for src in (tool.docstring or "", tool.description or ""):
-                src_upper = src.upper()
-                for arch_key in ARCHETYPE_REGISTRY.keys():
-                    if arch_key in src_upper:
-                        return arch_key
-            return ""
-
         current_env = self._resolved_environment_label()
         tools = (
             self._registry.list_latest_tools(environment=current_env)
@@ -1046,12 +2554,6 @@ class ControllerToolgenMixin:
                 continue
             similarity = difflib.SequenceMatcher(None, candidate_doc, existing_desc).ratio()
             if similarity > threshold:
-                # Archetype bypass: if both archetypes are known and explicitly different,
-                # the structural similarity is acceptable — do not abort.
-                if candidate_archetype:
-                    existing_archetype = _get_existing_tool_archetype(tool)
-                    if existing_archetype and existing_archetype != candidate_archetype:
-                        continue
                 return tool.name, similarity
         return None
 
@@ -1096,6 +2598,665 @@ class ControllerToolgenMixin:
                 return True, marker
         return False, ""
 
+    @staticmethod
+    def _toolgen_final_variable_kind(value: Any) -> str:
+        if value is None:
+            return "none"
+        if isinstance(value, bool):
+            return "scalar"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "integer" if float(value).is_integer() else "scalar"
+        text = str(value).strip()
+        if not text or text == "None":
+            return "none"
+        if text.startswith("#"):
+            return "pointer"
+        if re.fullmatch(r"-?\d+", text):
+            return "integer"
+        return "scalar"
+
+    @staticmethod
+    def _toolgen_looks_like_fallback_handoff(lowered_text: str) -> bool:
+        return any(
+            phrase in lowered_text
+            for phrase in (
+                "bypassed filter",
+                "returning base variable",
+                "returning unfiltered base variable",
+                "rescued initial variables",
+                "fallback_entity",
+                "unfiltered_base_entity",
+                "handing off the original seed variable",
+                "handing off pre-filter",
+                "pre-filter representative variable",
+                "handing off the pre-filter",
+                "handing off the pre-walk",
+                "pre-walk variable",
+                "pre walk variable",
+                "semantic filter returned no",
+                "semantic filter produced no",
+                "no filtered variable ids",
+                "no filtered vars",
+                "failed narrowing",
+                "narrowing failed",
+            )
+        )
+
+    @staticmethod
+    def _toolgen_semantic_code_smells(tool_code: str) -> list[str]:
+        if not tool_code:
+            return []
+        smells: list[str] = []
+        lowered = tool_code.lower()
+        line_count = len(tool_code.splitlines())
+        code_len = len(tool_code)
+        if re.search(
+            r"(?:base_vars|base_group|seed_group|running|selected_base|current_base)\s*=\s*(?:groups|resolved_groups)\[0\]",
+            tool_code,
+        ):
+            smells.append("base_group_selected_by_position")
+        if re.search(
+            r"next\s*\(\s*\(\s*\w+\s+for\s+\w+\s+in\s+(?:groups|resolved_groups)\s+if\s+\w+\s*\)",
+            tool_code,
+        ):
+            smells.append("first_nonempty_group_selected_heuristically")
+        if "candidate_map.values()" in tool_code or "for v in candidate_map.values()" in lowered:
+            smells.append("candidate_map_salvage_without_role_proof")
+        if re.search(
+            r"except\s+Exception\s+as\s+e\s*:.*?return\s*\{[^}]*[\"']status[\"']\s*:\s*[\"']SUCCESS[\"']",
+            tool_code,
+            re.S,
+        ) and any(
+            phrase in lowered
+            for phrase in (
+                "fallback_var",
+                "fallback_entity",
+                "rescued initial variables",
+                "returning base variable",
+                "unfiltered base variable",
+            )
+        ):
+            smells.append("broad_exception_success_fallback")
+        if any(
+            phrase in lowered
+            for phrase in (
+                "semantic filter returned no",
+                "semantic filter produced no",
+                "no filtered variable ids",
+                "no filtered vars",
+            )
+        ) and re.search(r"[\"']status[\"']\s*:\s*[\"']SUCCESS[\"']", tool_code):
+            smells.append("semantic_filter_empty_success_path")
+        if (
+            (
+                'payload.get("task_text")' in tool_code
+                or "payload.get('task_text')" in tool_code
+                or 'payload.get("asked_for")' in tool_code
+                or "payload.get('asked_for')" in tool_code
+            )
+            and any(
+                marker in lowered
+                for marker in (
+                    "re.search(",
+                    "re.findall(",
+                    "re.match(",
+                    "entities:",
+                    ".split(",
+                    "profession",
+                    "target_concept",
+                    "entity_target_concepts",
+                    "intermediate_target_concepts",
+                )
+            )
+        ):
+            smells.append("task_text_semantic_rediscovery")
+        if re.search(r"^\s*(?:import\s+kg_utils\b|from\s+kg_utils\s+import)", tool_code, re.MULTILINE):
+            smells.append("kg_utils_import_forbidden")  # kg_utils is a pre-injected global; import will fail
+        if any(
+            token in lowered
+            for token in (
+                "isinstance(kg_utils, dict)",
+                "hasattr(kg_utils",
+                "getattr(kg_utils",
+                "kg_utils.get(",
+                "kg_utils[",
+            )
+        ):
+            smells.append("kg_utils_shape_probing")
+        if re.search(
+            r"\b(?:vars?|ids?|groups?|resolved_groups|candidate_vars?|candidate_ids|matches|results)\s*\[\s*0\s*\]",
+            tool_code,
+        ):
+            smells.append("first_candidate_selection_by_index")
+        if re.search(
+            r"\b(?:profession|professions|domain|domains|category|categories|tokens?|labels?|relations?)\w*\s*=\s*\[[^\]]*[\"'][^\"']+[\"'][^\]]*\]",
+            tool_code,
+            re.IGNORECASE,
+        ):
+            smells.append("hardcoded_domain_token_list")
+        if any(
+            token in lowered
+            for token in (
+                "get_neighbors_stream",
+                "get_inbound_neighbors_batch",
+                "batch_candidate_vars",
+                "max_batches",
+                "collected_candidate_ids",
+                "running_total",
+                "bucket",
+                "streaming",
+            )
+        ):
+            smells.append("custom_streaming_or_bucketing_architecture")
+        if any(
+            token in lowered
+            for token in (
+                "_lookup_callable(",
+                "filter_items_by_type",
+                "filter_type(",
+                "_call(",
+            )
+        ):
+            smells.append("noncanonical_helper_surface")
+        if code_len > 7000 or line_count > 180:
+            smells.append("oversized_tool_scaffolding")
+        extra_comment_lines = 0
+        for line in tool_code.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("#"):
+                continue
+            if stripped.startswith(
+                (
+                    "# tool_name:",
+                    "# INVOKE_WITH:",
+                    "# RUN_PAYLOAD_REQUIRED:",
+                    "# RUN_PAYLOAD_OPTIONAL:",
+                    "# INVOKE_EXAMPLE:",
+                )
+            ):
+                continue
+            extra_comment_lines += 1
+        if extra_comment_lines > 2:
+            smells.append("comment_scaffolding")
+        try:
+            tree = ast.parse(tool_code)
+        except Exception:
+            tree = None
+        if tree is not None:
+            extra_defs = [
+                node.name
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name not in {"run", "self_test"}
+            ]
+            if extra_defs:
+                smells.append("helper_proliferation")
+            module_doc = ast.get_docstring(tree) or ""
+            run_doc = ""
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef) and node.name == "run":
+                    run_doc = ast.get_docstring(node) or ""
+                    break
+            if (
+                len(module_doc) > 140
+                or len(run_doc) > 420
+                or len(module_doc.splitlines()) > 3
+                or len(run_doc.splitlines()) > 7
+            ):
+                smells.append("docstring_scaffolding")
+        return smells
+
+    @staticmethod
+    def _toolgen_is_honest_zero_summary(
+        summary: Optional[Mapping[str, Any]],
+    ) -> bool:
+        if not isinstance(summary, Mapping):
+            return False
+        return (
+            str(summary.get("execution_status") or "") == "MACRO EXHAUSTED"
+            and str(summary.get("handoff_state") or "") == "exhausted"
+            and bool(summary.get("has_context", False))
+            and not bool(summary.get("has_final_variable", False))
+            and str(summary.get("reason") or "") in {"honest_zero", "no_material_progress"}
+        )
+
+    @staticmethod
+    def _toolgen_is_blocked_no_progress(
+        summary: Optional[Mapping[str, Any]],
+    ) -> bool:
+        if not isinstance(summary, Mapping):
+            return False
+        if ControllerToolgenMixin._toolgen_is_honest_zero_summary(summary):
+            return False
+        return (
+            str(summary.get("handoff_state") or "") in {"blocked", "exhausted"}
+            and not bool(summary.get("has_final_variable", False))
+            and not bool(summary.get("material_progress", False))
+        )
+
+    def _toolgen_blocked_rewrite_feedback(
+        self,
+        *,
+        phase: str,
+        usefulness_reason: str,
+        live_progress_summary: Optional[Mapping[str, Any]],
+        validator_top_issue: Optional[str] = None,
+        validator_fixes: Optional[list] = None,
+    ) -> str:
+        reason_text = str(usefulness_reason or "unknown").strip() or "unknown"
+        if self._toolgen_is_honest_zero_summary(live_progress_summary):
+            critical_instruction = (
+                "HONEST ZERO: The previous candidate resolved anchor context and then "
+                "honestly exhausted on an empty set. Do NOT rewrite the macro just to "
+                "force a non-empty result. Preserve the honest exhaustion behavior and "
+                "only revise code if it violates the helper contracts or output schema. "
+                "SSOT RETURN CONTRACT (applies even in honest-zero case — deviation causes GRADE 0): "
+                "run() MUST return EXACTLY this 3-key dict: "
+                "{\"status\": \"MACRO EXHAUSTED\", \"final_variable\": None, "
+                "\"observation\": \"MACRO EXHAUSTED: Resulting set is empty. minted_variables: \" + json.dumps(candidate_map)}. "
+                "NEVER return a raw string or bare variable ID even when exhausted."
+            )
+        else:
+            critical_instruction = (
+                f"REWRITE DIRECTIVE: The previous candidate did not pass the usefulness "
+                f"gate ({reason_text}). Rewrite this macro as a THIN helper-driven plan "
+                "translator. Trust the kg_utils facade implicitly (NO hasattr checks, "
+                "NO shape probing, NO dict-vs-object helper branching, NO broad except "
+                "Exception blocks). Use the canonical fields from payload['tool_plan']. "
+                "Keep the rewritten tool minimal: prefer only the required headers, a short "
+                "module docstring, run(payload), and self_test(). Delete dead helpers, "
+                "redundant comments, and bulky fallback scaffolding. "
+                "SSOT RETURN CONTRACT (HARD RULE — deviation causes immediate GRADE 0): "
+                "run() MUST return EXACTLY this 3-key dict and nothing else: "
+                "{\"status\": \"SUCCESS\", \"final_variable\": \"#N\", \"observation\": \"...\"}. "
+                "On MACRO EXHAUSTED: {\"status\": \"MACRO EXHAUSTED\", \"final_variable\": None, "
+                "\"observation\": \"MACRO EXHAUSTED: Resulting set is empty. minted_variables: \" + json.dumps(candidate_map)}. "
+                "On ERROR: {\"status\": \"ERROR\", \"final_variable\": None, \"observation\": \"...\"}. "
+                "NEVER return a raw string, bare variable ID (e.g. '#4'), or any other structure. "
+                "For COUNTING_INTERSECTOR: final_variable MUST be the count Variable ID returned "
+                "by the count primitive (e.g. '#5'), NOT a numeric answer."
+            )
+        payload: dict[str, Any] = {
+            "phase": phase,
+            "CRITICAL_INSTRUCTION": critical_instruction,
+            "usefulness_reason": reason_text,
+            "live_progress_summary": live_progress_summary,
+        }
+        if validator_top_issue:
+            payload["validator_top_issue"] = validator_top_issue
+        if validator_fixes:
+            payload["validator_fixes"] = validator_fixes
+        try:
+            # live_progress_summary already written by toolgen_live_progress_summary event.
+            self._append_generated_tools_log(
+                {
+                    "event": "toolgen_blocked_rewrite_directive",
+                    "phase": phase,
+                    "usefulness_reason": usefulness_reason,
+                }
+            )
+        except Exception:
+            pass
+        return json.dumps(payload, ensure_ascii=True, default=str)
+
+    def _summarize_toolgen_live_progress(
+        self,
+        execution_validation: Optional[Mapping[str, Any]],
+        exec_payload: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        tool_plan = self._build_tool_plan(exec_payload or {})
+        plan_steps = tool_plan.get("topological_execution_plan_steps") or []
+        if not isinstance(execution_validation, Mapping):
+            return {
+                "has_live_result": False,
+                "plan_step_count": len(plan_steps),
+                "plan_target_concept": tool_plan.get("target_concept") or "",
+                "material_progress": False,
+                "usefulness_passed": False,
+                "semantic_trust_level": "blocked",
+                "final_operation_safe": False,
+                "handoff_state": "blocked",
+                "reason": "missing_live_execution_result",
+            }
+        if bool(execution_validation.get("integration_context_invalid", False)):
+            return {
+                "has_live_result": True,
+                "plan_step_count": len(plan_steps),
+                "plan_target_concept": tool_plan.get("target_concept") or "",
+                "material_progress": False,
+                "usefulness_passed": False,
+                "semantic_trust_level": "blocked",
+                "final_operation_safe": False,
+                "handoff_state": "blocked",
+                "reason": "integration_context_invalid",
+                "value_delivered": "none",
+                "partial_value_usable": False,
+                "value_mode": "none",
+                "achieved_state": "none",
+            }
+
+        status = str(execution_validation.get("status") or "").strip()
+        final_variable = execution_validation.get("final_variable")
+        observation = str(
+            execution_validation.get("observation")
+            or execution_validation.get("msg")
+            or ""
+        )
+        lowered = observation.lower()
+        plan_text = " ".join(str(step) for step in plan_steps) if isinstance(plan_steps, list) else str(plan_steps)
+        plan_lowered = (
+            " ".join(
+                str(part)
+                for part in (
+                    tool_plan.get("target_concept") or "",
+                    tool_plan.get("attribute_target_concept") or "",
+                    tool_plan.get("composite_topology") or "",
+                    plan_text,
+                )
+            )
+        ).lower()
+        final_kind = self._toolgen_final_variable_kind(final_variable)
+        has_final = final_kind != "none"
+        has_plan = bool(plan_steps)
+        has_context = any(
+            marker in lowered
+            for marker in ("minted_variables", "candidate_map", "candidates", "#")
+        )
+        has_next_action_guidance = any(
+            marker in observation
+            for marker in (
+                "Action:",
+                "Final Answer:",
+                "count(",
+                "get_neighbors(",
+                "get_relations(",
+                "intersection(",
+                "union(",
+                "difference(",
+                "argmax(",
+                "argmin(",
+            )
+        ) or any(
+            phrase in lowered
+            for phrase in (
+                "next action",
+                "continue from",
+                "solver should",
+                "follow up with",
+                "critical to solver",
+            )
+        )
+        looks_fallback_only = self._toolgen_looks_like_fallback_handoff(lowered) or (
+            "safe query limit" in lowered
+        )
+        semantic_narrowing_failure = any(
+            phrase in lowered
+            for phrase in (
+                "semantic filter returned no",
+                "semantic filter produced no",
+                "no filtered variable ids",
+                "no filtered vars",
+                "failed narrowing",
+                "narrowing failed",
+            )
+        )
+        plan_requires_narrowing_or_final_op = any(
+            phrase in plan_lowered
+            for phrase in (
+                "resolve_semantic_filter",
+                "semantic filter",
+                "count",
+                "intersect",
+                "intersection",
+                "filter",
+                "difference",
+                "union",
+                "argmax",
+                "argmin",
+            )
+        )
+        narrowed_problem_space = any(
+            phrase in lowered
+            for phrase in (
+                "contains the intersected set",
+                "contains the filtered set",
+                "contains the walk result",
+                "contains the aggregated",
+                "resolved",
+                "intersected",
+                "filtered",
+                "walked",
+                "count result",
+                "narrowed",
+                "subset",
+            )
+        )
+        verified_narrowing_signal = any(
+            phrase in lowered
+            for phrase in (
+                "contains the intersected set",
+                "contains the filtered set",
+                "contains the walk result",
+                "correctly narrowed",
+                "postcondition verified",
+                "verified narrowed set",
+                "semantic_trust_level=verified",
+                "final_operation_safe=true",
+            )
+        )
+        looks_complete = status == "SUCCESS" and (
+            final_kind in {"integer", "scalar"}
+            or "already an integer count" in lowered
+            or "submit it directly" in lowered
+        )
+        looks_partial_handoff = (
+            status == "SUCCESS"
+            and has_final
+            and not looks_fallback_only
+            and has_next_action_guidance
+            and (final_kind == "pointer" or has_context or narrowed_problem_space)
+        )
+        # Phase 0: detect shallow-namespace anchor.  Generic Freebase types
+        # (common.topic, type.object, base.schemastaging) do not constitute a
+        # domain-relevant resolution — the entity was never meaningfully typed.
+        # We only check when minted_variables are present (has_context) so that
+        # ordinary "no relations found" exhaustions are not incorrectly flagged.
+        _SHALLOW_NS_RE = re.compile(r'common\.topic|type\.object|base\.schemastaging')
+        looks_shallow_resolution = bool(_SHALLOW_NS_RE.search(observation) and has_context)
+        # Phase 0: shallow anchor voids both partial-progress paths for exhausted macros
+        exhausted_with_guidance = (
+            status == "MACRO EXHAUSTED"
+            and has_context
+            and has_next_action_guidance
+            and not looks_shallow_resolution  # Phase 0: shallow anchor → guidance is moot
+        )
+        honest_zero = (
+            status == "MACRO EXHAUSTED"
+            and observation.startswith("MACRO EXHAUSTED: Resulting set is empty.")
+            and has_context
+            # Item B: do NOT require has_next_action_guidance — plain honest exhaustion with
+            # a domain-relevant anchor is admission-worthy even without a concrete next step.
+            # Requiring next action was causing ToolGen to fabricate JSON blobs.
+            and plan_requires_narrowing_or_final_op
+            and not looks_fallback_only
+            and not looks_shallow_resolution  # Phase 0: shallow anchor ≠ honest zero
+        )
+
+        material_progress = False
+        final_operation_safe = False
+        handoff_state = "blocked"
+        semantic_trust_level = "blocked"
+        reason = "no_material_progress"
+        if looks_complete:
+            handoff_state = "complete"
+            semantic_trust_level = "verified"
+            material_progress = True
+            final_operation_safe = True
+            reason = "completed_declared_subtask"
+        elif looks_partial_handoff and verified_narrowing_signal:
+            handoff_state = "partial_safe_continue"
+            semantic_trust_level = "verified"
+            material_progress = True
+            final_operation_safe = True
+            reason = "usable_partial_handoff"
+        elif looks_partial_handoff and (has_context or narrowed_problem_space):
+            handoff_state = "partial_safe_continue"
+            semantic_trust_level = "partial_unverified"
+            material_progress = True
+            final_operation_safe = False
+            reason = "partial_handoff_without_semantic_proof"
+        elif honest_zero:
+            handoff_state = "exhausted"
+            # Phase 2: separate actionable honest_zero (next-action guidance or
+            # partial handoff) from non-actionable (exhausted with no follow-up cue).
+            # Non-actionable keeps material_progress=True for diagnostic logging but
+            # gets lower trust so it won't rank as strong reusable value.
+            _has_handoff = has_next_action_guidance or looks_partial_handoff
+            # Phase 2: use partial_unverified (not fallback_unverified) so that
+            # honest_zero_no_handoff tools still pass the usefulness gate while
+            # ranking lower than fully actionable honest_zero tools (verified).
+            # fallback_unverified would trigger usefulness_passed=False at the
+            # grade-cap check, blocking registration entirely — too aggressive.
+            semantic_trust_level = "verified" if _has_handoff else "partial_unverified"
+            material_progress = True  # preserved for logging and usefulness gate
+            final_operation_safe = False
+            reason = "honest_zero" if _has_handoff else "honest_zero_no_handoff"
+        elif (
+            status == "SUCCESS"
+            and has_final
+            and looks_fallback_only
+            and (has_context or has_next_action_guidance)
+        ):
+            handoff_state = "partial_fallback_not_final"
+            semantic_trust_level = "fallback_unverified"
+            material_progress = True
+            final_operation_safe = False
+            if plan_requires_narrowing_or_final_op or semantic_narrowing_failure:
+                reason = "fallback_partial_not_final_unsafe"
+            else:
+                reason = "fallback_partial_with_recovery_context"
+        elif exhausted_with_guidance:
+            handoff_state = "exhausted"
+            semantic_trust_level = "blocked"
+            material_progress = True
+            final_operation_safe = False
+            reason = "exhausted_with_concrete_handoff"
+        elif status == "SUCCESS" and looks_fallback_only:
+            handoff_state = "partial_fallback_not_final"
+            semantic_trust_level = "fallback_unverified"
+            final_operation_safe = False
+            reason = "fallback_only_without_advancement"
+        elif status == "MACRO EXHAUSTED":
+            handoff_state = "exhausted"
+            semantic_trust_level = "blocked"
+            reason = "exhausted_without_concrete_handoff"
+        elif status in {"ERROR", "SHAPE_MISMATCH"}:
+            handoff_state = "blocked"
+            semantic_trust_level = "blocked"
+            reason = "runtime_or_shape_failure"
+        elif status == "SUCCESS" and has_final:
+            handoff_state = "partial_safe_continue"
+            semantic_trust_level = "partial_unverified"
+            final_operation_safe = False
+            reason = "nonfinal_partial_result"
+
+        value_delivered = self._toolgen_classify_value_delivered(
+            tool_plan=tool_plan,
+            execution_validation=execution_validation,
+            live_progress_summary={
+                "execution_status": status,
+                "has_final_variable": has_final,
+                "has_context": has_context,
+                "material_progress": material_progress,
+                "has_next_action_guidance": has_next_action_guidance,
+                "handoff_state": handoff_state,
+                "final_operation_safe": final_operation_safe,
+            },
+        )
+        partial_value_usable = self._toolgen_partial_value_usable(
+            value_delivered,
+            {
+                "has_context": has_context,
+                "material_progress": material_progress,
+                "handoff_state": handoff_state,
+                "has_next_action_guidance": has_next_action_guidance,
+            },
+            preferred_tool_mode=str(tool_plan.get("preferred_tool_mode") or ""),
+        )
+        if value_delivered != "none" and not looks_shallow_resolution:
+            material_progress = True
+            if handoff_state == "blocked":
+                handoff_state = (
+                    "exhausted"
+                    if status == "MACRO EXHAUSTED"
+                    else "partial_safe_continue"
+                )
+            if reason in {"no_material_progress", "exhausted_without_concrete_handoff"}:
+                reason = f"value_delivered:{value_delivered}"
+            # Upgrade trust when value_delivered proves the tool is truly solver-usable —
+            # not just that it made internal progress.
+            #
+            # Two cases qualify for verified:
+            #   1. produced_final_variable — the tool answered the question.
+            #   2. Explicit actionable partial handoff — the tool provided both a narrowed
+            #      variable (has_context) and a concrete next action (has_next_action_guidance).
+            #      Intermediate-only states like resolved_both_anchors and built_intersection_set
+            #      are diagnostic progress but not automatically solver-usable; they remain
+            #      partial_unverified unless accompanied by explicit next-action text.
+            _actionable_handoff = has_next_action_guidance and has_context
+            if semantic_trust_level == "blocked" or (
+                semantic_trust_level == "partial_unverified"
+                and reason == "honest_zero_no_handoff"
+            ):
+                semantic_trust_level = (
+                    "verified"
+                    if (
+                        value_delivered == "produced_final_variable"
+                        or _actionable_handoff
+                    )
+                    else "partial_unverified"
+                )
+
+        return {
+            "has_live_result": True,
+            "plan_step_count": len(plan_steps),
+            "plan_target_concept": tool_plan.get("target_concept") or "",
+            "execution_status": status,
+            "final_variable": final_variable,
+            "final_variable_kind": final_kind,
+            "has_final_variable": has_final,
+            "has_context": has_context,
+            "has_next_action_guidance": has_next_action_guidance,
+            "looks_fallback_only": looks_fallback_only,
+            "semantic_narrowing_failure": semantic_narrowing_failure,
+            "looks_complete": looks_complete,
+            "looks_partial_handoff": looks_partial_handoff,
+            "narrowed_problem_space": narrowed_problem_space,
+            "verified_narrowing_signal": verified_narrowing_signal,
+            "handoff_state": handoff_state,
+            "semantic_trust_level": semantic_trust_level,
+            "final_operation_safe": final_operation_safe,
+            "plan_requires_narrowing_or_final_op": plan_requires_narrowing_or_final_op,
+            "material_progress": material_progress,
+            "usefulness_passed": material_progress or (not has_plan and has_final),
+            "reason": reason,
+            "looks_shallow_resolution": looks_shallow_resolution,  # Phase 0
+            "value_delivered": value_delivered,
+            "partial_value_usable": partial_value_usable,
+            "value_mode": (
+                "full_solve"
+                if value_delivered == "produced_final_variable"
+                else (
+                    "diagnostic_probe"
+                    if str(tool_plan.get("preferred_tool_mode") or "") == "diagnostic_probe"
+                    or value_delivered == "produced_actionable_handoff"
+                    else ("progress_tool" if value_delivered != "none" else "none")
+                )
+            ),
+            "achieved_state": self._toolgen_achieved_state_for_value(value_delivered),
+        }
+
     def _toolgen_validate_candidate_tool(
         self,
         tool_spec: Mapping[str, Any],
@@ -1107,11 +3268,10 @@ class ControllerToolgenMixin:
         if not tool_code:
             return None
         exec_payload = getattr(self, "_toolgen_execution_payload", None)
-        # Live execution check — crash-only mode.
-        # We run the tool and report ONLY hard runtime errors (compile failures,
-        # NameError, timeout, etc.) to the validator.  Functional dead-ends
-        # ("MACRO EXHAUSTED", empty results) are silently discarded so the
-        # validator grades on code logic alone, not live KG outcome.
+        # Live execution check — usefulness-gated admission mode.
+        # We still surface hard runtime errors directly, but we also summarize
+        # whether the live result produced final utility or an actionable partial
+        # handoff. Honest but non-actionable dead ends no longer pass admission.
         _CRASH_ISSUE_PREFIXES = (
             "execution_compile_failed",
             "execution_exec_failed",
@@ -1122,8 +3282,79 @@ class ControllerToolgenMixin:
             "execution_ssot_error",  # Surfaces shape mismatches from server-side eval
         )
         live_test_str = ""
-        if isinstance(exec_payload, Mapping) and run_live_execution_check:
+        execution_validation: Optional[Mapping[str, Any]] = None
+        usefulness_summary = {
+            "has_live_result": False,
+            "material_progress": False,
+            "usefulness_passed": True,
+            "semantic_trust_level": "blocked",
+            "final_operation_safe": False,
+            "handoff_state": "blocked",
+            "reason": "no_live_context",
+        }
+        if isinstance(exec_payload, Mapping):
             execution_validation = self._toolgen_execution_check(tool_code, exec_payload)
+            usefulness_summary = self._summarize_toolgen_live_progress(
+                execution_validation, exec_payload
+            )
+        semantic_code_smells = self._toolgen_semantic_code_smells(tool_code)
+        severe_semantic_smell = False
+        trust_level = str(usefulness_summary.get("semantic_trust_level") or "blocked")
+        usefulness_reason = str(usefulness_summary.get("reason") or "unknown")
+        if semantic_code_smells:
+            trust_level = trust_level if trust_level != "verified" else "partial_unverified"
+        if (
+            usefulness_summary.get("plan_requires_narrowing_or_final_op")
+            and trust_level == "fallback_unverified"
+        ):
+            severe_semantic_smell = True
+            usefulness_reason = "fallback_unverified_not_safe_for_declared_plan"
+        if (
+            usefulness_summary.get("semantic_narrowing_failure")
+            and usefulness_summary.get("execution_status") == "SUCCESS"
+            and usefulness_summary.get("final_variable_kind") in {"integer", "scalar"}
+        ):
+            severe_semantic_smell = True
+            trust_level = "fallback_unverified"
+            usefulness_reason = "definitive_result_after_failed_semantic_narrowing"
+        is_kg_env = self._resolved_environment_label() == "knowledge_graph"
+        blocking_kg_smells = {
+            "kg_utils_import_forbidden",  # import will raise ModuleNotFoundError at runtime
+            "base_group_selected_by_position",
+            "first_nonempty_group_selected_heuristically",
+            "candidate_map_salvage_without_role_proof",
+            "semantic_filter_empty_success_path",
+            "broad_exception_success_fallback",
+            "task_text_semantic_rediscovery",
+            "kg_utils_shape_probing",
+            "first_candidate_selection_by_index",
+            "hardcoded_domain_token_list",
+            "custom_streaming_or_bucketing_architecture",
+            "noncanonical_helper_surface",
+        }
+        if (
+            usefulness_summary.get("plan_requires_narrowing_or_final_op")
+            and not usefulness_summary.get("final_operation_safe", False)
+            and any(smell in semantic_code_smells for smell in blocking_kg_smells)
+        ):
+            severe_semantic_smell = True
+            trust_level = "fallback_unverified"
+            usefulness_reason = "semantic_trustworthiness_not_proven"
+        if is_kg_env and any(smell in semantic_code_smells for smell in blocking_kg_smells):
+            severe_semantic_smell = True
+            if trust_level == "verified":
+                trust_level = "partial_unverified"
+            usefulness_reason = "blocking_semantic_code_smells"
+        usefulness_passed = bool(usefulness_summary.get("usefulness_passed", False))
+        if severe_semantic_smell or (
+            usefulness_summary.get("has_live_result")
+            and trust_level in {"fallback_unverified", "blocked"}
+        ):
+            usefulness_passed = False
+        # Phase 0: shallow-namespace anchor → honest but useless; update reason for tracing
+        if usefulness_summary.get("looks_shallow_resolution") and not usefulness_passed:
+            usefulness_reason = "shallow_namespace_anchor_not_domain_relevant"
+        if isinstance(exec_payload, Mapping) and run_live_execution_check:
             if execution_validation is None:
                 # Clean run — no crash, no note needed.
                 pass
@@ -1137,9 +3368,33 @@ class ControllerToolgenMixin:
                     live_test_str = f"LIVE_TEST_RESULTS (success): final_variable={fv}, observation={obs}"
                 elif ev_status == "MACRO EXHAUSTED":
                     obs = execution_validation.get("observation", "")
+                    # Detect potential semantic-bridge miss: observation contains only
+                    # shallow/generic-namespace candidates while the payload had richer
+                    # semantic targets available that appear unused.
+                    _shallow_only = bool(
+                        re.search(r'common\.topic|type\.object|freebase\.type_profile', obs)
+                        and not re.search(r'(?i)no relations found|no \w+ found', obs)
+                    )
+                    _has_semantic_ctx = bool(
+                        exec_payload
+                        and (
+                            exec_payload.get("entity_target_concepts")
+                            or exec_payload.get("domain_hints")
+                        )
+                    )
+                    _bridge_note = ""
+                    if _shallow_only and _has_semantic_ctx:
+                        _bridge_note = (
+                            " SEMANTIC_BRIDGE_NOTE: Observation shows only shallow/common-topic"
+                            " candidates. The payload included entity_target_concepts or"
+                            " domain_hints that could have guided role-specific first-hop"
+                            " resolution but appear unused. This is likely a semantic bridge"
+                            " miss, not pure data sparsity."
+                        )
                     live_test_str = (
                         f"LIVE_TEST_RESULTS (exhausted): The tool ran without Python errors "
                         f"but failed to solve the task. It returned MACRO EXHAUSTED. Observation: {obs}"
+                        + _bridge_note
                     )
                 elif ev_status == "SHAPE_MISMATCH":
                     msg = execution_validation.get("msg", "")
@@ -1151,7 +3406,7 @@ class ControllerToolgenMixin:
                         result_json = str(execution_validation)
                     msg = execution_validation.get("msg", result_json)
                     live_test_str = f"LIVE_TEST_RESULTS (error/crash detected): {msg}"
-                # else: functional dead-end — drop silently, grade on logic only
+                # else: non-final live result; usefulness is captured via LIVE_PROGRESS_SUMMARY
         elif isinstance(exec_payload, Mapping):
             live_test_str = (
                 "LIVE_TEST_RESULTS (deferred): Runtime execution check is intentionally "
@@ -1163,6 +3418,30 @@ class ControllerToolgenMixin:
         augmented_task_pack = task_pack
         if live_test_str:
             augmented_task_pack = task_pack + "\n\n" + live_test_str
+        try:
+            augmented_task_pack += (
+                "\n\nLIVE_PROGRESS_SUMMARY: "
+                + json.dumps(usefulness_summary, ensure_ascii=True, default=str)
+            )
+        except Exception:
+            pass
+        if semantic_code_smells:
+            try:
+                augmented_task_pack += (
+                    "\n\nSEMANTIC_CODE_SMELLS: "
+                    + json.dumps(semantic_code_smells, ensure_ascii=True, default=str)
+                )
+            except Exception:
+                pass
+        plan_repair_cycle = 0
+        round_context = {}
+        if isinstance(exec_payload, Mapping):
+            try:
+                plan_repair_cycle = int(exec_payload.get("plan_repair_cycle") or 0)
+            except Exception:
+                plan_repair_cycle = 0
+            if isinstance(exec_payload.get("toolgen_retry_context"), Mapping):
+                round_context = dict(exec_payload.get("toolgen_retry_context") or {})
         payload = {
             "task_pack": augmented_task_pack,
             "tool": {
@@ -1172,8 +3451,142 @@ class ControllerToolgenMixin:
                 "environment": self._resolved_environment_label(),
             },
             "tool_code": tool_code,
+            "plan_repair_cycle": plan_repair_cycle,
+            "tool_context": {
+                "tool_plan": self._build_tool_plan(exec_payload or {}),
+                "round_context": round_context,
+                "live_progress_summary": usefulness_summary,
+            },
         }
-        return self._toolgen_validator_call(payload)
+        validation = self._toolgen_validator_call(payload)
+        if not isinstance(validation, Mapping):
+            return validation
+        validation = self._toolgen_apply_validation_policy(
+            validation=validation,
+            execution_validation=execution_validation,
+            live_progress_summary=usefulness_summary,
+            round_context=round_context,
+            tool_plan=self._build_tool_plan(exec_payload or {}),
+            tool_code=tool_code,
+            failure_phase="validator",
+        )
+        validation["live_progress_summary"] = usefulness_summary
+        validation["semantic_code_smells"] = semantic_code_smells
+        validation["semantic_trust_level"] = trust_level
+        validation["usefulness_passed"] = usefulness_passed
+        validation["usefulness_reason"] = usefulness_reason
+        validation["final_operation_safe"] = bool(
+            usefulness_summary.get("final_operation_safe", False)
+        )
+        validation["handoff_state"] = str(
+            usefulness_summary.get("handoff_state") or "blocked"
+        )
+        validation["achieved_state"] = str(
+            usefulness_summary.get("achieved_state") or "none"
+        )
+        try:
+            reported_grade = int(validation.get("grade") or 0)
+        except Exception:
+            reported_grade = 0
+        uncapped_grade = reported_grade
+        grade_cap_reason = None
+        if not usefulness_passed:
+            grade_cap = self.MIN_REGISTRATION_GRADE
+            if (
+                validation["handoff_state"] in {"blocked", "exhausted"}
+                or not usefulness_summary.get("material_progress", False)
+                or not usefulness_summary.get("has_final_variable", False)
+            ):
+                grade_cap = 4
+            if reported_grade > grade_cap:
+                reported_grade = grade_cap
+                validation["grade"] = reported_grade
+                grade_cap_reason = (
+                    "usefulness_failed_cap"
+                    if grade_cap == self.MIN_REGISTRATION_GRADE
+                    else "usefulness_failed_blocked_cap"
+                )
+        validation["uncapped_grade"] = uncapped_grade
+        validation["grade_cap_reason"] = grade_cap_reason
+        try:
+            self._append_generated_tools_log(
+                {
+                    "event": "toolgen_live_progress_summary",
+                    "tool_name": tool_spec.get("name"),
+                    "strategy_family": validation.get("strategy_family"),
+                    "execution_style": validation.get("execution_style"),
+                    "preferred_tool_mode": validation.get("preferred_tool_mode"),
+                    "fallback_strategies": validation.get("fallback_strategies"),
+                    "strategy_sequence": validation.get("strategy_sequence"),
+                    "strategy_index": validation.get("strategy_index"),
+                    "strategy_epoch": validation.get("strategy_epoch"),
+                    "strategy_source": validation.get("strategy_source"),
+                    "failure_family": validation.get("failure_family"),
+                    "failure_bucket": validation.get("failure_bucket"),
+                    "value_delivered": validation.get("value_delivered"),
+                    "same_strategy_as_previous": validation.get(
+                        "same_strategy_as_previous"
+                    ),
+                    "same_failure_as_previous": validation.get(
+                        "same_failure_as_previous"
+                    ),
+                    "pivot_required": validation.get("pivot_required"),
+                    "partial_value_usable": validation.get("partial_value_usable"),
+                    "achieved_state": usefulness_summary.get("achieved_state"),
+                    "usefulness_passed": validation["usefulness_passed"],
+                    "usefulness_reason": validation["usefulness_reason"],
+                    "handoff_state": validation["handoff_state"],
+                    "semantic_trust_level": validation["semantic_trust_level"],
+                    "final_operation_safe": validation["final_operation_safe"],
+                    "semantic_code_smells": semantic_code_smells,
+                    "grade": validation.get("grade"),
+                    "uncapped_grade": validation.get("uncapped_grade"),
+                    "grade_cap_reason": validation.get("grade_cap_reason"),
+                    "live_progress_summary": usefulness_summary,
+                }
+            )
+        except Exception:
+            pass
+        try:
+            self._append_toolgen_strategy_classification(
+                tool_name=tool_spec.get("name"),
+                round=round_context.get("round"),
+                strategy_family=validation.get("strategy_family"),
+                execution_style=validation.get("execution_style"),
+                preferred_tool_mode=validation.get("preferred_tool_mode"),
+                fallback_strategies=validation.get("fallback_strategies"),
+                strategy_source=validation.get("strategy_source"),
+                strategy_index=validation.get("strategy_index"),
+                strategy_epoch=validation.get("strategy_epoch"),
+                failure_bucket=validation.get("failure_bucket"),
+                same_strategy_as_previous=validation.get("same_strategy_as_previous"),
+                pivot_required=validation.get("pivot_required"),
+            )
+            self._append_toolgen_failure_classification(
+                tool_name=tool_spec.get("name"),
+                round=round_context.get("round"),
+                failure_family=validation.get("failure_family"),
+                failure_bucket=validation.get("failure_bucket"),
+                strategy_source=validation.get("strategy_source"),
+                strategy_index=validation.get("strategy_index"),
+                strategy_epoch=validation.get("strategy_epoch"),
+                same_failure_as_previous=validation.get("same_failure_as_previous"),
+                material_progress=usefulness_summary.get("material_progress"),
+            )
+            self._append_toolgen_value_delivered(
+                tool_name=tool_spec.get("name"),
+                round=round_context.get("round"),
+                value_delivered=validation.get("value_delivered"),
+                failure_bucket=validation.get("failure_bucket"),
+                strategy_source=validation.get("strategy_source"),
+                strategy_index=validation.get("strategy_index"),
+                strategy_epoch=validation.get("strategy_epoch"),
+                partial_value_usable=validation.get("partial_value_usable"),
+                usefulness_passed=validation.get("usefulness_passed"),
+            )
+        except Exception:
+            pass
+        return validation
 
     def _toolgen_should_validate(self) -> bool:
         return getattr(self, "_toolgen_validator_agent", None) is not None
@@ -1244,6 +3657,28 @@ class ControllerToolgenMixin:
                     "3) inside try: payload = payload or {}."
                 )
 
+        # -- forbidden kg_utils import --
+        if re.search(r"^\s*import\s+kg_utils\b", code, flags=re.MULTILINE):
+            issues.append(
+                "CRITICAL: Do NOT write 'import kg_utils'. The kg_utils helper facade "
+                "is pre-injected as a module-level global before your code executes. "
+                "Just call kg_utils.resolve_entity_to_vars(...) etc. directly. "
+                "Adding the import statement will raise ModuleNotFoundError at validation."
+            )
+
+        # -- SSOT return shape: raw string or bare variable ID returns --
+        # Detect patterns like: return "#4", return "MACRO EXHAUSTED", return f"#
+        if re.search(
+            r'return\s+["\'](?:#\d*|MACRO\s+EXHAUSTED|ERROR)',
+            code,
+        ):
+            issues.append(
+                "CRITICAL: SSOT schema violation — run() must return the 3-key dict "
+                "{\"status\": ..., \"final_variable\": ..., \"observation\": ...}. "
+                "You are returning a raw string or bare variable ID (e.g. '#4' or "
+                "'MACRO EXHAUSTED: ...'). Wrap ALL return paths in the SSOT dict."
+            )
+
         # -- undefined bare function calls: DISABLED --
         # This check falsely flags dynamic callbacks extracted from payload
         # (e.g., get_relations_fn = actions_spec.get("get_relations")) as undefined.
@@ -1288,6 +3723,11 @@ class ControllerToolgenMixin:
         upgrade_goal: str = "",
         active_variables: Optional[Sequence[Any]] = None,
         target_archetype_hint: str = "",
+        topological_execution_plan: Any = "",
+        entity_target_concepts: Optional[list] = None,
+        plan_repair_cycle: int = 0,
+        recovery_policy: str = "",
+        tool_plan: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         # The live execution check routes to the task server via
         # evaluate_generated_macro(), where the real shadow proxy interceptor is
@@ -1299,29 +3739,26 @@ class ControllerToolgenMixin:
         registry_dir = getattr(self, "_registry_dir", "") or getattr(self, "_toolgen_registry_root", "") or "."
         state_dir = os.path.join(registry_dir, "tool_state")
         run_id = "live_eval"
-        # Extract entity hints from task_text so tools that expect an
-        # 'entities' key in the payload have something to work with during
-        # the live execution check.  This mirrors what the live
-        # Orchestrator populates when it invokes Macro tools.
-        entities: list[str] = []
-        if isinstance(task_text, str):
-            # Try "Entities: [A, B]" pattern first
-            ent_match = re.search(r"Entities\s*:\s*\[([^\]]+)\]", task_text)
-            if ent_match:
-                entities = [
-                    e.strip().strip("'\"")
-                    for e in ent_match.group(1).split(",")
-                    if e.strip()
-                ]
-            # Fallback: "Entities: A, B" (no brackets)
-            if not entities:
-                ent_match2 = re.search(r"Entities\s*:\s*([^\n\r;]+)", task_text)
-                if ent_match2:
-                    entities = [
-                        e.strip().strip("'\"")
-                        for e in ent_match2.group(1).split(",")
-                        if e.strip()
-                    ]
+        # Entities come strictly from the tool_plan provided by the Orchestrator.
+        # Do not attempt to reconstruct from raw task_text.
+        entities: list[str] = list((tool_plan or {}).get("entities") or []) if isinstance(tool_plan, Mapping) else []
+
+        canonical_plan_input: dict[str, Any] = {}
+        if isinstance(tool_plan, Mapping):
+            canonical_plan_input.update(dict(tool_plan))
+        if target_archetype_hint:
+            canonical_plan_input.setdefault("target_archetype", target_archetype_hint)
+        if topological_execution_plan not in (None, "", []):
+            canonical_plan_input.setdefault(
+                "topological_execution_plan", topological_execution_plan
+            )
+        if entity_target_concepts is not None:
+            canonical_plan_input.setdefault(
+                "entity_target_concepts", entity_target_concepts
+            )
+        if recovery_policy:
+            canonical_plan_input.setdefault("recovery_policy", recovery_policy)
+        canonical_tool_plan = self._build_tool_plan(canonical_plan_input)
 
         # Parse target_archetype from multiple sources in priority order:
         # 1. explicit hint from the Orchestrator decision dict (most reliable),
@@ -1329,8 +3766,10 @@ class ControllerToolgenMixin:
         # 3. task_text itself.
         # This ensures we have a non-empty archetype even on the very first
         # generation turn when no prior failure has occurred.
-        target_archetype = ""
+        target_archetype = str(canonical_tool_plan.get("target_archetype") or "").strip()
         for _src in (target_archetype_hint, failure_context, task_text):
+            if target_archetype:
+                break
             if _src:
                 _src_upper = _src.upper()
                 for _arch_key in ARCHETYPE_REGISTRY.keys():
@@ -1348,54 +3787,45 @@ class ControllerToolgenMixin:
         # compatibility with older callers.
         explicit_upgrade_goal = str(upgrade_goal or "").strip() or failure_context
 
-        # ── Derive target_concept and domain_hints ──────────────────────────
-        # The live-test payload must mirror what the Tool Invoker provides in
-        # production.  Without these keys the tool falls back to the full
-        # task_text string as base_target, which causes score_relations to
-        # pick structurally-matching but semantically-wrong relations (e.g.,
-        # "base.permaculture...products" over "food.cheese_milk_source.cheeses").
-        #
-        # Extraction priority:
-        #   1. JSON fragments already embedded in upgrade_goal / failure_context
-        #      (present in later repair rounds after a Tool Invoker turn).
-        #   2. "what … NOUN (is|are|…)" heuristic on the question text.
-        #   3. Empty string / empty list — same as before this patch.
-        _q_text = task_text.split("Entities:")[0].strip() if "Entities:" in task_text else task_text
+        # Semantic keys should come from the canonical tool plan whenever present.
+        semantic_sources: dict[str, str] = {
+            "target_concept": "tool_plan",
+            "domain_hints": "tool_plan",
+            "attribute_target_concept": "tool_plan",
+        }
+        _live_target_concept = str(canonical_tool_plan.get("target_concept") or "").strip()
+        _live_domain_hints: list[str] = list(canonical_tool_plan.get("domain_hints") or [])
+        _attr_target_concept = str(
+            canonical_tool_plan.get("attribute_target_concept") or ""
+        ).strip()
+        _attr_domain_hints: list[str] = list(
+            canonical_tool_plan.get("attribute_domain_hints") or []
+        )
 
-        # Step 1: try to recover from prior-round JSON context
-        _live_target_concept = ""
-        _live_domain_hints: list[str] = []
-        for _ctx in (upgrade_goal or "", failure_context or ""):
-            if not _live_target_concept:
-                _tc_m = re.search(r'"target_concept"\s*:\s*"([^"]+)"', _ctx)
-                if _tc_m:
-                    _live_target_concept = _tc_m.group(1).strip()
-            if not _live_domain_hints:
-                _dh_m = re.search(r'"domain_hints"\s*:\s*\[([^\]]*)\]', _ctx)
-                if _dh_m:
-                    _live_domain_hints = [
-                        h.strip().strip("'\"")
-                        for h in _dh_m.group(1).split(",")
-                        if h.strip().strip("'\"")
-                    ]
+        # Semantic fields come strictly from the canonical tool_plan.
+        # Do not fall back to regex parsing of upgrade_goal or failure_context.
 
-        # Step 2: "what … NOUN (is|are|was|were|does|do|exist)" heuristic
-        if not _live_target_concept:
-            _wh_m = re.search(
-                r"(?i)\bwhat\s+(?:\w[\w\-]*\s+){0,8}(\w[\w\-]*)\s+(?:is|are|was|were|does|do|exist\b)",
-                _q_text,
+        try:
+            _etc_raw = canonical_tool_plan.get("entity_target_concepts") or []
+            self._append_generated_tools_log(
+                {
+                    "event": "toolgen_exec_payload_semantics",
+                    "target_concept_source": semantic_sources["target_concept"],
+                    "domain_hints_source": semantic_sources["domain_hints"],
+                    "attribute_target_concept_source": semantic_sources["attribute_target_concept"],
+                    "has_tool_plan": bool(canonical_tool_plan),
+                    # Phase 2 observability: were credible type/domain hints available?
+                    "target_concept": _live_target_concept or None,
+                    "execution_style": canonical_tool_plan.get("execution_style") or None,
+                    "preferred_tool_mode": canonical_tool_plan.get("preferred_tool_mode") or None,
+                    "fallback_strategies": canonical_tool_plan.get("fallback_strategies") or None,
+                    "has_entity_target_concepts": bool(_etc_raw),
+                    "entity_target_concepts_count": len(_etc_raw),
+                    "has_domain_hints": bool(_live_domain_hints),
+                }
             )
-            if _wh_m:
-                _live_target_concept = _wh_m.group(1).strip().lower()
-
-        # Step 3: attribute keys — for ATTRIBUTE_INTERSECTOR the last entity IS
-        # the attribute literal; it should score against itself as target_concept.
-        _attr_target_concept = ""
-        _attr_domain_hints: list[str] = []
-        if target_archetype == "ATTRIBUTE_INTERSECTOR" and entities:
-            _attr_target_concept = entities[-1]
-            _attr_domain_hints = _live_domain_hints
-        # ── end semantic key extraction ─────────────────────────────────────
+        except Exception:
+            pass
 
         payload: dict[str, Any] = {
             "task_text": task_text,
@@ -1418,6 +3848,30 @@ class ControllerToolgenMixin:
             "domain_hints": _live_domain_hints,
             "attribute_target_concept": _attr_target_concept,
             "attribute_domain_hints": _attr_domain_hints,
+            "execution_style": canonical_tool_plan.get("execution_style", ""),
+            "preferred_tool_mode": canonical_tool_plan.get("preferred_tool_mode", ""),
+            "fallback_strategies": canonical_tool_plan.get("fallback_strategies", []),
+            # Plan-first keys — injected by the Orchestrator and/or Validator.
+            "topological_execution_plan": canonical_tool_plan.get(
+                "topological_execution_plan",
+                topological_execution_plan or "",
+            ),
+            "entity_target_concepts": canonical_tool_plan.get(
+                "entity_target_concepts",
+                entity_target_concepts if entity_target_concepts is not None else [],
+            ),
+            "intermediate_target_concepts": canonical_tool_plan.get(
+                "intermediate_target_concepts", []
+            ),
+            "composite_topology": canonical_tool_plan.get("composite_topology", []),
+            "plan_repair_cycle": plan_repair_cycle,
+            # Recovery policy forwarded from the Orchestrator decision so that
+            # generated macros can apply fallback / retry logic during live tests.
+            "recovery_policy": canonical_tool_plan.get(
+                "recovery_policy", recovery_policy or ""
+            ),
+            "tool_plan": canonical_tool_plan,
+            "toolgen_retry_context": {},
         }
         return payload
 
@@ -1426,6 +3880,8 @@ class ControllerToolgenMixin:
     ) -> Optional[Mapping[str, Any]]:
         if not tool_code or not isinstance(payload, Mapping):
             return None
+        # Strip stray `import kg_utils` lines — kg_utils is pre-injected as a global.
+        tool_code = re.sub(r"^\s*import\s+kg_utils\b.*\n?", "", tool_code, flags=re.MULTILINE)
         try:
             compiled = compile(tool_code, "<generated_tool>", "exec")
         except Exception as exc:
@@ -1438,12 +3894,23 @@ class ControllerToolgenMixin:
                 "traceback": tb,
             }
         module = types.ModuleType("generated_tool_exec")
-        # Pre-inject kg_utils so generated code can reference it as a global
-        # without an import statement (mirrors the task.py safe_globals injection).
-        module.__dict__["kg_utils"] = _kg_utils
+        helper_facade = _kg_utils.get_macro_helper_facade()
+        # Pre-inject a stable helper facade so generated code can call helpers
+        # directly without writing dict-vs-object adapter logic.
+        module.__dict__["kg_utils"] = helper_facade
         try:
             exec(compiled, module.__dict__)
         except Exception as exc:
+            lowered_exc = str(exc).lower()
+            if "kg_utils" in lowered_exc and (
+                "not defined" in lowered_exc
+                or "module not found" in lowered_exc
+                or "modulenotfounderror" in lowered_exc
+            ):
+                return self._toolgen_integration_context_invalid_result(
+                    reason="missing_kg_utils_global",
+                    summary="Execution failed because the kg_utils helper facade was not injected.",
+                )
             tb = traceback.format_exc()
             return {
                 "grade": 0,
@@ -1464,6 +3931,7 @@ class ControllerToolgenMixin:
         # variables or trace entries on the controller object itself.
         _snap_exec_payload = getattr(self, "_toolgen_execution_payload", None)
         _run_payload = dict(payload)
+        _run_payload["kg_utils"] = helper_facade
         try:
             _run_payload["trace"] = copy.deepcopy(list(payload.get("trace") or []))
             _run_payload["entities"] = copy.deepcopy(list(payload.get("entities") or []))
@@ -1476,10 +3944,29 @@ class ControllerToolgenMixin:
         # to access kg_api through the HTTP TaskClient.__getattr__ proxy.
         _task_ref = getattr(self, "_kg_task_ref", None)
         _eval_fn = getattr(_task_ref, "evaluate_generated_macro", None) if _task_ref else None
+        _server_eval_available = callable(_eval_fn)
         _server_eval_used = False
         result: Any = {}
+        if self._resolved_environment_label() == "knowledge_graph":
+            _entities = payload.get("entities") or []
+            if not isinstance(_entities, Sequence) or len(_entities) == 0:
+                return self._toolgen_integration_context_invalid_result(
+                    reason="missing_entities",
+                    summary="Execution failed because payload['entities'] was empty or missing.",
+                )
+            _spec = payload.get("actions_spec") or {}
+            if (
+                not _server_eval_available
+                and isinstance(_spec, Mapping)
+                and _spec
+                and not any(callable(value) for value in _spec.values())
+            ):
+                return self._toolgen_integration_context_invalid_result(
+                    reason="non_callable_placeholder_actions_spec",
+                    summary="Execution failed because actions_spec contained non-callable placeholder primitives.",
+                )
         try:
-            if callable(_eval_fn):
+            if _server_eval_available:
                 _server_eval_used = True
                 # Strip non-serializable values (callables) before JSON encoding.
                 _serializable = {
@@ -1508,6 +3995,12 @@ class ControllerToolgenMixin:
                 "summary": "Execution failed: timeout.",
             }
         except Exception as exc:
+            lowered_exc = str(exc).lower()
+            if "kg_utils" in lowered_exc and "not defined" in lowered_exc:
+                return self._toolgen_integration_context_invalid_result(
+                    reason="missing_kg_utils_global",
+                    summary="Execution failed because the kg_utils helper facade was not injected.",
+                )
             tb = traceback.format_exc()
             return {
                 "grade": 0,
@@ -1529,6 +4022,34 @@ class ControllerToolgenMixin:
                 "fixes": ["Ensure run() returns a dict with required keys."],
                 "summary": "Execution failed: output not dict.",
             }
+
+        # ── Integration-context error intercept (server-eval path) ───────────
+        # When server eval fails (e.g. TypeError from non-callable actions_spec
+        # primitive), the result arrives as {"status": "error", "error": "..."}.
+        # The error text must be checked for integration-context signals BEFORE
+        # the SSOT key check converts it into a generic schema-invalid error,
+        # which would lose the underlying cause and misdirect pivot pressure.
+        _server_error_text = str(result.get("error") or "").lower()
+        if _server_error_text:
+            if "kg_utils" in _server_error_text and "not defined" in _server_error_text:
+                return self._toolgen_integration_context_invalid_result(
+                    reason="missing_kg_utils_global",
+                    summary="Server eval failed because the kg_utils helper facade was not injected.",
+                )
+            if any(
+                token in _server_error_text
+                for token in (
+                    "non-callable placeholder",
+                    "non_callable_placeholder",
+                    "not callable",
+                    "is not callable",
+                    "'nonetype' object is not callable",
+                )
+            ) or ("typeerror" in _server_error_text and "callable" in _server_error_text):
+                return self._toolgen_integration_context_invalid_result(
+                    reason="non_callable_placeholder_actions_spec",
+                    summary="Server eval failed because actions_spec contained non-callable placeholder primitives.",
+                )
 
         # ── Strict SSOT schema validation ────────────────────────────────────
         _SSOT_KEYS = {"status", "final_variable", "observation"}
@@ -1583,8 +4104,17 @@ class ControllerToolgenMixin:
             # Only grant the pass-through when tool had no callable actions_spec.
             _spec = payload.get("actions_spec") or {}
             _proxy_active = _server_eval_used or any(callable(v) for v in _spec.values())
+            lowered_observation = observation_val.lower()
             if not _proxy_active and "missing_actions_spec" in observation_val:
-                return None
+                return self._toolgen_integration_context_invalid_result(
+                    reason="non_callable_placeholder_actions_spec",
+                    summary="Execution failed because actions_spec contained non-callable placeholder primitives.",
+                )
+            if "kg_utils" in lowered_observation and "not defined" in lowered_observation:
+                return self._toolgen_integration_context_invalid_result(
+                    reason="missing_kg_utils_global",
+                    summary="Execution failed because the kg_utils helper facade was not injected.",
+                )
             return {
                 "grade": 0,
                 "issues": [
@@ -1625,14 +4155,11 @@ class ControllerToolgenMixin:
                             "any task that uses different entities."
                         ],
                         "fixes": [
-                            "NEVER hardcode entity strings from task_text or the entities list. "
-                            "Extract them dynamically at runtime: "
-                            "entities = payload.get('entities', []) or "
-                            "kg_utils.parse_entities(payload.get('task_text', '')). "
-                            "Pass entities[0], entities[1], etc. as arguments to KG calls. "
-                            "Score and select relations dynamically using "
-                            "kg_utils.score_relations(task_text, relations, domain_hints) — "
-                            "do NOT hardcode relation names."
+                            "NEVER hardcode entity strings. Use payload['entities'] as the "
+                            "authoritative runtime entity list and payload['tool_plan'] as the "
+                            "authoritative semantic specification. Pass entities[i] directly to "
+                            "canonical KG helpers; do NOT rediscover entities or relations from "
+                            "task_text or asked_for."
                         ],
                         "summary": f"Execution failed: hardcoded entity strings {_hardcoded} detected.",
                     }
@@ -1689,6 +4216,7 @@ class ControllerToolgenMixin:
             # Backward compat: old orchestrator payloads only supplied reason.
             upgrade_goal = reason
         tool_type = _stringify(decision.get("tool_type"))
+        tool_plan = self._build_tool_plan(decision)
         catalog_summary = ""
         try:
             catalog_summary = self._toolgen_tool_list_appendix()
@@ -1708,18 +4236,25 @@ class ControllerToolgenMixin:
             f"TOOL TYPE REQUIRED: {tool_type}\n"
             f"FORGE CONTEXT: {reason}\n"
             f"UPGRADE GOAL: {upgrade_goal}\n"
-            "CRITICAL ABSTRACTION RULE: You are generating a tool for a class "
-            "of problems, not a specific task. You MUST write PARAMETRIC code. "
-            "Do NOT hardcode entities (like 'Naloxone', 'goats', 'cows') into "
-            "the script. Your script must dynamically extract entities from "
-            "'payload[\"task_text\"]' or 'payload[\"asked_for\"]' and execute "
-            "the search abstractly. Give the tool a generic, descriptive name "
-            "(e.g., 'multi_entity_intersection_macro_tool').\n"
+            f"CANONICAL TOOL PLAN: {json.dumps(tool_plan, ensure_ascii=True, default=str)}\n"
+            "CRITICAL GENERATION RULE: You are generating a parametric tool for a "
+            "class of problems, not a specific task. Trust payload['tool_plan'] "
+            "as the authoritative semantic specification and payload['entities'] "
+            "as the authoritative entity list. Do NOT rediscover semantics from "
+            "task_text or asked_for when tool_plan exists. Do NOT write helper "
+            "compatibility adapters, helper-shape probes, streaming/bucketing "
+            "architectures, or pseudo-solver fallback trees. Generate a thin "
+            "helper-driven translator that follows the plan and returns a legal "
+            "next-state variable or exact MACRO EXHAUSTED. Give the tool a "
+            "generic descriptive name.\n"
             "==============================\n\n"
             + catalog_block
         )
 
-        plan_str = _stringify(decision.get("topological_execution_plan"))
+        plan_str = _stringify(
+            tool_plan.get("topological_execution_plan_text")
+            or tool_plan.get("topological_execution_plan")
+        )
         if plan_str:
             blueprint_header += f"EXECUTION PLAN:\n{plan_str}\n\n"
 
@@ -1747,7 +4282,10 @@ class ControllerToolgenMixin:
         user_prompt = build_task_pack(env_name, env_contract, [toolgen_query])
         final_user_prompt = blueprint_header + user_prompt
         target_archetype_hint = _stringify(
-            decision.get("target_archetype") or decision.get("archetype") or ""
+            tool_plan.get("target_archetype")
+            or decision.get("target_archetype")
+            or decision.get("archetype")
+            or ""
         )
         requested_tool_type = tool_type.strip().lower()
         if env_name == "knowledge_graph":
@@ -1761,20 +4299,8 @@ class ControllerToolgenMixin:
                 if requested_tool_type == "macro"
                 else "AGG_TOOLGEN_USER_KG"
             )
-            # Inject archetype-specific instructions into the macro prompt template.
-            if requested_tool_type == "macro":
-                arch_key = target_archetype_hint.strip().upper()
-                arch_instructions = ARCHETYPE_INSTRUCTIONS.get(
-                    arch_key, _ARCHETYPE_INSTRUCTIONS_DEFAULT
-                )
-                # Use literal placeholder replacement instead of str.format().
-                # The macro prompt contains many JSON/code examples with braces,
-                # and str.format would treat them as format fields (KeyError).
-                system_prompt = system_prompt.replace(
-                    "{target_archetype}", arch_key or "UNKNOWN"
-                ).replace(
-                    "{target_archetype_instructions}", arch_instructions
-                )
+            # Archetype is metadata only — no placeholder injection needed.
+            # The topological_execution_plan is the sole code-generation directive.
         else:
             system_prompt = get_toolgen_system_prompt(
                 getattr(self, "_toolgen_pipeline_name", "baseline"),
@@ -1788,6 +4314,15 @@ class ControllerToolgenMixin:
             trace_steps, _ = self._build_structured_trace(chat_history)
         except Exception:
             trace_steps = []
+        entity_target_concepts = tool_plan.get("entity_target_concepts") or []
+        if not isinstance(entity_target_concepts, list):
+            entity_target_concepts = []
+        plan_repair_cycle = 0
+        try:
+            plan_repair_cycle = int(decision.get("plan_repair_cycle") or 0)
+        except Exception:
+            plan_repair_cycle = 0
+        recovery_policy = _stringify(tool_plan.get("recovery_policy")).strip()
         exec_payload = self._build_toolgen_execution_payload(
             task_text=toolgen_query,
             trace=trace_steps[-10:] if trace_steps else [],
@@ -1795,6 +4330,11 @@ class ControllerToolgenMixin:
             upgrade_goal=upgrade_goal,
             active_variables=[],
             target_archetype_hint=target_archetype_hint,
+            topological_execution_plan=tool_plan.get("topological_execution_plan"),
+            entity_target_concepts=entity_target_concepts,
+            plan_repair_cycle=plan_repair_cycle,
+            recovery_policy=recovery_policy,
+            tool_plan=tool_plan,
         )
         prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
         setattr(self, "_toolgen_execution_payload", exec_payload)
@@ -1823,7 +4363,29 @@ class ControllerToolgenMixin:
         force_max_rounds: Optional[int] = None,
     ) -> Optional[ToolMetadata]:
         system_prompt = self._prepare_toolgen_agents(system_prompt)
-        mode = get_toolgen_mode()
+        exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        base_exec_payload = (
+            copy.deepcopy(dict(exec_payload))
+            if isinstance(exec_payload, Mapping)
+            else {}
+        )
+        requested_mode = get_toolgen_mode()
+        mode = requested_mode
+        mode_override_reason = ""
+        if requested_mode == "staged":
+            current_tool_plan = self._build_tool_plan(base_exec_payload)
+            if (
+                self._resolved_environment_label() == "knowledge_graph"
+                and (
+                    bool(current_tool_plan.get("topological_execution_plan"))
+                    or "PLAN-FIRST AUTHORITY" in system_prompt
+                    or "SSOT OUTPUT SCHEMA" in system_prompt
+                )
+            ):
+                mode = "legacy"
+                mode_override_reason = (
+                    "knowledge_graph_macro_prompt_requires_ssot_legacy_path"
+                )
         validate = self._toolgen_should_validate()
         max_rounds = force_max_rounds if force_max_rounds is not None else (9 if validate else 1)
         relaxed_mode = False if force_strict else self._toolgen_relaxed_mode_enabled()
@@ -1841,9 +4403,13 @@ class ControllerToolgenMixin:
         best_candidate: Optional[Mapping[str, Any]] = None
         best_live_grade: int = -1
         best_live_candidate: Optional[Mapping[str, Any]] = None
+        best_partial_candidate: Optional[Mapping[str, Any]] = None
+        best_partial_live_candidate: Optional[Mapping[str, Any]] = None
+        last_round_context: Optional[Mapping[str, Any]] = None
+        last_round_tool_plan: Optional[Mapping[str, Any]] = None
+        force_full_rewrite_next_round = False
         round_history: list[dict] = []  # compact per-round memory (no code)
         is_upgrade_attempt, upgrade_trigger = self._toolgen_is_upgrade_attempt()
-        exec_payload = getattr(self, "_toolgen_execution_payload", None)
         upgrade_goal_present = bool(
             isinstance(exec_payload, Mapping)
             and str(exec_payload.get("upgrade_goal") or "").strip()
@@ -1853,6 +4419,8 @@ class ControllerToolgenMixin:
                 {
                     "event": "toolgen_attempt",
                     "mode": mode,
+                    "requested_mode": requested_mode,
+                    "mode_override_reason": mode_override_reason or None,
                     "max_rounds": max_rounds,
                     "prompt_chars": len(base_prompt or ""),
                     "system_prompt_name": prompt_name or "custom",
@@ -1863,20 +4431,365 @@ class ControllerToolgenMixin:
             )
         except Exception:
             pass
+        if mode_override_reason:
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_mode_override",
+                        "requested_mode": requested_mode,
+                        "effective_mode": mode,
+                        "reason": mode_override_reason,
+                        "environment": self._resolved_environment_label(),
+                    }
+                )
+            except Exception:
+                pass
+
+        def _record_round_history(
+            *,
+            round_idx: int,
+            round_context: Mapping[str, Any],
+            failure_phase: str,
+            grade: int,
+            summary: str,
+            tool_name: str = "",
+            top_issue: Any = None,
+            usefulness_passed: bool = False,
+            usefulness_reason: str = "",
+            material_progress: bool = False,
+            failure_family: str = "unknown_failure",
+            failure_bucket: str = "strategy_mismatch_no_progress",
+            value_delivered: str = "none",
+            partial_value_usable: bool = False,
+            semantic_code_smells: Optional[Sequence[str]] = None,
+            tool_code: str = "",
+        ) -> None:
+            round_history.append(
+                {
+                    "round": round_idx,
+                    "tool_name": tool_name or None,
+                    "grade": grade,
+                    "top_issue": top_issue,
+                    "summary": summary,
+                    "usefulness_passed": usefulness_passed,
+                    "usefulness_reason": usefulness_reason,
+                    "material_progress": material_progress,
+                    "failure_phase": failure_phase,
+                    "strategy_family": round_context.get("strategy_family"),
+                    "active_strategy_family": round_context.get(
+                        "active_strategy_family"
+                    )
+                    or round_context.get("strategy_family"),
+                    "execution_style": round_context.get("execution_style"),
+                    "active_execution_style": round_context.get(
+                        "active_execution_style"
+                    )
+                    or round_context.get("execution_style"),
+                    "preferred_tool_mode": round_context.get("preferred_tool_mode"),
+                    "active_preferred_tool_mode": round_context.get(
+                        "active_preferred_tool_mode"
+                    )
+                    or round_context.get("preferred_tool_mode"),
+                    "strategy_sequence": list(
+                        round_context.get("strategy_sequence") or []
+                    ),
+                    "strategy_index": round_context.get("strategy_index"),
+                    "strategy_epoch": round_context.get("strategy_epoch"),
+                    "strategy_source": round_context.get("strategy_source"),
+                    "previous_failure_bucket": round_context.get(
+                        "previous_failure_bucket"
+                    ),
+                    "failure_family": failure_family,
+                    "failure_bucket": failure_bucket,
+                    "value_delivered": value_delivered,
+                    "partial_value_usable": partial_value_usable,
+                    "semantic_code_smells": list(semantic_code_smells or []),
+                    "pivot_required": bool(round_context.get("pivot_required")),
+                    "code_shape_signature": self._toolgen_code_shape_signature(
+                        tool_code
+                    ),
+                }
+            )
+
+        def _persist_validated_candidate(
+            *,
+            candidate_obj: Optional[Mapping[str, Any]],
+            validation_obj: Optional[Mapping[str, Any]],
+            tool_code: str,
+            tool_spec_obj: Mapping[str, Any],
+            admitted: bool,
+            registered: bool,
+        ) -> None:
+            if not isinstance(candidate_obj, Mapping):
+                return
+            val_dict = validation_obj if isinstance(validation_obj, Mapping) else {}
+            achieved_summary = self._toolgen_best_achieved_state_summary(round_history)
+            try:
+                candidate_round = int(candidate_obj.get("round_idx") or round_idx)
+            except Exception:
+                candidate_round = round_idx
+            try:
+                persisted_grade = int(val_dict.get("grade") or 0)
+            except Exception:
+                persisted_grade = 0
+            self._persist_tool_candidate(
+                round_idx=candidate_round,
+                tool_name=(tool_spec_obj.get("name") if isinstance(tool_spec_obj, Mapping) else None)
+                or "unknown",
+                tool_code=tool_code,
+                failure_phase="validator",
+                mode=mode,
+                patch_mode=patch_mode,
+                target_archetype=str((tool_spec_obj or {}).get("target_archetype") or ""),
+                grade=persisted_grade,
+                uncapped_grade=val_dict.get("uncapped_grade"),
+                grade_cap_reason=str(val_dict.get("grade_cap_reason") or ""),
+                usefulness_passed=val_dict.get("usefulness_passed"),
+                usefulness_reason=str(val_dict.get("usefulness_reason") or ""),
+                plan_diagnosis=str(val_dict.get("plan_diagnosis") or ""),
+                admitted=admitted,
+                registered=registered,
+                extra_meta={
+                    "repair_mode": val_dict.get("repair_mode"),
+                    "summary": str(val_dict.get("summary") or "")[:300],
+                    "top_issue": str((val_dict.get("issues") or [""])[0])[:300],
+                    "strategy_family": val_dict.get("strategy_family"),
+                    "execution_style": val_dict.get("execution_style"),
+                    "preferred_tool_mode": val_dict.get("preferred_tool_mode"),
+                    "fallback_strategies": val_dict.get("fallback_strategies"),
+                    "strategy_sequence": val_dict.get("strategy_sequence"),
+                    "strategy_index": val_dict.get("strategy_index"),
+                    "strategy_epoch": val_dict.get("strategy_epoch"),
+                    "strategy_source": val_dict.get("strategy_source"),
+                    "failure_family": val_dict.get("failure_family"),
+                    "failure_bucket": val_dict.get("failure_bucket"),
+                    "value_delivered": val_dict.get("value_delivered"),
+                    "same_strategy_as_previous": val_dict.get(
+                        "same_strategy_as_previous"
+                    ),
+                    "same_failure_as_previous": val_dict.get(
+                        "same_failure_as_previous"
+                    ),
+                    "pivot_required": val_dict.get("pivot_required"),
+                    "partial_value_usable": val_dict.get("partial_value_usable"),
+                    "best_achieved_state": achieved_summary.get("best_achieved_state"),
+                    "best_achieved_round": achieved_summary.get("best_achieved_round"),
+                    "best_achieved_tool_name": achieved_summary.get("best_achieved_tool_name"),
+                    "code_shape_signature": self._toolgen_code_shape_signature(
+                        tool_code
+                    ),
+                },
+            )
+
+        def _update_candidate_banks(
+            candidate_obj: Optional[Mapping[str, Any]],
+            *,
+            live_candidate: bool = False,
+        ) -> None:
+            nonlocal best_candidate
+            nonlocal best_grade
+            nonlocal best_live_candidate
+            nonlocal best_live_grade
+            nonlocal best_partial_candidate
+            nonlocal best_partial_live_candidate
+            if not isinstance(candidate_obj, Mapping):
+                return
+            if self._toolgen_candidate_is_better(candidate_obj, best_candidate):
+                best_candidate = candidate_obj
+                best_grade = self._toolgen_candidate_grade(candidate_obj)
+            if self._toolgen_candidate_is_partial_progress(candidate_obj) and self._toolgen_candidate_is_better(
+                candidate_obj,
+                best_partial_candidate,
+                partial_bank=True,
+            ):
+                best_partial_candidate = candidate_obj
+            if live_candidate and self._toolgen_candidate_is_better(
+                candidate_obj,
+                best_live_candidate,
+            ):
+                best_live_candidate = candidate_obj
+                best_live_grade = self._toolgen_candidate_grade(candidate_obj)
+            if live_candidate and self._toolgen_candidate_is_partial_progress(candidate_obj) and self._toolgen_candidate_is_better(
+                candidate_obj,
+                best_partial_live_candidate,
+                partial_bank=True,
+            ):
+                best_partial_live_candidate = candidate_obj
+
+        def _append_best_candidate_summary(
+            *,
+            chosen_candidate: Optional[Mapping[str, Any]],
+            selection_source: str,
+        ) -> None:
+            if not isinstance(chosen_candidate, Mapping):
+                return
+            tool_spec_obj = chosen_candidate.get("tool_spec")
+            if not isinstance(tool_spec_obj, Mapping):
+                return
+            chosen_validation = (
+                chosen_candidate.get("validation")
+                if isinstance(chosen_candidate.get("validation"), Mapping)
+                else {}
+            )
+            best_partial_choice = best_partial_candidate
+            if self._toolgen_candidate_is_better(
+                best_partial_live_candidate,
+                best_partial_choice,
+                partial_bank=True,
+            ):
+                best_partial_choice = best_partial_live_candidate
+            best_achieved_summary = self._toolgen_best_achieved_state_summary(round_history)
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_best_candidate_summary",
+                        "tool_name": tool_spec_obj.get("name"),
+                        "selection_source": selection_source,
+                        "grade": chosen_validation.get("grade"),
+                        "strategy_family": chosen_validation.get("strategy_family"),
+                        "execution_style": chosen_validation.get("execution_style"),
+                        "preferred_tool_mode": chosen_validation.get(
+                            "preferred_tool_mode"
+                        ),
+                        "fallback_strategies": chosen_validation.get(
+                            "fallback_strategies"
+                        ),
+                        "strategy_sequence": chosen_validation.get("strategy_sequence"),
+                        "strategy_index": chosen_validation.get("strategy_index"),
+                        "strategy_epoch": chosen_validation.get("strategy_epoch"),
+                        "strategy_source": chosen_validation.get("strategy_source"),
+                        "failure_family": chosen_validation.get("failure_family"),
+                        "failure_bucket": chosen_validation.get("failure_bucket"),
+                        "value_delivered": chosen_validation.get("value_delivered"),
+                        "achieved_state": chosen_validation.get("achieved_state"),
+                        "pivot_required": chosen_validation.get("pivot_required"),
+                        "partial_value_usable": chosen_validation.get(
+                            "partial_value_usable"
+                        ),
+                        "best_partial_candidate_tool_name": (
+                            (
+                                (best_partial_choice or {}).get("tool_spec", {}) or {}
+                            ).get("name")
+                            if isinstance(
+                                (best_partial_choice or {}).get("tool_spec"), Mapping
+                            )
+                            else None
+                        ),
+                        "best_partial_candidate_value_delivered": (
+                            self._toolgen_candidate_validation(best_partial_choice).get(
+                                "value_delivered"
+                            )
+                            if isinstance(best_partial_choice, Mapping)
+                            else None
+                        ),
+                        "best_achieved_state": best_achieved_summary.get(
+                            "best_achieved_state"
+                        ),
+                        "best_achieved_round": best_achieved_summary.get(
+                            "best_achieved_round"
+                        ),
+                        "best_achieved_tool_name": best_achieved_summary.get(
+                            "best_achieved_tool_name"
+                        ),
+                        "live_progress_summary": chosen_candidate.get(
+                            "live_progress_summary"
+                        ),
+                    }
+                )
+            except Exception:
+                pass
+
         for round_idx in range(1, max_rounds + 1):
+            round_label = f"[ToolGen Internal Round {round_idx}/{max_rounds}]"
+            setattr(self, "_toolgen_internal_round_label", round_label)
+            setattr(self, "_toolgen_current_round_idx", round_idx)
+            round_context = self._toolgen_compute_round_strategy_context(
+                round_idx=round_idx,
+                exec_payload=base_exec_payload,
+                round_history=round_history,
+            )
+            current_exec_payload = self._toolgen_apply_round_strategy_context(
+                base_exec_payload,
+                round_context,
+            )
+            setattr(self, "_toolgen_execution_payload", current_exec_payload)
+            current_tool_plan = self._build_tool_plan(current_exec_payload)
+            last_round_context = dict(round_context)
+            last_round_tool_plan = dict(current_tool_plan)
+            if (
+                round_context.get("pivot_required")
+                and round_context.get("strategy_source") == "pivot_policy"
+            ):
+                try:
+                    self._append_toolgen_strategy_pivot(
+                        round=round_idx,
+                        previous_strategy=round_context.get("previous_strategy_family"),
+                        previous_failure_family=round_context.get(
+                            "previous_failure_family"
+                        ),
+                        previous_failure_bucket=round_context.get(
+                            "previous_failure_bucket"
+                        ),
+                        new_strategy=round_context.get("strategy_family"),
+                        execution_style=round_context.get("execution_style"),
+                        preferred_tool_mode=round_context.get("preferred_tool_mode"),
+                        strategy_source=round_context.get("strategy_source"),
+                        strategy_index=round_context.get("strategy_index"),
+                        strategy_epoch=round_context.get("strategy_epoch"),
+                        failure_bucket=round_context.get("previous_failure_bucket"),
+                        reason=round_context.get("pivot_reason"),
+                    )
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_strategy_pivot",
+                            "round": round_idx,
+                            "previous_strategy": round_context.get(
+                                "previous_strategy_family"
+                            ),
+                            "previous_failure_family": round_context.get(
+                                "previous_failure_family"
+                            ),
+                            "new_strategy": round_context.get("strategy_family"),
+                            "execution_style": round_context.get("execution_style"),
+                            "preferred_tool_mode": round_context.get(
+                                "preferred_tool_mode"
+                            ),
+                            "strategy_source": round_context.get("strategy_source"),
+                            "strategy_index": round_context.get("strategy_index"),
+                            "strategy_epoch": round_context.get("strategy_epoch"),
+                            "failure_bucket": round_context.get(
+                                "previous_failure_bucket"
+                            ),
+                            "reason": round_context.get("pivot_reason"),
+                        }
+                    )
+                except Exception:
+                    pass
             try:
                 self._append_generated_tools_log(
                     {
                         "event": "toolgen_round_start",
                         "mode": mode,
                         "round": round_idx,
+                        "round_label": round_label,
                         "patch_mode": patch_mode,
+                        "strategy_family": round_context.get("strategy_family"),
+                        "execution_style": round_context.get("execution_style"),
+                        "preferred_tool_mode": round_context.get(
+                            "preferred_tool_mode"
+                        ),
+                        "strategy_source": round_context.get("strategy_source"),
+                        "strategy_index": round_context.get("strategy_index"),
+                        "strategy_epoch": round_context.get("strategy_epoch"),
+                        "failure_bucket": round_context.get("previous_failure_bucket"),
+                        "pivot_required": round_context.get("pivot_required"),
                     }
                 )
             except Exception:
                 pass
+            print(f"{round_label} starting", file=sys.stderr, flush=True)
             # --- Full file rewrite every round ---
-            prompt = base_prompt
+            prompt = base_prompt + self._toolgen_round_context_block(round_context)
             if feedback_note:
                 code_block = ""
                 if last_tool_code:
@@ -1888,26 +4801,38 @@ class ControllerToolgenMixin:
                         lines.append(
                             f"  Round {h['round']}: grade={h['grade']} | "
                             f"top_issue={h['top_issue']} | "
+                            f"value_delivered={h.get('value_delivered') or 'none'} | "
                             f"summary={h['summary']}"
                         )
                     history_block = "\n\n" + "\n".join(lines)
                 prompt = (
                     base_prompt
+                    + self._toolgen_round_context_block(round_context)
                     + history_block
                     + "\n\nVALIDATOR_FEEDBACK:\n"
                     + feedback_note
                     + code_block
                     + "\n\nYou must output the ENTIRE file from scratch. "
                     + "Implement all requested fixes and refactor the code as necessary "
-                    + "to pass the live evaluation."
+                    + "to pass the live evaluation. Keep the replacement minimal: preserve "
+                    + "ALL required metadata headers (# INVOKE_WITH:, # RUN_PAYLOAD_REQUIRED:, "
+                    + "# RUN_PAYLOAD_OPTIONAL:, # INVOKE_EXAMPLE:), a short module docstring, "
+                    + "run(payload) with its contract guard/prereqs/limitations docstring, "
+                    + "and self_test() unless feedback explicitly requires more."
                 )
-            use_patch_round = (
+            current_round_patch_mode = (
                 patch_mode
                 and round_idx > 1
+                and not force_full_rewrite_next_round
+                # Strategy pivots change the semantics of the tool, not just its
+                # implementation.  Patching prior-strategy code against a new strategy
+                # produces incoherent diffs; always use a full rewrite after a pivot.
+                and not round_context.get("pivot_required")
                 and isinstance(last_tool_code, str)
                 and isinstance(last_tool_spec, Mapping)
             )
-            if use_patch_round:
+            force_full_rewrite_next_round = False
+            if current_round_patch_mode:
                 patch_plan, patch_raw = self._toolgen_generate_patch_plan_legacy(
                     system_prompt=system_prompt,
                     current_code=last_tool_code,
@@ -1937,6 +4862,7 @@ class ControllerToolgenMixin:
                         ensure_ascii=True,
                         default=str,
                     )
+                    force_full_rewrite_next_round = True
                     continue
                 patched_code, patch_err = self._toolgen_apply_patch_plan(
                     last_tool_code,
@@ -1964,6 +4890,7 @@ class ControllerToolgenMixin:
                         ensure_ascii=True,
                         default=str,
                     )
+                    force_full_rewrite_next_round = True
                     continue
                 candidate = {
                     "tool_spec": dict(last_tool_spec),
@@ -1971,19 +4898,68 @@ class ControllerToolgenMixin:
                     "patch_plan": patch_plan,
                 }
             elif mode == "legacy":
-                candidate = self._toolgen_generate_from_prompt_legacy(
-                    user_prompt=prompt,
-                    system_prompt=system_prompt,
-                    chat_history=chat_history,
-                    name_prefix=name_prefix,
-                )
+                try:
+                    candidate = self._toolgen_generate_from_prompt_legacy(
+                        user_prompt=prompt,
+                        system_prompt=system_prompt,
+                        chat_history=chat_history,
+                        name_prefix=name_prefix,
+                    )
+                except Exception as _gen_exc:
+                    # LLM call or extraction crashed — persist artifact and continue
+                    _gen_exc_str = str(_gen_exc)
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "tool_generation_failed",
+                                "phase": "llm_call_exception",
+                                "mode": mode,
+                                "round": round_idx,
+                                "error": _gen_exc_str,
+                            }
+                        )
+                    except Exception:
+                        pass
+                    self._write_failed_tool_artifact(
+                        stage="llm_call_exception",
+                        error=_gen_exc_str,
+                        metadata=self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                        ),
+                    )
+                    candidate = {"error": f"llm_call_exception: {_gen_exc_str}"}
             else:
-                candidate = self._toolgen_generate_from_prompt_staged(
-                    user_prompt=prompt,
-                    system_prompt=system_prompt,
-                    chat_history=chat_history,
-                    name_prefix=name_prefix,
-                )
+                try:
+                    candidate = self._toolgen_generate_from_prompt_staged(
+                        user_prompt=prompt,
+                        system_prompt=system_prompt,
+                        chat_history=chat_history,
+                        name_prefix=name_prefix,
+                    )
+                except Exception as _gen_exc:
+                    _gen_exc_str = str(_gen_exc)
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "tool_generation_failed",
+                                "phase": "llm_call_exception",
+                                "mode": mode,
+                                "round": round_idx,
+                                "error": _gen_exc_str,
+                            }
+                        )
+                    except Exception:
+                        pass
+                    self._write_failed_tool_artifact(
+                        stage="llm_call_exception",
+                        error=_gen_exc_str,
+                        metadata=self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                        ),
+                    )
+                    candidate = {"error": f"llm_call_exception: {_gen_exc_str}"}
             if not candidate:
                 try:
                     self._append_generated_tools_log(
@@ -2000,6 +4976,10 @@ class ControllerToolgenMixin:
                 self._write_failed_tool_artifact(
                     stage="toolgen_no_candidate",
                     error="no_candidate_returned",
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                    ),
                 )
                 continue
             if isinstance(candidate, Mapping) and candidate.get("error") and not candidate.get("tool_spec"):
@@ -2052,6 +5032,10 @@ class ControllerToolgenMixin:
                     stage="toolgen_generation_failed",
                     error=error,
                     raw_output=raw_output if isinstance(raw_output, str) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                    ),
                 )
                 continue
             last_candidate = candidate
@@ -2079,7 +5063,26 @@ class ControllerToolgenMixin:
                         "round": round_idx,
                         "tool_name": tool_spec.get("name"),
                         "code_len": len(tool_code),
-                        "patch_round": use_patch_round,
+                        "strategy_family": round_context.get("strategy_family"),
+                        "execution_style": round_context.get("execution_style"),
+                        "preferred_tool_mode": round_context.get(
+                            "preferred_tool_mode"
+                        ),
+                        "fallback_strategies": current_tool_plan.get(
+                            "fallback_strategies"
+                        ),
+                        "strategy_source": round_context.get("strategy_source"),
+                        "strategy_index": round_context.get("strategy_index"),
+                        "strategy_epoch": round_context.get("strategy_epoch"),
+                        "failure_bucket": round_context.get("previous_failure_bucket"),
+                        "pivot_required": round_context.get("pivot_required"),
+                        "same_strategy_as_previous": round_context.get(
+                            "same_strategy_as_previous"
+                        ),
+                        "same_failure_as_previous": round_context.get(
+                            "same_failure_as_previous"
+                        ),
+                        "patch_round": current_round_patch_mode,
                         "patch_ops": (
                             len(candidate.get("patch_plan", {}).get("operations", []))
                             if isinstance(candidate, Mapping)
@@ -2101,8 +5104,45 @@ class ControllerToolgenMixin:
                     candidate["tool_code"] = tool_code
                 last_tool_code = tool_code
 
+            # ── Critical contract pre-check (always runs, even in deferred patch mode) ──
+            # Catches forbidden imports and SSOT raw-return violations before wasting a round.
+            critical_contract_issues: list[str] = []
+            if re.search(r"^\s*import\s+kg_utils\b", tool_code, flags=re.MULTILINE):
+                critical_contract_issues.append(
+                    "CRITICAL: Do NOT write 'import kg_utils'. It is pre-injected as a global. "
+                    "Remove the import line and call kg_utils.* directly."
+                )
+            if re.search(r'return\s+["\'](?:#\d*|MACRO\s+EXHAUSTED|ERROR)', tool_code):
+                critical_contract_issues.append(
+                    "CRITICAL: SSOT schema violation — run() must return the 3-key dict "
+                    "{\"status\": ..., \"final_variable\": ..., \"observation\": ...}. "
+                    "NEVER return a raw string or bare variable ID."
+                )
+            if critical_contract_issues:
+                crit_err = " | ".join(critical_contract_issues)
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_critical_contract_fail",
+                            "mode": mode,
+                            "round": round_idx,
+                            "tool_name": tool_spec.get("name"),
+                            "issues": critical_contract_issues,
+                        }
+                    )
+                except Exception:
+                    pass
+                feedback_note = json.dumps(
+                    {"phase": "critical_contract_precheck", "error": crit_err},
+                    ensure_ascii=True,
+                    default=str,
+                )
+                continue
+
             # ── Quick structural pre-check (fast regex, before heavy AST) ──
-            precheck_issues = [] if defer_compile_gates else self.quick_structural_precheck(tool_code)
+            # Always run — cheap, catches missing headers on round 1 instead of
+            # wasting patch rounds on structurally invalid code.
+            precheck_issues = self.quick_structural_precheck(tool_code)
             if precheck_issues:
                 precheck_err = " | ".join(precheck_issues)
                 try:
@@ -2122,6 +5162,11 @@ class ControllerToolgenMixin:
                     error=precheck_err,
                     code=tool_code,
                     raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                        failure_family="runtime_dependency_error",
+                    ),
                 )
                 feedback_note = json.dumps(
                     {"phase": "precheck", "error": precheck_err},
@@ -2221,6 +5266,11 @@ class ControllerToolgenMixin:
                         stage="static_check_exception",
                         error=static_err,
                         raw_output=tool_code,
+                        metadata=self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                            failure_family="runtime_dependency_error",
+                        ),
                     )
                 try:
                     self._append_generated_tools_log(
@@ -2244,6 +5294,44 @@ class ControllerToolgenMixin:
                     spec=spec_obj,
                     code=tool_code,
                     raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                        failure_family="runtime_dependency_error",
+                    ),
+                )
+                self._persist_tool_candidate(
+                    round_idx=round_idx,
+                    tool_name=(spec_obj.name if spec_obj else None) or (tool_spec.get("name") if isinstance(tool_spec, Mapping) else None) or "unknown",
+                    tool_code=tool_code,
+                    failure_phase="static_check",
+                    mode=mode,
+                    patch_mode=patch_mode,
+                    target_archetype=str((tool_spec or {}).get("target_archetype") or ""),
+                    extra_meta={
+                        "error": static_err,
+                        **self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                            failure_family="runtime_dependency_error",
+                        ),
+                        **self._toolgen_best_achieved_state_summary(round_history),
+                        "code_shape_signature": self._toolgen_code_shape_signature(
+                            tool_code
+                        ),
+                    },
+                )
+                _record_round_history(
+                    round_idx=round_idx,
+                    round_context=round_context,
+                    failure_phase="static_check",
+                    grade=0,
+                    summary=static_err,
+                    tool_name=str(tool_spec.get("name") or ""),
+                    top_issue=static_err,
+                    failure_family="runtime_dependency_error",
+                    failure_bucket="code_local_no_progress",
+                    tool_code=tool_code,
                 )
                 try:
                     self._append_generated_tools_log(
@@ -2275,6 +5363,7 @@ class ControllerToolgenMixin:
                         ensure_ascii=True,
                         default=str,
                     )
+                force_full_rewrite_next_round = True
                 continue
             last_static_ok = True
             try:
@@ -2316,6 +5405,44 @@ class ControllerToolgenMixin:
                     spec=spec_obj,
                     code=tool_code,
                     raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                        failure_family="runtime_dependency_error",
+                    ),
+                )
+                self._persist_tool_candidate(
+                    round_idx=round_idx,
+                    tool_name=(spec_obj.name if spec_obj else None) or (tool_spec.get("name") if isinstance(tool_spec, Mapping) else None) or "unknown",
+                    tool_code=tool_code,
+                    failure_phase="smoke_test",
+                    mode=mode,
+                    patch_mode=patch_mode,
+                    target_archetype=str((tool_spec or {}).get("target_archetype") or ""),
+                    extra_meta={
+                        "error": str(smoke.error),
+                        **self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                            failure_family="runtime_dependency_error",
+                        ),
+                        **self._toolgen_best_achieved_state_summary(round_history),
+                        "code_shape_signature": self._toolgen_code_shape_signature(
+                            tool_code
+                        ),
+                    },
+                )
+                _record_round_history(
+                    round_idx=round_idx,
+                    round_context=round_context,
+                    failure_phase="smoke_test",
+                    grade=0,
+                    summary=str(smoke.error),
+                    tool_name=str(tool_spec.get("name") or ""),
+                    top_issue=str(smoke.error),
+                    failure_family="runtime_dependency_error",
+                    failure_bucket="code_local_no_progress",
+                    tool_code=tool_code,
                 )
                 try:
                     self._append_generated_tools_log(
@@ -2333,6 +5460,7 @@ class ControllerToolgenMixin:
                     ensure_ascii=True,
                     default=str,
                 )
+                force_full_rewrite_next_round = True
                 continue
             last_smoke_ok = True
             try:
@@ -2386,6 +5514,7 @@ class ControllerToolgenMixin:
                     ensure_ascii=True,
                     default=str,
                 )
+                force_full_rewrite_next_round = True
                 continue
 
             validation = self._toolgen_validate_candidate_tool(
@@ -2400,7 +5529,12 @@ class ControllerToolgenMixin:
                     file=sys.stderr,
                     flush=True,
                 )
+                force_full_rewrite_next_round = True
                 continue
+            validation = self._toolgen_apply_adapter_regression_guard(
+                validation,
+                round_history=round_history,
+            )
             last_validation = validation
             grade_raw = validation.get("grade")
             try:
@@ -2418,18 +5552,196 @@ class ControllerToolgenMixin:
                 )
             except Exception:
                 issues = []
+            usefulness_passed = bool(validation.get("usefulness_passed", True))
+            usefulness_reason = str(validation.get("usefulness_reason") or "")
+            live_progress_summary = validation.get("live_progress_summary")
+            blocked_no_progress = self._toolgen_is_blocked_no_progress(
+                live_progress_summary
+            )
+            if isinstance(candidate, Mapping):
+                candidate = dict(candidate)
+                candidate["round_idx"] = round_idx
+                candidate["validation"] = validation
+                candidate["usefulness_passed"] = usefulness_passed
+                candidate["live_progress_summary"] = live_progress_summary
+                # Track whether static/smoke were actually executed this round.
+                # Deferred candidates never ran those checks and must not be
+                # used as non-live fallback registrations (see patch-mode fallback).
+                candidate["checks_deferred"] = defer_compile_gates
             # Record compact round summary for next-round memory (no code)
             try:
                 _top_issue = (issues[0] if issues else None)
-                round_history.append({
-                    "round": round_idx,
-                    "grade": grade,
-                    "top_issue": _top_issue,
-                    "summary": validation.get("summary", ""),
-                })
+                _record_round_history(
+                    round_idx=round_idx,
+                    round_context=round_context,
+                    failure_phase="validator",
+                    grade=grade,
+                    summary=str(validation.get("summary", "") or ""),
+                    tool_name=str(tool_spec.get("name") or ""),
+                    top_issue=_top_issue,
+                    usefulness_passed=usefulness_passed,
+                    usefulness_reason=usefulness_reason,
+                    material_progress=bool(
+                        (live_progress_summary or {}).get("material_progress", False)
+                    ),
+                    failure_family=str(validation.get("failure_family") or "unknown_failure"),
+                    failure_bucket=str(
+                        validation.get("failure_bucket")
+                        or self._toolgen_failure_bucket(
+                            str(validation.get("failure_family") or "unknown_failure"),
+                            value_delivered=str(
+                                validation.get("value_delivered") or "none"
+                            ),
+                            partial_value_usable=bool(
+                                validation.get("partial_value_usable", False)
+                            ),
+                            material_progress=bool(
+                                (live_progress_summary or {}).get(
+                                    "material_progress",
+                                    False,
+                                )
+                            ),
+                            plan_diagnosis=str(
+                                validation.get("plan_diagnosis") or ""
+                            ),
+                        )
+                    ),
+                    value_delivered=str(validation.get("value_delivered") or "none"),
+                    partial_value_usable=bool(
+                        validation.get("partial_value_usable", False)
+                    ),
+                    semantic_code_smells=validation.get("semantic_code_smells") or [],
+                    tool_code=tool_code,
+                )
             except Exception:
                 pass
+
+            # --- PLAN-FIRST: Handle FLAWED_PLAN diagnosis from Validator ---
+            plan_diagnosis = str(validation.get("plan_diagnosis") or "OK").strip()
+            if plan_diagnosis == "FLAWED_PLAN":
+                top_issue = str((issues[0] if issues else "") or "").strip()
+                summary_text = str(validation.get("summary") or "").strip()
+                plan_message = summary_text or top_issue or (
+                    "The Orchestrator plan is logically impossible or violates the KG helper signatures."
+                )
+                observation = (
+                    "Observation: ToolGen aborted because the Orchestrator plan is flawed and "
+                    "cannot be repaired with code-only changes. Re-orchestrate with prose-only "
+                    "steps that name exact helpers but do not include literal Python kwargs, "
+                    "dictionary arguments, or invalid helper signatures. "
+                    f"Validator summary: {plan_message}"
+                )
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_reorchestrate_requested",
+                            "mode": mode,
+                            "round": round_idx,
+                            "round_label": round_label,
+                            "reason": "flawed_plan",
+                            "plan_diagnosis": plan_diagnosis,
+                            "summary": str(summary_text or "")[:300],
+                            "top_issue": str(top_issue or "")[:300],
+                        }
+                    )
+                except Exception:
+                    pass
+                print(
+                    f"{round_label} aborting ToolGen loop: plan_diagnosis=FLAWED_PLAN",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return {
+                    "error": "flawed_plan_requires_reorchestration",
+                    "plan_diagnosis": plan_diagnosis,
+                    "observation": observation,
+                    "validation": validation,
+                }
+            elif plan_diagnosis == "DATA_SPARSE":
+                if not usefulness_passed or blocked_no_progress:
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "toolgen_data_sparse_abort_skipped",
+                                "round": round_idx,
+                                "grade": grade,
+                                "tool_name": tool_spec.get("name"),
+                                "usefulness_passed": usefulness_passed,
+                                "usefulness_reason": usefulness_reason,
+                                "blocked_no_progress": blocked_no_progress,
+                            }
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # The KG lacks the data, but the code correctly handled the
+                    # exhaustion. Stop burning generation rounds — no code change
+                    # can conjure absent KG data. Accept the current candidate and
+                    # exit the loop so the best-candidate registration runs below.
+                    #
+                    # CRITICAL: promote to best_live_candidate before breaking so
+                    # patch_mode registration (which requires best_live_candidate != None)
+                    # does not silently discard this structurally sound tool.
+                    previous_best_candidate = best_candidate
+                    previous_best_live_candidate = best_live_candidate
+                    previous_best_partial_candidate = best_partial_candidate
+                    previous_best_partial_live_candidate = best_partial_live_candidate
+                    _update_candidate_banks(
+                        candidate,
+                        live_candidate=grade >= self.MIN_REGISTRATION_GRADE,
+                    )
+                    promoted_to_best_candidate = best_candidate is not previous_best_candidate
+                    promoted_to_live_candidate = (
+                        best_live_candidate is not previous_best_live_candidate
+                    )
+                    promoted_to_best_partial_candidate = (
+                        best_partial_candidate is not previous_best_partial_candidate
+                    )
+                    promoted_to_best_partial_live_candidate = (
+                        best_partial_live_candidate
+                        is not previous_best_partial_live_candidate
+                    )
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "toolgen_data_sparse_abort",
+                                "round": round_idx,
+                                "grade": grade,
+                                "tool_name": tool_spec.get("name"),
+                                "promoted_to_live_candidate": promoted_to_live_candidate,
+                                "promoted_to_best_candidate": promoted_to_best_candidate,
+                                "promoted_to_best_partial_candidate": promoted_to_best_partial_candidate,
+                                "promoted_to_best_partial_live_candidate": promoted_to_best_partial_live_candidate,
+                                "usefulness_passed": usefulness_passed,
+                            }
+                        )
+                    except Exception:
+                        pass
+                    break
+
+            current_best_achieved = self._toolgen_best_achieved_state_summary(round_history)
             try:
+                # Trim validation to key fields only — full LLM output bloats the log.
+                # live_progress_summary is already written by toolgen_live_progress_summary.
+                _v_trim = {
+                    "grade": validation.get("grade"),
+                    "plan_diagnosis": validation.get("plan_diagnosis"),
+                    "repair_mode": validation.get("repair_mode"),
+                    "summary": str(validation.get("summary") or "")[:300],
+                    "top_issue": str((validation.get("issues") or [""])[0])[:300],
+                    "strategy_family": validation.get("strategy_family"),
+                    "execution_style": validation.get("execution_style"),
+                    "preferred_tool_mode": validation.get("preferred_tool_mode"),
+                    "fallback_strategies": validation.get("fallback_strategies"),
+                    "strategy_sequence": validation.get("strategy_sequence"),
+                    "strategy_index": validation.get("strategy_index"),
+                    "strategy_epoch": validation.get("strategy_epoch"),
+                    "strategy_source": validation.get("strategy_source"),
+                    "failure_family": validation.get("failure_family"),
+                    "failure_bucket": validation.get("failure_bucket"),
+                    "value_delivered": validation.get("value_delivered"),
+                    "pivot_required": validation.get("pivot_required"),
+                }
                 self._append_generated_tools_log(
                     {
                         "event": "toolgen_validation_result",
@@ -2439,17 +5751,79 @@ class ControllerToolgenMixin:
                         "live_check_deferred": defer_compile_gates,
                         "tool_name": tool_spec.get("name"),
                         "grade": grade,
-                        "validation": validation,
+                        "uncapped_grade": validation.get("uncapped_grade"),
+                        "grade_cap_reason": validation.get("grade_cap_reason"),
+                        "plan_diagnosis": plan_diagnosis,
+                        "strategy_family": validation.get("strategy_family"),
+                        "execution_style": validation.get("execution_style"),
+                        "preferred_tool_mode": validation.get("preferred_tool_mode"),
+                        "fallback_strategies": validation.get("fallback_strategies"),
+                        "strategy_sequence": validation.get("strategy_sequence"),
+                        "strategy_index": validation.get("strategy_index"),
+                        "strategy_epoch": validation.get("strategy_epoch"),
+                        "strategy_source": validation.get("strategy_source"),
+                        "failure_family": validation.get("failure_family"),
+                        "failure_bucket": validation.get("failure_bucket"),
+                        "value_delivered": validation.get("value_delivered"),
+                        "achieved_state": validation.get("achieved_state"),
+                        "same_strategy_as_previous": validation.get(
+                            "same_strategy_as_previous"
+                        ),
+                        "same_failure_as_previous": validation.get(
+                            "same_failure_as_previous"
+                        ),
+                        "pivot_required": validation.get("pivot_required"),
+                        "partial_value_usable": validation.get("partial_value_usable"),
+                        "usefulness_passed": usefulness_passed,
+                        "usefulness_reason": usefulness_reason,
+                        "best_achieved_state": current_best_achieved.get("best_achieved_state"),
+                        "best_achieved_round": current_best_achieved.get("best_achieved_round"),
+                        "best_achieved_tool_name": current_best_achieved.get("best_achieved_tool_name"),
+                        "validation": _v_trim,
                     }
                 )
             except Exception:
                 pass
-            if grade > best_grade:
-                best_grade = grade
-                best_candidate = candidate
-            if not defer_compile_gates and grade > best_live_grade:
-                best_live_grade = grade
-                best_live_candidate = candidate
+            try:
+                _grade_cap = validation.get("grade_cap_reason") or ""
+                _usefulness_reason = validation.get("usefulness_reason") or ""
+                _live_ps = validation.get("live_progress_summary") or {}
+                _is_shallow = (
+                    "semantic_bridge" in _grade_cap.lower()
+                    or "shallow" in _grade_cap.lower()
+                    or _usefulness_reason == "shallow_namespace_anchor_not_domain_relevant"
+                    or bool(_live_ps.get("looks_shallow_resolution"))
+                )
+                self._append_tool_value_trace(
+                    "toolgen_validation_decision",
+                    tool_name=tool_spec.get("name"),
+                    archetype=tool_spec.get("archetype") or tool_spec.get("target_archetype"),
+                    grade=grade,
+                    uncapped_grade=validation.get("uncapped_grade"),
+                    grade_cap_reason=_grade_cap or None,
+                    is_shallow_resolution=_is_shallow if _is_shallow else None,
+                    usefulness_passed=usefulness_passed,
+                    will_pass_threshold=grade >= self.MIN_REGISTRATION_GRADE,
+                    round=round_idx,
+                    strategy_family=validation.get("strategy_family"),
+                    execution_style=validation.get("execution_style"),
+                    preferred_tool_mode=validation.get("preferred_tool_mode"),
+                    strategy_source=validation.get("strategy_source"),
+                    strategy_index=validation.get("strategy_index"),
+                    strategy_epoch=validation.get("strategy_epoch"),
+                    failure_family=validation.get("failure_family"),
+                    failure_bucket=validation.get("failure_bucket"),
+                    value_delivered=validation.get("value_delivered"),
+                    pivot_required=validation.get("pivot_required"),
+                    best_achieved_state=current_best_achieved.get("best_achieved_state"),
+                )
+            except Exception:
+                pass
+            last_candidate = candidate
+            _update_candidate_banks(
+                candidate,
+                live_candidate=not defer_compile_gates,
+            )
             min_grade = 8
             try:
                 override = os.getenv("LIFELONG_TOOLGEN_MIN_GRADE", "").strip()
@@ -2457,19 +5831,108 @@ class ControllerToolgenMixin:
                     min_grade = max(7, int(override))
             except Exception:
                 min_grade = 8
+            adapter_feedback_note = self._toolgen_adapter_feedback_note(validation)
+            if self._toolgen_should_early_stop_progress_tool(validation):
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_progress_early_stop",
+                            "mode": mode,
+                            "round": round_idx,
+                            "tool_name": tool_spec.get("name"),
+                            "preferred_tool_mode": validation.get("preferred_tool_mode"),
+                            "value_delivered": validation.get("value_delivered"),
+                            "semantic_trust_level": validation.get("semantic_trust_level"),
+                            "best_achieved_state": current_best_achieved.get(
+                                "best_achieved_state"
+                            ),
+                        }
+                    )
+                except Exception:
+                    pass
+                break
             if patch_mode and round_idx < max_rounds:
                 feedback_payload = {
                     "phase": "validator",
                     "grade": grade,
+                    # Policy-computed diagnosis fields — exposed so the model can
+                    # prioritise the dominant runtime failure over minor validator
+                    # issues that may appear first in the issues list.
+                    "failure_family": validation.get("failure_family"),
+                    "failure_bucket": validation.get("failure_bucket"),
+                    "repair_mode": validation.get("repair_mode"),
                     "issues": validation.get("issues", []),
                     "fixes": validation.get("fixes", []),
                     "summary": validation.get("summary", ""),
                 }
+                if adapter_feedback_note:
+                    feedback_payload["critical_instruction"] = adapter_feedback_note
+                if (
+                    self._resolved_environment_label() == "knowledge_graph"
+                    and blocked_no_progress
+                ):
+                    _v_issues = validation.get("issues") if isinstance(validation, Mapping) else []
+                    _v_fixes = validation.get("fixes") if isinstance(validation, Mapping) else []
+                    _v_top = str(_v_issues[0]) if _v_issues else None
+                    feedback_note = self._toolgen_blocked_rewrite_feedback(
+                        phase="validator_blocked_no_progress",
+                        usefulness_reason=usefulness_reason,
+                        live_progress_summary=live_progress_summary,
+                        validator_top_issue=_v_top,
+                        validator_fixes=list(_v_fixes) if _v_fixes else None,
+                    )
+                    # Only force full rewrite when the tool was truly blocked
+                    # (ERROR/SHAPE_MISMATCH → handoff_state="blocked").  MACRO
+                    # EXHAUSTED → "exhausted" is a patchable code issue (wrong
+                    # variable, wrong count); let patch mode continue.
+                    force_full_rewrite_next_round = (
+                        str((live_progress_summary or {}).get("handoff_state") or "") == "blocked"
+                    )
+                    continue
                 # Patch-mode staged gates:
                 # 1) Non-live validator grade must pass.
                 # 2) Then run a live-execution validator pass immediately.
                 # 3) Only then register early; otherwise continue patching.
                 if grade >= min_grade:
+                    if not usefulness_passed:
+                        if (
+                            self._resolved_environment_label() == "knowledge_graph"
+                            and self._toolgen_is_blocked_no_progress(live_progress_summary)
+                        ):
+                            _v_issues = validation.get("issues") if isinstance(validation, Mapping) else []
+                            _v_fixes = validation.get("fixes") if isinstance(validation, Mapping) else []
+                            _v_top = str(_v_issues[0]) if _v_issues else None
+                            feedback_note = self._toolgen_blocked_rewrite_feedback(
+                                phase="usefulness_gate_blocked_no_progress",
+                                usefulness_reason=usefulness_reason,
+                                live_progress_summary=live_progress_summary,
+                                validator_top_issue=_v_top,
+                                validator_fixes=list(_v_fixes) if _v_fixes else None,
+                            )
+                            # Only force full rewrite when the tool was truly blocked
+                            # (ERROR/SHAPE_MISMATCH → handoff_state="blocked").  MACRO
+                            # EXHAUSTED → "exhausted" is a patchable code issue; let
+                            # patch mode continue.
+                            force_full_rewrite_next_round = (
+                                str((live_progress_summary or {}).get("handoff_state") or "") == "blocked"
+                            )
+                        else:
+                            feedback_note = json.dumps(
+                                {
+                                    "phase": "usefulness_gate",
+                                    "error": (
+                                        "Tool is structurally valid but did not make "
+                                        "material task progress toward the declared plan."
+                                    ),
+                                    "usefulness_reason": usefulness_reason,
+                                    "live_progress_summary": live_progress_summary,
+                                    "critical_instruction": adapter_feedback_note or None,
+                                },
+                                ensure_ascii=True,
+                                default=str,
+                            )
+                            force_full_rewrite_next_round = False
+                        continue
                     live_validation = self._toolgen_validate_candidate_tool(
                         tool_spec,
                         tool_code,
@@ -2487,6 +5950,10 @@ class ControllerToolgenMixin:
                             spec=spec_obj,
                             code=tool_code,
                             raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                            metadata=self._toolgen_round_failure_metadata(
+                                round_context=round_context,
+                                tool_plan=current_tool_plan,
+                            ),
                         )
                         feedback_note = json.dumps(
                             {
@@ -2496,11 +5963,22 @@ class ControllerToolgenMixin:
                             ensure_ascii=True,
                             default=str,
                         )
+                        force_full_rewrite_next_round = True
                         continue
+                    live_validation = self._toolgen_apply_adapter_regression_guard(
+                        live_validation,
+                        round_history=round_history,
+                    )
                     try:
                         live_grade = int(live_validation.get("grade"))
                     except Exception:
                         live_grade = 0
+                    live_usefulness_passed = bool(
+                        live_validation.get("usefulness_passed", True)
+                    )
+                    live_usefulness_reason = str(
+                        live_validation.get("usefulness_reason") or ""
+                    )
                     try:
                         live_issues = live_validation.get("issues", [])
                         if not isinstance(live_issues, list):
@@ -2518,7 +5996,12 @@ class ControllerToolgenMixin:
                                 "tool_name": tool_spec.get("name"),
                                 "non_live_grade": grade,
                                 "live_grade": live_grade,
-                                "passed": live_grade >= min_grade,
+                                "passed": live_grade >= min_grade and live_usefulness_passed,
+                                "usefulness_passed": live_usefulness_passed,
+                                "usefulness_reason": live_usefulness_reason,
+                                "live_progress_summary": live_validation.get(
+                                    "live_progress_summary"
+                                ),
                                 "live_summary": live_summary,
                                 "live_top_issue": top_live_issue,
                                 "live_issues_count": len(live_issues),
@@ -2528,10 +6011,19 @@ class ControllerToolgenMixin:
                         )
                     except Exception:
                         pass
-                    if live_grade >= min_grade:
-                        if live_grade > best_live_grade:
-                            best_live_grade = live_grade
-                            best_live_candidate = candidate
+                    live_candidate = candidate
+                    if isinstance(candidate, Mapping):
+                        live_candidate = dict(candidate)
+                        live_candidate["validation"] = live_validation
+                        live_candidate["usefulness_passed"] = live_usefulness_passed
+                        live_candidate["live_progress_summary"] = live_validation.get(
+                            "live_progress_summary"
+                        )
+                    _update_candidate_banks(
+                        live_candidate,
+                        live_candidate=True,
+                    )
+                    if live_grade >= min_grade and live_usefulness_passed:
                         # Ensure compile/smoke checks run before early registration.
                         gate_static_ok, gate_static_err = self._toolgen_static_check(tool_code)
                         try:
@@ -2559,6 +6051,11 @@ class ControllerToolgenMixin:
                                 spec=spec_obj,
                                 code=tool_code,
                                 raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                                metadata=self._toolgen_round_failure_metadata(
+                                    round_context=round_context,
+                                    tool_plan=current_tool_plan,
+                                    failure_family="runtime_dependency_error",
+                                ),
                             )
                             feedback_note = json.dumps(
                                 {
@@ -2568,6 +6065,7 @@ class ControllerToolgenMixin:
                                 ensure_ascii=True,
                                 default=str,
                             )
+                            force_full_rewrite_next_round = True
                             continue
                         gate_smoke = validate_tool_code(tool_code)
                         try:
@@ -2595,6 +6093,11 @@ class ControllerToolgenMixin:
                                 spec=spec_obj,
                                 code=tool_code,
                                 raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                                metadata=self._toolgen_round_failure_metadata(
+                                    round_context=round_context,
+                                    tool_plan=current_tool_plan,
+                                    failure_family="runtime_dependency_error",
+                                ),
                             )
                             feedback_note = json.dumps(
                                 {
@@ -2604,13 +6107,52 @@ class ControllerToolgenMixin:
                                 ensure_ascii=True,
                                 default=str,
                             )
+                            force_full_rewrite_next_round = True
                             continue
                         metadata = self._register_tool_from_payload(tool_spec, chat_history)
                         if metadata:
+                            chosen_live_candidate = (
+                                live_candidate
+                                if isinstance(live_candidate, Mapping)
+                                else candidate
+                            )
+                            selection_source = (
+                                "best_full_candidate"
+                                if self._toolgen_candidate_is_full_solve(
+                                    chosen_live_candidate
+                                )
+                                else (
+                                    "best_partial_candidate"
+                                    if self._toolgen_candidate_is_partial_progress(
+                                        chosen_live_candidate
+                                    )
+                                    else "best_live_candidate"
+                                )
+                            )
+                            _append_best_candidate_summary(
+                                chosen_candidate=chosen_live_candidate,
+                                selection_source=selection_source,
+                            )
+                            _persist_validated_candidate(
+                                candidate_obj=candidate,
+                                validation_obj=live_validation,
+                                tool_code=tool_code,
+                                tool_spec_obj=tool_spec,
+                                admitted=True,
+                                registered=True,
+                            )
                             self._registry.record_validation_result(metadata.name, success=True)
                             if hasattr(self._registry, "set_quality_score"):
                                 self._registry.set_quality_score(metadata.name, float(live_grade))
                             return metadata
+                        _persist_validated_candidate(
+                            candidate_obj=candidate,
+                            validation_obj=live_validation,
+                            tool_code=tool_code,
+                            tool_spec_obj=tool_spec,
+                            admitted=True,
+                            registered=False,
+                        )
                         try:
                             spec_obj = ToolSpec.from_payload(dict(tool_spec))
                         except Exception:
@@ -2625,6 +6167,20 @@ class ControllerToolgenMixin:
                             code=tool_code,
                             raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
                             raw_output=live_validation,
+                                metadata=self._toolgen_round_failure_metadata(
+                                    round_context=round_context,
+                                    tool_plan=current_tool_plan,
+                                    failure_family=str(
+                                        live_validation.get("failure_family")
+                                    or "unknown_failure"
+                                ),
+                                value_delivered=str(
+                                    live_validation.get("value_delivered") or "none"
+                                ),
+                                partial_value_usable=bool(
+                                    live_validation.get("partial_value_usable", False)
+                                ),
+                            ),
                         )
                         feedback_note = json.dumps(
                             {
@@ -2637,6 +6193,7 @@ class ControllerToolgenMixin:
                             ensure_ascii=True,
                             default=str,
                         )
+                        force_full_rewrite_next_round = False
                         continue
                     # Live gate failed: feed live-specific feedback into patch loop.
                     try:
@@ -2653,31 +6210,169 @@ class ControllerToolgenMixin:
                         code=tool_code,
                         raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
                         raw_output=live_validation,
+                        metadata=self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                            failure_family=str(
+                                live_validation.get("failure_family")
+                                or "unknown_failure"
+                            ),
+                            value_delivered=str(
+                                live_validation.get("value_delivered") or "none"
+                            ),
+                            partial_value_usable=bool(
+                                live_validation.get("partial_value_usable", False)
+                            ),
+                        ),
                     )
-                    feedback_note = json.dumps(
-                        {
-                            "phase": "live_gate_validation",
-                            "grade": live_grade,
-                            "issues": live_validation.get("issues", []),
-                            "fixes": live_validation.get("fixes", []),
-                            "summary": live_validation.get("summary", ""),
+                    live_progress = live_validation.get("live_progress_summary")
+                    if (
+                        self._resolved_environment_label() == "knowledge_graph"
+                        and self._toolgen_is_blocked_no_progress(live_progress)
+                    ):
+                        _lv_issues = live_validation.get("issues") if isinstance(live_validation, Mapping) else []
+                        _lv_fixes = live_validation.get("fixes") if isinstance(live_validation, Mapping) else []
+                        _lv_top = str(_lv_issues[0]) if _lv_issues else None
+                        feedback_note = self._toolgen_blocked_rewrite_feedback(
+                            phase="live_gate_blocked_no_progress",
+                            usefulness_reason=live_usefulness_reason,
+                            live_progress_summary=live_progress,
+                            validator_top_issue=_lv_top,
+                            validator_fixes=list(_lv_fixes) if _lv_fixes else None,
+                        )
+                        # Only force full rewrite when the tool was truly blocked
+                        # (ERROR/SHAPE_MISMATCH/no live result → handoff_state="blocked").
+                        # MACRO EXHAUSTED → "exhausted" may be a patchable code issue
+                        # (wrong variable, wrong count) rather than a strategy failure,
+                        # so let patch mode continue for exhausted results.
+                        force_full_rewrite_next_round = (
+                            str((live_progress or {}).get("handoff_state") or "") == "blocked"
+                        )
+                    else:
+                        feedback_note = json.dumps(
+                            {
+                                "phase": (
+                                    "live_gate_usefulness"
+                                    if live_grade >= min_grade and not live_usefulness_passed
+                                    else "live_gate_validation"
+                                ),
+                                "grade": live_grade,
+                                "failure_family": live_validation.get("failure_family"),
+                                "failure_bucket": live_validation.get("failure_bucket"),
+                                "repair_mode": live_validation.get("repair_mode"),
+                                "issues": live_validation.get("issues", []),
+                                "fixes": live_validation.get("fixes", []),
+                                "summary": live_validation.get("summary", ""),
+                                "usefulness_reason": live_usefulness_reason,
+                                "live_progress_summary": live_progress,
+                                "critical_instruction": self._toolgen_adapter_feedback_note(
+                                    live_validation
+                                )
+                                or None,
+                            },
+                            ensure_ascii=True,
+                            default=str,
+                        )
+                        force_full_rewrite_next_round = False
+                    continue
+                feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
+                force_full_rewrite_next_round = False
+                continue
+            if grade >= min_grade:
+                if not usefulness_passed:
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "toolgen_usefulness_rejected",
+                                "mode": mode,
+                                "round": round_idx,
+                                "tool_name": tool_spec.get("name"),
+                                "grade": grade,
+                                "usefulness_reason": usefulness_reason,
+                                "live_progress_summary": live_progress_summary,
+                            }
+                        )
+                    except Exception:
+                        pass
+                    if (
+                        self._resolved_environment_label() == "knowledge_graph"
+                        and self._toolgen_is_blocked_no_progress(live_progress_summary)
+                    ):
+                        _v_issues2 = validation.get("issues") if isinstance(validation, Mapping) else []
+                        _v_fixes2 = validation.get("fixes") if isinstance(validation, Mapping) else []
+                        _v_top2 = str(_v_issues2[0]) if _v_issues2 else None
+                        feedback_note = self._toolgen_blocked_rewrite_feedback(
+                            phase="usefulness_gate_blocked_no_progress",
+                            usefulness_reason=usefulness_reason,
+                            live_progress_summary=live_progress_summary,
+                            validator_top_issue=_v_top2,
+                            validator_fixes=list(_v_fixes2) if _v_fixes2 else None,
+                        )
+                    else:
+                        feedback_note = json.dumps(
+                            {
+                                "phase": "usefulness_gate",
+                                "error": (
+                                "Tool was structurally valid but not materially helpful "
+                                "toward the declared plan."
+                            ),
+                            "usefulness_reason": usefulness_reason,
+                            "live_progress_summary": live_progress_summary,
+                            "critical_instruction": adapter_feedback_note or None,
                         },
                         ensure_ascii=True,
                         default=str,
                     )
+                    force_full_rewrite_next_round = True
                     continue
-                feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
-                continue
-            if grade >= min_grade:
+                try:
+                    self._append_tool_value_trace(
+                        "tool_registration_decision",
+                        tool_name=tool_spec.get("name"),
+                        archetype=tool_spec.get("archetype") or tool_spec.get("target_archetype"),
+                        grade=grade,
+                        admission_decision="registered",
+                    )
+                except Exception:
+                    pass
                 metadata = self._register_tool_from_payload(tool_spec, chat_history)
                 if staged_meta:
                     self._toolgen_log_staged_registration(staged_meta, metadata)
                 if metadata:
+                    selection_source = (
+                        "best_full_candidate"
+                        if self._toolgen_candidate_is_full_solve(candidate)
+                        else (
+                            "best_partial_candidate"
+                            if self._toolgen_candidate_is_partial_progress(candidate)
+                            else "best_candidate"
+                        )
+                    )
+                    _append_best_candidate_summary(
+                        chosen_candidate=candidate,
+                        selection_source=selection_source,
+                    )
+                    _persist_validated_candidate(
+                        candidate_obj=candidate,
+                        validation_obj=validation,
+                        tool_code=tool_code,
+                        tool_spec_obj=tool_spec,
+                        admitted=True,
+                        registered=True,
+                    )
                     self._registry.record_validation_result(metadata.name, success=True)
                     # Initialize quality_score from the validation grade.
                     if hasattr(self._registry, "set_quality_score"):
                         self._registry.set_quality_score(metadata.name, float(grade))
                     return metadata
+                _persist_validated_candidate(
+                    candidate_obj=candidate,
+                    validation_obj=validation,
+                    tool_code=tool_code,
+                    tool_spec_obj=tool_spec,
+                    admitted=True,
+                    registered=False,
+                )
                 # --- Registration failed despite passing validation ---
                 print(
                     f"[WARN] Tool grade={grade} passed validator but "
@@ -2696,6 +6391,13 @@ class ControllerToolgenMixin:
                             "grade": grade,
                             "reason": "spec_alignment_or_validate",
                         }
+                    )
+                    self._append_tool_value_trace(
+                        "tool_registration_decision",
+                        tool_name=tool_spec.get("name"),
+                        archetype=tool_spec.get("archetype") or tool_spec.get("target_archetype"),
+                        grade=grade,
+                        admission_decision="rejected_spec_alignment",
                     )
                 except Exception:
                     pass
@@ -2721,6 +6423,7 @@ class ControllerToolgenMixin:
                 feedback_note = json.dumps(
                     reg_feedback, ensure_ascii=True, default=str
                 )
+                force_full_rewrite_next_round = True
                 continue
             print(
                 "[WARN] Tool rejected by Validator. Registry will not be updated.",
@@ -2736,6 +6439,7 @@ class ControllerToolgenMixin:
                 spec_obj = ToolSpec.from_payload(dict(tool_spec))
             except Exception:
                 spec_obj = None
+            _val_dict = validation if isinstance(validation, dict) else {}
             failed_artifact_paths = self._write_failed_tool_artifact(
                 stage="validator",
                 error=f"grade={grade}",
@@ -2743,36 +6447,171 @@ class ControllerToolgenMixin:
                 code=tool_code,
                 raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
                 raw_output=validation,
+                metadata={
+                    "strategy_family": _val_dict.get("strategy_family"),
+                    "active_strategy_family": _val_dict.get("active_strategy_family"),
+                    "execution_style": _val_dict.get("execution_style"),
+                    "active_execution_style": _val_dict.get("active_execution_style"),
+                    "preferred_tool_mode": _val_dict.get("preferred_tool_mode"),
+                    "active_preferred_tool_mode": _val_dict.get(
+                        "active_preferred_tool_mode"
+                    ),
+                    "fallback_strategies": _val_dict.get("fallback_strategies"),
+                    "strategy_sequence": _val_dict.get("strategy_sequence"),
+                    "strategy_index": _val_dict.get("strategy_index"),
+                    "strategy_epoch": _val_dict.get("strategy_epoch"),
+                    "strategy_source": _val_dict.get("strategy_source"),
+                    "failure_family": _val_dict.get("failure_family"),
+                    "failure_bucket": _val_dict.get("failure_bucket"),
+                    "value_delivered": _val_dict.get("value_delivered"),
+                    "same_strategy_as_previous": _val_dict.get(
+                        "same_strategy_as_previous"
+                    ),
+                    "same_failure_as_previous": _val_dict.get(
+                        "same_failure_as_previous"
+                    ),
+                    "pivot_required": _val_dict.get("pivot_required"),
+                    "partial_value_usable": _val_dict.get("partial_value_usable"),
+                },
+            )
+            self._persist_tool_candidate(
+                round_idx=round_idx,
+                tool_name=(spec_obj.name if spec_obj else None) or (tool_spec.get("name") if isinstance(tool_spec, Mapping) else None) or "unknown",
+                tool_code=tool_code,
+                failure_phase="validator",
+                mode=mode,
+                patch_mode=patch_mode,
+                target_archetype=str((tool_spec or {}).get("target_archetype") or ""),
+                grade=grade,
+                plan_diagnosis=str(_val_dict.get("plan_diagnosis") or ""),
+                usefulness_passed=usefulness_passed,
+                usefulness_reason=usefulness_reason,
+                extra_meta={
+                    "repair_mode": _val_dict.get("repair_mode"),
+                    "summary": str(_val_dict.get("summary") or "")[:300],
+                    "top_issue": str((_val_dict.get("issues") or [""])[0])[:300],
+                    "strategy_family": _val_dict.get("strategy_family"),
+                    "execution_style": _val_dict.get("execution_style"),
+                    "preferred_tool_mode": _val_dict.get("preferred_tool_mode"),
+                    "fallback_strategies": _val_dict.get("fallback_strategies"),
+                    "strategy_sequence": _val_dict.get("strategy_sequence"),
+                    "strategy_index": _val_dict.get("strategy_index"),
+                    "strategy_epoch": _val_dict.get("strategy_epoch"),
+                    "strategy_source": _val_dict.get("strategy_source"),
+                    "failure_family": _val_dict.get("failure_family"),
+                    "failure_bucket": _val_dict.get("failure_bucket"),
+                    "value_delivered": _val_dict.get("value_delivered"),
+                    "same_strategy_as_previous": _val_dict.get(
+                        "same_strategy_as_previous"
+                    ),
+                    "same_failure_as_previous": _val_dict.get(
+                        "same_failure_as_previous"
+                    ),
+                    "pivot_required": _val_dict.get("pivot_required"),
+                    "partial_value_usable": _val_dict.get("partial_value_usable"),
+                    **self._toolgen_best_achieved_state_summary(round_history),
+                    "code_shape_signature": self._toolgen_code_shape_signature(
+                        tool_code
+                    ),
+                },
             )
             # NOTE: Do NOT call _cleanup_failed_draft_files here — failed validator
             # tools must persist in callback_state for post-run analysis.
             try:
+                _vf_trim = {
+                    "grade": validation.get("grade") if isinstance(validation, dict) else grade,
+                    "plan_diagnosis": validation.get("plan_diagnosis") if isinstance(validation, dict) else None,
+                    "repair_mode": validation.get("repair_mode") if isinstance(validation, dict) else None,
+                    "summary": str((validation.get("summary") or "") if isinstance(validation, dict) else "")[:300],
+                    "top_issue": str(((validation.get("issues") or [""])[0]) if isinstance(validation, dict) else "")[:300],
+                }
                 self._append_generated_tools_log(
                     {
                         "event": "tool_generation_failed",
                         "phase": "validator",
                         "tool_name": tool_spec.get("name"),
                         "grade": grade,
-                        "validation": validation,
+                        "validation": _vf_trim,
                     }
+                )
+                self._append_tool_value_trace(
+                    "tool_registration_decision",
+                    tool_name=tool_spec.get("name"),
+                    archetype=tool_spec.get("archetype") or tool_spec.get("target_archetype"),
+                    grade=grade,
+                    admission_decision="rejected_grade_threshold",
                 )
             except Exception:
                 pass
 
-            # Pass the full validation dict (all issues and fixes) intact.
-            feedback_payload["CRITICAL_INSTRUCTION"] = (
-                "You must output the ENTIRE file from scratch. "
-                "Implement all requested fixes and refactor the code as necessary "
-                "to pass the live evaluation."
-            )
+            if (
+                self._resolved_environment_label() == "knowledge_graph"
+                and self._toolgen_is_blocked_no_progress(live_progress_summary)
+            ):
+                _vf_issues = _val_dict.get("issues") or []
+                _vf_fixes = _val_dict.get("fixes") or []
+                _vf_top = str(_vf_issues[0]) if _vf_issues else None
+                feedback_note = self._toolgen_blocked_rewrite_feedback(
+                    phase="validator_blocked_no_progress",
+                    usefulness_reason=usefulness_reason,
+                    live_progress_summary=live_progress_summary,
+                    validator_top_issue=_vf_top,
+                    validator_fixes=list(_vf_fixes) if _vf_fixes else None,
+                )
+            else:
+                # Pass the full validation dict (all issues and fixes) intact.
+                feedback_payload["CRITICAL_INSTRUCTION"] = (
+                    "You must output the ENTIRE file from scratch. "
+                    "Implement all requested fixes and refactor the code as necessary "
+                    "to pass the live evaluation. Keep the replacement minimal: preserve "
+                    "only the required metadata headers, a short module docstring, "
+                    "run(payload), and self_test() unless feedback explicitly requires more."
+                )
+                adapter_feedback_note = self._toolgen_adapter_feedback_note(validation)
+                if adapter_feedback_note:
+                    feedback_payload["critical_instruction"] = adapter_feedback_note
+                feedback_note = json.dumps(
+                    feedback_payload, ensure_ascii=True, default=str
+                )
+        # Clear round tracker so post-loop artifact writes don't carry a stale round number.
+        setattr(self, "_toolgen_current_round_idx", None)
 
-            feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
-        # Prefer the highest-graded validated candidate over the last one.
+        # Prefer the strongest validated candidate over the last one.
         # In patch mode, fallback registration is ONLY allowed for live-gated candidates.
-        effective_best_grade = best_grade
+        best_full_live_candidate = (
+            best_live_candidate
+            if self._toolgen_candidate_is_full_solve(best_live_candidate)
+            else None
+        )
+        best_full_candidate = best_full_live_candidate
+        if self._toolgen_candidate_is_full_solve(best_candidate) and self._toolgen_candidate_is_better(
+            best_candidate,
+            best_full_candidate,
+        ):
+            best_full_candidate = best_candidate
+        best_partial_choice = best_partial_candidate
+        if self._toolgen_candidate_is_better(
+            best_partial_live_candidate,
+            best_partial_choice,
+            partial_bank=True,
+        ):
+            best_partial_choice = best_partial_live_candidate
+        selection_source = "fallback_existing_behavior"
         if patch_mode:
-            use_candidate = best_live_candidate
-            effective_best_grade = best_live_grade
+            use_candidate = (
+                best_full_live_candidate
+                or best_partial_live_candidate
+                or best_live_candidate
+            )
+            if use_candidate is best_full_live_candidate and use_candidate is not None:
+                selection_source = "best_full_candidate"
+            elif (
+                use_candidate is best_partial_live_candidate
+                and use_candidate is not None
+            ):
+                selection_source = "best_partial_candidate"
+            elif use_candidate is best_live_candidate and use_candidate is not None:
+                selection_source = "best_live_candidate"
             if use_candidate is None:
                 if last_tool_spec and last_tool_code:
                     try:
@@ -2789,6 +6628,20 @@ class ControllerToolgenMixin:
                         code=last_tool_code,
                         raw_spec=last_tool_spec if isinstance(last_tool_spec, Mapping) else None,
                         raw_output=last_validation,
+                        metadata=self._toolgen_round_failure_metadata(
+                            round_context=last_round_context,
+                            tool_plan=last_round_tool_plan,
+                            failure_family=str(
+                                (last_validation or {}).get("failure_family")
+                                or "unknown_failure"
+                            ),
+                            value_delivered=str(
+                                (last_validation or {}).get("value_delivered") or "none"
+                            ),
+                            partial_value_usable=bool(
+                                (last_validation or {}).get("partial_value_usable", False)
+                            ),
+                        ),
                     )
                 try:
                     self._append_generated_tools_log(
@@ -2801,9 +6654,41 @@ class ControllerToolgenMixin:
                     )
                 except Exception:
                     pass
-                return None
+                # Fall back to the best non-live partial/full candidate rather
+                # than discarding useful progress entirely.  This mirrors the
+                # non-patch fallback chain and prevents silent drops when no
+                # live-gated candidate exists.
+                # Require that the candidate actually ran static+smoke checks
+                # (checks_deferred=False); candidates that only had deferred
+                # checks may have structural violations and must not be registered.
+                use_candidate = None
+                for _fb_cand in (best_partial_choice, best_candidate):
+                    if _fb_cand is None:
+                        continue
+                    if not _fb_cand.get("checks_deferred", True):
+                        use_candidate = _fb_cand
+                        break
+                if use_candidate is None:
+                    return None
+                selection_source = (
+                    "best_partial_candidate_non_live_patch_fallback"
+                    if use_candidate is best_partial_choice
+                    else "best_candidate_non_live_patch_fallback"
+                )
         else:
-            use_candidate = best_candidate if best_candidate is not None else last_candidate
+            use_candidate = (
+                best_full_candidate
+                or best_partial_choice
+                or best_live_candidate
+                or (best_candidate if best_candidate is not None else last_candidate)
+            )
+            if use_candidate is best_full_candidate and use_candidate is not None:
+                selection_source = "best_full_candidate"
+            elif use_candidate is best_partial_choice and use_candidate is not None:
+                selection_source = "best_partial_candidate"
+            elif use_candidate is best_live_candidate and use_candidate is not None:
+                selection_source = "best_live_candidate"
+        effective_best_grade = self._toolgen_candidate_grade(use_candidate)
         if not use_candidate:
             if relaxed_mode and last_tool_spec and last_tool_code:
                 if (last_grade or 0) < self.MIN_REGISTRATION_GRADE:
@@ -2851,6 +6736,11 @@ class ControllerToolgenMixin:
                     spec=spec_obj,
                     code=last_tool_code,
                     raw_spec=last_tool_spec if isinstance(last_tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=last_round_context,
+                        tool_plan=last_round_tool_plan,
+                        failure_family="runtime_dependency_error",
+                    ),
                 )
             try:
                 self._append_generated_tools_log(
@@ -2873,12 +6763,68 @@ class ControllerToolgenMixin:
                 flush=True,
             )
             return None
+        if isinstance(use_candidate, Mapping) and not bool(
+            use_candidate.get("usefulness_passed", True)
+        ):
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_fallback_usefulness_block",
+                        "mode": mode,
+                        "tool_name": (
+                            use_candidate.get("tool_spec", {}) or {}
+                        ).get("name")
+                        if isinstance(use_candidate.get("tool_spec"), Mapping)
+                        else None,
+                        "usefulness_reason": (
+                            (use_candidate.get("validation", {}) or {}).get(
+                                "usefulness_reason"
+                            )
+                            if isinstance(use_candidate.get("validation"), Mapping)
+                            else None
+                        ),
+                        "live_progress_summary": use_candidate.get(
+                            "live_progress_summary"
+                        ),
+                    }
+                )
+            except Exception:
+                pass
+            return None
         tool_spec = use_candidate.get("tool_spec")
         if not isinstance(tool_spec, Mapping):
             return None
+        # Phase 1: Persist target_archetype into input_schema.properties so
+        # _extract_tool_archetype recovers a concrete label from the registry
+        # instead of falling back to "UNKNOWN" via name scanning.
+        _reg_arch = str((base_exec_payload or {}).get("target_archetype") or "").strip().upper()
+        if _reg_arch and _reg_arch in ARCHETYPE_REGISTRY:
+            tool_spec = dict(tool_spec)
+            _reg_schema = dict(tool_spec.get("input_schema") or {})
+            _reg_props = dict(_reg_schema.get("properties") or {})
+            _reg_props["target_archetype"] = {"const": _reg_arch, "type": "string"}
+            _reg_schema["properties"] = _reg_props
+            tool_spec["input_schema"] = _reg_schema
+        chosen_validation = (
+            use_candidate.get("validation")
+            if isinstance(use_candidate.get("validation"), Mapping)
+            else {}
+        )
+        _append_best_candidate_summary(
+            chosen_candidate=use_candidate,
+            selection_source=selection_source,
+        )
         metadata = self._register_tool_from_payload(tool_spec, chat_history)
         if use_candidate.get("staged_meta"):
             self._toolgen_log_staged_registration(use_candidate.get("staged_meta"), metadata)
+        _persist_validated_candidate(
+            candidate_obj=use_candidate,
+            validation_obj=chosen_validation,
+            tool_code=str(use_candidate.get("tool_code") or ""),
+            tool_spec_obj=tool_spec,
+            admitted=True,
+            registered=bool(metadata),
+        )
         if metadata and validate:
             self._registry.record_validation_result(metadata.name, success=False)
             caps = getattr(self, "_tool_confidence_caps", None)
@@ -2896,8 +6842,10 @@ class ControllerToolgenMixin:
         chat_history: ChatHistory,
         name_prefix: str,
     ) -> Optional[Mapping[str, Any]]:
+        round_label = str(getattr(self, "_toolgen_internal_round_label", "") or "").strip()
+        log_prefix = f"{round_label} " if round_label else ""
         if getattr(self, "_toolgen_agent", None) is None:
-            print("[TOOLGEN] ERROR: _toolgen_agent is None, cannot generate tool")
+            print(f"{log_prefix}[TOOLGEN] ERROR: _toolgen_agent is None, cannot generate tool")
             self._write_failed_tool_artifact(
                 stage="toolgen_generation_failed",
                 error="missing_toolgen_agent",
@@ -2905,7 +6853,7 @@ class ControllerToolgenMixin:
             return {"error": "missing_toolgen_agent"}
 
         if not user_prompt or not user_prompt.strip():
-            print("[TOOLGEN] ERROR: user_prompt is empty, cannot generate tool")
+            print(f"{log_prefix}[TOOLGEN] ERROR: user_prompt is empty, cannot generate tool")
             self._write_failed_tool_artifact(
                 stage="toolgen_generation_failed",
                 error="empty_user_prompt",
@@ -2920,25 +6868,25 @@ class ControllerToolgenMixin:
         prompt_str = str(final_system_prompt) + str(user_prompt)
 
         if len(prompt_str) > max_chars:
-            print(f"[WARN] Prompt too large ({len(prompt_str)} chars). Truncating history...")
+            print(f"{log_prefix}[WARN] Prompt too large ({len(prompt_str)} chars). Truncating history...")
             # Keep the system instructions (final_system_prompt) but slice the user history
             user_prompt = str(user_prompt)[-max_chars:]
 
         print(
-            f"[DEBUG] Final Staged Prompt Length: "
+            f"{log_prefix}[DEBUG] Final Staged Prompt Length: "
             f"{len(str(final_system_prompt)) + len(str(user_prompt))} chars"
         )
         debug_prompt = os.getenv("TOOLGEN_DEBUG_PROMPT") == "1"
         if debug_prompt and not getattr(self, "_toolgen_first_prompt_printed", False):
-            print("[ToolGen] first_run system_prompt:\n" + final_system_prompt)
-            print("[ToolGen] first_run user_prompt:\n" + user_prompt)
+            print(f"{log_prefix}[ToolGen] first_run system_prompt:\n" + final_system_prompt)
+            print(f"{log_prefix}[ToolGen] first_run user_prompt:\n" + user_prompt)
             self._toolgen_first_prompt_printed = True
         self._write_agent_system_prompt("toolgen", final_system_prompt)
         raw_text_full = ""
         extracted = None
         for attempt in range(3):
             print(
-                "[TOOLGEN] Calling toolgen agent inference...",
+                f"{log_prefix}[TOOLGEN] Calling toolgen agent inference...",
                 file=sys.stderr,
                 flush=True,
             )
@@ -2948,13 +6896,13 @@ class ControllerToolgenMixin:
                     user_prompt=user_prompt,
                 )
                 print(
-                    "[TOOLGEN] Toolgen agent inference completed",
+                    f"{log_prefix}[TOOLGEN] Toolgen agent inference completed",
                     file=sys.stderr,
                     flush=True,
                 )
             except Exception as e:
                 print(
-                    f"[TOOLGEN] ERROR: Toolgen agent inference failed: {e}",
+                    f"{log_prefix}[TOOLGEN] ERROR: Toolgen agent inference failed: {e}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -2965,13 +6913,13 @@ class ControllerToolgenMixin:
                 head = (raw_text_full or "")[:200].replace("\n", "\\n")
                 tail = (raw_text_full or "")[-200:].replace("\n", "\\n")
                 print(
-                    f"[TOOLGEN] raw_output_len={raw_len} head={head}",
+                    f"{log_prefix}[TOOLGEN] raw_output_len={raw_len} head={head}",
                     file=sys.stderr,
                     flush=True,
                 )
                 if raw_len > 200:
                     print(
-                        f"[TOOLGEN] raw_output_tail={tail}",
+                        f"{log_prefix}[TOOLGEN] raw_output_tail={tail}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -2987,7 +6935,7 @@ class ControllerToolgenMixin:
             fallback = self._strip_code_fences(raw_text_full)
             if fallback and "def run" in fallback:
                 print(
-                    "[TOOLGEN] Fallback: extracted code from fenced block",
+                    f"{log_prefix}[TOOLGEN] Fallback: extracted code from fenced block",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -2998,7 +6946,7 @@ class ControllerToolgenMixin:
                     has_end = "###TOOL_END" in (raw_text_full or "")
                     has_run = "def run" in (raw_text_full or "")
                     print(
-                        f"[TOOLGEN] marker_missing start={has_start} end={has_end} has_run={has_run}",
+                        f"{log_prefix}[TOOLGEN] marker_missing start={has_start} end={has_end} has_run={has_run}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -3586,6 +7534,31 @@ class ControllerToolgenMixin:
                 ["constraints", "output_contract", "draft_response", "candidate_output", "env_observation"],
             )
         normalized.setdefault("capabilities", [])
+        # Phase 1: persist archetype into input_schema.properties.target_archetype.const
+        # so _extract_tool_archetype (tier-2) reliably recovers it from the registry on
+        # future loads — without this, the extraction falls back to name scanning and
+        # often returns "UNKNOWN", which Phase 1's reuse gate now treats as incompatible.
+        _arch_from_spec = str(
+            normalized.get("target_archetype") or normalized.get("archetype") or ""
+        ).strip().upper()
+        if not _arch_from_spec or _arch_from_spec not in ARCHETYPE_REGISTRY:
+            # Infer archetype from tool name via substring scan when the spec
+            # doesn't declare it explicitly.  Generated KG tool names embed the
+            # archetype key (e.g. "attribute_intersector_macro_generated_tool"),
+            # but the boundary-regex in _extract_tool_archetype rejects matches
+            # where the key is followed by "_" — so we do a simple substring scan
+            # here at registration time and persist the result into the schema.
+            _name_upper = str(normalized.get("name") or "").upper()
+            for _arch_key in ARCHETYPE_REGISTRY:
+                if _arch_key in _name_upper:
+                    _arch_from_spec = _arch_key
+                    break
+        if _arch_from_spec and _arch_from_spec in ARCHETYPE_REGISTRY:
+            _schema = normalized.get("input_schema")
+            if isinstance(_schema, dict):
+                _props = _schema.setdefault("properties", {})
+                if isinstance(_props, dict):
+                    _props["target_archetype"] = {"const": _arch_from_spec, "type": "string"}
         # Extract module docstring from code and use as description for dedup/retrieval
         code_lines = normalized.get("code_lines")
         if isinstance(code_lines, list):
@@ -3663,6 +7636,96 @@ class ControllerToolgenMixin:
         if args.vararg or args.kwarg or args.kwonlyargs:
             return "run_signature_mismatch"
         return None
+
+    def _tool_candidates_dir(self) -> Path:
+        """Directory for per-round candidate source + metadata files.
+
+        Every candidate that reaches at least the static check phase is written
+        here regardless of whether it was admitted.  Format::
+
+            generated_tool_candidates/
+                round_01__<tool_name>__candidate.py
+                round_01__<tool_name>__metadata.json
+        """
+        base_path = None
+        log_path = getattr(self, "_generated_tools_log_path", None)
+        if log_path is not None:
+            base_path = Path(log_path).parent
+        if base_path is None:
+            base_path = Path("outputs")
+        return base_path / "generated_tool_candidates"
+
+    def _persist_tool_candidate(
+        self,
+        *,
+        round_idx: int,
+        tool_name: str,
+        tool_code: Optional[str],
+        failure_phase: str,
+        mode: str = "",
+        patch_mode: bool = False,
+        target_archetype: str = "",
+        composite_topology: Any = None,
+        grade: Optional[int] = None,
+        uncapped_grade: Optional[int] = None,
+        grade_cap_reason: str = "",
+        usefulness_passed: Optional[bool] = None,
+        usefulness_reason: str = "",
+        plan_diagnosis: str = "",
+        admitted: bool = False,
+        registered: bool = False,
+        extra_meta: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Write candidate source + metadata to generated_tool_candidates/.
+
+        Best-effort — never raises.
+        """
+        try:
+            out_dir = self._tool_candidates_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            round_label = f"round_{round_idx:02d}"
+            safe_name = re.sub(r"[^\w\-]", "_", tool_name or "unknown")[:60]
+            stem = f"{round_label}__{safe_name}"
+
+            # Source file
+            if tool_code:
+                src_path = out_dir / f"{stem}__candidate.py"
+                src_path.write_text(tool_code, encoding="utf-8")
+
+            # Metadata file
+            meta: dict[str, Any] = {
+                "tool_name": tool_name,
+                "round": round_idx,
+                "mode": mode,
+                "patch_mode": patch_mode,
+                "target_archetype": target_archetype,
+                "composite_topology": composite_topology,
+                "failure_phase": failure_phase,
+                "grade": grade,
+                "uncapped_grade": uncapped_grade,
+                "grade_cap_reason": grade_cap_reason,
+                "usefulness_passed": usefulness_passed,
+                "usefulness_reason": usefulness_reason,
+                "plan_diagnosis": plan_diagnosis,
+                "admitted": admitted,
+                "registered": registered,
+                "source_artifact": f"{stem}__candidate.py" if tool_code else None,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            if extra_meta:
+                meta.update(extra_meta)
+            meta_path = out_dir / f"{stem}__metadata.json"
+            meta_path.write_text(
+                json.dumps(meta, ensure_ascii=True, default=str, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            try:
+                self._append_generated_tools_log(
+                    {"event": "tool_candidate_persist_failed", "round": round_idx, "tool_name": tool_name}
+                )
+            except Exception:
+                pass
 
     def _failed_tool_log_dir(self) -> Path:
         base_path = None
@@ -3743,18 +7806,27 @@ class ControllerToolgenMixin:
         code: Optional[str] = None,
         raw_spec: Optional[Mapping[str, Any]] = None,
         raw_output: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
     ) -> list[Path]:
         try:
             tool_name = (spec.name if spec else None) or "unknown_tool"
             ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
             suffix = "py" if code else "txt"
-            filename = f"{tool_name}__{stage}__{ts}.{suffix}"
+            _round = getattr(self, "_toolgen_current_round_idx", None)
+            round_prefix = f"{_round}_" if _round is not None else ""
+            filename = f"{round_prefix}{tool_name}__{stage}__{ts}.{suffix}"
             header = (
                 f"# stage: {stage}\n"
                 f"# tool_name: {tool_name}\n"
                 f"# signature: {(spec.signature if spec else '')}\n"
                 f"# error: {error}\n"
             )
+            if metadata:
+                header += (
+                    "# metadata: "
+                    + json.dumps(dict(metadata), ensure_ascii=True, default=str)
+                    + "\n"
+                )
             if code:
                 content = header + "\n" + code
             else:
@@ -3765,6 +7837,7 @@ class ControllerToolgenMixin:
                     "error": error,
                     "raw_spec": raw_spec,
                     "raw_output": raw_output,
+                    "metadata": metadata,
                 }
                 content = header + "\n" + json.dumps(meta, ensure_ascii=True, default=str, indent=2)
             written_paths: list[Path] = []
@@ -3987,6 +8060,30 @@ class ControllerToolgenMixin:
         if metadata:
             self._generated_tool_counter += 1
             self._mark_tool_invoked(metadata.name)
+            try:
+                payload = {
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "event": "register",
+                    "tool_name": metadata.name,
+                    "signature": metadata.signature,
+                    "description": metadata.description,
+                    "tool_type": metadata.tool_type,
+                    "tool_category": metadata.tool_category,
+                    "input_schema": metadata.input_schema,
+                    "required_keys": metadata.required_keys,
+                    "optional_keys": metadata.optional_keys,
+                    "property_types": metadata.property_types,
+                    "capabilities": metadata.capabilities,
+                    "path": getattr(
+                        self._registry,
+                        "_get_tool_path",
+                        lambda n, environment=None: None,
+                    )(metadata.name, environment=getattr(metadata, "environment", None)),
+                }
+                payload.update(self._get_run_task_metadata())
+                self._append_generated_tools_log(payload)
+            except Exception:
+                pass
         return metadata
 
     def _consider_tool_generation(
@@ -4055,7 +8152,13 @@ class ControllerToolgenMixin:
                     name_prefix=getattr(self, "_toolgen_name_prefix", ""),
                     prompt_name=f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}",
                 )
-                if tool:
+                if isinstance(tool, Mapping) and tool.get("error"):
+                    print(
+                        f"agg3 bootstrapped env={env_name} aborted={tool.get('error')}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                elif tool:
                     print(f"agg3 bootstrapped env={env_name} tools=1")
                 agg_envs.add(env_name)
                 return tool

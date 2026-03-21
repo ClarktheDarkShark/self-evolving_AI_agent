@@ -1,20 +1,227 @@
 """Utility helpers for parsing and scoring Knowledge Graph environment outputs.
 
-Zero external dependencies beyond the standard library (re, json).
+Zero external dependencies beyond the standard library.
 These functions are pre-injected into the macro sandbox and may also be
 imported normally. Generated macro tools should prefer these over any
 hand-rolled regex or string-parsing logic.
 """
 
+from __future__ import annotations
+
+from difflib import SequenceMatcher
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Optional
 import re
+
+
+_UNSAFE_RELATION_EXACT = {
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+    "http://www.w3.org/2000/01/rdf-schema#label",
+    "type.object.id",
+    "type.object.key",
+    "type.object.name",
+    "type.object.type",
+    "common.topic.alias",
+    "common.topic.description",
+}
+_UNSAFE_RELATION_PREFIXES = (
+    "http://rdf.freebase.com/key/",
+    "user.",
+    "kg.object_profile.",
+    "freebase.type_profile.",
+    "wikipedia.",
+    "common.topic.notable_types",
+    "base.ontologies.",
+)
+
+_GENERIC_TYPE_PREFIXES = (
+    "common.",
+    "type.",
+    "base.",
+    "freebase.",
+    "user.",
+    "kg.",
+)
+_TYPE_STOP_WORDS = {
+    "is",
+    "the",
+    "of",
+    "and",
+    "from",
+    "what",
+    "a",
+    "to",
+    "in",
+    "for",
+    "are",
+    "how",
+    "many",
+    "which",
+    "who",
+    "that",
+    "have",
+    "has",
+    "with",
+}
+
+
+class _KGMacroHelperFacade:
+    """Stable helper surface for generated KG macros.
+
+    Generated code should call helper methods directly and should not need to
+    guess whether ``kg_utils`` is a module, dict, or ad-hoc wrapper. This
+    facade supports attribute access and lightweight dict-style access for
+    backward compatibility, while exposing a fixed callable surface for the
+    core helper methods used by ToolGen.
+    """
+
+    _STABLE_HELPERS = (
+        "resolve_entity_to_vars",
+        "resolve_semantic_filter",
+        "cross_intersect",
+        "walk_to_target",
+        "extract_var_ids",
+        "extract_attribute_value",
+    )
+
+    def resolve_entity_to_vars(
+        self,
+        entity,
+        target_concept,
+        actions_spec,
+        domain_hints,
+        max_k=1,
+    ):
+        return resolve_entity_to_vars(
+            entity,
+            target_concept,
+            actions_spec,
+            domain_hints,
+            max_k=max_k,
+        )
+
+    def resolve_semantic_filter(
+        self,
+        base_var,
+        target_concept,
+        variable_list,
+        domain_hints=None,
+        asked_for="",
+        max_type_candidates=8,
+    ):
+        return resolve_semantic_filter(
+            base_var,
+            target_concept,
+            variable_list,
+            domain_hints=domain_hints,
+            asked_for=asked_for,
+            max_type_candidates=max_type_candidates,
+        )
+
+    def cross_intersect(self, actions_spec, vars_a, vars_b, max_calls=12):
+        return cross_intersect(actions_spec, vars_a, vars_b, max_calls=max_calls)
+
+    def walk_to_target(
+        self,
+        actions_spec,
+        base_vars,
+        target_concept,
+        domain_hints,
+        max_calls=6,
+    ):
+        return walk_to_target(
+            actions_spec,
+            base_vars,
+            target_concept,
+            domain_hints,
+            max_calls=max_calls,
+        )
+
+    def extract_var_ids(self, env_output):
+        return extract_var_ids(env_output)
+
+    def extract_attribute_value(self, env_output):
+        return extract_attribute_value(env_output)
+
+    def __getattr__(self, name: str):
+        obj = globals().get(name)
+        if obj is None:
+            raise AttributeError(name)
+        return obj
+
+    def __getitem__(self, name: str):
+        try:
+            return getattr(self, name)
+        except AttributeError as exc:
+            raise KeyError(name) from exc
+
+    def get(self, name: str, default=None):
+        try:
+            return getattr(self, name)
+        except AttributeError:
+            return default
+
+    def __contains__(self, name: str) -> bool:
+        try:
+            getattr(self, name)
+            return True
+        except AttributeError:
+            return False
+
+    def keys(self):
+        return list(self._STABLE_HELPERS)
+
+    def items(self):
+        return [(name, getattr(self, name)) for name in self.keys()]
+
+    def values(self):
+        return [getattr(self, name) for name in self.keys()]
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return len(self._STABLE_HELPERS)
+
+
+_MACRO_HELPER_FACADE = _KGMacroHelperFacade()
+
+
+def get_macro_helper_facade():
+    """Return the stable helper facade injected into generated KG macros."""
+    return _MACRO_HELPER_FACADE
+
+
+def is_structurally_unsafe_relation(relation: str) -> bool:
+    """Return True when *relation* is structural metadata, not semantic topology."""
+    rel = str(relation or "").strip()
+    if not rel:
+        return False
+    if rel in _UNSAFE_RELATION_EXACT:
+        return True
+    return rel.startswith(_UNSAFE_RELATION_PREFIXES)
+
+
+def filter_structurally_safe_relations(relations) -> list[str]:
+    """Drop structurally unsafe relations while preserving order and uniqueness."""
+    safe_relations = []
+    seen = set()
+    for relation in relations or []:
+        rel = str(relation or "").strip()
+        if not rel or is_structurally_unsafe_relation(rel) or rel in seen:
+            continue
+        seen.add(rel)
+        safe_relations.append(rel)
+    return safe_relations
 
 
 def safe_parse_relations(env_output: str) -> list:
     """Parse a raw KG environment relation string into a clean token list.
 
     Strips leading/trailing brackets, splits by comma, and trims whitespace.
-    URLs and URIs (e.g. ``http://rdf.freebase.com/key/en``) are kept fully
-    intact as single tokens — they are *not* split on slashes or dots.
+    URLs and URIs are parsed as intact single tokens. Structural filtering is
+    applied later at relation-selection time, not during generic parsing.
 
     Args:
         env_output: The raw string returned by ``get_relations``, e.g.
@@ -39,6 +246,173 @@ def safe_parse_relations(env_output: str) -> list:
     if not cleaned.strip():
         return []
     return [token.strip() for token in cleaned.split(",") if token.strip()]
+
+
+def _normalize_semantic_token(token: str) -> str:
+    token = str(token or "").strip().lower()
+    if not token:
+        return ""
+    if token.endswith("ies") and len(token) > 3:
+        return token[:-3] + "y"
+    if token.endswith("ses") and len(token) > 3:
+        return token[:-2]
+    if token.endswith("s") and not token.endswith("ss") and len(token) > 3:
+        return token[:-1]
+    return token
+
+
+def _semantic_words(text: str) -> list[str]:
+    raw_words = re.findall(r"\b\w+\b", str(text or "").lower())
+    normalized = []
+    seen = set()
+    for word in raw_words:
+        if word in _TYPE_STOP_WORDS:
+            continue
+        norm = _normalize_semantic_token(word)
+        if norm and norm not in seen:
+            normalized.append(norm)
+            seen.add(norm)
+    return normalized
+
+
+@lru_cache(maxsize=1)
+def _load_fb_type_catalog() -> tuple[str, ...]:
+    repo_root = Path(__file__).resolve().parents[2]
+    ontology_path = repo_root / "data" / "knowledge_graph" / "ontology" / "fb_types"
+    types: list[str] = []
+    seen: set[str] = set()
+    try:
+        # Deliberately use the type ontology only. This keeps the semantic
+        # filter resolver in the "type node" space and prevents relation names
+        # from outranking true ontology classes.
+        with ontology_path.open("r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                lhs = line.split(maxsplit=1)[0].strip().rstrip(".")
+                if not lhs or "." not in lhs or lhs in seen:
+                    continue
+                seen.add(lhs)
+                types.append(lhs)
+    except Exception:
+        return tuple()
+    return tuple(types)
+
+
+def _score_type_candidate(
+    target_concept: str,
+    type_name: str,
+    domain_hints: Optional[list[str]] = None,
+    asked_for: str = "",
+) -> int:
+    target_phrase = str(target_concept or "").strip().lower()
+    if not target_phrase:
+        target_phrase = str(asked_for or "").strip().lower()
+    if not target_phrase:
+        return 0
+
+    type_lower = str(type_name or "").strip().lower()
+    if not type_lower:
+        return 0
+
+    type_words = {_normalize_semantic_token(w) for w in re.split(r"[._/]", type_lower) if w}
+    type_words.discard("")
+    target_words = set(_semantic_words(target_phrase))
+    hint_words = {_normalize_semantic_token(h) for h in (domain_hints or []) if str(h).strip()}
+    leaf = _normalize_semantic_token(type_lower.split(".")[-1])
+    compact_type = type_lower.replace(".", "_")
+
+    score = 0
+    normalized_target = _normalize_semantic_token(target_phrase.replace(" ", "_"))
+    target_compact = re.sub(r"\s+", "_", target_phrase)
+    fuzzy_targets = [target_phrase, normalized_target.replace("_", " "), target_compact.replace("_", " ")]
+    fuzzy_candidates = [leaf, compact_type.replace("_", " "), type_lower.replace(".", " ")]
+
+    if leaf and leaf == normalized_target:
+        score += 5000
+    if target_compact and target_compact in type_lower:
+        score += 2500
+    if target_phrase and target_phrase.replace(" ", "") in type_lower.replace(".", "").replace("_", ""):
+        score += 1800
+
+    overlap = target_words.intersection(type_words)
+    score += 250 * len(overlap)
+    for word in target_words:
+        if word == leaf:
+            score += 800
+        elif word in type_lower:
+            score += 25
+    for hint in hint_words:
+        if hint and hint in type_lower:
+            score += 120
+
+    best_ratio = 0.0
+    for lhs in fuzzy_targets:
+        lhs_norm = str(lhs or "").strip().lower()
+        if not lhs_norm:
+            continue
+        for rhs in fuzzy_candidates:
+            rhs_norm = str(rhs or "").strip().lower()
+            if not rhs_norm:
+                continue
+            best_ratio = max(best_ratio, SequenceMatcher(None, lhs_norm, rhs_norm).ratio())
+    if best_ratio >= 0.97:
+        score += 2600
+    elif best_ratio >= 0.90:
+        score += 1800
+    elif best_ratio >= 0.82:
+        score += 900
+    elif best_ratio >= 0.72:
+        score += 300
+
+    if type_lower.startswith(_GENERIC_TYPE_PREFIXES):
+        score -= 200
+    if leaf in {"topic", "object", "entity", "thing", "person"} and normalized_target != leaf:
+        score -= 400
+
+    return score
+
+
+def resolve_concept_to_types(
+    concept: str,
+    domain_hints: Optional[list[str]] = None,
+    asked_for: str = "",
+    max_candidates: int = 8,
+) -> list[str]:
+    """Resolve a semantic concept string to the best ontology type candidates."""
+    try:
+        limit = max(1, int(max_candidates))
+    except Exception:
+        limit = 8
+
+    ranked: list[tuple[int, str]] = []
+    for type_name in _load_fb_type_catalog():
+        score = _score_type_candidate(concept, type_name, domain_hints=domain_hints, asked_for=asked_for)
+        if score <= 0:
+            continue
+        ranked.append((score, type_name))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [type_name for _, type_name in ranked[:limit]]
+
+
+def _lazy_import_variable_cls():
+    try:
+        from src.tasks.instance.knowledge_graph.api import Variable
+
+        return Variable
+    except Exception:
+        return None
+
+
+def _resolve_pointer_variable(base_var: str, variable_list: Any) -> tuple[Optional[int], Any]:
+    match = re.match(r"^#(\d+)$", str(base_var or "").strip())
+    if not match or not isinstance(variable_list, list):
+        return None, None
+    idx = int(match.group(1))
+    if idx < 0 or idx >= len(variable_list):
+        return None, None
+    return idx, variable_list[idx]
 
 
 def score_relations(target_concept, relations, domain_hints=None):
@@ -68,6 +442,7 @@ def score_relations(target_concept, relations, domain_hints=None):
 
     Returns:
         A list of ``(relation, score)`` tuples sorted *descending* by score.
+        Structurally unsafe relations are skipped entirely.
     """
     STOP_WORDS = {"is", "the", "of", "and", "from", "what", "a", "to", "in", "for", "are"}
 
@@ -77,6 +452,8 @@ def score_relations(target_concept, relations, domain_hints=None):
 
     scored = []
     for rel in relations:
+        if is_structurally_unsafe_relation(rel):
+            continue
         rel_lower = rel.lower()
         # Parts are tokens split by dots, underscores, or slashes
         rel_parts = set(re.split(r"[._/]", rel_lower))
@@ -102,9 +479,11 @@ def select_top_k_relations(scored_relations, max_k=3):
     """Select relation names with a safe score-zero fallback.
 
     Selection policy:
-    1) Keep relations with score > 0, up to ``max_k`` (preserve sorted order).
+    1) Keep structurally safe relations with score > 0, up to ``max_k``
+       (preserve sorted order).
     2) If no positive scores exist, return exactly one relation: the first item
-       from the incoming scored list (the "score-zero fallback").
+       from the incoming scored list after structural filtering (the
+       "score-zero fallback").
 
     Notes:
     - This helper assumes ``scored_relations`` is already sorted descending by
@@ -134,7 +513,7 @@ def select_top_k_relations(scored_relations, max_k=3):
                     score_val = 0.0
         else:
             rel = str(item).strip()
-        if rel:
+        if rel and not is_structurally_unsafe_relation(rel):
             normalized.append((rel, score_val))
     if not normalized:
         return []
@@ -169,7 +548,8 @@ def resolve_entity_to_vars(
     1. ``get_relations(entity)``
     2. ``safe_parse_relations`` to clean the raw response.
     3. ``score_relations(target_concept, rels, domain_hints)`` + sort descending.
-    4. ``select_top_k_relations(scored, max_k)`` — score-zero fallback included.
+    4. ``select_top_k_relations(scored, max_k)`` — score-zero fallback included
+       after structural filtering.
     5. ``get_neighbors(entity, rel)`` for each selected relation.
     6. ``extract_var_ids`` on each neighbor response, normalize pound-sign format.
     7. Populate ``candidate_map`` and scrape semantic type.
@@ -195,7 +575,8 @@ def resolve_entity_to_vars(
         * ``type`` — ontological type scraped from KG response, e.g.
           ``"food.cheese"``; defaults to ``"unknown_type"``.
         * ``candidate_map`` — ``{"entity [rel]": "#X"}`` entry per minted var,
-          ready to embed in MACRO EXHAUSTED observations for graceful degradation.
+          limited to structurally safe relations and ready to embed in MACRO
+          EXHAUSTED observations for graceful degradation.
 
         Always returns the three-key dict; never raises.
     """
@@ -222,7 +603,7 @@ def resolve_entity_to_vars(
         return empty
 
     # 2. Parse + score + select (score-zero safe)
-    relations = safe_parse_relations(rels_text)
+    relations = filter_structurally_safe_relations(safe_parse_relations(rels_text))
     if not relations:
         return empty
     scored = score_relations(target_concept or "", relations, domain_hints)
@@ -258,6 +639,75 @@ def resolve_entity_to_vars(
                 candidate_map.setdefault(f"{entity_str} [{rel}]", var_id)
 
     return {"vars": vars_out, "type": last_type, "candidate_map": candidate_map}
+
+
+def resolve_semantic_filter(
+    base_var: str,
+    target_concept: str,
+    variable_list: list,
+    domain_hints: Optional[list[str]] = None,
+    asked_for: str = "",
+    max_type_candidates: int = 8,
+) -> dict:
+    """Apply a lazy backend type filter to a previously minted Variable.
+
+    This helper avoids probing a large Variable with ``get_relations`` /
+    ``get_neighbors``. Instead, it:
+
+    1. resolves ``target_concept`` to an ontology type from ``fb_types``,
+    2. maps ``#N`` back to the real backend Variable object,
+    3. mints a new Variable with program ``(AND <base_program> <type>)``,
+    4. appends it to ``variable_list`` and returns the new ``#ID``.
+
+    Returns a dict matching the other helper conventions:
+    ``{"vars": [...], "type": ..., "matched_type": ..., "candidate_map": ...}``
+    """
+    empty = {
+        "vars": [],
+        "type": "unknown_type",
+        "matched_type": "",
+        "candidate_map": {},
+        "mode": "semantic_filter",
+    }
+    idx, base_obj = _resolve_pointer_variable(base_var, variable_list)
+    if idx is None or base_obj is None:
+        return empty
+
+    Variable = _lazy_import_variable_cls()
+    base_program = str(getattr(base_obj, "program", "") or "").strip()
+    base_type = str(getattr(base_obj, "type", "") or "").strip()
+    if Variable is None or not base_program:
+        return empty
+
+    candidates = resolve_concept_to_types(
+        target_concept,
+        domain_hints=domain_hints,
+        asked_for=asked_for,
+        max_candidates=max_type_candidates,
+    )
+    if not candidates:
+        return empty
+
+    matched_type = candidates[0]
+    try:
+        new_variable = Variable(
+            type=base_type or matched_type,
+            program=f"(AND {matched_type} {base_program})",
+        )
+        variable_list.append(new_variable)
+    except Exception:
+        return empty
+
+    new_var_id = f"#{len(variable_list) - 1}"
+    return {
+        "vars": [new_var_id],
+        "type": base_type or matched_type,
+        "matched_type": matched_type,
+        "candidate_map": {
+            f"{base_var} semantic_filter[{target_concept or asked_for or matched_type}]": new_var_id
+        },
+        "mode": "semantic_filter",
+    }
 
 
 def extract_attribute_value(env_output):
@@ -509,7 +959,7 @@ def walk_to_target(
         if "Error" in rels_text:
             continue
 
-        relations = safe_parse_relations(rels_text)
+        relations = filter_structurally_safe_relations(safe_parse_relations(rels_text))
         if not relations:
             continue
         scored = score_relations(target_concept or "", relations, hints)

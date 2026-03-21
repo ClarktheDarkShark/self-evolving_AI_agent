@@ -195,6 +195,9 @@ class ControllerHistoryMixin:
 
     def _macro_instruction_from_output(self, output: Any) -> str:
         if isinstance(output, Mapping):
+            macro_observation = output.get("macro_observation")
+            if isinstance(macro_observation, str) and macro_observation.strip():
+                return macro_observation.strip()
             final_answer = (
                 output.get("final_answer")
                 or output.get("answer")
@@ -217,18 +220,334 @@ class ControllerHistoryMixin:
         text = str(output).strip()
         return text or "(empty output)"
 
+    def _normalize_macro_runtime_output(
+        self, output: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(output or {})
+        macro_observation = str(normalized.get("macro_observation") or "").strip()
+        if not macro_observation:
+            return normalized
+
+        status_match = re.search(
+            r"->\s*(SUCCESS|MACRO EXHAUSTED|ERROR|SHAPE_MISMATCH)",
+            macro_observation,
+            flags=re.IGNORECASE,
+        )
+        if status_match and not normalized.get("status"):
+            normalized["status"] = status_match.group(1).upper()
+
+        final_match = re.search(
+            r"Final variable:\s*([^\.\n]+)",
+            macro_observation,
+            flags=re.IGNORECASE,
+        )
+        if final_match and "final_variable" not in normalized:
+            raw_final = final_match.group(1).strip()
+            normalized["final_variable"] = (
+                None if raw_final.lower() in {"", "none", "null"} else raw_final
+            )
+
+        obs_match = re.search(
+            r"Observation:\s*(.*)$",
+            macro_observation,
+            flags=re.IGNORECASE,
+        )
+        if obs_match and not normalized.get("observation"):
+            normalized["observation"] = obs_match.group(1).strip()
+        return normalized
+
+    @staticmethod
+    def _looks_like_fallback_handoff(lowered_text: str) -> bool:
+        return any(
+            phrase in lowered_text
+            for phrase in (
+                "bypassed filter",
+                "returning base variable",
+                "returning unfiltered base variable",
+                "rescued initial variables",
+                "fallback_entity",
+                "unfiltered_base_entity",
+                "handing off the original seed variable",
+                "handing off pre-filter",
+                "pre-filter representative variable",
+                "handing off the pre-filter",
+                "handing off the pre-walk",
+                "pre-walk variable",
+                "pre walk variable",
+                "semantic filter returned no",
+                "semantic filter produced no",
+                "no filtered variable ids",
+                "no filtered vars",
+                "failed narrowing",
+                "narrowing failed",
+            )
+        )
+
+    def _classify_tool_handoff(self, name: str, result: ToolResult) -> dict[str, Any]:
+        output = result.output if isinstance(result.output, Mapping) else {}
+        if isinstance(output, Mapping) and self._is_macro_tool(name, result):
+            output = self._normalize_macro_runtime_output(output)
+        handoff = {
+            "tool_name": name,
+            "tool_status": str(output.get("status") or ("SUCCESS" if result.success else "ERROR")),
+            "handoff_state": "blocked",
+            "semantic_trust_level": "blocked",
+            "safe_to_continue": False,
+            "final_operation_safe": False,
+            "recommended_next_action_category": "backtrack",
+            "fallback_guidance": "Do not repeat the same failing tool call. Backtrack or try a different path.",
+            "trust_classification": "blocked_exhausted_ignore",
+            "ignore_recommendation": True,
+            "ignore_reason": "blocked_or_no_usable_progress",
+        }
+        if not isinstance(output, Mapping):
+            if result.success:
+                handoff["handoff_state"] = "partial_safe_continue"
+                handoff["semantic_trust_level"] = "partial_unverified"
+                handoff["safe_to_continue"] = True
+                handoff["recommended_next_action_category"] = "inspect_result"
+                handoff["fallback_guidance"] = (
+                    "Use the returned result directly if it fits the task; otherwise continue solving."
+                )
+                handoff["trust_classification"] = "partial_useful"
+                handoff["ignore_recommendation"] = False
+                handoff["ignore_reason"] = ""
+            return handoff
+
+        observation_text = str(
+            output.get("observation") or output.get("macro_observation") or ""
+        )
+        lowered = json.dumps(output, ensure_ascii=True, default=str).lower()
+        observation_lowered = observation_text.lower()
+        final_variable = output.get("final_variable")
+        is_count_like = isinstance(final_variable, (int, float)) or (
+            isinstance(final_variable, str) and final_variable.strip().lstrip("-").isdigit()
+        )
+        has_pointer = isinstance(final_variable, str) and final_variable.strip().startswith("#")
+        fallback_only = self._looks_like_fallback_handoff(lowered)
+        has_next_action_hint = any(
+            phrase in lowered
+            for phrase in (
+                "action:",
+                "count(",
+                "get_neighbors(",
+                "get_relations(",
+                "intersection(",
+                "union(",
+                "difference(",
+                "argmax(",
+                "argmin(",
+                "critical to solver",
+                "continue from",
+                "next action",
+            )
+        )
+        verified_narrowing_signal = any(
+            phrase in observation_lowered or phrase in lowered
+            for phrase in (
+                "contains the filtered set",
+                "contains the intersected set",
+                "contains the walk result",
+                "correctly narrowed",
+                "postcondition verified",
+                "verified narrowed set",
+                "semantic_trust_level=verified",
+                "final_operation_safe=true",
+            )
+        )
+        has_structured_candidates = any(
+            marker in observation_lowered for marker in ("minted_variables", "candidate_map")
+        )
+        empty_structured_candidates = bool(
+            re.search(r"minted_variables:\s*\{\s*\}", observation_text, flags=re.IGNORECASE)
+        )
+        shallow_resolution = bool(
+            re.search(
+                r"common\.topic|type\.object|base\.schemastaging|freebase\.type_profile",
+                observation_lowered,
+            )
+        )
+        meaningful_partial_context = bool(
+            (has_structured_candidates and not empty_structured_candidates and not shallow_resolution)
+            or verified_narrowing_signal
+            or (
+                has_pointer
+                and not fallback_only
+                and not shallow_resolution
+                and str(output.get("status") or "").strip().upper() == "SUCCESS"
+            )
+        )
+
+        if self._is_macro_tool(name, result):
+            status = str(output.get("status") or "").strip().upper()
+            handoff["tool_status"] = status or handoff["tool_status"]
+            if status == "SUCCESS":
+                if is_count_like or "already an integer count" in lowered or "submit it directly" in observation_lowered:
+                    handoff["handoff_state"] = "complete"
+                    handoff["semantic_trust_level"] = "verified"
+                    handoff["safe_to_continue"] = True
+                    handoff["final_operation_safe"] = True
+                    handoff["recommended_next_action_category"] = "finish"
+                    handoff["fallback_guidance"] = (
+                        "If the query still needs one final primitive, do that now; otherwise finish."
+                    )
+                elif has_pointer:
+                    if fallback_only or shallow_resolution:
+                        handoff["handoff_state"] = "partial_fallback_not_final"
+                        handoff["semantic_trust_level"] = "fallback_unverified"
+                        handoff["safe_to_continue"] = False
+                        handoff["final_operation_safe"] = False
+                        handoff["recommended_next_action_category"] = "backtrack"
+                        handoff["fallback_guidance"] = (
+                            "This is a low-trust fallback/base variable, not a semantically completed result. "
+                            "Ignore it for direct submission and backtrack or recover only if independently justified."
+                        )
+                    elif meaningful_partial_context:
+                        handoff["handoff_state"] = "partial_safe_continue"
+                        handoff["semantic_trust_level"] = (
+                            "verified" if verified_narrowing_signal else "partial_unverified"
+                        )
+                        handoff["safe_to_continue"] = True
+                        handoff["final_operation_safe"] = bool(verified_narrowing_signal)
+                        handoff["recommended_next_action_category"] = (
+                            "continue_from_partial"
+                            if verified_narrowing_signal
+                            else "inspect_result"
+                        )
+                        handoff["fallback_guidance"] = (
+                            "Continue from the returned variable/result, but only finalize if the narrowing/result is explicitly verified."
+                        )
+                    else:
+                        handoff["handoff_state"] = "partial_safe_continue"
+                        handoff["semantic_trust_level"] = "partial_unverified"
+                        handoff["safe_to_continue"] = False
+                        handoff["final_operation_safe"] = False
+                        handoff["recommended_next_action_category"] = "backtrack"
+                        handoff["fallback_guidance"] = (
+                            "This partial result is weak or semantically unclear. Ignore it unless another trusted signal independently confirms it."
+                        )
+                else:
+                    handoff["handoff_state"] = "partial_safe_continue"
+                    handoff["semantic_trust_level"] = "partial_unverified"
+                    handoff["safe_to_continue"] = meaningful_partial_context
+                    handoff["final_operation_safe"] = False
+                    handoff["recommended_next_action_category"] = (
+                        "inspect_result" if meaningful_partial_context else "backtrack"
+                    )
+                    handoff["fallback_guidance"] = (
+                        "Use the returned result only if it adds meaningful partial context; otherwise continue solving without anchoring on it."
+                    )
+            elif status == "MACRO EXHAUSTED":
+                handoff["handoff_state"] = "exhausted"
+                handoff["semantic_trust_level"] = (
+                    "partial_unverified" if meaningful_partial_context else "blocked"
+                )
+                handoff["safe_to_continue"] = meaningful_partial_context
+                handoff["final_operation_safe"] = False
+                handoff["recommended_next_action_category"] = (
+                    "continue_from_candidates"
+                    if meaningful_partial_context
+                    else "backtrack"
+                )
+                handoff["fallback_guidance"] = (
+                    "Use only domain-relevant anchored variables if present; otherwise ignore this exhausted result and backtrack."
+                )
+            else:
+                handoff["handoff_state"] = "blocked"
+                handoff["semantic_trust_level"] = "blocked"
+                handoff["safe_to_continue"] = False
+                handoff["final_operation_safe"] = False
+                handoff["recommended_next_action_category"] = "backtrack"
+            if (
+                has_next_action_hint
+                and meaningful_partial_context
+                and handoff["recommended_next_action_category"] == "backtrack"
+            ):
+                handoff["recommended_next_action_category"] = "follow_handoff_guidance"
+                handoff["safe_to_continue"] = True
+            handoff["has_meaningful_partial_context"] = meaningful_partial_context
+            handoff["has_next_action_hint"] = has_next_action_hint
+            if handoff["handoff_state"] == "complete" and handoff["final_operation_safe"]:
+                handoff["trust_classification"] = "direct_submit_safe"
+                handoff["ignore_recommendation"] = False
+                handoff["ignore_reason"] = ""
+            elif handoff["safe_to_continue"] and meaningful_partial_context:
+                handoff["trust_classification"] = "partial_useful"
+                handoff["ignore_recommendation"] = False
+                handoff["ignore_reason"] = ""
+            elif handoff["handoff_state"] in {"blocked", "exhausted"} and not handoff["safe_to_continue"]:
+                handoff["trust_classification"] = "blocked_exhausted_ignore"
+                handoff["ignore_recommendation"] = True
+                handoff["ignore_reason"] = (
+                    "shallow_or_non_actionable_context"
+                    if shallow_resolution or has_structured_candidates
+                    else "no_meaningful_partial_progress"
+                )
+            else:
+                handoff["trust_classification"] = "low_trust_ignore"
+                handoff["ignore_recommendation"] = True
+                handoff["ignore_reason"] = "fallback_or_low_trust_partial"
+            return handoff
+
+        if self._is_advisory_result(result):
+            handoff["handoff_state"] = "partial_safe_continue"
+            handoff["semantic_trust_level"] = "partial_unverified"
+            handoff["safe_to_continue"] = True
+            handoff["final_operation_safe"] = False
+            handoff["recommended_next_action_category"] = "follow_recommendation"
+            handoff["fallback_guidance"] = (
+                "Prefer the advisory recommendation, but continue manually if it does not fit the current state."
+            )
+            handoff["trust_classification"] = "partial_useful"
+            handoff["ignore_recommendation"] = False
+            handoff["ignore_reason"] = ""
+            return handoff
+
+        if result.success:
+            handoff["handoff_state"] = "partial_safe_continue"
+            handoff["semantic_trust_level"] = "partial_unverified"
+            handoff["safe_to_continue"] = True
+            handoff["final_operation_safe"] = False
+            handoff["recommended_next_action_category"] = "inspect_result"
+            handoff["fallback_guidance"] = (
+                "Inspect the tool output and continue with the next environment action."
+            )
+            handoff["trust_classification"] = "partial_useful"
+            handoff["ignore_recommendation"] = False
+            handoff["ignore_reason"] = ""
+        return handoff
+
     def _format_tool_result(self, name: str, result: ToolResult) -> str:
+        handoff = self._classify_tool_handoff(name, result)
         payload = {
             "tool_name": name,
             "success": result.success,
             "output": result.output,
             "error": result.error,
+            "handoff": handoff,
         }
         if self._is_macro_tool(name, result):
-            instruction = self._macro_instruction_from_output(result.output)
+            trust_classification = str(handoff.get("trust_classification") or "")
+            if trust_classification == "direct_submit_safe":
+                instruction = self._macro_instruction_from_output(result.output)
+            elif trust_classification == "partial_useful":
+                instruction = (
+                    "Useful partial tool result. Do not submit directly unless HANDOFF says complete. "
+                    + str(handoff.get("fallback_guidance") or "")
+                )
+            else:
+                instruction = (
+                    "Low-trust tool result. Ignore for direct submission. "
+                    + str(handoff.get("fallback_guidance") or "")
+                )
             payload["macro_instruction"] = instruction
-            return "MACRO_TOOL_RESULT: " + instruction + "\nTOOL_RESULT: " + json.dumps(
-                payload, ensure_ascii=True, default=str
+            return (
+                "MACRO_TOOL_RESULT: "
+                + instruction
+                + "\nHANDOFF: "
+                + json.dumps(handoff, ensure_ascii=True, default=str)
+                + "\nTOOL_RESULT: "
+                + json.dumps(payload, ensure_ascii=True, default=str)
             )
         if isinstance(result.output, Mapping):
             # Advisory schema: pruned_observation, answer_recommendation, confidence_score
@@ -285,6 +604,7 @@ class ControllerHistoryMixin:
         pruned = result.output.get("pruned_observation")
         confidence = result.output.get("confidence_score", 0.0)
         status = result.output.get("status")
+        handoff = self._classify_tool_handoff(name, result)
 
         if recommendation:
             parts.append(f"Recommendation: {recommendation}")
@@ -296,6 +616,19 @@ class ControllerHistoryMixin:
             parts.append(f"Confidence: {float(confidence)}")
         if isinstance(status, str):
             parts.append(f"Status: {status}")
+        parts.append(f"Handoff: {handoff.get('handoff_state')}")
+        parts.append(f"Semantic Trust: {handoff.get('semantic_trust_level')}")
+        parts.append(f"Trust Classification: {handoff.get('trust_classification')}")
+        parts.append(f"Safe Continue: {handoff.get('safe_to_continue')}")
+        parts.append(f"Final Operation Safe: {handoff.get('final_operation_safe')}")
+        parts.append(
+            f"Next Action Category: {handoff.get('recommended_next_action_category')}"
+        )
+        parts.append(f"Fallback Guidance: {handoff.get('fallback_guidance')}")
+        parts.append(
+            "Structured Handoff: "
+            + json.dumps(handoff, ensure_ascii=True, default=str)
+        )
 
         rationale = result.output.get("rationale")
         if isinstance(rationale, list) and rationale:
@@ -318,6 +651,7 @@ class ControllerHistoryMixin:
         payload: dict[str, Any] = {
             "tool_name": tool_name,
             "success": result.success,
+            "handoff": self._classify_tool_handoff(tool_name, result),
         }
         if result.error:
             payload["error"] = result.error

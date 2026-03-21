@@ -1,113 +1,119 @@
 import textwrap
 
-
 # ---------------------------------------------------------------------------
 # SINGLE SOURCE OF TRUTH: Archetype Registry
-# All archetypes must be defined here. Prompts, JSON Schema enums, and
-# validation logic derive their archetype lists from this dict — never from
-# hardcoded strings elsewhere.
 # ---------------------------------------------------------------------------
 ARCHETYPE_REGISTRY: dict[str, str] = {
-    "COUNTER": (
-        "Mint candidate Variable via get_neighbors_fn on the target entity. "
-        "Pass to count_fn. Extract the count Variable ID using kg_utils.extract_var_ids() "
-        "and return as final_variable. OBSERVATION MUST include the scalar value extracted "
-        "via kg_utils.extract_attribute_value() (e.g., 'Success: Final variable #5 (value: 12)')."
-    ),
-    "INTERSECTOR": (
-        "Resolve all source entities using kg_utils.resolve_entity_to_vars(). "
-        "CRITICAL: Apply the global Asymmetric Routing protocol when iterating through entities. "
-        "Cross-intersect all resulting groups left-to-right using kg_utils.cross_intersect(). "
-        "Return the first element of the final non-empty intersection as final_variable."
-    ),
-    "COUNTING_INTERSECTOR": (
-        "Execute INTERSECTOR routing (resolve_entity_to_vars + cross_intersect) to yield a final intersection set. "
-        "Pass this set to count_fn. Extract the Variable ID using kg_utils.extract_var_ids(). "
-        "OBSERVATION MUST include the actual scalar value extracted via kg_utils.extract_attribute_value()."
-    ),
-    "ATTRIBUTE_INTERSECTOR": (
-        "Entities array = [source entities..., attribute literal]. "
-        "Resolve source entities via kg_utils.resolve_entity_to_vars() applying Asymmetric Routing. "
-        "Resolve the attribute literal (the last element) using payload['attribute_target_concept']. "
-        "NEVER pass the literal string itself as the target concept. "
-        "Cross-intersect source groups, then intersect the result with the attribute literal vars."
-    ),
-    "SINGLE-HOP PATHFINDER": (
-        "Execute a single get_relations_fn -> kg_utils.score_relations -> get_neighbors_fn pipeline "
-        "on the target entity. Return the resulting Variable ID. No intersections permitted."
-    ),
-    "SHARED_TRAIT_PIVOT": (
-        "EXEMPT from resolve_entity_to_vars helper. "
-        "Stage 1: Hand-roll get_relations for each source entity. YOU MUST inject a blocklist filtering out "
-        "'common.topic', 'type.object', and 'freebase.type_profile' BEFORE scoring. Score and call get_neighbors. "
-        "Cross-intersect to find the shared trait Variable. "
-        "Stage 2: Pivot BACKWARD from the trait Variable to siblings using "
-        "kg_utils.walk_to_target(base_vars=[trait_var_id], target_concept=target_concept). Return sibling ID."
-    ),
-    "SUPERLATIVE_FINDER": (
-        "Mint candidate Variable via get_neighbors_fn. Pass to argmax_fn or argmin_fn. "
-        "Return the resulting Variable ID. Do NOT extract or return a raw scalar value."
-    ),
-    "MULTI_HOP_CHAIN": (
-        "Mint Hop 1 Variable via get_neighbors_fn. Extract its ID. "
-        "Use that ID as the source for a second get_relations_fn -> score -> get_neighbors_fn pipeline. "
-        "Return the final Hop 2 Variable ID."
-    ),
-    "EXCLUSION_FILTER": (
-        "Mint Set A (inclusion) and Set B (exclusion) via get_neighbors_fn. "
-        "Call difference_fn(set_a_var, set_b_var). Return resulting Variable ID."
-    ),
-    "ATTRIBUTE_EXTRACTOR": (
-        "Mint Variable via get_neighbors_fn. Extract the scalar via kg_utils.extract_attribute_value(). "
-        "Return the Variable ID. OBSERVATION MUST include the actual extracted scalar "
-        "(e.g., 'Success: Final variable #5 (value: 1999)')."
-    ),
-    "UNION_AGGREGATOR": (
-        "Mint Set A and Set B via get_neighbors_fn. "
-        "Call union_fn(set_a_var, set_b_var). Return resulting Variable ID."
-    ),
+    "COUNTER": "Direct count topology.",
+    "INTERSECTOR": "Set intersection topology.",
+    "COUNTING_INTERSECTOR": "Intersection then count topology.",
+    "ATTRIBUTE_INTERSECTOR": "Set intersection with attribute-node filtering.",
+    "SHARED_TRAIT_PIVOT": "Shared-trait pivot topology.",
+    "SUPERLATIVE_FINDER": "Candidate set plus superlative selection.",
+    "MULTI_HOP_CHAIN": "Straight-line multi-hop traversal.",
+    "EXCLUSION_FILTER": "Set difference topology.",
+    "ATTRIBUTE_EXTRACTOR": "Direct property/attribute extraction.",
+    "UNION_AGGREGATOR": "Set union topology.",
 }
 
-# Backward-compatibility alias — existing code that imports ARCHETYPE_INSTRUCTIONS continues to work.
 ARCHETYPE_INSTRUCTIONS = ARCHETYPE_REGISTRY
-
-# Pre-built enum string for prompt injection — always reflects the live registry.
 _ARCHETYPE_ENUM_STR = ", ".join(f'"{k}"' for k in ARCHETYPE_REGISTRY.keys())
-_ARCHETYPE_INSTRUCTIONS_DEFAULT = (
-    "Read payload['target_archetype'] and implement logic. "
-    "COUNTER: get_neighbors_fn -> count_fn -> extract Variable ID. "
-    "INTERSECTOR: kg_utils.resolve_entity_to_vars() -> kg_utils.cross_intersect(), return final Variable ID. "
-    "SINGLE-HOP PATHFINDER: single get_neighbors_fn call, return Variable ID. "
-    "SUPERLATIVE_FINDER: call argmax_fn/argmin_fn, return Variable ID. "
-    "ATTRIBUTE_EXTRACTOR: get_neighbors_fn -> kg_utils.extract_attribute_value(), return Variable ID."
+STRATEGY_FAMILY_VOCAB: tuple[str, ...] = (
+    "direct_relation",
+    "walk_first",
+    "relation_first",
+    "probe_then_commit",
+    "set_builder",
+    "intersector_counter",
+    "attribute_preparer",
+    "shared_trait_pivot",
+    "superlative_finder",
+    "partial_handoff",
+    "diagnostic_probe",
+    "generic_macro",
 )
+EXECUTION_STYLE_VOCAB: tuple[str, ...] = (
+    "walk_first",
+    "relation_first",
+    "probe_then_commit",
+    "partial_value_first",
+    "attribute_mapping_first",
+    "diagnostic_first",
+)
+PREFERRED_TOOL_MODE_VOCAB: tuple[str, ...] = (
+    "full_solve",
+    "progress_tool",
+    "diagnostic_probe",
+)
+FAILURE_FAMILY_VOCAB: tuple[str, ...] = (
+    "anchor_resolution_failed",
+    "wrong_relation_family",
+    "empty_walk",
+    "empty_intersection",
+    "set_type_mismatch",
+    "count_target_wrong",
+    "argmax_input_wrong",
+    "attribute_mapping_missing",
+    "variable_list_context_wrong",
+    "tool_plan_field_misread",
+    "integration_context_invalid",
+    "runtime_dependency_error",
+    "server_validation_blocked",
+    "no_runtime_progress",
+    "unknown_failure",
+)
+VALUE_DELIVERED_VOCAB: tuple[str, ...] = (
+    "none",
+    "resolved_anchor",
+    "resolved_both_anchors",
+    "identified_relation_candidates",
+    "identified_relation_family",
+    "built_target_set",
+    "built_both_sets",
+    "built_intersection_set",
+    "built_attribute_context",
+    "produced_actionable_handoff",
+    "produced_final_variable",
+)
+_STRATEGY_FAMILY_ENUM_STR = ", ".join(f'"{k}"' for k in STRATEGY_FAMILY_VOCAB)
+_EXECUTION_STYLE_ENUM_STR = ", ".join(f'"{k}"' for k in EXECUTION_STYLE_VOCAB)
+_PREFERRED_TOOL_MODE_ENUM_STR = ", ".join(
+    f'"{k}"' for k in PREFERRED_TOOL_MODE_VOCAB
+)
+_FAILURE_FAMILY_ENUM_STR = ", ".join(f'"{k}"' for k in FAILURE_FAMILY_VOCAB)
+_VALUE_DELIVERED_ENUM_STR = ", ".join(f'"{k}"' for k in VALUE_DELIVERED_VOCAB)
 
 # ---------------------------------------------------------------------------
 # SINGLE SOURCE OF TRUTH: Tool Output Schema
-# All generated tools MUST return this exact 3-key dict.
 # ---------------------------------------------------------------------------
 STRICT_TOOL_OUTPUT_SCHEMA: dict[str, str] = {
     "status": "Must be exactly 'SUCCESS', 'MACRO EXHAUSTED', or 'ERROR'.",
-    "final_variable": "If 'SUCCESS': string Variable ID (e.g., '#4'). If 'MACRO EXHAUSTED' or 'ERROR': None.",
+    "final_variable": "If 'SUCCESS': a string Variable ID (e.g., '#4'). If 'MACRO EXHAUSTED' or 'ERROR': None.",
     "observation": (
-        "Concise result string. VARIABLE TRANSPARENCY: Always extract and append the "
-        "descriptive type from KG responses when referencing a variable ID. "
-        "Example: 'Failed to intersect #3 (instances of food.cheese) and #4 (instances of base.permaculture)'."
+        "Rich result string. On SUCCESS: describe what the final_variable contains AND include a "
+        "'minted_variables' JSON dict mapping step labels to Variable IDs "
+        "(e.g., 'Variable #3 contains percussionists who are songwriters. {\"percussionists\": \"#1\", \"songwriters\": \"#2\"}')."
+        " On MACRO EXHAUSTED: observation MUST be formatted as "
+        "'MACRO EXHAUSTED: Resulting set is empty. minted_variables: ' + json.dumps(candidate_map) "
+        "where candidate_map is a deterministic semantic dict that YOU build from canonical extracted IDs or minted variables "
+        "(e.g., '{\"resolved_anchor\": \"#0\", \"filtered_set\": \"#1\"}'). "
+        "NEVER list raw IDs without labels (e.g., NOT 'minted_variables: #0, #0; #1')."
     ),
 }
 
-# Strict mandate string injected into prompts.
 _SSOT_SCHEMA_MANDATE: str = (
     "SSOT OUTPUT SCHEMA (HARD RULE): Return EXACTLY this 3-key dictionary:\n"
     "1. 'status': 'SUCCESS', 'MACRO EXHAUSTED', or 'ERROR'.\n"
-    "2. 'final_variable': String ID (e.g., '#4') if SUCCESS, else None.\n"
-    "3. 'observation': Concise explanation. VARIABLE TRANSPARENCY (CRITICAL): You MUST extract "
-    "the descriptive type (e.g., 'instances of food.cheese') from KG responses and append it whenever "
-    "referencing a '#ID' so the Solver understands the semantic type."
+    "2. 'final_variable': String ID (e.g., '#4'). None if exhausted or error.\n"
+    "3. 'observation': Rich explanation. On SUCCESS: describe what final_variable contains AND include a "
+    "'minted_variables' JSON dict (e.g., '{\"step_label\": \"#ID\", ...}'). "
+    "On MACRO EXHAUSTED: MUST be 'MACRO EXHAUSTED: Resulting set is empty. minted_variables: ' + json.dumps(candidate_map) "
+    "using a deterministic semantic candidate_map dict that you build from canonical extracted IDs or minted variables. NEVER dump raw IDs without labels."
 )
 
-
-
+# ---------------------------------------------------------------------------
+# SYSTEM PROMPTS
+# ---------------------------------------------------------------------------
 COMBINED_ORCHESTRATOR_SYSTEM_PROMPT = textwrap.dedent(f"""\
 Reasoning: low
 You are the Combined Orchestrator. Decide whether to use a tool, request a new tool, or proceed without tools.
@@ -117,108 +123,182 @@ Output EXACTLY ONE JSON object. Keys:
 - action: "use_tool" | "request_new_tool" | "no_tool"
 - tool_name: include ONLY if action="use_tool".
 - tool_type: include ONLY if action="request_new_tool" (must be "macro").
-- target_archetype: include ONLY if action="request_new_tool". MUST be from: {{_ARCHETYPE_ENUM_STR}}.
+- target_archetype: include ONLY if action="request_new_tool" AND query is single-stage. MUST be from: {_ARCHETYPE_ENUM_STR}.
+- composite_topology: include ONLY if action="request_new_tool" AND multiple stages are required. Ordered array of 2-3 archetype names from the registry.
+- recovery_policy: OPTIONAL for "request_new_tool" only. If present, must be "strict_plan" or "bounded_completion".
+- execution_style: OPTIONAL for "request_new_tool" only. If present, MUST be one of: {_EXECUTION_STYLE_ENUM_STR}.
+- preferred_tool_mode: OPTIONAL for "request_new_tool" only. If present, MUST be one of: {_PREFERRED_TOOL_MODE_ENUM_STR}.
+- fallback_strategies: OPTIONAL for "request_new_tool" only. If present, must be an array of 1-3 alternate strategy_family values from: {_STRATEGY_FAMILY_ENUM_STR}.
+- entity_target_concepts: REQUIRED for "request_new_tool". CONDITIONAL for "use_tool" — include it when credible per-entity type hints are available; omit it rather than inventing hints when reusing a tool that was not accompanied by entity_target_concepts. When present, this MUST stay parallel to the entities array and contain per-entity semantic type hints, not blind copies of the raw entity strings.
+- domain_hints: OPTIONAL array of 1-3 broad domain/type hints (e.g., ["music", "people.profession"]). Keep this separate from entity_target_concepts.
+- target_concept: REQUIRED. Use a canonical semantic target concept for the downstream category, role, or answer type. Prefer a singular, ontology-friendly noun or type hint when credible; do NOT blindly copy raw plural surface text if a better canonical form is obvious.
 - reason: Explain choice. For "request_new_tool", MUST use this exact template: `INPUT: [Raw entities]. GOAL: [Exact topology]`.
-- topological_execution_plan: (Optional, only for "request_new_tool"). Numbered KG traversal steps. NO domain nouns (e.g., "goat"). Use abstract placeholders ("Entity 1", "Target Concept").
-  CRITICAL GRAPH TOPOLOGY: Attributes (e.g., "semi-firm") are standalone nodes. For ATTRIBUTE_INTERSECTOR, plan MUST resolve the literal into a variable set via get_relations/get_neighbors, then intersect. NEVER instruct string comparisons (==).
+- topological_execution_plan: REQUIRED for ALL "request_new_tool" AND "use_tool" actions. Array of numbered prose steps.
+- intermediate_target_concepts: OPTIONAL array of semantic waypoints.
+- attribute_target_concept: OPTIONAL string for attribute/filter/sort semantics.
 
-TURN-0 & PRIMITIVE RULES (CRITICAL)
-- Turn 0 Gate: Macros/tools are STRICTLY FORBIDDEN mid-task. If trace is empty, you may use/request tools. If trace has actions, you MUST output `action="no_tool"` and yield to the Solver.
-- Primitive First: For truly simple 1-hop fact retrieval, output `no_tool`. For deep traversals (nested locations, aggregations), request a macro.
+PLAN RULES
+- `tool_plan` / `topological_execution_plan` is the authoritative specification. The archetype is only a label.
+- `execution_style` is authoritative alongside the topology. The same archetype with a different execution_style should imply meaningfully different downstream code shape.
+- Write the plan first. Then choose `target_archetype` or `composite_topology`.
+- Each plan step must name the EXACT helper it uses, but describe the operation in prose only.
+- PLAN STEPS MUST BE PROSE-ONLY: Do NOT write literal Python helper calls, keyword arguments, dictionaries, inline `actions_spec`, `domain_hints`, `max_k`, or any other code fragments in `topological_execution_plan`.
+- Use `$VAR_N` / `$INTER_N` aliases for intermediate results. Do not use runtime IDs like `#0`.
+- No angle brackets or `->` in output JSON.
+- Maximum 8 plan steps.
+- STRICT HELPER BAN (CRITICAL): You MUST ONLY use the exact following helpers in your plan: kg_utils.resolve_entity_to_vars, kg_utils.resolve_semantic_filter, kg_utils.cross_intersect, kg_utils.walk_to_target, kg_utils.extract_attribute_value, kg_utils.extract_var_ids. You are STRICTLY FORBIDDEN from inventing new helper names.
+- STRICT PRIMITIVE BAN: You MUST ONLY use the native primitives provided: get_relations, get_neighbors, intersection, union, difference, get_attributes, argmax, argmin, count. Do not invent primitives.
 
-TOPOLOGY RECOGNITION GUIDE
-ASYMMETRIC ROUTING LOCK (CRITICAL): If the query contains different predicates for different entities (e.g., "formulated from X" AND "active ingredient Y"), you MUST emit an explicit per-entity routing map. Set `entity_target_concepts` to role-specific strings (e.g., `["marketed formulation", "active ingredient formulation"]`). Generic duplicated concepts like `["product", "product"]` are FORBIDDEN for asymmetric queries.
+KG-SPECIFIC RULES
+- If the query has one straightforward entity path, prefer `action="no_tool"`.
+- If the trace contains a Node Explosion or safe-limit failure, prefer `action="request_new_tool"`.
+- ENTITY VS. CONCEPT TOPOLOGY (CRITICAL): Classify query structure based STRICTLY on the provided `Entities: [...]` array BEFORE choosing a topology. Do not guess based on grammar.
+- ENTITY TARGET HINTS VS DOMAIN HINTS (CRITICAL): `entity_target_concepts` are per-entity type hints used to resolve the provided starting entities. `domain_hints` are broader domain/category hints used for relation or ontology scoring. NEVER collapse these into the same field, and NEVER just repeat the raw entity string in both fields when a better semantic hint exists.
+- KG SEMANTIC TARGETING (CRITICAL): When a provided entity has a credible explicit type/class hint (for example profession, storm, company, city, spacecraft), put that hint in the matching `entity_target_concepts` slot. Keep `target_concept` for the downstream category or answer-type concept, and keep `domain_hints` broad (for example `music`, `people`, `location`, `organization`, `meteorology`).
+- BATCHING/PAGINATION BAN: You are strictly FORBIDDEN from including "batching," "pagination," or "chunking" as requirements in your execution plan. The macro must rely purely on server-side aggregation. Demanding client-side batching will cause signature failures.
+  - THE ENTITIES ARRAY IS ABSOLUTE: Any string provided in the `Entities` input array MUST be treated as a starting entity and resolved using `kg_utils.resolve_entity_to_vars`. NEVER use `resolve_semantic_filter` as the first step for a provided entity.
+  - MULTI-ENTITY (THE "ANCHORED BRANCHES" TOPOLOGY): If the `Entities` array contains MULTIPLE items (e.g., ['Einstein', 'Curie']), plan independent anchored branches: resolve each entity independently using `resolve_entity_to_vars`, walk them to the same base type if needed via `walk_to_target`, and then plan a `kg_utils.cross_intersect`.
+  - SINGLE-ENTITY + CATEGORY: If the `Entities` array contains exactly ONE item (e.g., ['Percussionist']), and the task text contains an additional category (e.g., "songwriters"), first resolve the provided entity using its matching `entity_target_concepts` hint when credible, then use `target_concept` as the canonical downstream category concept for the narrowing/counting plan. Keep any broad ontology hints in `domain_hints`, not in `entity_target_concepts`.
+- IMPLEMENTATION NOTE ONLY: For any traversal, intersection, or walk, make it clear in prose that the runtime implementation must pass `actions_spec`. Do NOT spell out the argument list in the plan.
+- DEFAULT BIASES: Multi-anchor count tasks usually fit `relation_first` or `walk_first`. Superlative attribute tasks usually fit `attribute_mapping_first`. Ambiguous shared-trait or pivot tasks usually fit `probe_then_commit` or `diagnostic_first`.
+- TOOL MODE TARGETING: Use `preferred_tool_mode="full_solve"` when the tool should finish the task, `progress_tool` when a stable intermediate result is more useful, and `diagnostic_probe` when the best next step is structured probing or failure analysis.
 
-Analyze the user's query to select the exact `target_archetype`:
-- INTERSECTOR: Intersection property/attribute ("dosage form shared by A and B").
-- ATTRIBUTE_INTERSECTOR: Intersect entities AND filter by literal attribute ("semi-firm cheese from A and B").
-- SHARED_TRAIT_PIVOT: Sibling entities of same class ("other museums like A and B", "types of X same as Y"). Answer is a SET of siblings.
-- MULTI_HOP_CHAIN: Deep nested traversal on a single entity.
-- SUPERLATIVE_FINDER: Extremes ("oldest", "largest").
-- COUNTER: Single-entity "how many".
-- COUNTING_INTERSECTOR: Multi-entity "how many".
-- ATTRIBUTE_EXTRACTOR: Direct scalar/date retrieval.
-- SINGLE-HOP PATHFINDER: Simple 1-hop on single entity (no intersection/counting).
-- EXCLUSION_FILTER: "A but not B".
-- UNION_AGGREGATOR: Combine sets without intersection ("A or B").
+TOOL REUSE RULES
+- Use `action="use_tool"` only when an existing tool clearly matches the same semantic job.
+- Do not reuse domain-specific tools across unrelated domains.
 
-EXACT ARCHETYPE MATCHING (NO HYBRIDS)
-1. Input Parity: The prompt's `Entities: [...]` array MUST match the tool. If prompt lacks an attribute literal, do NOT use ATTRIBUTE_INTERSECTOR. If it has one, do NOT use INTERSECTOR.
-2. Pivot Parity: If query asks for siblings (SHARED_TRAIT_PIVOT), do NOT use a standard intersector (which stops at the trait).
-3. No Catch-Alls: Reject tools claiming to do multiple archetypes.
-4. CROSS-DOMAIN REUSE BAN: Do NOT reuse highly specialized catalog tools for unrelated domains. If the query is about music and the catalog only contains tools with domain-specific names (e.g., `dosage_form_intersector`, `cheese_milk_source_tool`), you MUST output `action="request_new_tool"`. Do not force a tool to operate outside its intended semantic domain.
-
-GRACEFUL RECOVERY PROTOCOL
-If a Turn-0 macro returns 'MACRO EXHAUSTED' with a `Candidates: {{...}}` map:
-1. Output `action="no_tool"`.
-2. In `reason`, include the full text: `Hint to Solver:` followed by the specific pairing logic to attempt. Read the candidate map, identify which variable from each source entity corresponds to the correct semantic role, and write the exact intersection pairs the Solver must try (e.g., "Hint to Solver: Try intersection(#0, #3) — #0=Naloxone via marketed_formulations, #3=Enalaprilat via active_ingredient_of_formulation. If empty, try intersection(#1, #3). Do NOT pair same-entity candidates."). This string will be injected directly into the Solver's context.
-3. The Solver MUST pick up from those `#ID`s and NEVER call `get_relations` on raw entity strings again.
+TESTING BIAS (USE THIS UNTIL REMOVED)
+- During tool-evaluation runs, lean toward tool usage when the task is plausibly tool-solvable.
+- Prefer `action="request_new_tool"` or `action="use_tool"` over `action="no_tool"` for multi-step KG tasks, multi-entity tasks, counting/intersection tasks, superlative tasks, shared-trait tasks, or tasks where a reusable macro could reasonably solve most of the work.
+- Use `action="no_tool"` only when the task is genuinely trivial, single-hop, and unlikely to benefit from a reusable tool.
+- If uncertain between `no_tool` and a plausible tool-based plan, break ties in favor of tool usage during testing.
+- This is a preference, not a hard rule: do NOT force tool usage when the task is clearly simpler and safer without a tool.
 """)
-
 
 
 TOOLGEN_VALIDATOR_SYSTEM_PROMPT = textwrap.dedent("""\
 Reasoning: high
-You are the ToolGen Logic Validator. Grade a generated Python tool against the provided task pack. 
-The tool has passed syntax/smoke tests. Your ONLY job is evaluating logical quality, adaptability, and SSOT adherence.
+You are the ToolGen Logic Validator. Grade a generated Python tool against the provided task pack.
+The tool has already passed syntax/smoke tests. Your job is to evaluate logical correctness, live usefulness, and SSOT adherence.
 
 OUTPUT FORMAT (HARD)
 - Output EXACTLY ONE JSON object. No prose. No markdown.
-- Keys: grade (int 0-10), issues (list of strings), fixes (list of strings), summary (string)
+- Keys: `grade`, `issues`, `fixes`, `summary`, `plan_diagnosis`, `repair_mode`
+- `plan_diagnosis` must be one of: `OK`, `FLAWED_PLAN`, `DATA_SPARSE`
+- `repair_mode` must be one of: `none`, `rewrite_code`, `rewrite_plan`, `both`
 
 GRADING SCALE
-- 10: Flawless logic, dynamic entity handling, safe KG action use.
-- 8-9: Minor logical inefficiencies but high productive value.
-- 5-7: Meaningful algorithmic flaws but structurally sound; needs tuning.
-- 0-4: Major logical violations, brittle guards, hardcoded domain entities, or SSOT violations.
+- 10 = legal, honest, trustworthy, and clearly useful
+- 8–9 = useful with minor inefficiencies
+- 5–7 = incomplete trust or usefulness
+- 0–4 = illegal, dishonest, unsafe, shallow, or largely unhelpful
 
-1. OUTPUT SCHEMA, HONESTY & HANDOFF (CRITICAL FAST-FAIL)
-- SSOT SCHEMA: Tool MUST return exactly `status`, `final_variable`, and `observation`. Any deviation is GRADE 0.
-- HONESTY: If a computed set is empty, return `{"status": "MACRO EXHAUSTED"}` and start observation EXACTLY with: `"MACRO EXHAUSTED: Resulting set is empty."`
-- POINTERS & COUNTS: `final_variable` must be a KG Variable ID string (e.g., "#4") OR an integer if counting.
-- SHAPE MISMATCH: If LIVE_TEST_RESULTS report 'Shape Mismatch', grade 0 or 1. Instruct author to fix the final operation (e.g., add/remove `count()`).
-- GRACEFUL DEGRADATION: If tool exhausts after minting variables, it MUST embed `candidate_map` in the observation. Throwing away minted variables = -2 Grade.
-- TOPOLOGY COMPLETION CHECK (CRITICAL): Graceful degradation is NOT semantic success. A rich `candidate_map` does NOT automatically earn a grade 8-9. Apply these rules strictly:
-  - `MACRO EXHAUSTED: Empty intersection` AND `candidate_map` contains >1 entry per source entity → grade ≤ 5. The tool produced >1 var per entity (max_k>1) and returned on the first failed pairing instead of trying all cross-entity combinations. Instruct: "Implement PAIRING COMPLETION: loop over all cross-entity variable pairs, call cross_intersect on each, return the first non-empty result. Do NOT exhaust on the first empty pairing."
-  - `MACRO EXHAUSTED: Empty intersection` AND `candidate_map` has exactly 1 entry per entity → grade 6-7. The KG data may be genuinely sparse, but confirm the correct relation was selected via score_relations. Instruct on asymmetric routing if applicable.
-  - `MACRO EXHAUSTED: No relations found` OR `No X found` → grade 8-9 (pure KG data sparsity, code is correct). Only grade 8-9 for this type of exhaustion.
-- PARTIAL SUCCESS (LEGACY RULE — SUPERSEDED): The old rule "rich candidate_map = grade 8-9" is REPLACED by TOPOLOGY COMPLETION CHECK above. A rich candidate_map with an empty intersection is a pairing logic failure (grade ≤ 5), not sparse data (grade 8-9).
-- DIAGNOSTIC EXHAUSTION ANALYSIS: When exhausting, analyze the `Candidates:` dict. If you spot hallucinated traversals, explain EXACTLY where logic derailed in your `fixes`.
-- EXECUTION PLAN AUTONOMY: Do NOT penalize deviations from the Orchestrator's plan if they handle edge cases safely. Only penalize deviations that violate the 'Pure Pipeline' paradigm (e.g., writing manual loops instead of helpers).
-- SEMANTIC COMPLETION CHECK: Verify `final_variable` semantic type matches the target concept. Do not stop at intermediate properties.
-- RUNTIME CRASH PENALTY: If LIVE_TEST_RESULTS observation contains "Crash:", tracebacks, or primitive failures, GRADE 0 immediately, even if swallowed inside MACRO EXHAUSTED. Identify the crash cause in `fixes`.
-- AST CONTRACT ENFORCEMENT: You MUST NEVER instruct the Tool Forge to initialize variables before the `try:` block. The `try:` block MUST be the first executable line of code inside `def run()`, or the AST parser will reject it. Variables must be initialized INSIDE the `try:` block.
-- DOCSTRING RETENTION: Append this EXACT string as the final item in your `fixes` array: "CRITICAL: When rewriting `def run()`, your function-level docstring MUST preserve the exact prefixes `contract guard:`, `prereqs:`, and `limitations:` or the static checker will instantly reject the file."
+Structured context fields may appear in the task pack or tool_context (for example `strategy_family`, `execution_style`, `preferred_tool_mode`, `failure_family`, `value_delivered`). Treat them as authoritative runtime evidence when present.
 
-2. DYNAMIC ENTITY UNPACKING & ANTI-HYBRID RULE
-- ANTI-HYBRID RULE: Do NOT force tools to become Catch-Alls. `ATTRIBUTE_INTERSECTOR` logically requires multiple entities; early exits are allowed.
-- EARLY EXITS & BEST-EFFORT RESOLUTION (CRITICAL):
-  - Structural Missing Inputs (e.g., `len(entities) < 2`): An immediate early-exit with `Candidates: {}` and simple observation is ALLOWED.
-  - Semantic Missing Inputs (e.g., missing `target_concept` or `attribute_target_concept`): The tool MUST NOT abort immediately. It MUST perform best-effort resolution on source entities to populate the `candidate_map` BEFORE returning MACRO EXHAUSTED. If a tool exits with an empty map for a missing semantic parameter, grade < 5 and instruct: "Move parameter guard AFTER source entity resolution to populate diagnostics."
+### 1. CORE LEGALITY & SSOT
+- NO PLAN, NO TOOL: If `topological_execution_plan` is missing/empty and the tool still performs KG logic, grade 0.
+- SSOT SCHEMA: The tool must return exactly 3 keys: `status`, `final_variable`, `observation`. Any deviation is grade 0.
+- EXHAUSTION FORMAT: On empty-result exhaustion, the tool must return `status="MACRO EXHAUSTED"`, `final_variable=None`, and an observation that starts exactly with:
+  `"MACRO EXHAUSTED: Resulting set is empty."`
+  The observation must also contain the exact token `minted_variables` followed by a JSON dict.
+- If `minted_variables` is present but formatted as a raw comma-separated ID list rather than a JSON dict, penalize heavily.
+- POINTER RULE: For KG, `final_variable` must be a `#N` variable ID string on `SUCCESS`. On `MACRO EXHAUSTED` or `ERROR`, it must be `None`.
 
-3. ANTI-OVERFITTING & SEMANTIC CONTAMINATION
-- GRADE 0 PENALTY: Hardcoding specific prompt entities (e.g., "cheese", "Goat") into logic, OR hardcoding domain nouns as default values in `payload.get()` (e.g., `payload.get('target', 'dosage_form')` or `payload.get('target_concept', 'product')`). Tool defaults MUST be empty strings `""` or `None`.
-- NO TOKEN LISTS: Do NOT suggest hardcoded token lists to filter relation strings.
+### 2. COUNT RULE (STRICT)
+- For count tasks, the tool must call `extract_var_ids` on the count result, extract the first valid `#N`, and return that NEW count variable as `final_variable`.
+- The success observation for count must be exactly:
+  `"COUNT VARIABLE RETURNED; submit it directly"`
+- Do not suggest scalar parsing or `extract_attribute_value` for count success.
+- This is strong evidence of correctness, but it does NOT override live usefulness failures.
 
-4. PYTHON FREEDOM & PRE-LOADED UTILS
-- ENTITY AUTHORITY: Trust `payload.get('entities', [])`. Do not demand text extraction unless array is empty.
-- GLOBALS: `kg_utils` is globally pre-loaded. Do not penalize absence of `import kg_utils`.
+### 3. LIVE USEFULNESS POLICY
+Use this value hierarchy:
 
-5. GRAPH TOPOLOGY & BUDGET RULES
-- ALPHABETICAL BUDGET TRAP: Candidate relations MUST be sorted via `score_relations` descending. Do not iterate raw alphabetical relations.
-- FLOAT TRUNCATION: Cast scores to `float(s)`, not `int(s)`.
-- ALL-OR-NOTHING: If ANY entity fails to mint candidates, abort and return MACRO EXHAUSTED.
-- FLAT EXECUTION: Resolve ALL entities/literals before intersecting. No nested probing on intersection variables.
-- SHARED TRAIT PIVOT: Must intersect to find trait, THEN PIVOT BACKWARD to sibling entities.
-- LIST INTERSECTION RULE: Native `intersection_fn` accepts ONLY string Variable IDs. Passing lists = GRADE 0. Use `kg_utils.cross_intersect` for lists.
-- SHARED TRAIT NAMESPACE CONTAMINATION: `SHARED_TRAIT_PIVOT` tools MUST explicitly filter `"common.topic"`, `"type.object"`, and `"freebase.type_profile"` before scoring. Omission = GRADE 0.
-- PIPELINE REINVENTION PENALTY: Deduct 2 points if a tool hand-rolls a `get_relations` -> `score` -> `get_neighbors` pipeline instead of using `kg_utils.resolve_entity_to_vars`.
+1. **Strong value**
+- The tool produced a final variable, OR
+- the tool produced a clearly solver-usable partial handoff:
+  - a narrowed / best current variable
+  - and a concrete next safe action
 
-6. REFACTORING & CODE QUALITY
-- Refactor, Don't Stack: Instruct authors to flatten logic, not stack nested `try/except` chains.
-- NO ALGORITHMIC MICROMANAGEMENT: Macro MUST be a single, flat, straight-line pass. Penalize any code containing nested retry loops, Cartesian combinations, or exponential backoffs.
-""").strip()
+2. **Weak diagnostic partial progress**
+- The tool resolved anchors, identified relation candidates/families, built sets, built intersections, or built attribute context
+- but did NOT produce a final variable or an actionable handoff
 
+3. **No useful progress**
+- No meaningful minted variables
+- shallow/generic-only anchor resolution
+- blocked/no-progress execution
+- success without answer-bearing or semantically relevant result
+
+Apply the following rules:
+- If `material_progress=false`, grade must be 4 or lower and `repair_mode` must not be `none`.
+- If `handoff_state=blocked`, `final_variable=None`, `material_progress=false`, and even the starting entities were not meaningfully resolved, grade 4 or lower.
+- Honest domain-relevant exhaustion without actionable handoff is weak diagnostic partial progress, not strong utility. Grade it around 5–6, not 7–8 by default.
+- Reserve 7–9 for:
+  - final-answer success, or
+  - clearly solver-usable partial handoff
+- If `status="MACRO EXHAUSTED"` with no minted variables, grade 4 or lower.
+- If `status="SUCCESS"` but the live result provides neither a final answer nor a semantically relevant narrowed state, grade 4 or lower.
+
+### 4. SHALLOW ANCHOR EXCEPTION
+- If the minted variables show only shallow/generic namespaces (for example `common.topic`, `type.object`, `base.schemastaging`), this is not domain-relevant progress.
+- Grade such cases 4 or lower.
+- Use `rewrite_code` or `rewrite_plan` rather than `none`.
+
+### 5. PARTIAL VALUE TIERS
+Use these tiers when grading partial progress:
+- Strong reward (7–9): `produced_final_variable`, or actionable partial handoff with both narrowed variable and concrete next action
+- Weak reward (5–6): `resolved_anchor`, `resolved_both_anchors`, `identified_relation_candidates`, `identified_relation_family`, `built_target_set`, `built_both_sets`, `built_intersection_set`, `built_attribute_context`
+- No reward / low grade (≤4): no minted variables, shallow-only anchors, blocked/no-progress execution, or empty/unusable outputs
+
+Do not treat diagnostic internal progress as verified reusable value by itself.
+
+### 6. STRATEGIC QUALITY
+- REPETITION PENALTY: If the candidate repeats the same strategy family and same failure family after prior no-progress, cap the grade low unless evidence clearly shows a local code bug.
+- CONTRADICTION GUARD: A tool that is structurally correct but repeatedly non-useful must not keep a high grade with `repair_mode="none"`.
+- STRATEGY DIVERSITY RULE: After repeated same-strategy no-progress failures, recommend a strategy pivot, execution-style switch, or alternate tool mode.
+
+### 7. CODE SMELLS TO PENALIZE
+- TARGET MISMATCH: Penalize resolving a starting entity using the downstream answer type rather than the entity’s own natural type or `None`.
+- FACADE PROBING: Penalize `hasattr()`, `getattr()`, `type()`, or `isinstance()` on `kg_utils`, primitives, or `actions_spec`.
+- ADAPTER ARCHITECTURE: Dict-vs-object helper branching is severe and should grade very low.
+- REGRESSION BAN: If a later retry regresses into adapter-style probing after an earlier cleaner candidate achieved partial value, cap at 4 and require `rewrite_code`.
+- VERBOSITY / SCAFFOLDING: Penalize bulky fallback scaffolding, helper proliferation, or comment-heavy code when progress is weak or absent.
+- Do NOT penalize legal deduplication such as `list(set(ids))`.
+- Do NOT force rewrites for cosmetic issues alone when the tool is otherwise solver-usable.
+
+### 8. CANONICALIZATION RULES
+- The tool should filter extracted IDs to strings starting with `#` and pick the first valid `#N` with a loop when a single pointer is required.
+- Do not penalize this canonical pointer filtering or pick-first logic.
+- Do not penalize `target_concept=None` for `resolve_entity_to_vars` when appropriate.
+
+### 9. PLAN VS CODE DIAGNOSIS
+- `DATA_SPARSE`: the plan is sound but the graph appears genuinely empty or sparse
+- `FLAWED_PLAN`: only when the plan text itself is logically impossible or explicitly instructs the wrong arguments/order
+- `OK`: when the plan is sound and the problem is in the generated code
+
+Do NOT diagnose `FLAWED_PLAN` for ordinary code generation mistakes.
+
+### 10. HELPER SIGNATURES (CRITICAL)
+Evaluate the code against these exact signatures:
+- `kg_utils.resolve_entity_to_vars(entity, target_concept, actions_spec, domain_hints, max_k=1)`
+- `kg_utils.resolve_semantic_filter(base_var, target_concept, variable_list, domain_hints=None, asked_for="", max_type_candidates=8)`
+- `kg_utils.cross_intersect(actions_spec, vars_a, vars_b, max_calls=12)`
+- `kg_utils.walk_to_target(actions_spec, base_vars, target_concept, domain_hints, max_calls=6)`
+- `kg_utils.extract_var_ids(env_output)` -> `list[str]`
+- `kg_utils.extract_attribute_value(env_output)` -> `str | None`
+- `actions_spec.get("count")(variable_id)` -> env_output
+
+CRITICAL:
+- `count` is a primitive, not a `kg_utils` helper.
+- For `resolve_semantic_filter`, `variable_list` must come from the authoritative live context when available. Penalize fabricated `[]` when real live context exists.
+
+### 11. REWRITE HYGIENE
+- The docstring with `contract guard:`, `prereqs:`, and `limitations:` must be the FIRST statement inside `def run()`.
+- Append this EXACT string to `fixes`:
+  `CRITICAL: When rewriting \`def run()\`, you MUST include a \`\"\"\"Module-level docstring\"\"\"\` before your imports. Furthermore, your function-level docstring MUST be the FIRST statement inside \`def run()\` and MUST preserve the exact prefixes \`contract guard:\`, \`prereqs:\`, and \`limitations:\`.`
+- Prefer a compact rewrite: one `run(payload)` plus `self_test()`, unless evidence proves more structure is necessary.
+""")
 
 
 TOOL_INVOKER_SYSTEM_PROMPT = textwrap.dedent("""\
@@ -226,34 +306,46 @@ Reasoning: low
 You are the Tool Invoker. Choose a tool from the AVAILABLE TOOLS CATALOG (must end in "_generated_tool") and provide its payload.
 
 OUTPUT FORMAT (HARD RULE)
-Output EXACTLY ONE JSON object. No markdown, no XML, no prose, no wrappers.
-{
-  "tool_name": "<selected_tool>",
-  "payload": { <flat_dict_of_arguments> },
-  "reason": "<= 12 words explaining choice>"
-}
+Output EXACTLY ONE JSON object on EXACTLY ONE LINE. You MUST output this as a single, unformatted, flat string.
+CRITICAL PARSER RULES:
+- NO markdown code blocks.
+- NO newlines (`\n`) or pretty-printing indentation.
+- NO WRAPPER TAGS: Do NOT wrap the JSON in tags such as `<internal_tool>...</internal_tool>`.
+- NO EXTRA PROSE: Do not add any text before or after the single JSON object.
+Example: {"tool_name": "example_macro_generated_tool", "payload": {"entities": ["A"]}, "reason": "explain choice"}
 
 TOOL SELECTION (HARD)
-- Only select tools from the AVAILABLE TOOLS CATALOG.
-- CROSS-DOMAIN BAN: Check the tool name and description for domain keywords. Do NOT invoke a tool with a domain-specific name (e.g., `release_relation_scanner`) for a task in an unrelated domain (e.g., museums). If the Orchestrator forced a tool use but no domain-appropriate tool exists, you must still try to pick the most generic tool available, NEVER a strictly cross-domain one.
+- `tool_name` MUST be exactly one of:
+  - an exact name from the AVAILABLE TOOLS CATALOG (must end in "_generated_tool"), OR
+  - the sentinel string `"none"` when no catalog tool is semantically compatible.
+- ROLE BOUNDARY BAN (CRITICAL): You are strictly FORBIDDEN from outputting 'request_new_tool', 'use_tool', or 'no_tool' as the `tool_name`.
+- CROSS-DOMAIN BAN: You MUST NOT invoke a tool with a domain-specific name (e.g., `cyclone_superlative`) for a task in an unrelated domain (e.g., counting spacecraft or book characters). If the AVAILABLE TOOLS CATALOG only contains tools that are semantically mismatched or cross-domain, output `"tool_name": "none"` with no `payload` key.
+- NO-COMPATIBLE-TOOL PATH: When `"tool_name": "none"`, omit the `payload` field entirely.
 
 MACRO PAYLOAD SCHEMA (CRITICAL)
 Your `payload` dict MUST contain all required keys for the tool. For MACRO tools, you MUST include:
 - `entities`: Array of strings parsed from `Entities: [...]` in task_text. MUST NOT be `[]`.
-- `target_concept`: The final answer-type noun (e.g., "cheese", NOT "products"). NEVER derived from tool metadata, docstrings, or structural predicates. For counting or transitive queries (e.g., "how many species...", "how many diseases..."), you MUST explicitly provide the core semantic target (e.g., "species", "infectious disease"). If you fail to provide this, the tool will score relations against generic fallback metadata and fail.
-- `domain_hints`: Array of 1-3 high-level semantic categories (e.g., ["food", "dairy"]).
-- `entity_target_concepts` (HARD REQUIRED): Array of strings exactly parallel to `entities` (excluding any attribute literal). Provide a specific semantic target for EACH base entity. Asymmetric queries: provide per-entity relations (e.g., `["formulation", "active ingredient"]`). Symmetric queries: duplicate the target (e.g., `["cheese", "cheese"]`). NEVER omit this for macros.
-- `attribute_target_concept` (CONDITIONAL): If the query involves an attribute literal (e.g., "semi-firm"), provide its semantic concept (e.g., "cheese"). If no attribute literal, omit.
-- `target_archetype`: The exact archetype string defined by the Orchestrator in the previous turn.
-- `upgrade_goal`: The Orchestrator's exact `reason` string verbatim when requesting a new tool (e.g., "INPUT: ... GOAL: ..."). Output `""` if not a new request.
-- `env_observation` (CONDITIONAL): The most recent line in history containing "Error:", "Observation:", or "Variable:". Include verbatim. Max 1200 chars. Omit if none found.
+- `tool_plan`: Copy the canonical tool-plan object from the invoker input when present.
+- `target_concept` (STRICT PASSTHROUGH): Copy verbatim from `tool_plan.target_concept`.
+- `domain_hints` (PASSTHROUGH, CONDITIONAL): Copy verbatim if present.
+- `execution_style` (STRICT PASSTHROUGH, CONDITIONAL): Copy verbatim from `tool_plan.execution_style` if present.
+- `preferred_tool_mode` (STRICT PASSTHROUGH, CONDITIONAL): Copy verbatim from `tool_plan.preferred_tool_mode` if present.
+- `fallback_strategies` (STRICT PASSTHROUGH, CONDITIONAL): Copy verbatim from `tool_plan.fallback_strategies` if present.
+- `entity_target_concepts` (CONDITIONAL PASSTHROUGH): If `tool_plan.entity_target_concepts` is present and non-empty, copy it verbatim. If absent, omit this field — do NOT invent per-entity hints that were not provided upstream.
+- `intermediate_target_concepts` (STRICT PASSTHROUGH, CONDITIONAL): Copy verbatim if present.
+- `recovery_policy` (STRICT PASSTHROUGH, CONDITIONAL): Copy verbatim if present.
+- `attribute_target_concept` (STRICT PASSTHROUGH, CONDITIONAL): Copy verbatim if present.
+- `topological_execution_plan` (PASSTHROUGH): Copy verbatim from `tool_plan.topological_execution_plan`.
+- `composite_topology` (PASSTHROUGH): Copy verbatim if present.
+- `target_archetype` (STRICT PASSTHROUGH, CONDITIONAL): Copy verbatim if present.
+- `upgrade_goal`: Exact `reason` string verbatim when requesting a new tool. Output `""` if not a new request.
+- `env_observation` (CONDITIONAL): The most recent line in history containing "Error:", "Observation:", or "Variable:".
 
 FIELD DERIVATION RULES
-- Copy verbatim from invoker input: `task_text`, `actions_spec`, `run_id`, `state_dir`.
+- Prefer copying from the invoker input when present, but do NOT invent them if absent.
 - `asked_for`: Use everything after "Question:" up to ", Entities" (trimmed). If missing, use `task_text`.
-- `trace`: Always set to `[]` (backend supplies actual trace).
-- `constraints` / `output_contract`: Include ONLY if present in invoker input.
-""").strip()
+- `trace`: If omitted, backend supplies the actual trace. Do not hallucinate fake trace content.
+""")
 
 
 SOLVER_SYSTEM_PROMPT = textwrap.dedent("""\
@@ -265,30 +357,166 @@ CORE DIRECTIVES (HARD RULE)
 - No prose, rationale, or markdown.
 - NO MACROS. Use ONLY 9 primitives: get_relations, get_neighbors, intersection, union, difference, get_attributes, argmax, argmin, count.
 - If a Variable completely satisfies the prompt constraints, output `Final Answer: #<id>`.
+- Never fabricate a variable id from a non-variable output. Only output `Final Answer: #N` when `#N` is an actual variable id already present in the environment or tool chain.
+- REGEX PARSER MANDATE: You MUST NEVER output a raw number (e.g., 'Final Answer: 0' or 'Final Answer: 42' is FATAL). The environment regex strictly requires a Variable ID. You must always output the Variable ID that holds your final answer (e.g., `Final Answer: #4`).
 
-DEAD END & PARTIAL STATE RECOVERY (CRITICAL)
-If a macro returns MACRO EXHAUSTED with a `Candidates: {...}` map, or if ANY manual action yields an empty result (`[]`) or empty intersection:
-1. DO NOT submit empty variables. You MUST backtrack.
-2. DO NOT restart from scratch if a `Candidates:` map exists. You MUST read the minted `#ID`s from the observation string and resume manually (e.g., `Action: intersection(#0, #1)`). Ignoring partial candidate sets is a catastrophic failure.
-3. TYPE ERRORS: If an intersection fails with "same type", DO NOT repeat it. Pivot to `Action: get_relations(#ID)` to manually find matching property nodes.
+MACRO HANDOFF & GRACEFUL RECOVERY
+Tool sidecar messages now include explicit handoff structure (`HANDOFF:` JSON or `Structured Handoff:` lines). Follow that handoff first, then inspect the detailed observation.
+- COMPLETE: If `handoff_state=complete`, finish or do the one remaining safe primitive.
+- PARTIAL SAFE: If `handoff_state=partial_safe_continue`, continue from the returned variable/result.
+- FALLBACK NOT FINAL: If `handoff_state=partial_fallback_not_final`, do NOT finalize from that variable. Recover with another narrowing step.
+- LOW TRUST / IGNORE: If `trust_classification=low_trust_ignore` or `trust_classification=blocked_exhausted_ignore`, do NOT submit from that tool result. Treat it as weak evidence and backtrack quickly unless the handoff explicitly preserves useful partial context.
+- EXHAUSTED/BLOCKED: Backtrack. If minted/candidate variables are present, use them instead of restarting from scratch.
 
-MACRO HANDOFF & GRACEFUL RECOVERY (TOOL OUTPUT HANDLING)
-Apply these rules based on the macro's returned `status` field:
-- 1. SUCCESS: If the observation says `Success: Final variable #X (instances of Y)`, check if Y matches the requested answer concept. If it does, you MUST submit `Final Answer: #X` immediately. Do NOT extract variables from the `Candidates:` map to re-compute the intersections manually. The macro's result is authoritative.
-- 2. MACRO EXHAUSTED — TOOL RESULT DISQUALIFICATION: When testing tool candidates, if you call `get_relations(#N)` on an intersection result and receive `[]`, variable `#N` is an empty set. That specific tool candidate path is DEAD. Discard it immediately and try the next pair from the candidate map. Never submit a variable whose `get_relations` returned `[]`.
-- 3. MACRO EXHAUSTED — ASYMMETRIC CANDIDATE PAIRING: If the `Candidates:` map contains multiple variables per source entity (e.g., `Naloxone [rel_A]: #0`, `Naloxone [rel_B]: #1`, `Enalaprilat [rel_C]: #2`, `Enalaprilat [rel_D]: #3`), do NOT pair by index position alone. Try ALL cross-entity pairings: in addition to `intersection(#0, #2)` and `intersection(#1, #3)`, also try `intersection(#0, #3)` and `intersection(#1, #2)`. Use the relation labels in the key (e.g., `marketed_formulations` vs `active_ingredient`) to prioritize semantically compatible pairs first.
-- MACRO HINT PRIORITY: If a `[MACRO HINT]` appears in your context, it contains the Orchestrator's explicit pairing instructions. Follow those instructions FIRST before trying other combinations.
+GENERAL RECOVERY RULES
+- Never submit an empty result.
+- If `get_relations(#N)` or `get_neighbors(#N, relation)` reports a node explosion, do not repeat the same broad probe. Narrow first or backtrack.
+""")
 
-TOPOLOGICAL FINISHING RULES
-Do not prematurely submit intermediate variables:
-- FINAL PROPERTY HOP: If the query asks for a property of intersected entities (e.g., "What genre is the movie..."), DO NOT submit the intersected base variable. Extract the property: `get_relations(#BaseVar)` -> `get_neighbors(#BaseVar, prop_rel)` -> `Final Answer: #NewVar`.
-- SIBLING PIVOT: For queries asking for "other [entities] same as X" or "similar to X": 1. Find the shared trait variable (DO NOT SUBMIT IT). 2. Pivot BACKWARD using the SAME relation to find the siblings: `get_neighbors(#TraitVar, rel)` -> `Final Answer: #SiblingVar`.
-- QUANTITATIVE RULE: If asked "how many", "what number", or "count", you MUST invoke `Action: count(#var)` before the Final Answer.
 
-NODE EXPLOSION RECOVERY
-If `Action: get_relations(#N)` returns a 'Node Explosion Prevented' error, variable `#N` is too large (e.g., thousands of recordings or breeds). Do NOT repeat the action. You must either: 1) Narrow the set via `intersection(#N, #Other)`, or 2) Navigate UP to a coarser granularity. For example, if you hit an explosion at the `music.recording` level, pivot back and intersect at the `music.album` or `music.release` level instead. Do not attempt exhaustive traversals on exploded variables.
-""").strip()
+MACRO_TOOLGEN_USER_KG = textwrap.dedent('''\
+You are ToolGen. Generate ONE specialized Python macro for the Knowledge-Graph.
 
+### 1. PLAN AUTHORITY
+- `payload['tool_plan']` / `payload['topological_execution_plan']` is the specification. Implement that plan directly.
+- If structured fields such as `execution_style`, `preferred_tool_mode`, `fallback_strategies`, or retry context are present, follow them.
+- If `pivot_required=true` or retry context shows repeated no-progress, do NOT repeat the same strategy family.
+- The same archetype with a different `execution_style` must produce meaningfully different code shape.
+- The tool may be `full_solve`, `progress_tool`, or `diagnostic_probe` depending on `preferred_tool_mode`.
+- Follow the declared sequence. Do NOT invent arbitrary new helper stages beyond the plan.
+- Small deterministic recovery is allowed only when `recovery_policy` explicitly permits it.
+- Write the SMALLEST correct tool.
+
+### 2. RUNTIME / STRUCTURE RULES
+- `kg_utils` is pre-injected. **DO NOT `import kg_utils`**.
+- Call helpers directly using their exact signatures.
+- Do NOT add adapter-style dict-vs-object branching around `kg_utils` or `actions_spec`.
+- Prefer exactly two top-level functions: `run(payload)` and `self_test()`.
+- Keep only the required metadata header comments.
+- Keep the module docstring to one short sentence.
+- Keep the `run()` docstring to the required `contract guard:`, `prereqs:`, and `limitations:` lines only.
+
+### 3. EXACT HELPER SIGNATURES
+Use these exact calls. Do not invent kwargs or alternate shapes.
+- `kg_utils.resolve_entity_to_vars(entity, target_concept, actions_spec, domain_hints, max_k=1)`
+- `kg_utils.resolve_semantic_filter(base_var, target_concept, variable_list, domain_hints=None, asked_for="", max_type_candidates=8)`
+- `kg_utils.cross_intersect(actions_spec, vars_a, vars_b, max_calls=12)`
+- `kg_utils.walk_to_target(actions_spec, base_vars, target_concept, domain_hints, max_calls=6)`
+- `kg_utils.extract_var_ids(env_output)` -> `list[str]`
+- `kg_utils.extract_attribute_value(env_output)` -> `str | None`
+- `actions_spec.get("count")(variable_id)` -> env_output for the NEW count variable
+
+CRITICAL:
+- For `resolve_semantic_filter`, `variable_list` must come from the live current context (typically `resolve_result.get("vars")` or `walk_result.get("vars")`). Use `payload.get("variable_list")` only as fallback when it is clearly the intended runtime context. Never fabricate `[]`.
+
+### 4. STATIC / SAFETY BANS
+- **NO BRACKET INDEXING:** do not use list indexing like `x[0]` or `x[-1]`. Extract a single item using a loop.
+- **NO TUPLE UNPACKING:** do not use tuple/list unpacking to bypass the index ban.
+- **NO TYPE PROBING:** never use `isinstance()`, `type()`, `hasattr()`, or `getattr()`.
+- **NO BROAD EXCEPTIONS:** catch specific errors only (`KeyError`, `TypeError`, `ValueError`).
+- Do not use the banned variable names: `stream`, `streaming`, `bucket`, `running_total`, `batch_candidate_vars`, `max_batches`, `collected_candidate_ids`, `get_inbound_neighbors_batch`, `get_neighbors_stream`.
+
+### 5. POINTER / CANONICALIZATION RULES
+- After every helper or primitive returning env_output, immediately call `kg_utils.extract_var_ids(env_output)`.
+- Filter extracted IDs so only strings starting with `#` remain.
+- If a required set-producing step has no valid `#` IDs, return `MACRO EXHAUSTED`.
+- Preserve both the raw env_output and the canonical ID list.
+- Do NOT pass raw helper dicts downstream.
+- Do NOT merge raw helper outputs into `candidate_map` / `minted_variables`.
+- Build `candidate_map` explicitly from canonical extracted IDs with deterministic semantic labels.
+
+### 6. KG EXECUTION RULES
+- Never pass raw entity strings directly into traversal helpers. Resolve entities first with `kg_utils.resolve_entity_to_vars`.
+- `resolve_entity_to_vars` expects a SINGLE entity string. Extract it using a loop, not indexing.
+- If `entity_target_concepts` contains a credible per-entity type hint, use the aligned hint for entity resolution. Otherwise pass `target_concept=None`.
+- Do NOT substitute `entity_target_concepts` for `domain_hints`.
+- Preserve set semantics until a helper contract explicitly requires a single pointer or you are returning `final_variable`.
+- For `walk_to_target`, pass the FULL current canonical ID list.
+- For `cross_intersect`, pass the FULL canonical ID lists for both branches.
+- For `resolve_semantic_filter`, `base_var` must be a SINGLE canonical variable ID and `variable_list` must be the live current context.
+- After `extract_attribute_value`, treat the result as scalar text. Never call `extract_var_ids` on that scalar.
+- Only apply walk/type-parity logic if the provided plan includes that walk. Do not insert unprompted walks.
+
+### 7. COUNT RULE (CRITICAL)
+- `count` creates a NEW variable ID containing the number.
+- Call `count` on the SINGLE canonical set variable you intend to count.
+- Then call `kg_utils.extract_var_ids(count_res)`.
+- Extract the first legal `#N` using a loop and return THAT NEW count variable as `final_variable`.
+- On count success, observation MUST be exactly:
+  `"COUNT VARIABLE RETURNED; submit it directly"`
+- Never return the pre-count set variable.
+- Never use `extract_attribute_value` or scalar parsing for count success.
+
+### 8. HONEST EXHAUSTION RULE
+If any required filter, walk, or intersection step yields no valid IDs, return:
+- `status="MACRO EXHAUSTED"`
+- `final_variable=None`
+- `observation = "MACRO EXHAUSTED: Resulting set is empty. minted_variables: " + json.dumps(candidate_map)`
+
+CRITICAL:
+- `candidate_map` must be a deterministic dict built from canonical extracted IDs.
+- Use `json.dumps({})` when nothing was minted.
+- Never list raw IDs without semantic labels.
+- Never fabricate recovery steps or `next_action` JSON.
+
+### 9. OUTPUT CONTRACT
+Return EXACTLY these 3 keys:
+- `status`: `SUCCESS`, `MACRO EXHAUSTED`, or `ERROR`
+- `final_variable`: string `#N` on `SUCCESS`, else `None`
+- `observation`: rich result string; on exhaustion it must start exactly with `MACRO EXHAUSTED: Resulting set is empty.`
+
+
+### 10. REQUIRED CODE STRUCTURE
+### METADATA HEADER BLOCK (CRITICAL)
+- You MUST emit the required metadata header block EXACTLY as Python comments.
+- These lines are mandatory and omission causes immediate precheck failure before tool logic is evaluated.
+- The following four header lines MUST appear verbatim near the top of the file, before imports, module docstring, and code:
+  - `# INVOKE_WITH: ...`
+  - `# RUN_PAYLOAD_REQUIRED: ...`
+  - `# RUN_PAYLOAD_OPTIONAL: ...`
+  - `# INVOKE_EXAMPLE: ...`
+- Do NOT paraphrase, reorder, rename, or omit these headers.
+- The “smallest correct tool” rule does NOT permit removing this metadata block.
+                                        
+Keep the code as short as possible while preserving:
+- required metadata headers
+- one short module docstring
+- `run(payload)`
+- `self_test()`
+
+`run()` MUST have a docstring starting with:
+- `contract guard:`
+- `prereqs:`
+- `limitations:`
+
+###TOOL_START
+# tool_name: <descriptive_name>_macro_generated_tool
+# INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
+# RUN_PAYLOAD_REQUIRED: ["task_text", "asked_for", "trace", "actions_spec", "run_id", "state_dir", "entities"]
+# RUN_PAYLOAD_OPTIONAL: ["env_observation", "domain_hints", "target_concept", "attribute_target_concept", "entity_target_concepts", "intermediate_target_concepts", "topological_execution_plan", "composite_topology", "target_archetype", "upgrade_goal", "recovery_policy", "execution_style", "preferred_tool_mode", "fallback_strategies", "tool_plan", "toolgen_retry_context", "variable_list"]
+# INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state","entities":["A"]}],"kwargs":{}}
+
+"""KG macro."""
+
+import json
+
+def run(payload: dict) -> dict:
+    """
+    contract guard: payload must contain the required run keys.
+    prereqs: kg_utils facade and needed actions_spec primitives are available.
+    limitations: deterministic stdlib-only translator; no extra scaffolding.
+    """
+    try:
+        payload = payload or {}
+        candidate_map = {}
+        return {"status": "MACRO EXHAUSTED", "final_variable": None, "observation": "MACRO EXHAUSTED: Resulting set is empty. minted_variables: " + json.dumps(candidate_map)}
+    except (KeyError, TypeError, ValueError) as e:
+        return {"status": "ERROR", "final_variable": None, "observation": f"Tool error: {str(e)}"}
+
+def self_test() -> bool:
+    return True
+###TOOL_END
+''').strip()
 
 
 TOOLGEN_SYSTEM_PROMPT_MARKERS = textwrap.dedent('''
@@ -301,150 +529,20 @@ OUTPUT (HARD)
   Then raw Python source (no markdown, no prose, no JSON)
   Last line: ###TOOL_END
 
-{appendix}
+MANDATORY METADATA HEADERS — ALL FOUR must appear verbatim in the first 80 lines as Python comments, immediately after ###TOOL_START:
+  # tool_name: <descriptive_name>_generated_tool
+  # INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
+  # RUN_PAYLOAD_REQUIRED: ["task_text", "asked_for", "trace", "actions_spec", "run_id", "state_dir", "entities"]
+  # RUN_PAYLOAD_OPTIONAL: ["env_observation", "domain_hints", "target_concept", "attribute_target_concept", "entity_target_concepts", "intermediate_target_concepts", "topological_execution_plan", "composite_topology", "target_archetype", "upgrade_goal", "recovery_policy", "execution_style", "preferred_tool_mode", "fallback_strategies", "tool_plan", "toolgen_retry_context", "variable_list"]
+  # INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state","entities":["A"]}],"kwargs":{}}
+Do NOT omit or rename any of these five comment lines. The tool will be hard-rejected at round 1 if any are missing.
 ''').strip()
-
-
-
-
 
 AGG_TOOLGEN_USER_KG = textwrap.dedent('''
 ''').strip()
 
-
-
-
-MACRO_TOOLGEN_USER_KG = textwrap.dedent('''\
-You are ToolGen. Generate ONE highly specialized, robust Python macro for the Knowledge-Graph.
-
-### 1. EXECUTION & PRIMITIVES
-- Archetype: {target_archetype}. Instructions: {target_archetype_instructions}
-- Upgrade Goal: If `upgrade_goal` is present, physically alter logic to solve the roadblock.
-- NATIVE PRIMITIVES (CRITICAL): `actions_spec` contains ONLY: get_relations, get_neighbors, intersection, union, difference, get_attributes, argmax, argmin, count. Hallucinating others causes a KeyError crash.
-- SIGNATURES: Native primitives require STRING IDs (e.g., `intersection_fn('#0', '#1')`), NOT lists. Passing lists crashes the tool. Use `kg_utils.cross_intersect` for lists.
-- HELPERS FIRST: You MUST use `kg_utils` for all KG parsing.
-  - `kg_utils.resolve_entity_to_vars(entity, target_concept, actions_spec, domain_hints, max_k=1)` -> dict (keys: "vars", "type", "candidate_map")
-  - `kg_utils.cross_intersect(actions_spec, vars_a, vars_b, max_calls=12)` -> dict
-  - `kg_utils.walk_to_target(actions_spec, base_vars, target_concept, domain_hints, max_calls=6)` -> dict
-  - `kg_utils.extract_var_ids(env_output)` -> list[str]
-
-### 2. STRICT OUTPUT SCHEMA (SSOT) & RECOVERY TRAPS
-Return EXACTLY 3 keys: `status`, `final_variable`, `observation`.
-- HONESTY: If ANY entity resolution or intersection yields empty sets, instantly return `{"status": "MACRO EXHAUSTED"}`.
-- PROVENANCE (CRITICAL): On exhaustion, embed the `candidate_map` of minted variables in the observation (e.g., `... Candidates: {"Naloxone [rel]": "#0"}`). 
-- POUND SIGN TRAP: `final_variable` MUST include the `#` (e.g., `"#5"`). 
-- COUNT PRIMITIVE TRAP: `count_fn(#X)` returns a string (e.g., "Variable #5..."). You MUST parse it: `ids = kg_utils.extract_var_ids(str(raw))`. Do NOT cast to `int()`.
-- VARIABLE TRANSPARENCY: Always extract and append the descriptive type on success (e.g., `Success: #6 (instances of food.cheese)`).
-
-### 3. GRAPH TOPOLOGY RULES
-- ATTRIBUTES ARE NODES: Attributes ("semi-firm") are standalone nodes. NEVER extract literal strings for Python `==` or `re.search` comparisons. All filtering is done via KG set intersection (resolve literal -> cross_intersect).
-- FLAT EXECUTION: Resolve ALL candidate variables for all input entities BEFORE intersecting. Never call `get_relations` on a minted intersection variable.
-- SHARED TRAIT NAMESPACE FILTER: For `SHARED_TRAIT_PIVOT` ONLY, you MUST strip generic namespaces (`common.topic`, `type.object`, `freebase.type_profile`) from `get_relations` BEFORE scoring.
-- CALL BUDGET: Hard limit of 15 KG calls. Greedy, straight-line pass. No retry loops.
-- PARAMETRIC FALLBACK MANDATE (CRITICAL): When setting default values for `payload.get()`, you are STRICTLY FORBIDDEN from using domain-specific string literals (e.g., `payload.get('target_concept', 'product')` or `payload.get('attribute_target_concept', 'dosage_form')`). If a caller fails to provide a semantic target, the fallback MUST be an empty string `""` or `None`. Hardcoding domain nouns into fallbacks destroys the tool's universal applicability and causes semantic contamination across unrelated queries.
-- PAIRING COMPLETION MANDATE (CRITICAL): If candidate minting yields multiple variables per source entity (e.g., `max_k>1`), your Python script MUST perform the relation-aligned cross-pair intersection internally. Write logic to iterate through all cross-entity variable combinations, call `cross_intersect` on each pairing, and return the FIRST non-empty result. Do NOT return an unresolved menu of candidate branches as `MACRO EXHAUSTED: Empty intersection` simply because one pairing was empty. The tool must try ALL cross-entity pairs before exhausting. Example: for entities A with vars [#0,#1] and B with vars [#2,#3], try (#0,#2), (#0,#3), (#1,#2), (#1,#3) and return the first non-empty intersection.
-
-### 4. GOLDEN ROUTING EXAMPLE (ASYMMETRIC & PARAMETRIC)
-# YOUR TOOLS MUST BE THIN ROUTING SCRIPTS. DO NOT HAND-ROLL LOOPS.
-# This template demonstrates the REQUIRED Asymmetric Routing and Graceful Exhaustion protocols.
-def run(payload: dict) -> dict:
-    try:
-        payload = payload or {}
-        actions_spec = payload.get("actions_spec", {})
-        entities = payload.get("entities", []) or kg_utils.parse_entities(payload.get("task_text", ""))
-        base_target = str(payload.get("target_concept") or payload.get("asked_for") or "")
-        attr_target = str(payload.get("attribute_target_concept") or base_target)
-        ent_targets = payload.get("entity_target_concepts") or []
-        
-        if len(entities) < 2:  # Adjust minimum based on archetype
-            return {"status": "MACRO EXHAUSTED", "final_variable": None, "observation": "MACRO EXHAUSTED: Insufficient entities. Candidates: {}"}
-
-        candidate_map = {}
-        groups = []
-        for i, ent in enumerate(entities):
-            is_attr = (i == len(entities) - 1) and payload.get("attribute_target_concept")
-            # Apply Asymmetric Routing or Attribute Fallback
-            current_target = attr_target if is_attr else (ent_targets[i] if i < len(ent_targets) else base_target)
-            
-            res = kg_utils.resolve_entity_to_vars(ent, current_target, actions_spec, payload.get("domain_hints"), max_k=2)
-            candidate_map.update(res.get("candidate_map", {}))
-            if not res.get("vars"):
-                return {"status": "MACRO EXHAUSTED", "final_variable": None, "observation": f"MACRO EXHAUSTED: Empty set for {ent}. Candidates: {candidate_map}"}
-            groups.append(res["vars"])
-
-        running = groups[0]
-        var_type = "unknown_type"
-        for group in groups[1:]:
-            inter = kg_utils.cross_intersect(actions_spec, running, group)
-            running = inter.get("vars", [])
-            var_type = inter.get("type", "unknown_type")
-            if not running:
-                return {"status": "MACRO EXHAUSTED", "final_variable": None, "observation": f"MACRO EXHAUSTED: Empty intersection. Candidates: {candidate_map}"}
-
-        return {"status": "SUCCESS", "final_variable": running[0], "observation": f"Success: Final variable {running[0]} (instances of {var_type}). Via: {list(candidate_map.keys())}"}
-    except Exception as e:
-        return {"status": "ERROR", "final_variable": None, "observation": f"Crash: {e}"}
-
-### 5. MANDATORY BOILERPLATE
-CRITICAL DOCSTRING RULE: The docstring MUST contain the exact literal phrases 'contract guard:', 'prereqs:', and 'limitations:'. 
-CRITICAL MARKER PRESERVATION: Preserve `###TOOL_START` and `###TOOL_END` exactly.
-
-###TOOL_START
-"""
-contract guard + prereqs + limitations. INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; OUTPUT_SCHEMA: status,final_variable,observation
-[REPLACE THIS LINE: Describe Archetype, target concept, and logic.]
-"""
-
-# tool_name: <highly_descriptive_name>_macro_generated_tool
-# INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
-# RUN_PAYLOAD_REQUIRED: ["entities"]
-# RUN_PAYLOAD_OPTIONAL: ["task_text", "asked_for", "trace", "actions_spec", "run_id", "state_dir", "domain_hints", "target_concept", "attribute_target_concept", "entity_target_concepts", "target_archetype", "upgrade_goal"]
-# INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state"}], "kwargs":{}}
-
-import re
-
-def run(payload: dict) -> dict:
-    """
-    contract guard: validates payload contains required keys before execution.
-    prereqs: requires actions_spec with get_relations and get_neighbors.
-    limitations: stdlib only, no network calls, deterministic.
-    [REPLACE THIS LINE with your Archetype description.]
-    """
-    try:
-        payload = payload or {}
-        actions_spec = payload.get("actions_spec", {})
-        def safe_action(name):
-            return actions_spec.get(name) if callable(actions_spec.get(name)) else lambda *a, **k: f"Error: {name} missing"
-
-        get_relations_fn = safe_action("get_relations")
-        get_neighbors_fn = safe_action("get_neighbors")
-        intersection_fn = safe_action("intersection")
-        count_fn = safe_action("count")
-
-        raw_entities = payload.get("entities", [])
-        entities = raw_entities if raw_entities else kg_utils.parse_entities(payload.get("task_text", ""))
-        
-        # [GRACEFUL EARLY EXIT: ADJUST MINIMUM COUNT BASED ON ARCHETYPE]
-        if len(entities) < 2: 
-            return {"status": "MACRO EXHAUSTED", "final_variable": None, "observation": "MACRO EXHAUSTED: Insufficient entities. Candidates: {}"}
-        
-        # --- YOUR LOGIC HERE ---
-        
-        return {"status": "MACRO EXHAUSTED", "final_variable": None, "observation": "MACRO EXHAUSTED: Resulting set is empty."}
-    except Exception as e:
-        return {"status": "ERROR", "final_variable": None, "observation": f"Crash: {e}"}
-
-def self_test() -> bool:
-    return True
-###TOOL_END
-''').strip()
-
-
-
-
-
 TOOLGEN_DEBUG_APPENDIX = textwrap.dedent('''
-(CRITICAL!!!) DEBUG MODE OVERRIDES
+(CRITICAL!!!) DEBUG OVERRIDES
 - When this text is present, you are in a debug override mode. The intent is to reduce inference time and simplify tools
 - Keep the total tool source more simple and under 100 lines. The max line constraint is meant to ensure tools are more simple, not simply shorter.
 - self_test() MUST simply return True (no assertions).
@@ -471,7 +569,11 @@ __all__ = [
     "TOOLGEN_DEBUG_APPENDIX",
     "ARCHETYPE_REGISTRY",
     "ARCHETYPE_INSTRUCTIONS",
-    "_ARCHETYPE_INSTRUCTIONS_DEFAULT",
+    "STRATEGY_FAMILY_VOCAB",
+    "EXECUTION_STYLE_VOCAB",
+    "PREFERRED_TOOL_MODE_VOCAB",
+    "FAILURE_FAMILY_VOCAB",
+    "VALUE_DELIVERED_VOCAB",
     "STRICT_TOOL_OUTPUT_SCHEMA",
     "_SSOT_SCHEMA_MANDATE",
 ]

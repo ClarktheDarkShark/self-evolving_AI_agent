@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 import types
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -102,6 +103,117 @@ def _build_variation_args(
     return ["alt"], {}
 
 
+def _looks_like_kg_macro(code: str) -> bool:
+    markers = (
+        "kg_utils",
+        "target_concept",
+        "entity_target_concepts",
+        "intermediate_target_concepts",
+        "actions_spec",
+        "get_neighbors",
+        "get_relations",
+    )
+    return sum(1 for marker in markers if marker in (code or "")) >= 2
+
+
+class _KGSemanticRediscoveryVisitor(ast.NodeVisitor):
+    _SEMANTIC_NAME_HINTS = (
+        "target",
+        "concept",
+        "profession",
+        "category",
+        "relation",
+        "entity",
+        "entities",
+        "label",
+        "noun",
+        "domain",
+    )
+    _TEXT_FN_ATTRS = {"search", "match", "findall", "finditer", "split", "partition", "rsplit"}
+
+    def __init__(self) -> None:
+        self.task_text_vars: set[str] = set()
+        self.violations: list[str] = []
+
+    @staticmethod
+    def _payload_text_get(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "payload"
+            and node.func.attr == "get"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and str(node.args[0].value) in {"task_text", "asked_for"}
+        )
+
+    def _contains_text_source(self, node: ast.AST) -> bool:
+        for child in ast.walk(node):
+            if self._payload_text_get(child):
+                return True
+            if isinstance(child, ast.Name) and child.id in self.task_text_vars:
+                return True
+        return False
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if self._payload_text_get(node.value):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self.task_text_vars.add(target.id)
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Name)
+                and any(hint in target.id.lower() for hint in self._SEMANTIC_NAME_HINTS)
+                and self._contains_text_source(node.value)
+            ):
+                self.violations.append(
+                    f"semantic_target_assignment_from_text:{target.id}"
+                )
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        text_parse = False
+        if isinstance(func, ast.Attribute):
+            if func.attr in self._TEXT_FN_ATTRS and self._contains_text_source(func.value):
+                text_parse = True
+            elif (
+                isinstance(func.value, ast.Name)
+                and func.value.id == "re"
+                and func.attr in self._TEXT_FN_ATTRS
+                and any(self._contains_text_source(arg) for arg in node.args)
+            ):
+                text_parse = True
+        if text_parse:
+            self.violations.append("semantic_parse_from_task_text")
+        self.generic_visit(node)
+
+
+def _kg_semantic_rediscovery_issues(code: str) -> list[str]:
+    if not _looks_like_kg_macro(code):
+        return []
+    plan_authority_present = any(
+        token in code
+        for token in (
+            "tool_plan",
+            "topological_execution_plan",
+            "target_concept",
+            "entity_target_concepts",
+            "intermediate_target_concepts",
+        )
+    )
+    if not plan_authority_present:
+        return []
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+    visitor = _KGSemanticRediscoveryVisitor()
+    visitor.visit(tree)
+    return visitor.violations
+
+
 def validate_tool_code(
     code: str, *, timeout_s: float = 2.0
 ) -> ToolValidationResult:
@@ -111,15 +223,25 @@ def validate_tool_code(
                 success=False,
                 error=f"missing_invoke_contract:{heading}",
             )
+    kg_semantic_issues = _kg_semantic_rediscovery_issues(code or "")
+    if kg_semantic_issues:
+        return ToolValidationResult(
+            success=False,
+            error="kg_semantic_rediscovery:" + ",".join(kg_semantic_issues),
+        )
+    # Strip any stray `import kg_utils` lines — kg_utils is a pre-injected global
+    # and a bare import would raise ModuleNotFoundError at exec time.
+    _clean_code = re.sub(r"^\s*import\s+kg_utils\b.*\n?", "", code, flags=re.MULTILINE)
     try:
-        compiled = compile(code, "<generated_tool>", "exec")
+        compiled = compile(_clean_code, "<generated_tool>", "exec")
     except Exception as exc:
         return ToolValidationResult(success=False, error=f"compile failed: {exc}")
 
     module = types.ModuleType("generated_tool")
     # Pre-inject kg_utils so generated code can reference it as a global
     # without an import statement (mirrors the task.py safe_globals injection).
-    module.__dict__["kg_utils"] = _kg_utils
+    helper_facade = _kg_utils.get_macro_helper_facade()
+    module.__dict__["kg_utils"] = helper_facade
     try:
         exec(compiled, module.__dict__)
     except Exception as exc:
@@ -179,6 +301,7 @@ def validate_tool_code(
         "constraints": {},
         "target_archetype": "UNKNOWN",
         "upgrade_goal": "",
+        "kg_utils": helper_facade,
         "actions_spec": {
             "get_relations": lambda *_args: "Relations of mock: [mock.rel]",
             "get_neighbors": lambda *_args: "Variable #99 = get_neighbors(mock, mock.rel)",
