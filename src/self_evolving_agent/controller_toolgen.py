@@ -12,7 +12,7 @@ import traceback
 import sys
 import textwrap
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 import ast
 import types
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -28,7 +28,6 @@ from .controller_prompts import (
     TOOLGEN_DEBUG_APPENDIX,
     TOOLGEN_SYSTEM_PROMPT_MARKERS,
     TOOLGEN_VALIDATOR_SYSTEM_PROMPT,
-    AGG_TOOLGEN_USER_KG,
     MACRO_TOOLGEN_USER_KG,
     ARCHETYPE_REGISTRY,
     EXECUTION_STYLE_VOCAB,
@@ -83,6 +82,7 @@ class ControllerToolgenMixin:
     # Hard floor: tools graded at or below this threshold are never registered,
     # even through relaxed / fallback paths.
     MIN_REGISTRATION_GRADE = 6
+    MAX_TOOLGEN_ROUNDS = 5
 
     # ── Hardened feedback overrides for common static-check failures ──
     _HARDENED_STATIC_FEEDBACK: dict[str, str] = {
@@ -289,6 +289,272 @@ class ControllerToolgenMixin:
             "produced_actionable_handoff": 3,
             "produced_final_variable": 4,
         }.get(str(state or ""), 0)
+
+    @staticmethod
+    def _toolgen_is_runtime_no_value_pattern(
+        summary: Optional[Mapping[str, Any]],
+    ) -> bool:
+        if not isinstance(summary, Mapping):
+            return False
+        return (
+            (bool(summary.get("has_live_result", False)) or "execution_status" in summary)
+            and not bool(summary.get("integration_context_invalid", False))
+            and str(summary.get("value_delivered") or "none") == "none"
+            and str(summary.get("achieved_state") or "none") == "none"
+            and not bool(summary.get("partial_value_usable", False))
+            and not bool(summary.get("has_final_variable", False))
+            and not bool(summary.get("material_progress", False))
+        )
+
+    def _toolgen_synthesize_runtime_repair_brief(
+        self,
+        *,
+        live_progress_summary: Optional[Mapping[str, Any]],
+        round_context: Optional[Mapping[str, Any]] = None,
+        validation: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        summary = dict(live_progress_summary or {})
+        if not self._toolgen_is_runtime_no_value_pattern(summary):
+            return None
+        round_context = dict(round_context or {})
+        validation = dict(validation or {})
+        execution_status = str(summary.get("execution_status") or "unknown").strip() or "unknown"
+        has_context = bool(summary.get("has_context", False))
+        has_next_action_guidance = bool(summary.get("has_next_action_guidance", False))
+        narrowed_problem_space = bool(summary.get("narrowed_problem_space", False))
+        previous_round_no_progress = round_context.get("material_progress_last_round") is False
+        previous_failure_bucket = str(round_context.get("previous_failure_bucket") or "")
+        repeated_no_value_pattern = bool(
+            previous_round_no_progress
+            and execution_status == "MACRO EXHAUSTED"
+            and previous_failure_bucket
+            in {
+                "code_local_no_progress",
+                "context_handling_no_progress",
+                "strategy_mismatch_no_progress",
+            }
+        )
+        if narrowed_problem_space:
+            missing_value_type = "no_finalization_after_narrowing"
+            redesign_direction = "emit_grounded_intermediate_before_final"
+        elif has_context and not has_next_action_guidance:
+            missing_value_type = "no_executable_handoff"
+            redesign_direction = "emit_concrete_handoff_from_live_anchor"
+        elif has_context:
+            missing_value_type = "no_grounded_intermediate"
+            redesign_direction = "emit_grounded_intermediate_before_final"
+        else:
+            missing_value_type = "no_classified_value"
+            redesign_direction = "rewrite_toward_first_valuable_state"
+        if repeated_no_value_pattern:
+            redesign_direction = "replace_exhausted_full_solve_shape"
+        issues = validation.get("issues")
+        if not isinstance(issues, list):
+            issues = [str(issues or "")] if issues else []
+        secondary_issues = [
+            str(item or "").strip()
+            for item in issues
+            if str(item or "").strip()
+        ][:3]
+        runtime_failure_summary = (
+            f"Observed runtime outcome: {execution_status} produced no classified value, "
+            "no final variable, and no solver-usable handoff."
+        )
+        return {
+            "runtime_failure_summary": runtime_failure_summary,
+            "missing_value_type": missing_value_type,
+            "redesign_direction": redesign_direction,
+            "secondary_issues": secondary_issues,
+        }
+
+    @staticmethod
+    def _toolgen_runtime_repair_instruction(
+        runtime_repair_brief: Optional[Mapping[str, Any]],
+    ) -> str:
+        if not isinstance(runtime_repair_brief, Mapping):
+            return ""
+        missing_value_type = str(
+            runtime_repair_brief.get("missing_value_type") or "no_classified_value"
+        )
+        redesign_direction = str(
+            runtime_repair_brief.get("redesign_direction")
+            or "rewrite_toward_first_valuable_state"
+        )
+        base = (
+            "RUNTIME-FIRST REPAIR TARGET: The previous candidate followed the plan but "
+            f"delivered no accepted value. Missing value type: {missing_value_type}. "
+        )
+        if redesign_direction == "replace_exhausted_full_solve_shape":
+            return (
+                base
+                + "Stop local patching. Do not preserve the current exhausted full-solver "
+                "skeleton; perform a more substantial rewrite toward the first acceptable "
+                "value state before polishing contract details."
+            )
+        if redesign_direction == "emit_concrete_handoff_from_live_anchor":
+            return (
+                base
+                + "Rewrite toward a concrete, solver-usable handoff from the live anchor "
+                "state instead of preserving the same exhausted shape."
+            )
+        if redesign_direction == "emit_grounded_intermediate_before_final":
+            return (
+                base
+                + "Rewrite toward a grounded intermediate result before attempting final "
+                "completion."
+            )
+        return (
+            base
+            + "Rewrite toward the first acceptable value state instead of preserving the "
+            "same exhausted candidate shape."
+        )
+
+    # -----------------------------------------------------------------------
+    # Phase 1: runtime-repair → bound retry-state mutations
+    # -----------------------------------------------------------------------
+
+    # Redesign directions that require a full structural replacement of the
+    # prior code shape.  Prior code must NOT be shown to ToolGen on these.
+    _PHASE1_STRUCTURAL_DIRECTIONS: frozenset[str] = frozenset({
+        "replace_exhausted_full_solve_shape",
+        "rewrite_toward_first_valuable_state",
+    })
+
+    # Redesign directions that call for a "first valuable state" recovery.
+    # These switch preferred_tool_mode away from full_solve and inject a
+    # minimum_acceptable_deliverable so ToolGen stops at partial progress.
+    _PHASE1_FIRST_VALUE_DIRECTIONS: frozenset[str] = frozenset({
+        "replace_exhausted_full_solve_shape",
+        "rewrite_toward_first_valuable_state",
+        "emit_grounded_intermediate_before_final",
+        "emit_concrete_handoff_from_live_anchor",
+    })
+
+    # Generic minimum_acceptable_deliverable injected when the current round
+    # has no explicit one.  Deliberately non-task-specific.
+    _PHASE1_GENERIC_MIN_DELIVERABLE: str = (
+        "First grounded KG state: produce at least one result from a real kg_utils "
+        "primitive — resolve_entity_to_vars, walk_to_target, cross_intersect, "
+        "resolve_semantic_filter, or count — called on a real entity from "
+        "payload['entities']. "
+        "Stop once you have one valid #N variable or a confirmed MACRO EXHAUSTED "
+        "observation with a real resolved anchor. "
+        "NOT acceptable as first value: tool_plan echo, payload field copy, entity "
+        "string minting, placeholder candidate minting without KG-derived IDs, or "
+        "generic next-step prose without observed KG execution output. "
+        "Do not attempt full solve."
+    )
+
+    @staticmethod
+    def _toolgen_phase1_retry_state(
+        feedback_note: str,
+    ) -> dict[str, Any]:
+        """Compute Phase-1 retry-state mutations from the previous round's
+        feedback_note JSON string.
+
+        Returns a mutation dict with keys:
+          active                        – bool: Phase-1 condition is met
+          omit_prior_code               – bool: omit LAST_TOOL_CODE from prompt
+          override_preferred_tool_mode  – str|None: switch away from full_solve
+          minimum_acceptable_deliverable – str|None: injected stop condition
+          primary_repair_dominates      – bool: PRIMARY_REPAIR_TARGET present
+
+        Phase-1 is activated when all of the following hold:
+          * runtime_repair_brief OR primary_repair_instruction present
+          * no usable value from previous candidate:
+              - value_delivered == "none"
+              - achieved_state == "none"
+              - partial_value_usable == False
+              - has_final_variable == False
+              - has_next_action_guidance == False
+              - handoff_state in {blocked, exhausted, ""}
+          (When live_progress_summary is absent, presence of
+           runtime_repair_brief alone is treated as sufficient.)
+        """
+        _default: dict[str, Any] = {
+            "active": False,
+            "omit_prior_code": False,
+            "override_preferred_tool_mode": None,
+            "minimum_acceptable_deliverable": None,
+            "primary_repair_dominates": False,
+        }
+        if not feedback_note:
+            return dict(_default)
+        try:
+            payload = json.loads(feedback_note)
+        except Exception:
+            return dict(_default)
+        if not isinstance(payload, dict):
+            return dict(_default)
+
+        brief = payload.get("runtime_repair_brief")
+        if not isinstance(brief, dict):
+            brief = None
+        primary = (
+            str(payload.get("PRIMARY_REPAIR_TARGET") or "").strip()
+            or str(payload.get("primary_repair_instruction") or "").strip()
+        )
+
+        # Nothing to bind — not a runtime-repair feedback payload.
+        if not brief and not primary:
+            return dict(_default)
+
+        # Detect no-value trigger condition.
+        lps = payload.get("live_progress_summary")
+        if isinstance(lps, dict):
+            no_value = (
+                str(lps.get("value_delivered") or "none") == "none"
+                and str(lps.get("achieved_state") or "none") == "none"
+                and not bool(lps.get("partial_value_usable", False))
+                and not bool(lps.get("has_final_variable", False))
+                and not bool(lps.get("has_next_action_guidance", False))
+                and str(lps.get("handoff_state") or "") in {"blocked", "exhausted", ""}
+            )
+        else:
+            # No live summary present — treat runtime_repair_brief as
+            # sufficient signal (it is only synthesised for no-value outcomes).
+            no_value = bool(brief)
+
+        if not no_value:
+            return dict(_default)
+
+        redesign = str((brief or {}).get("redesign_direction") or "").strip()
+
+        structural = (
+            redesign in ControllerToolgenMixin._PHASE1_STRUCTURAL_DIRECTIONS
+        )
+        first_value = (
+            redesign in ControllerToolgenMixin._PHASE1_FIRST_VALUE_DIRECTIONS
+        )
+
+        return {
+            "active": True,
+            "omit_prior_code": structural,
+            "override_preferred_tool_mode": "progress_tool" if first_value else None,
+            "minimum_acceptable_deliverable": (
+                ControllerToolgenMixin._PHASE1_GENERIC_MIN_DELIVERABLE
+                if first_value
+                else None
+            ),
+            "primary_repair_dominates": bool(primary),
+        }
+
+    @staticmethod
+    def _toolgen_phase1_retry_execution_plan(
+        minimum_acceptable_deliverable: str,
+    ) -> tuple[list[str], str]:
+        deliverable = (
+            str(minimum_acceptable_deliverable or "").strip()
+            or ControllerToolgenMixin._PHASE1_GENERIC_MIN_DELIVERABLE
+        )
+        steps = [
+            "1. Follow the declared strategy only until the first acceptable value state is reached.",
+            f"2. Minimum acceptable deliverable: {deliverable}",
+            "3. Stop immediately after producing that value or solver-usable handoff; do not continue to full solve.",
+        ]
+        return steps, "\n".join(steps)
+
+    # -----------------------------------------------------------------------
 
     @staticmethod
     def _toolgen_candidate_validation(
@@ -1047,6 +1313,7 @@ class ControllerToolgenMixin:
         self,
         exec_payload: Optional[Mapping[str, Any]],
         round_context: Mapping[str, Any],
+        phase1_retry_state: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         payload = dict(exec_payload or {})
         tool_plan = self._build_tool_plan(payload)
@@ -1065,9 +1332,50 @@ class ControllerToolgenMixin:
             or tool_plan.get("fallback_strategies")
             or []
         )
+        # Phase 1: propagate minimum_acceptable_deliverable from round_context
+        # into tool_plan and top-level payload so ToolGen can read it from
+        # both payload['tool_plan'] and payload directly.
+        _mad = round_context.get("minimum_acceptable_deliverable")
+        if _mad and not tool_plan.get("minimum_acceptable_deliverable"):
+            tool_plan["minimum_acceptable_deliverable"] = _mad
+        phase1_active = bool((phase1_retry_state or {}).get("active"))
+        phase1_progress_retry = phase1_active and (
+            str(tool_plan.get("preferred_tool_mode") or "") == "progress_tool"
+            or bool(tool_plan.get("minimum_acceptable_deliverable"))
+            or bool(_mad)
+        )
+        if phase1_progress_retry:
+            progress_steps, progress_text = (
+                self._toolgen_phase1_retry_execution_plan(
+                    str(
+                        tool_plan.get("minimum_acceptable_deliverable")
+                        or _mad
+                        or ""
+                    )
+                )
+            )
+            tool_plan["topological_execution_plan"] = list(progress_steps)
+            tool_plan["topological_execution_plan_raw"] = list(progress_steps)
+            tool_plan["topological_execution_plan_steps"] = list(progress_steps)
+            tool_plan["topological_execution_plan_text"] = progress_text
         payload["execution_style"] = tool_plan.get("execution_style")
         payload["preferred_tool_mode"] = tool_plan.get("preferred_tool_mode")
         payload["fallback_strategies"] = tool_plan.get("fallback_strategies")
+        if _mad:
+            payload["minimum_acceptable_deliverable"] = _mad
+        if phase1_progress_retry:
+            payload["topological_execution_plan"] = tool_plan.get(
+                "topological_execution_plan"
+            )
+            payload["topological_execution_plan_raw"] = tool_plan.get(
+                "topological_execution_plan_raw"
+            )
+            payload["topological_execution_plan_steps"] = tool_plan.get(
+                "topological_execution_plan_steps"
+            )
+            payload["topological_execution_plan_text"] = tool_plan.get(
+                "topological_execution_plan_text"
+            )
         payload["tool_plan"] = tool_plan
         payload["toolgen_retry_context"] = dict(round_context)
         return payload
@@ -1334,6 +1642,20 @@ class ControllerToolgenMixin:
             )
         ):
             return "runtime_dependency_error"
+        # Runtime-first family stabilization: anchor on no_runtime_progress when the
+        # live summary already establishes exhausted/no-value/no-final, BEFORE checking
+        # incidental validator text that can drift the family each round.
+        # Only skipped when a durable execution-level root cause was matched above
+        # (integration_context_invalid, server_validation_blocked, runtime_dependency_error).
+        # General rule: applies to any environment where live outcome is authoritative.
+        _lps_ffam = live_progress_summary or {}
+        if (
+            str(_lps_ffam.get("handoff_state") or "") in {"blocked", "exhausted"}
+            and str(_lps_ffam.get("value_delivered") or "none") == "none"
+            and not bool(_lps_ffam.get("has_final_variable", False))
+            and str(_lps_ffam.get("achieved_state") or "none") == "none"
+        ):
+            return "no_runtime_progress"
         if "count" in lowered and any(
             token in lowered for token in ("wrong count", "pre-count", "count variable")
         ):
@@ -1473,6 +1795,59 @@ class ControllerToolgenMixin:
         result["failure_bucket"] = failure_bucket
         result["value_delivered"] = value_delivered
         result["partial_value_usable"] = partial_value_usable
+        runtime_repair_brief = self._toolgen_synthesize_runtime_repair_brief(
+            live_progress_summary=summary,
+            round_context=round_context,
+            validation=result,
+        )
+        primary_repair_instruction = self._toolgen_runtime_repair_instruction(
+            runtime_repair_brief
+        )
+        result["runtime_repair_brief"] = runtime_repair_brief
+        result["primary_repair_instruction"] = primary_repair_instruction or None
+        if isinstance(runtime_repair_brief, Mapping):
+            result["missing_value_type"] = runtime_repair_brief.get(
+                "missing_value_type"
+            ) or "no_classified_value"
+            result["redesign_direction"] = runtime_repair_brief.get(
+                "redesign_direction"
+            ) or "rewrite_toward_first_valuable_state"
+            _rt_issue = (
+                "Runtime-first failure: candidate delivered no accepted value "
+                f"({result['missing_value_type']}). Prioritize runtime-value delivery over "
+                "format-only or local compliance fixes."
+            )
+            _rt_fix = primary_repair_instruction or (
+                "Rewrite toward the first acceptable value state before polishing "
+                "contract details."
+            )
+            _ei = result.get("issues")
+            _ef = result.get("fixes")
+            if not isinstance(_ei, list):
+                _ei = [str(_ei or "")] if _ei else []
+            if not isinstance(_ef, list):
+                _ef = [str(_ef or "")] if _ef else []
+            result["issues"] = [_rt_issue] + [
+                str(item or "").strip()
+                for item in _ei
+                if str(item or "").strip()
+            ]
+            result["fixes"] = [_rt_fix] + [
+                str(item or "").strip()
+                for item in _ef
+                if str(item or "").strip()
+            ]
+            existing_summary = str(result.get("summary") or "").strip()
+            runtime_summary = str(
+                runtime_repair_brief.get("runtime_failure_summary") or ""
+            ).strip()
+            redesign_direction = str(
+                runtime_repair_brief.get("redesign_direction") or ""
+            ).strip()
+            result["summary"] = (
+                f"{runtime_summary} Redesign direction: {redesign_direction}."
+                + (f" Secondary validator summary: {existing_summary}" if existing_summary else "")
+            ).strip()
         result["same_strategy_as_previous"] = bool(
             round_context.get("previous_strategy_family")
             and self._toolgen_strategy_equivalent(
@@ -1836,6 +2211,7 @@ class ControllerToolgenMixin:
         feedback_note: str,
         round_history: Sequence[Mapping[str, Any]],
         base_prompt: str,
+        phase1_omit_prior_code: bool = False,
     ) -> str:
         history_lines: list[str] = []
         if round_history:
@@ -1848,7 +2224,15 @@ class ControllerToolgenMixin:
         feedback_block = feedback_note or "(none)"
         # Keep patch prompts bounded for latency/stability.
         task_pack_excerpt = base_prompt[-8000:] if isinstance(base_prompt, str) else str(base_prompt)
-        code_excerpt = self._toolgen_compact_patch_code_context(current_code)
+        # Phase 1: omit code excerpt when a structural rewrite is required.
+        if phase1_omit_prior_code:
+            code_section = (
+                "CURRENT_TOOL_CODE: [omitted — structural rewrite required by "
+                "PRIMARY_REPAIR_TARGET; generate a new implementation from scratch]"
+            )
+        else:
+            code_excerpt = self._toolgen_compact_patch_code_context(current_code)
+            code_section = f"```python\n{code_excerpt}\n```"
         return textwrap.dedent(
             f"""\
             You are ToolPatch. You must propose SURGICAL patches for an existing Python tool.
@@ -1874,6 +2258,9 @@ class ControllerToolgenMixin:
             RULES
             - Prefer replacing only `run`.
             - Do NOT output a full file rewrite.
+            - If `VALIDATOR_FEEDBACK` reports a module-level contract failure outside `run()` (for example a forbidden import or bad metadata header), use `replace_text` or `replace_between_markers` to repair that module-level code. Do NOT assume replacing only `run` is sufficient.
+            - If `VALIDATOR_FEEDBACK` includes `PRIMARY_REPAIR_TARGET` or `runtime_repair_brief`, treat that as the dominant rewrite goal. Do NOT spend the patch on secondary formatting or local cleanup until the tool delivers accepted value or a solver-usable handoff.
+            - If the dominant repair target says to replace an exhausted full-solver shape, do NOT preserve the current skeleton just because it is close to valid Python.
             - MANDATORY HEADERS (must appear verbatim in the patched file — never remove or rename):
               # INVOKE_WITH: ...
               # RUN_PAYLOAD_REQUIRED: ...
@@ -1895,10 +2282,112 @@ class ControllerToolgenMixin:
             {feedback_block}
 
             CURRENT_TOOL_CODE:
-            ```python
-            {code_excerpt}
-            ```
+            {code_section}
             """
+        )
+
+    def _toolgen_strip_preinjected_kg_utils_imports(self, code: str) -> str:
+        """Remove bare `import kg_utils` lines that are always invalid in KG tools.
+
+        This is safe because KG tools reference the pre-injected global as
+        `kg_utils.*`; deleting the redundant import preserves semantics while
+        unblocking patch rounds from module-level contract deadlocks.
+
+        Also handles the case where the import is the sole statement in a
+        try/except block — stripping only the import line would leave an empty
+        ``try:`` body, which is a syntax error.  Any such empty body is patched
+        with ``pass`` so the surrounding structure remains valid Python.
+        """
+        if not isinstance(code, str) or not code:
+            return ""
+        # Strip bare import / from-import lines.
+        code = re.sub(r"^[ \t]*import\s+kg_utils\b[^\n]*\n?", "", code, flags=re.MULTILINE)
+        code = re.sub(r"^[ \t]*from\s+kg_utils\s+import[^\n]*\n?", "", code, flags=re.MULTILINE)
+        # If stripping left a try: whose body is now empty (directly followed by
+        # except / finally / else), insert `pass` to restore syntactic validity.
+        code = re.sub(
+            r"(^([ \t]*)try:[ \t]*\n)([ \t]*(?:except|finally|else)\b)",
+            r"\1\2    pass\n\3",
+            code,
+            flags=re.MULTILINE,
+        )
+        return code
+
+    def _toolgen_patch_sanitize_contract_retry_source(
+        self,
+        code: str,
+        *,
+        feedback_note: str,
+    ) -> str:
+        """Apply tiny safe normalizations for exact contract failures in patch mode."""
+        normalized = str(code or "")
+        if "import kg_utils" in str(feedback_note or ""):
+            normalized = self._toolgen_strip_preinjected_kg_utils_imports(normalized)
+        return normalized
+
+    def _toolgen_build_full_rewrite_prompt(
+        self,
+        *,
+        base_prompt: str,
+        round_context: Mapping[str, Any],
+        feedback_note: str,
+        round_history: Sequence[Mapping[str, Any]],
+        last_tool_code: Optional[str],
+        phase1_retry_state: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        prompt = base_prompt + self._toolgen_round_context_block(round_context)
+        if not feedback_note:
+            return prompt
+        phase1_state = dict(phase1_retry_state or {})
+        code_block = ""
+        if last_tool_code and not bool(phase1_state.get("omit_prior_code")):
+            code_block = "\n\nLAST_TOOL_CODE:\n" + last_tool_code
+        history_block = ""
+        if round_history:
+            lines = ["PRIOR_ROUNDS (do not repeat these mistakes):"]
+            for h in round_history:
+                lines.append(
+                    f"  Round {h['round']}: grade={h['grade']} | "
+                    f"top_issue={h['top_issue']} | "
+                    f"value_delivered={h.get('value_delivered') or 'none'} | "
+                    f"summary={h['summary']}"
+                )
+            history_block = "\n\n" + "\n".join(lines)
+        if bool(phase1_state.get("primary_repair_dominates")):
+            rewrite_instruction = (
+                "\n\nYou must output the ENTIRE file from scratch. "
+                "Implement ONLY the PRIMARY_REPAIR_TARGET above as your primary "
+                "objective. Secondary issues listed in VALIDATOR_FEEDBACK are "
+                "context only; do not address them until the primary repair "
+                "delivers accepted value or a solver-usable handoff. "
+                "Keep the replacement minimal: preserve ALL required metadata "
+                "headers (# INVOKE_WITH:, # RUN_PAYLOAD_REQUIRED:, "
+                "# RUN_PAYLOAD_OPTIONAL:, # INVOKE_EXAMPLE:), a short module "
+                "docstring, run(payload) with its contract guard/prereqs/"
+                "limitations docstring, and self_test() unless feedback "
+                "explicitly requires more."
+            )
+        else:
+            rewrite_instruction = (
+                "\n\nYou must output the ENTIRE file from scratch. "
+                "Implement all requested fixes and refactor the code as necessary "
+                "to pass the live evaluation. Keep the replacement minimal: preserve "
+                "ALL required metadata headers (# INVOKE_WITH:, # RUN_PAYLOAD_REQUIRED:, "
+                "# RUN_PAYLOAD_OPTIONAL:, # INVOKE_EXAMPLE:), a short module docstring, "
+                "run(payload) with its contract guard/prereqs/limitations docstring, "
+                "and self_test() unless feedback explicitly requires more."
+            )
+        return (
+            base_prompt
+            + self._toolgen_round_context_block(round_context)
+            + history_block
+            + "\n\nVALIDATOR_FEEDBACK:\n"
+            + feedback_note
+            + code_block
+            + "\n\nIf VALIDATOR_FEEDBACK contains PRIMARY_REPAIR_TARGET or "
+            + "runtime_repair_brief, those runtime-value directives outrank "
+            + "secondary formatting or local compliance issues."
+            + rewrite_instruction
         )
 
     def _toolgen_generate_patch_plan_legacy(
@@ -1909,6 +2398,7 @@ class ControllerToolgenMixin:
         feedback_note: str,
         round_history: Sequence[Mapping[str, Any]],
         base_prompt: str,
+        phase1_omit_prior_code: bool = False,
     ) -> tuple[Optional[Mapping[str, Any]], Optional[str]]:
         patch_system_prompt = (
             "Reasoning: low\n"
@@ -1919,6 +2409,7 @@ class ControllerToolgenMixin:
             feedback_note=feedback_note,
             round_history=round_history,
             base_prompt=base_prompt,
+            phase1_omit_prior_code=phase1_omit_prior_code,
         )
         raw = self._toolgen_call_llm(
             system_prompt=patch_system_prompt,
@@ -2713,6 +3204,31 @@ class ControllerToolgenMixin:
             ]
             if extra_defs:
                 smells.append("helper_proliferation")
+            # Helper signature validation: check positional arg counts against
+            # the exact contracts defined in the prompt/validator.
+            # walk_to_target(actions_spec, base_vars, target_concept, domain_hints, ...) → 4
+            # cross_intersect(actions_spec, vars_a, vars_b, ...)                         → 3
+            # resolve_semantic_filter(base_var, target_concept, variable_list, ...)      → 3
+            _HELPER_MIN_POSITIONAL: dict[str, int] = {
+                "walk_to_target": 4,
+                "cross_intersect": 3,
+                "resolve_semantic_filter": 3,
+            }
+            for _node in ast.walk(tree):
+                if not isinstance(_node, ast.Call):
+                    continue
+                _func = _node.func
+                if not (
+                    isinstance(_func, ast.Attribute)
+                    and isinstance(_func.value, ast.Name)
+                    and _func.value.id == "kg_utils"
+                    and _func.attr in _HELPER_MIN_POSITIONAL
+                ):
+                    continue
+                _required = _HELPER_MIN_POSITIONAL[_func.attr]
+                if len(_node.args) < _required:
+                    smells.append("helper_signature_mismatch")
+                    break  # one instance is enough to flag the tool
             module_doc = ast.get_docstring(tree) or ""
             run_doc = ""
             for node in tree.body:
@@ -2762,10 +3278,18 @@ class ControllerToolgenMixin:
         phase: str,
         usefulness_reason: str,
         live_progress_summary: Optional[Mapping[str, Any]],
+        runtime_repair_brief: Optional[Mapping[str, Any]] = None,
+        primary_repair_instruction: Optional[str] = None,
         validator_top_issue: Optional[str] = None,
         validator_fixes: Optional[list] = None,
     ) -> str:
         reason_text = str(usefulness_reason or "unknown").strip() or "unknown"
+        runtime_repair_brief = (
+            dict(runtime_repair_brief or {})
+            if isinstance(runtime_repair_brief, Mapping)
+            else None
+        )
+        primary_repair_instruction = str(primary_repair_instruction or "").strip()
         if self._toolgen_is_honest_zero_summary(live_progress_summary):
             critical_instruction = (
                 "HONEST ZERO: The previous candidate resolved anchor context and then "
@@ -2800,6 +3324,8 @@ class ControllerToolgenMixin:
             )
         payload: dict[str, Any] = {
             "phase": phase,
+            "PRIMARY_REPAIR_TARGET": primary_repair_instruction or None,
+            "runtime_repair_brief": runtime_repair_brief,
             "CRITICAL_INSTRUCTION": critical_instruction,
             "usefulness_reason": reason_text,
             "live_progress_summary": live_progress_summary,
@@ -2815,6 +3341,8 @@ class ControllerToolgenMixin:
                     "event": "toolgen_blocked_rewrite_directive",
                     "phase": phase,
                     "usefulness_reason": usefulness_reason,
+                    "runtime_repair_brief": runtime_repair_brief,
+                    "primary_repair_instruction": primary_repair_instruction or None,
                 }
             )
         except Exception:
@@ -2884,6 +3412,12 @@ class ControllerToolgenMixin:
             marker in lowered
             for marker in ("minted_variables", "candidate_map", "candidates", "#")
         )
+        # Require concrete executable signal — an agent-format marker or a direct
+        # function-call invocation — not generic advisory prose.
+        # Removed: "next action", "continue from", "solver should", "follow up with",
+        # "critical to solver".  These phrases routinely appear in generic exhausted
+        # messages and were inflating apparent handoff value without real executable
+        # content, causing honest-zero outputs with no delivered value to look actionable.
         has_next_action_guidance = any(
             marker in observation
             for marker in (
@@ -2897,15 +3431,6 @@ class ControllerToolgenMixin:
                 "difference(",
                 "argmax(",
                 "argmin(",
-            )
-        ) or any(
-            phrase in lowered
-            for phrase in (
-                "next action",
-                "continue from",
-                "solver should",
-                "follow up with",
-                "critical to solver",
             )
         )
         looks_fallback_only = self._toolgen_looks_like_fallback_handoff(lowered) or (
@@ -2951,6 +3476,27 @@ class ControllerToolgenMixin:
                 "count result",
                 "narrowed",
                 "subset",
+            )
+        )
+        # Downstream-op signal: a stricter subset of narrowed_problem_space that
+        # excludes bare "resolved" so we can distinguish "only resolved an anchor"
+        # from "resolved + then did downstream narrowing/filtering/intersection".
+        downstream_op_signal = any(
+            phrase in lowered
+            for phrase in (
+                "contains the intersected set",
+                "contains the filtered set",
+                "contains the walk result",
+                "contains the aggregated",
+                "intersected",
+                "filtered",
+                "walked",
+                "count result",
+                "narrowed",
+                "subset",
+                "intersection",
+                "filter result",
+                "walk result",
             )
         )
         verified_narrowing_signal = any(
@@ -3140,7 +3686,7 @@ class ControllerToolgenMixin:
                 )
 
         # Late policy correction: MACRO EXHAUSTED with opaque/weak delivered value and
-        # no next-action guidance is not meaningful partial progress.
+        # no usable partial value is not meaningful partial progress.
         #
         # This runs AFTER the value_delivered upgrade block so it cannot be overridden.
         #
@@ -3153,18 +3699,45 @@ class ControllerToolgenMixin:
         #
         # resolved_both_anchors and stronger values remain material_progress=True since
         # they represent meaningful multi-step KG traversal.
+        #
+        # Escape hatch: partial_value_usable=True means the output has at least some
+        # solver-usable content (e.g. resolved_anchor with has_context). For value_delivered
+        # ="none", partial_value_usable is always False, so honest_zero alone cannot pass
+        # usefulness — generic "next action" / "solver should" phrases no longer protect it.
         _OPAQUE_EXHAUSTION_VALUES = {"none", "resolved_anchor"}
         if (
             status == "MACRO EXHAUSTED"
             and value_delivered in _OPAQUE_EXHAUSTION_VALUES
             and not has_final
-            and not has_next_action_guidance
+            and not partial_value_usable  # replaces `not has_next_action_guidance`:
+            # partial_value_usable=False for value_delivered="none" regardless of guidance
+            # text, closing the path where loose phrase detection kept material_progress=True.
         ):
             material_progress = False
             if reason in {"honest_zero", "honest_zero_no_handoff"}:
                 reason = "exhausted_no_classified_value"
             elif reason not in {"exhausted_no_classified_value"}:
                 reason = "exhausted_no_actionable_handoff"
+
+        # Progress-tool minimum-deliverable tightening: when the active plan
+        # requires downstream narrowing/intersection/filter/count AND the tool
+        # is in progress_tool mode, a SUCCESS that only delivered a resolved
+        # anchor (no actual downstream operation observed) is insufficient.
+        # Demote it so it does not register as acceptable partial progress and
+        # force the next round to do real downstream work.
+        _pt_mode = str((tool_plan or {}).get("preferred_tool_mode") or "")
+        if (
+            _pt_mode == "progress_tool"
+            and plan_requires_narrowing_or_final_op
+            and value_delivered in {"resolved_anchor", "resolved_both_anchors"}
+            and not downstream_op_signal
+            and not verified_narrowing_signal
+            and status == "SUCCESS"
+            and material_progress
+        ):
+            material_progress = False
+            reason = "resolved_anchor_only_insufficient_for_plan"
+            semantic_trust_level = "fallback_unverified"
 
         return {
             "has_live_result": True,
@@ -3279,6 +3852,7 @@ class ControllerToolgenMixin:
             "hardcoded_domain_token_list",
             "custom_streaming_or_bucketing_architecture",
             "noncanonical_helper_surface",
+            "helper_signature_mismatch",  # wrong positional-arg count → runtime TypeError
         }
         if (
             usefulness_summary.get("plan_requires_narrowing_or_final_op")
@@ -3487,6 +4061,10 @@ class ControllerToolgenMixin:
                     "semantic_trust_level": validation["semantic_trust_level"],
                     "final_operation_safe": validation["final_operation_safe"],
                     "semantic_code_smells": semantic_code_smells,
+                    "runtime_repair_brief": validation.get("runtime_repair_brief"),
+                    "primary_repair_instruction": validation.get(
+                        "primary_repair_instruction"
+                    ),
                     "grade": validation.get("grade"),
                     "uncapped_grade": validation.get("uncapped_grade"),
                     "grade_cap_reason": validation.get("grade_cap_reason"),
@@ -3814,7 +4392,7 @@ class ControllerToolgenMixin:
         if not tool_code or not isinstance(payload, Mapping):
             return None
         # Strip stray `import kg_utils` lines — kg_utils is pre-injected as a global.
-        tool_code = re.sub(r"^\s*import\s+kg_utils\b.*\n?", "", tool_code, flags=re.MULTILINE)
+        tool_code = self._toolgen_strip_preinjected_kg_utils_imports(tool_code)
         try:
             compiled = compile(tool_code, "<generated_tool>", "exec")
         except Exception as exc:
@@ -4136,61 +4714,18 @@ class ControllerToolgenMixin:
         query: str,
         chat_history: ChatHistory,
     ) -> Optional[ToolMetadata]:
-        def _stringify(value: Any) -> str:
-            if value is None:
-                return ""
-            if isinstance(value, (list, tuple, set)):
-                return ", ".join(str(v) for v in value)
-            return str(value)
-
-        reason = _stringify(decision.get("reason"))
-        upgrade_goal = _stringify(decision.get("upgrade_goal")).strip()
+        reason = self._toolgen_stringify_prompt_value(decision.get("reason"))
+        upgrade_goal = self._toolgen_stringify_prompt_value(
+            decision.get("upgrade_goal")
+        ).strip()
         if not upgrade_goal:
             # Backward compat: old orchestrator payloads only supplied reason.
             upgrade_goal = reason
-        tool_type = _stringify(decision.get("tool_type"))
+        tool_type = self._toolgen_stringify_prompt_value(decision.get("tool_type"))
+        env_name = self._resolved_environment_label()
+        if env_name == "knowledge_graph" and not tool_type.strip():
+            tool_type = "macro"
         tool_plan = self._build_tool_plan(decision)
-        catalog_summary = ""
-        try:
-            catalog_summary = self._toolgen_tool_list_appendix()
-        except Exception:
-            catalog_summary = ""
-        catalog_block = (
-            "=== EXISTING TOOL CATALOG ===\n"
-            f"{catalog_summary}\n\n"
-            "=== GAP ANALYSIS REQUIREMENT ===\n"
-            "You must review the existing tools above. DO NOT generate a tool that duplicates this "
-            "functionality. The existing tools failed or were insufficient. You must identify the GAP "
-            "and write a specialized tool that performs a NEW graph computation or filter.\n\n"
-        )
-
-        blueprint_header = (
-            "=== ORCHESTRATOR BLUEPRINT ===\n"
-            f"TOOL TYPE REQUIRED: {tool_type}\n"
-            f"FORGE CONTEXT: {reason}\n"
-            f"UPGRADE GOAL: {upgrade_goal}\n"
-            f"CANONICAL TOOL PLAN: {json.dumps(tool_plan, ensure_ascii=True, default=str)}\n"
-            "CRITICAL GENERATION RULE: You are generating a parametric tool for a "
-            "class of problems, not a specific task. Trust payload['tool_plan'] "
-            "as the authoritative semantic specification and payload['entities'] "
-            "as the authoritative entity list. Do NOT rediscover semantics from "
-            "task_text or asked_for when tool_plan exists. Do NOT write helper "
-            "compatibility adapters, helper-shape probes, streaming/bucketing "
-            "architectures, or pseudo-solver fallback trees. Generate a thin "
-            "helper-driven translator that follows the plan and returns a legal "
-            "next-state variable or exact MACRO EXHAUSTED. Give the tool a "
-            "generic descriptive name.\n"
-            "==============================\n\n"
-            + catalog_block
-        )
-
-        plan_str = _stringify(
-            tool_plan.get("topological_execution_plan_text")
-            or tool_plan.get("topological_execution_plan")
-        )
-        if plan_str:
-            blueprint_header += f"EXECUTION PLAN:\n{plan_str}\n\n"
-
         parts = [query]
         if reason:
             parts.append(f"FORGE CONTEXT: {reason}")
@@ -4198,7 +4733,6 @@ class ControllerToolgenMixin:
             parts.append(f"UPGRADE GOAL: {upgrade_goal}")
         toolgen_query = "\n".join(parts)
 
-        env_name = self._resolved_environment_label()
         env_contract = ""
         context = getattr(self, "_toolgen_agg_context", None)
         if isinstance(context, Mapping):
@@ -4212,28 +4746,24 @@ class ControllerToolgenMixin:
             except Exception:
                 env_contract = ""
 
-        user_prompt = build_task_pack(env_name, env_contract, [toolgen_query])
-        final_user_prompt = blueprint_header + user_prompt
-        target_archetype_hint = _stringify(
+        final_user_prompt = self._toolgen_build_blueprint_prompt(
+            query=query,
+            tool_type=tool_type,
+            reason=reason,
+            upgrade_goal=upgrade_goal,
+            tool_plan=tool_plan,
+            env_name=env_name,
+            env_contract=env_contract,
+        )
+        target_archetype_hint = self._toolgen_stringify_prompt_value(
             tool_plan.get("target_archetype")
             or decision.get("target_archetype")
             or decision.get("archetype")
             or ""
         )
-        requested_tool_type = tool_type.strip().lower()
         if env_name == "knowledge_graph":
-            system_prompt = (
-                MACRO_TOOLGEN_USER_KG
-                if requested_tool_type == "macro"
-                else AGG_TOOLGEN_USER_KG
-            )
-            prompt_name = (
-                "MACRO_TOOLGEN_USER_KG"
-                if requested_tool_type == "macro"
-                else "AGG_TOOLGEN_USER_KG"
-            )
-            # Archetype is metadata only — no placeholder injection needed.
-            # The topological_execution_plan is the sole code-generation directive.
+            system_prompt = MACRO_TOOLGEN_USER_KG
+            prompt_name = "MACRO_TOOLGEN_USER_KG"
         else:
             system_prompt = get_toolgen_system_prompt(
                 getattr(self, "_toolgen_pipeline_name", "baseline"),
@@ -4255,7 +4785,9 @@ class ControllerToolgenMixin:
             plan_repair_cycle = int(decision.get("plan_repair_cycle") or 0)
         except Exception:
             plan_repair_cycle = 0
-        recovery_policy = _stringify(tool_plan.get("recovery_policy")).strip()
+        recovery_policy = self._toolgen_stringify_prompt_value(
+            tool_plan.get("recovery_policy")
+        ).strip()
         exec_payload = self._build_toolgen_execution_payload(
             task_text=toolgen_query,
             trace=trace_steps[-10:] if trace_steps else [],
@@ -4270,7 +4802,20 @@ class ControllerToolgenMixin:
             tool_plan=tool_plan,
         )
         prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        prev_prompt_context = getattr(self, "_toolgen_prompt_context", None)
         setattr(self, "_toolgen_execution_payload", exec_payload)
+        setattr(
+            self,
+            "_toolgen_prompt_context",
+            {
+                "query": query,
+                "tool_type": tool_type,
+                "reason": reason,
+                "upgrade_goal": upgrade_goal,
+                "env_name": env_name,
+                "env_contract": env_contract,
+            },
+        )
         try:
             return self._toolgen_generate_from_prompt(
                 user_prompt=final_user_prompt,
@@ -4279,10 +4824,131 @@ class ControllerToolgenMixin:
                 name_prefix=getattr(self, "_toolgen_name_prefix", ""),
                 prompt_name=prompt_name,
                 force_strict=True,
-                force_max_rounds=8,
+                force_max_rounds=self.MAX_TOOLGEN_ROUNDS,
             )
         finally:
             setattr(self, "_toolgen_execution_payload", prev_exec_payload)
+            setattr(self, "_toolgen_prompt_context", prev_prompt_context)
+
+    @staticmethod
+    def _toolgen_stringify_prompt_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple, set)):
+            return ", ".join(str(v) for v in value)
+        return str(value)
+
+    def _toolgen_build_blueprint_prompt(
+        self,
+        *,
+        query: str,
+        tool_type: str,
+        reason: str,
+        upgrade_goal: str,
+        tool_plan: Optional[Mapping[str, Any]],
+        env_name: str,
+        env_contract: str,
+    ) -> str:
+        normalized_tool_plan = self._build_tool_plan(tool_plan or {})
+        catalog_summary = ""
+        try:
+            catalog_summary = self._toolgen_tool_list_appendix()
+        except Exception:
+            catalog_summary = ""
+        catalog_block = (
+            "=== EXISTING TOOL CATALOG ===\n"
+            f"{catalog_summary}\n\n"
+            "=== GAP ANALYSIS REQUIREMENT ===\n"
+            "You must review the existing tools above. DO NOT generate a tool that duplicates this "
+            "functionality. The existing tools failed or were insufficient. You must identify the GAP "
+            "and write a specialized tool that performs a NEW graph computation or filter.\n\n"
+        )
+        blueprint_header = (
+            "=== ORCHESTRATOR BLUEPRINT ===\n"
+            f"TOOL TYPE REQUIRED: {tool_type}\n"
+            f"FORGE CONTEXT: {reason}\n"
+            f"UPGRADE GOAL: {upgrade_goal}\n"
+            f"CANONICAL TOOL PLAN: {json.dumps(normalized_tool_plan, ensure_ascii=True, default=str)}\n"
+            "CRITICAL GENERATION RULE: You are generating a parametric tool for a "
+            "class of problems, not a specific task. Trust payload['tool_plan'] "
+            "as the authoritative semantic specification and payload['entities'] "
+            "as the authoritative entity list. Do NOT rediscover semantics from "
+            "task_text or asked_for when tool_plan exists. Do NOT write helper "
+            "compatibility adapters, helper-shape probes, streaming/bucketing "
+            "architectures, or pseudo-solver fallback trees. Write the smallest "
+            "correct KG tool that calls real kg_utils.* primitives on the provided "
+            "entities; stop at the first grounded useful KG state. Do NOT echo "
+            "tool_plan, payload fields, or entity strings as a substitute for real "
+            "KG results. Return only the canonical 3-key dict with status, "
+            "final_variable, and observation; never return a raw string or bare "
+            "variable ID. If the effective plan is empty or unusable, return an "
+            "honest ERROR result instead of inventing KG traversal. Give the tool "
+            "a generic descriptive name.\n"
+            "==============================\n\n"
+            + catalog_block
+        )
+        plan_str = self._toolgen_stringify_prompt_value(
+            normalized_tool_plan.get("topological_execution_plan_text")
+            or normalized_tool_plan.get("topological_execution_plan")
+        )
+        if plan_str:
+            blueprint_header += f"EXECUTION PLAN:\n{plan_str}\n\n"
+        parts = [query]
+        if reason:
+            parts.append(f"FORGE CONTEXT: {reason}")
+        if upgrade_goal:
+            parts.append(f"UPGRADE GOAL: {upgrade_goal}")
+        toolgen_query = "\n".join(parts)
+        user_prompt = build_task_pack(env_name, env_contract, [toolgen_query])
+        return blueprint_header + user_prompt
+
+    def _toolgen_refresh_retry_prompt_scaffold(
+        self,
+        *,
+        fallback_prompt: str,
+        exec_payload: Optional[Mapping[str, Any]],
+    ) -> str:
+        prompt_context = getattr(self, "_toolgen_prompt_context", None)
+        if (
+            not isinstance(prompt_context, Mapping)
+            or "CANONICAL TOOL PLAN:" not in str(fallback_prompt or "")
+            or not isinstance(exec_payload, Mapping)
+        ):
+            return fallback_prompt
+        query = self._toolgen_stringify_prompt_value(
+            prompt_context.get("query") or exec_payload.get("task_text") or ""
+        ).strip()
+        if not query:
+            return fallback_prompt
+        tool_type = self._toolgen_stringify_prompt_value(
+            prompt_context.get("tool_type") or "macro"
+        ).strip() or "macro"
+        reason = self._toolgen_stringify_prompt_value(
+            prompt_context.get("reason")
+            or exec_payload.get("env_observation")
+            or ((exec_payload.get("constraints") or {}).get("failure_context"))
+            or ""
+        )
+        upgrade_goal = self._toolgen_stringify_prompt_value(
+            prompt_context.get("upgrade_goal") or exec_payload.get("upgrade_goal") or ""
+        ).strip()
+        if not upgrade_goal:
+            upgrade_goal = reason
+        env_name = self._toolgen_stringify_prompt_value(
+            prompt_context.get("env_name") or self._resolved_environment_label()
+        ).strip() or self._resolved_environment_label()
+        env_contract = self._toolgen_stringify_prompt_value(
+            prompt_context.get("env_contract") or ""
+        )
+        return self._toolgen_build_blueprint_prompt(
+            query=query,
+            tool_type=tool_type,
+            reason=reason,
+            upgrade_goal=upgrade_goal,
+            tool_plan=self._build_tool_plan(exec_payload),
+            env_name=env_name,
+            env_contract=env_contract,
+        )
 
     def _toolgen_generate_from_prompt(
         self,
@@ -4320,7 +4986,11 @@ class ControllerToolgenMixin:
                     "knowledge_graph_macro_prompt_requires_ssot_legacy_path"
                 )
         validate = self._toolgen_should_validate()
-        max_rounds = force_max_rounds if force_max_rounds is not None else (9 if validate else 1)
+        max_rounds = (
+            force_max_rounds
+            if force_max_rounds is not None
+            else (self.MAX_TOOLGEN_ROUNDS if validate else 1)
+        )
         relaxed_mode = False if force_strict else self._toolgen_relaxed_mode_enabled()
         patch_mode = self._toolgen_patch_mode_enabled() and mode == "legacy" and validate
         base_prompt = user_prompt
@@ -4395,6 +5065,7 @@ class ControllerToolgenMixin:
             value_delivered: str = "none",
             partial_value_usable: bool = False,
             semantic_code_smells: Optional[Sequence[str]] = None,
+            runtime_repair_brief: Optional[Mapping[str, Any]] = None,
             tool_code: str = "",
         ) -> None:
             round_history.append(
@@ -4437,6 +5108,9 @@ class ControllerToolgenMixin:
                     "value_delivered": value_delivered,
                     "partial_value_usable": partial_value_usable,
                     "semantic_code_smells": list(semantic_code_smells or []),
+                    "runtime_repair_brief": dict(runtime_repair_brief or {})
+                    if isinstance(runtime_repair_brief, Mapping)
+                    else None,
                     "pivot_required": bool(round_context.get("pivot_required")),
                     "code_shape_signature": self._toolgen_code_shape_signature(
                         tool_code
@@ -4497,6 +5171,12 @@ class ControllerToolgenMixin:
                     "failure_family": val_dict.get("failure_family"),
                     "failure_bucket": val_dict.get("failure_bucket"),
                     "value_delivered": val_dict.get("value_delivered"),
+                    "runtime_repair_brief": val_dict.get("runtime_repair_brief"),
+                    "primary_repair_instruction": val_dict.get(
+                        "primary_repair_instruction"
+                    ),
+                    "missing_value_type": val_dict.get("missing_value_type"),
+                    "redesign_direction": val_dict.get("redesign_direction"),
                     "same_strategy_as_previous": val_dict.get(
                         "same_strategy_as_previous"
                     ),
@@ -4641,12 +5321,52 @@ class ControllerToolgenMixin:
                 exec_payload=base_exec_payload,
                 round_history=round_history,
             )
+
+            # ── Phase 1: bind runtime-repair directives into retry state ──
+            # Must happen BEFORE _toolgen_apply_round_strategy_context so that
+            # mode and deliverable mutations flow into the exec payload and
+            # ROUND_STRATEGY_CONTEXT rendered for ToolGen.
+            phase1_retry_state = self._toolgen_phase1_retry_state(feedback_note)
+            if phase1_retry_state["active"]:
+                # 2a: switch preferred_tool_mode away from full_solve only when
+                # the current computed mode is still full_solve (or unset).
+                _p1_mode = phase1_retry_state["override_preferred_tool_mode"]
+                if _p1_mode and round_context.get(
+                    "active_preferred_tool_mode"
+                ) in {"full_solve", "", None}:
+                    round_context["preferred_tool_mode"] = _p1_mode
+                    round_context["active_preferred_tool_mode"] = _p1_mode
+                # 2b: inject minimum_acceptable_deliverable when absent.
+                _p1_mad = phase1_retry_state["minimum_acceptable_deliverable"]
+                if _p1_mad and not round_context.get("minimum_acceptable_deliverable"):
+                    round_context["minimum_acceptable_deliverable"] = _p1_mad
+                try:
+                    self._append_generated_tools_log({
+                        "event": "toolgen_phase1_retry_mutation",
+                        "round": round_idx,
+                        "omit_prior_code": phase1_retry_state["omit_prior_code"],
+                        "override_preferred_tool_mode": phase1_retry_state[
+                            "override_preferred_tool_mode"
+                        ],
+                        "minimum_acceptable_deliverable_injected": bool(_p1_mad),
+                        "primary_repair_dominates": phase1_retry_state[
+                            "primary_repair_dominates"
+                        ],
+                    })
+                except Exception:
+                    pass
+
             current_exec_payload = self._toolgen_apply_round_strategy_context(
                 base_exec_payload,
                 round_context,
+                phase1_retry_state=phase1_retry_state,
             )
             setattr(self, "_toolgen_execution_payload", current_exec_payload)
             current_tool_plan = self._build_tool_plan(current_exec_payload)
+            round_base_prompt = self._toolgen_refresh_retry_prompt_scaffold(
+                fallback_prompt=base_prompt,
+                exec_payload=current_exec_payload,
+            )
             last_round_context = dict(round_context)
             last_round_tool_plan = dict(current_tool_plan)
             if (
@@ -4721,38 +5441,25 @@ class ControllerToolgenMixin:
             except Exception:
                 pass
             print(f"{round_label} starting", file=sys.stderr, flush=True)
+            # Hard pivot enforcement: when a strategy pivot is required, omit the
+            # prior tool code from the generation prompt so the LLM cannot anchor
+            # on the disallowed-strategy implementation.  Patch mode is already
+            # blocked by the current_round_patch_mode guard below; this closes the
+            # full-rewrite path where LAST_TOOL_CODE would otherwise still appear.
+            _effective_phase1_state = phase1_retry_state
+            if round_context.get("pivot_required"):
+                _effective_phase1_state = dict(phase1_retry_state)
+                _effective_phase1_state["omit_prior_code"] = True
             # --- Full file rewrite every round ---
-            prompt = base_prompt + self._toolgen_round_context_block(round_context)
-            if feedback_note:
-                code_block = ""
-                if last_tool_code:
-                    code_block = "\n\nLAST_TOOL_CODE:\n" + last_tool_code
-                history_block = ""
-                if round_history:
-                    lines = ["PRIOR_ROUNDS (do not repeat these mistakes):"]
-                    for h in round_history:
-                        lines.append(
-                            f"  Round {h['round']}: grade={h['grade']} | "
-                            f"top_issue={h['top_issue']} | "
-                            f"value_delivered={h.get('value_delivered') or 'none'} | "
-                            f"summary={h['summary']}"
-                        )
-                    history_block = "\n\n" + "\n".join(lines)
-                prompt = (
-                    base_prompt
-                    + self._toolgen_round_context_block(round_context)
-                    + history_block
-                    + "\n\nVALIDATOR_FEEDBACK:\n"
-                    + feedback_note
-                    + code_block
-                    + "\n\nYou must output the ENTIRE file from scratch. "
-                    + "Implement all requested fixes and refactor the code as necessary "
-                    + "to pass the live evaluation. Keep the replacement minimal: preserve "
-                    + "ALL required metadata headers (# INVOKE_WITH:, # RUN_PAYLOAD_REQUIRED:, "
-                    + "# RUN_PAYLOAD_OPTIONAL:, # INVOKE_EXAMPLE:), a short module docstring, "
-                    + "run(payload) with its contract guard/prereqs/limitations docstring, "
-                    + "and self_test() unless feedback explicitly requires more."
-                )
+            prompt = self._toolgen_build_full_rewrite_prompt(
+                base_prompt=round_base_prompt,
+                round_context=round_context,
+                feedback_note=feedback_note or "",
+                round_history=round_history,
+                last_tool_code=last_tool_code,
+                phase1_retry_state=_effective_phase1_state,
+            )
+            last_tool_has_patchable_run = self._toolgen_has_patchable_run(last_tool_code)
             current_round_patch_mode = (
                 patch_mode
                 and round_idx > 1
@@ -4761,17 +5468,25 @@ class ControllerToolgenMixin:
                 # implementation.  Patching prior-strategy code against a new strategy
                 # produces incoherent diffs; always use a full rewrite after a pivot.
                 and not round_context.get("pivot_required")
-                and isinstance(last_tool_code, str)
+                # Phase 1: structural-rewrite directions must not patch; there is
+                # no prior code in the prompt to patch against.
+                and not phase1_retry_state["omit_prior_code"]
+                and last_tool_has_patchable_run
                 and isinstance(last_tool_spec, Mapping)
             )
             force_full_rewrite_next_round = False
             if current_round_patch_mode:
+                patch_current_code = self._toolgen_patch_sanitize_contract_retry_source(
+                    last_tool_code,
+                    feedback_note=feedback_note or "",
+                )
                 patch_plan, patch_raw = self._toolgen_generate_patch_plan_legacy(
                     system_prompt=system_prompt,
-                    current_code=last_tool_code,
+                    current_code=patch_current_code,
                     feedback_note=feedback_note or "",
                     round_history=round_history,
-                    base_prompt=base_prompt,
+                    base_prompt=round_base_prompt,
+                    phase1_omit_prior_code=phase1_retry_state["omit_prior_code"],
                 )
                 if not patch_plan:
                     try:
@@ -4786,6 +5501,17 @@ class ControllerToolgenMixin:
                         )
                     except Exception:
                         pass
+                    self._write_failed_tool_artifact(
+                        stage="patch_plan_parse",
+                        error="invalid_patch_plan",
+                        code=patch_current_code,
+                        raw_spec=last_tool_spec if isinstance(last_tool_spec, Mapping) else None,
+                        metadata=self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                            failure_family="patch_plan_parse_error",
+                        ),
+                    )
                     feedback_note = json.dumps(
                         {
                             "phase": "patch_plan_parse",
@@ -4798,7 +5524,7 @@ class ControllerToolgenMixin:
                     force_full_rewrite_next_round = True
                     continue
                 patched_code, patch_err = self._toolgen_apply_patch_plan(
-                    last_tool_code,
+                    patch_current_code,
                     patch_plan,
                 )
                 if patch_err or not patched_code:
@@ -4814,6 +5540,17 @@ class ControllerToolgenMixin:
                         )
                     except Exception:
                         pass
+                    self._write_failed_tool_artifact(
+                        stage="patch_apply",
+                        error=patch_err or "unknown_patch_apply_error",
+                        code=patch_current_code,
+                        raw_spec=last_tool_spec if isinstance(last_tool_spec, Mapping) else None,
+                        metadata=self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                            failure_family="patch_apply_error",
+                        ),
+                    )
                     feedback_note = json.dumps(
                         {
                             "phase": "patch_apply",
@@ -4825,6 +5562,10 @@ class ControllerToolgenMixin:
                     )
                     force_full_rewrite_next_round = True
                     continue
+                patched_code = self._toolgen_patch_sanitize_contract_retry_source(
+                    patched_code,
+                    feedback_note=feedback_note or "",
+                )
                 candidate = {
                     "tool_spec": dict(last_tool_spec),
                     "tool_code": patched_code,
@@ -4935,7 +5676,7 @@ class ControllerToolgenMixin:
                     salvage = self._extract_marked_python(raw_output)
                     if not salvage:
                         salvage = self._strip_code_fences(raw_output)
-                    if salvage and "def run" in salvage:
+                    if salvage and self._validate_run_ast(salvage) is None:
                         tool_spec = self._wrap_marker_tool_spec(salvage)
                         tool_name = str(tool_spec.get("name") or "")
                         tool_spec["name"] = self._apply_tool_name_prefix(tool_name, name_prefix)
@@ -4961,6 +5702,18 @@ class ControllerToolgenMixin:
                     )
                 except Exception:
                     pass
+                if str(candidate.get("error") or "") == "run_signature":
+                    force_full_rewrite_next_round = True
+                    feedback_note = json.dumps(
+                        {
+                            "phase": "run_signature",
+                            "error": str(candidate.get("run_signature_error") or error),
+                        },
+                        ensure_ascii=True,
+                        default=str,
+                    )
+                elif candidate.get("force_full_rewrite_next_round"):
+                    force_full_rewrite_next_round = True
                 self._write_failed_tool_artifact(
                     stage="toolgen_generation_failed",
                     error=error,
@@ -4987,6 +5740,17 @@ class ControllerToolgenMixin:
                     )
                 except Exception:
                     pass
+                self._write_failed_tool_artifact(
+                    stage="candidate_shape",
+                    error="candidate missing valid tool_spec or tool_code",
+                    code=tool_code if isinstance(tool_code, str) else None,
+                    raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                        failure_family="candidate_shape_error",
+                    ),
+                )
                 continue
             try:
                 self._append_generated_tools_log(
@@ -5045,12 +5809,9 @@ class ControllerToolgenMixin:
                     "CRITICAL: Do NOT write 'import kg_utils'. It is pre-injected as a global. "
                     "Remove the import line and call kg_utils.* directly."
                 )
-            if re.search(r'return\s+["\'](?:#\d*|MACRO\s+EXHAUSTED|ERROR)', tool_code):
-                critical_contract_issues.append(
-                    "CRITICAL: SSOT schema violation — run() must return the 3-key dict "
-                    "{\"status\": ..., \"final_variable\": ..., \"observation\": ...}. "
-                    "NEVER return a raw string or bare variable ID."
-                )
+            ssot_contract_error = self._toolgen_run_ssot_contract_error(tool_code)
+            if ssot_contract_error:
+                critical_contract_issues.append(ssot_contract_error)
             if critical_contract_issues:
                 crit_err = " | ".join(critical_contract_issues)
                 try:
@@ -5065,6 +5826,22 @@ class ControllerToolgenMixin:
                     )
                 except Exception:
                     pass
+                try:
+                    _crit_spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                except Exception:
+                    _crit_spec_obj = None
+                self._write_failed_tool_artifact(
+                    stage="critical_contract_fail",
+                    error=crit_err,
+                    spec=_crit_spec_obj,
+                    code=tool_code,
+                    raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                        failure_family="contract_violation",
+                    ),
+                )
                 feedback_note = json.dumps(
                     {"phase": "critical_contract_precheck", "error": crit_err},
                     ensure_ascii=True,
@@ -5435,6 +6212,22 @@ class ControllerToolgenMixin:
                     )
                 except Exception:
                     pass
+                try:
+                    _noreg_spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                except Exception:
+                    _noreg_spec_obj = None
+                self._write_failed_tool_artifact(
+                    stage="registration_no_validate",
+                    error="spec_alignment_or_validate",
+                    spec=_noreg_spec_obj,
+                    code=tool_code,
+                    raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                        failure_family="registration_error",
+                    ),
+                )
                 feedback_note = json.dumps(
                     {
                         "phase": "registration",
@@ -5461,6 +6254,17 @@ class ControllerToolgenMixin:
                     "[DEBUG] ToolGen Validator Result: no_validation_returned",
                     file=sys.stderr,
                     flush=True,
+                )
+                self._write_failed_tool_artifact(
+                    stage="validation_missing",
+                    error="no_validation_returned",
+                    code=tool_code,
+                    raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                        failure_family="validation_missing",
+                    ),
                 )
                 force_full_rewrite_next_round = True
                 continue
@@ -5544,6 +6348,7 @@ class ControllerToolgenMixin:
                         validation.get("partial_value_usable", False)
                     ),
                     semantic_code_smells=validation.get("semantic_code_smells") or [],
+                    runtime_repair_brief=validation.get("runtime_repair_brief"),
                     tool_code=tool_code,
                 )
             except Exception:
@@ -5591,7 +6396,47 @@ class ControllerToolgenMixin:
                     "validation": validation,
                 }
             elif plan_diagnosis == "DATA_SPARSE":
-                if not usefulness_passed or blocked_no_progress:
+                # DATA_SPARSE should only be honoured when the code is
+                # structurally clean and the KG graph truly appears empty.
+                # If the evidence points to code quality issues or a blocked
+                # handoff (tool itself failed, not the graph), override the
+                # diagnosis to OK so the normal failure path fires instead.
+                _data_sparse_code_smells = set(
+                    validation.get("semantic_code_smells") or []
+                ) & {
+                    "kg_utils_import_forbidden",
+                    "helper_signature_mismatch",
+                    "kg_utils_shape_probing",
+                    "task_text_semantic_rediscovery",
+                    "hardcoded_domain_token_list",
+                    "noncanonical_helper_surface",
+                    "custom_streaming_or_bucketing_architecture",
+                }
+                _data_sparse_handoff_blocked = str(
+                    (live_progress_summary or {}).get("handoff_state") or ""
+                ) == "blocked"
+                _data_sparse_clearly_code_failure = (
+                    bool(_data_sparse_code_smells)
+                    or grade <= 2
+                    or _data_sparse_handoff_blocked
+                )
+                if _data_sparse_clearly_code_failure:
+                    plan_diagnosis = "OK"
+                    try:
+                        self._append_generated_tools_log(
+                            {
+                                "event": "toolgen_data_sparse_overridden",
+                                "round": round_idx,
+                                "grade": grade,
+                                "tool_name": tool_spec.get("name"),
+                                "reason": "code_quality_or_handoff_failure",
+                                "blocking_smells": list(_data_sparse_code_smells),
+                                "handoff_blocked": _data_sparse_handoff_blocked,
+                            }
+                        )
+                    except Exception:
+                        pass
+                if plan_diagnosis == "DATA_SPARSE" and (not usefulness_passed or blocked_no_progress):
                     try:
                         self._append_generated_tools_log(
                             {
@@ -5606,7 +6451,7 @@ class ControllerToolgenMixin:
                         )
                     except Exception:
                         pass
-                else:
+                elif plan_diagnosis == "DATA_SPARSE":
                     # The KG lacks the data, but the code correctly handled the
                     # exhaustion. Stop burning generation rounds — no code change
                     # can conjure absent KG data. Accept the current candidate and
@@ -5662,6 +6507,10 @@ class ControllerToolgenMixin:
                     "repair_mode": validation.get("repair_mode"),
                     "summary": str(validation.get("summary") or "")[:300],
                     "top_issue": str((validation.get("issues") or [""])[0])[:300],
+                    "runtime_repair_brief": validation.get("runtime_repair_brief"),
+                    "primary_repair_instruction": validation.get(
+                        "primary_repair_instruction"
+                    ),
                     "strategy_family": validation.get("strategy_family"),
                     "execution_style": validation.get("execution_style"),
                     "preferred_tool_mode": validation.get("preferred_tool_mode"),
@@ -5699,6 +6548,10 @@ class ControllerToolgenMixin:
                         "failure_bucket": validation.get("failure_bucket"),
                         "value_delivered": validation.get("value_delivered"),
                         "achieved_state": validation.get("achieved_state"),
+                        "runtime_repair_brief": validation.get("runtime_repair_brief"),
+                        "primary_repair_instruction": validation.get(
+                            "primary_repair_instruction"
+                        ),
                         "same_strategy_as_previous": validation.get(
                             "same_strategy_as_previous"
                         ),
@@ -5787,6 +6640,10 @@ class ControllerToolgenMixin:
             if patch_mode and round_idx < max_rounds:
                 feedback_payload = {
                     "phase": "validator",
+                    "primary_repair_instruction": validation.get(
+                        "primary_repair_instruction"
+                    ),
+                    "runtime_repair_brief": validation.get("runtime_repair_brief"),
                     "grade": grade,
                     # Policy-computed diagnosis fields — exposed so the model can
                     # prioritise the dominant runtime failure over minor validator
@@ -5811,15 +6668,51 @@ class ControllerToolgenMixin:
                         phase="validator_blocked_no_progress",
                         usefulness_reason=usefulness_reason,
                         live_progress_summary=live_progress_summary,
+                        runtime_repair_brief=validation.get("runtime_repair_brief"),
+                        primary_repair_instruction=validation.get(
+                            "primary_repair_instruction"
+                        ),
                         validator_top_issue=_v_top,
                         validator_fixes=list(_v_fixes) if _v_fixes else None,
                     )
-                    # Only force full rewrite when the tool was truly blocked
-                    # (ERROR/SHAPE_MISMATCH → handoff_state="blocked").  MACRO
-                    # EXHAUSTED → "exhausted" is a patchable code issue (wrong
-                    # variable, wrong count); let patch mode continue.
+                    # Force full rewrite when:
+                    #   a) tool was truly blocked (ERROR/SHAPE_MISMATCH → "blocked"), OR
+                    #   b) 2+ consecutive exhausted-no-classified-value rounds — local
+                    #      patching cannot recover a tool that repeatedly delivers no value.
+                    _hs_v = str((live_progress_summary or {}).get("handoff_state") or "")
+                    _no_val_reason_v = usefulness_reason in {
+                        "exhausted_no_classified_value",
+                        "exhausted_no_actionable_handoff",
+                    }
+                    _consec_no_val_v = 0
+                    if _hs_v == "exhausted" and _no_val_reason_v:
+                        for _rh in reversed(round_history):
+                            if str(_rh.get("usefulness_reason") or "") in {
+                                "exhausted_no_classified_value",
+                                "exhausted_no_actionable_handoff",
+                            }:
+                                _consec_no_val_v += 1
+                            else:
+                                break
                     force_full_rewrite_next_round = (
-                        str((live_progress_summary or {}).get("handoff_state") or "") == "blocked"
+                        _hs_v == "blocked"
+                        or (_hs_v == "exhausted" and _no_val_reason_v and _consec_no_val_v >= 2)
+                    )
+                    try:
+                        _spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                    except Exception:
+                        _spec_obj = None
+                    self._write_failed_tool_artifact(
+                        stage="patch_validator_blocked",
+                        error=f"usefulness_reason={usefulness_reason}",
+                        spec=_spec_obj,
+                        code=tool_code,
+                        raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                        metadata=self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                            failure_family="usefulness_gate_failed",
+                        ),
                     )
                     continue
                 # Patch-mode staged gates:
@@ -5839,20 +6732,53 @@ class ControllerToolgenMixin:
                                 phase="usefulness_gate_blocked_no_progress",
                                 usefulness_reason=usefulness_reason,
                                 live_progress_summary=live_progress_summary,
+                                runtime_repair_brief=validation.get(
+                                    "runtime_repair_brief"
+                                ),
+                                primary_repair_instruction=validation.get(
+                                    "primary_repair_instruction"
+                                ),
                                 validator_top_issue=_v_top,
                                 validator_fixes=list(_v_fixes) if _v_fixes else None,
                             )
-                            # Only force full rewrite when the tool was truly blocked
-                            # (ERROR/SHAPE_MISMATCH → handoff_state="blocked").  MACRO
-                            # EXHAUSTED → "exhausted" is a patchable code issue; let
-                            # patch mode continue.
+                            # Force full rewrite when:
+                            #   a) tool was truly blocked (ERROR/SHAPE_MISMATCH → "blocked"), OR
+                            #   b) 2+ consecutive exhausted-no-classified-value rounds.
+                            _hs_ug = str(
+                                (live_progress_summary or {}).get("handoff_state") or ""
+                            )
+                            _no_val_reason_ug = usefulness_reason in {
+                                "exhausted_no_classified_value",
+                                "exhausted_no_actionable_handoff",
+                            }
+                            _consec_no_val_ug = 0
+                            if _hs_ug == "exhausted" and _no_val_reason_ug:
+                                for _rh in reversed(round_history):
+                                    if str(_rh.get("usefulness_reason") or "") in {
+                                        "exhausted_no_classified_value",
+                                        "exhausted_no_actionable_handoff",
+                                    }:
+                                        _consec_no_val_ug += 1
+                                    else:
+                                        break
                             force_full_rewrite_next_round = (
-                                str((live_progress_summary or {}).get("handoff_state") or "") == "blocked"
+                                _hs_ug == "blocked"
+                                or (
+                                    _hs_ug == "exhausted"
+                                    and _no_val_reason_ug
+                                    and _consec_no_val_ug >= 2
+                                )
                             )
                         else:
                             feedback_note = json.dumps(
                                 {
                                     "phase": "usefulness_gate",
+                                    "primary_repair_instruction": validation.get(
+                                        "primary_repair_instruction"
+                                    ),
+                                    "runtime_repair_brief": validation.get(
+                                        "runtime_repair_brief"
+                                    ),
                                     "error": (
                                         "Tool is structurally valid but did not make "
                                         "material task progress toward the declared plan."
@@ -5865,6 +6791,22 @@ class ControllerToolgenMixin:
                                 default=str,
                             )
                             force_full_rewrite_next_round = False
+                        try:
+                            _spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                        except Exception:
+                            _spec_obj = None
+                        self._write_failed_tool_artifact(
+                            stage="patch_usefulness_gate",
+                            error=f"usefulness_reason={usefulness_reason}",
+                            spec=_spec_obj,
+                            code=tool_code,
+                            raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                            metadata=self._toolgen_round_failure_metadata(
+                                round_context=round_context,
+                                tool_plan=current_tool_plan,
+                                failure_family="usefulness_gate_failed",
+                            ),
+                        )
                         continue
                     live_validation = self._toolgen_validate_candidate_tool(
                         tool_spec,
@@ -6170,16 +7112,42 @@ class ControllerToolgenMixin:
                             phase="live_gate_blocked_no_progress",
                             usefulness_reason=live_usefulness_reason,
                             live_progress_summary=live_progress,
+                            runtime_repair_brief=live_validation.get(
+                                "runtime_repair_brief"
+                            ),
+                            primary_repair_instruction=live_validation.get(
+                                "primary_repair_instruction"
+                            ),
                             validator_top_issue=_lv_top,
                             validator_fixes=list(_lv_fixes) if _lv_fixes else None,
                         )
-                        # Only force full rewrite when the tool was truly blocked
-                        # (ERROR/SHAPE_MISMATCH/no live result → handoff_state="blocked").
-                        # MACRO EXHAUSTED → "exhausted" may be a patchable code issue
-                        # (wrong variable, wrong count) rather than a strategy failure,
-                        # so let patch mode continue for exhausted results.
+                        # Force full rewrite when:
+                        #   a) the tool was truly blocked, OR
+                        #   b) 2+ consecutive exhausted-no-classified-value rounds were
+                        #      observed at live gate. In that case local patching is too
+                        #      conservative and contradicts the runtime-first redesign goal.
+                        _hs_lg = str((live_progress or {}).get("handoff_state") or "")
+                        _no_val_reason_lg = live_usefulness_reason in {
+                            "exhausted_no_classified_value",
+                            "exhausted_no_actionable_handoff",
+                        }
+                        _consec_no_val_lg = 0
+                        if _hs_lg == "exhausted" and _no_val_reason_lg:
+                            for _rh in reversed(round_history):
+                                if str(_rh.get("usefulness_reason") or "") in {
+                                    "exhausted_no_classified_value",
+                                    "exhausted_no_actionable_handoff",
+                                }:
+                                    _consec_no_val_lg += 1
+                                else:
+                                    break
                         force_full_rewrite_next_round = (
-                            str((live_progress or {}).get("handoff_state") or "") == "blocked"
+                            _hs_lg == "blocked"
+                            or (
+                                _hs_lg == "exhausted"
+                                and _no_val_reason_lg
+                                and _consec_no_val_lg >= 2
+                            )
                         )
                     else:
                         feedback_note = json.dumps(
@@ -6188,6 +7156,12 @@ class ControllerToolgenMixin:
                                     "live_gate_usefulness"
                                     if live_grade >= min_grade and not live_usefulness_passed
                                     else "live_gate_validation"
+                                ),
+                                "primary_repair_instruction": live_validation.get(
+                                    "primary_repair_instruction"
+                                ),
+                                "runtime_repair_brief": live_validation.get(
+                                    "runtime_repair_brief"
                                 ),
                                 "grade": live_grade,
                                 "failure_family": live_validation.get("failure_family"),
@@ -6208,6 +7182,22 @@ class ControllerToolgenMixin:
                         )
                         force_full_rewrite_next_round = False
                     continue
+                try:
+                    _spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                except Exception:
+                    _spec_obj = None
+                self._write_failed_tool_artifact(
+                    stage="patch_grade_below_threshold",
+                    error=f"grade={grade} below min_grade={min_grade}",
+                    spec=_spec_obj,
+                    code=tool_code,
+                    raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                        failure_family="grade_below_threshold",
+                    ),
+                )
                 feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
                 force_full_rewrite_next_round = False
                 continue
@@ -6238,6 +7228,10 @@ class ControllerToolgenMixin:
                             phase="usefulness_gate_blocked_no_progress",
                             usefulness_reason=usefulness_reason,
                             live_progress_summary=live_progress_summary,
+                            runtime_repair_brief=validation.get("runtime_repair_brief"),
+                            primary_repair_instruction=validation.get(
+                                "primary_repair_instruction"
+                            ),
                             validator_top_issue=_v_top2,
                             validator_fixes=list(_v_fixes2) if _v_fixes2 else None,
                         )
@@ -6245,6 +7239,12 @@ class ControllerToolgenMixin:
                         feedback_note = json.dumps(
                             {
                                 "phase": "usefulness_gate",
+                                "primary_repair_instruction": validation.get(
+                                    "primary_repair_instruction"
+                                ),
+                                "runtime_repair_brief": validation.get(
+                                    "runtime_repair_brief"
+                                ),
                                 "error": (
                                 "Tool was structurally valid but not materially helpful "
                                 "toward the declared plan."
@@ -6255,6 +7255,22 @@ class ControllerToolgenMixin:
                         },
                         ensure_ascii=True,
                         default=str,
+                    )
+                    try:
+                        _spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                    except Exception:
+                        _spec_obj = None
+                    self._write_failed_tool_artifact(
+                        stage="usefulness_gate",
+                        error=f"usefulness_reason={usefulness_reason}",
+                        spec=_spec_obj,
+                        code=tool_code,
+                        raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                        metadata=self._toolgen_round_failure_metadata(
+                            round_context=round_context,
+                            tool_plan=current_tool_plan,
+                            failure_family="usefulness_gate_failed",
+                        ),
                     )
                     force_full_rewrite_next_round = True
                     continue
@@ -6353,6 +7369,22 @@ class ControllerToolgenMixin:
                     if "input_schema_required_mismatch" in err_key:
                         reg_feedback["error"] = err_msg
                         break
+                try:
+                    _spec_obj = ToolSpec.from_payload(dict(tool_spec))
+                except Exception:
+                    _spec_obj = None
+                self._write_failed_tool_artifact(
+                    stage="registration_rejected",
+                    error=f"grade={grade} passed validator but registration failed",
+                    spec=_spec_obj,
+                    code=tool_code,
+                    raw_spec=tool_spec if isinstance(tool_spec, Mapping) else None,
+                    metadata=self._toolgen_round_failure_metadata(
+                        round_context=round_context,
+                        tool_plan=current_tool_plan,
+                        failure_family="registration_error",
+                    ),
+                )
                 feedback_note = json.dumps(
                     reg_feedback, ensure_ascii=True, default=str
                 )
@@ -6397,6 +7429,12 @@ class ControllerToolgenMixin:
                     "failure_family": _val_dict.get("failure_family"),
                     "failure_bucket": _val_dict.get("failure_bucket"),
                     "value_delivered": _val_dict.get("value_delivered"),
+                    "runtime_repair_brief": _val_dict.get("runtime_repair_brief"),
+                    "primary_repair_instruction": _val_dict.get(
+                        "primary_repair_instruction"
+                    ),
+                    "missing_value_type": _val_dict.get("missing_value_type"),
+                    "redesign_direction": _val_dict.get("redesign_direction"),
                     "same_strategy_as_previous": _val_dict.get(
                         "same_strategy_as_previous"
                     ),
@@ -6457,6 +7495,14 @@ class ControllerToolgenMixin:
                     "repair_mode": validation.get("repair_mode") if isinstance(validation, dict) else None,
                     "summary": str((validation.get("summary") or "") if isinstance(validation, dict) else "")[:300],
                     "top_issue": str(((validation.get("issues") or [""])[0]) if isinstance(validation, dict) else "")[:300],
+                    "runtime_repair_brief": validation.get("runtime_repair_brief")
+                    if isinstance(validation, dict)
+                    else None,
+                    "primary_repair_instruction": validation.get(
+                        "primary_repair_instruction"
+                    )
+                    if isinstance(validation, dict)
+                    else None,
                 }
                 self._append_generated_tools_log(
                     {
@@ -6488,6 +7534,10 @@ class ControllerToolgenMixin:
                     phase="validator_blocked_no_progress",
                     usefulness_reason=usefulness_reason,
                     live_progress_summary=live_progress_summary,
+                    runtime_repair_brief=_val_dict.get("runtime_repair_brief"),
+                    primary_repair_instruction=_val_dict.get(
+                        "primary_repair_instruction"
+                    ),
                     validator_top_issue=_vf_top,
                     validator_fixes=list(_vf_fixes) if _vf_fixes else None,
                 )
@@ -6503,6 +7553,12 @@ class ControllerToolgenMixin:
                 adapter_feedback_note = self._toolgen_adapter_feedback_note(validation)
                 if adapter_feedback_note:
                     feedback_payload["critical_instruction"] = adapter_feedback_note
+                feedback_payload["primary_repair_instruction"] = _val_dict.get(
+                    "primary_repair_instruction"
+                )
+                feedback_payload["runtime_repair_brief"] = _val_dict.get(
+                    "runtime_repair_brief"
+                )
                 feedback_note = json.dumps(
                     feedback_payload, ensure_ascii=True, default=str
                 )
@@ -6891,7 +7947,20 @@ class ControllerToolgenMixin:
                     raw_output=raw_text_full,
                 )
                 return {"error": "toolgen_markers_missing", "raw_output": raw_text_full}
-
+        run_sig_error = self._validate_run_ast(extracted)
+        if run_sig_error:
+            self._write_failed_tool_artifact(
+                stage="run_signature",
+                error=run_sig_error,
+                code=extracted,
+                raw_output=raw_text_full,
+            )
+            return {
+                "error": "run_signature",
+                "raw_output": raw_text_full,
+                "run_signature_error": run_sig_error,
+                "force_full_rewrite_next_round": True,
+            }
         tool_spec = self._wrap_marker_tool_spec(extracted)
         tool_name = str(tool_spec.get("name") or "")
         tool_spec["name"] = self._apply_tool_name_prefix(tool_name, name_prefix)
@@ -7550,18 +8619,73 @@ class ControllerToolgenMixin:
             return "input_schema_required_mismatch"
         return None
 
-    def _validate_run_ast(self, code: str) -> Optional[str]:
+    @staticmethod
+    def _toolgen_top_level_run_ast(
+        code: str,
+    ) -> tuple[Optional[ast.FunctionDef], Optional[str]]:
         try:
             tree = ast.parse(code)
         except Exception as exc:
-            return f"ast_parse_failed: {exc}"
-        run_fn = None
+            return None, f"ast_parse_failed: {exc}"
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name == "run":
-                run_fn = node
-                break
-        if run_fn is None:
-            return "run_not_found"
+                return node, None
+        return None, "run_not_found"
+
+    @staticmethod
+    def _toolgen_iter_non_nested_returns(
+        function_node: ast.FunctionDef,
+    ) -> Iterable[ast.Return]:
+        stack: list[ast.AST] = list(reversed(function_node.body))
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.Return):
+                yield node
+                continue
+            if isinstance(
+                node,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+            ):
+                continue
+            stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+    @staticmethod
+    def _toolgen_string_literal_value(node: Optional[ast.AST]) -> Optional[str]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            parts: list[str] = []
+            for value in node.values:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    parts.append(value.value)
+                    continue
+                return None
+            return "".join(parts)
+        return None
+
+    def _toolgen_run_ssot_contract_error(self, code: str) -> Optional[str]:
+        run_fn, run_error = self._toolgen_top_level_run_ast(code)
+        if run_error is not None or run_fn is None:
+            return None
+        for return_node in self._toolgen_iter_non_nested_returns(run_fn):
+            literal_value = self._toolgen_string_literal_value(return_node.value)
+            if literal_value is None:
+                continue
+            if re.match(r'^(?:#\d*|MACRO\s+EXHAUSTED|ERROR)', literal_value):
+                return (
+                    "CRITICAL: SSOT schema violation — run() must return the 3-key dict "
+                    '{"status": ..., "final_variable": ..., "observation": ...}. '
+                    "NEVER return a raw string or bare variable ID."
+                )
+        return None
+
+    def _toolgen_has_patchable_run(self, code: Any) -> bool:
+        return isinstance(code, str) and self._validate_run_ast(code) is None
+
+    def _validate_run_ast(self, code: str) -> Optional[str]:
+        run_fn, run_error = self._toolgen_top_level_run_ast(code)
+        if run_error is not None or run_fn is None:
+            return run_error
         args = run_fn.args
         total_args = list(args.posonlyargs) + list(args.args)
         if len(total_args) != 1 or total_args[0].arg != "payload":

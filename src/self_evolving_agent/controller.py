@@ -40,7 +40,6 @@ from .controller_prompts import (
     TOOL_INVOKER_SYSTEM_PROMPT,
     COMBINED_ORCHESTRATOR_SYSTEM_PROMPT,
     TOOLGEN_VALIDATOR_SYSTEM_PROMPT,
-    AGG_TOOLGEN_USER_KG,
     MACRO_TOOLGEN_USER_KG,
 )
 from .controller_toolgen import ControllerToolgenMixin
@@ -1331,16 +1330,8 @@ class SelfEvolvingController(
                 setattr(self, "_toolgen_execution_payload", exec_payload)
                 requested_tool_type = "macro"
                 if env_name == "knowledge_graph":
-                    system_prompt = (
-                        MACRO_TOOLGEN_USER_KG
-                        if requested_tool_type == "macro"
-                        else AGG_TOOLGEN_USER_KG
-                    )
-                    prompt_name = (
-                        "MACRO_TOOLGEN_USER_KG"
-                        if requested_tool_type == "macro"
-                        else "AGG_TOOLGEN_USER_KG"
-                    )
+                    system_prompt = MACRO_TOOLGEN_USER_KG
+                    prompt_name = "MACRO_TOOLGEN_USER_KG"
                 else:
                     system_prompt = get_toolgen_system_prompt("aggregate3", env_name)
                     prompt_name = f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}"
@@ -1352,7 +1343,7 @@ class SelfEvolvingController(
                         name_prefix=getattr(self, "_toolgen_name_prefix", ""),
                         prompt_name=prompt_name,
                         force_strict=True,
-                        force_max_rounds=8,
+                        force_max_rounds=self.MAX_TOOLGEN_ROUNDS,
                     )
                 finally:
                     setattr(self, "_toolgen_execution_payload", prev_exec_payload)
@@ -1370,16 +1361,8 @@ class SelfEvolvingController(
                 final_user_prompt = reflection_header + user_prompt
                 requested_tool_type = "macro"
                 if env_name == "knowledge_graph":
-                    system_prompt = (
-                        MACRO_TOOLGEN_USER_KG
-                        if requested_tool_type == "macro"
-                        else AGG_TOOLGEN_USER_KG
-                    )
-                    prompt_name = (
-                        "MACRO_TOOLGEN_USER_KG"
-                        if requested_tool_type == "macro"
-                        else "AGG_TOOLGEN_USER_KG"
-                    )
+                    system_prompt = MACRO_TOOLGEN_USER_KG
+                    prompt_name = "MACRO_TOOLGEN_USER_KG"
                 else:
                     system_prompt = get_toolgen_system_prompt(
                         getattr(self, "_toolgen_pipeline_name", "baseline"),
@@ -1402,7 +1385,7 @@ class SelfEvolvingController(
                         name_prefix=getattr(self, "_toolgen_name_prefix", ""),
                         prompt_name=prompt_name,
                         force_strict=True,
-                        force_max_rounds=8,
+                        force_max_rounds=self.MAX_TOOLGEN_ROUNDS,
                     )
                 finally:
                     setattr(self, "_toolgen_execution_payload", prev_exec_payload)
@@ -1802,7 +1785,18 @@ class SelfEvolvingController(
                 )
                 _mid_task = bool(pre_orch_trace)
 
-                if real_existing_tools_count > 0:
+                if self._force_toolgen_always_on:
+                    # Bypass all forge-denial gates when testing flag is set.
+                    # Production gates (existing tools, circuit breakers,
+                    # not-stuck) are intentionally skipped so every task
+                    # exercises the full ToolGen loop when the orchestrator
+                    # explicitly requests a new tool under the test-mode prompt.
+                    forge_allowed = True
+                    forge_denied_reason = None
+                    self._append_loop_log(
+                        "  [FORCE_TOOLGEN_ALWAYS_ON] All forge denial gates bypassed."
+                    )
+                elif real_existing_tools_count > 0:
                     action = "use_tool"
                     forge_denied_reason = "real_tools_available"
                     self._append_loop_log(
@@ -1884,6 +1878,7 @@ class SelfEvolvingController(
                         file=sys.stderr,
                         flush=True,
                     )
+                if forge_allowed:
                     self._append_loop_log("  >>> ESCAPE HATCH TRIGGERED <<<")
                     escape_result = self._handle_escape_hatch(
                         decision, task_query, working_history

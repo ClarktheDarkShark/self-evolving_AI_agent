@@ -919,7 +919,13 @@ class ControllerOrchestratorMixin:
 
         # Extract escape hatch arguments from the orchestrator decision
         reason = str(decision.get("reason") or "")
-        tool_type = str(decision.get("tool_type") or "advisory")
+        env_name = ""
+        try:
+            env_name = str(self._resolved_environment_label() or "").strip().lower()
+        except Exception:
+            env_name = ""
+        default_tool_type = "macro" if env_name == "knowledge_graph" else "advisory"
+        tool_type = str(decision.get("tool_type") or default_tool_type)
 
         # Build an enriched query for ToolGen from the escape hatch context
         parts = [query]
@@ -1469,6 +1475,16 @@ class ControllerOrchestratorMixin:
                 f"\n\n[CRITICAL OVERRIDE]: The Forge just successfully generated a new tool "
                 f"named '{forced_tool_name}' specifically to solve your current roadblock. "
                 f"You MUST output action='use_tool' and tool_name='{forced_tool_name}' on this exact turn."
+            )
+        elif getattr(self, "_force_toolgen_always_on", False):
+            prompt += (
+                "\n\n[TEST MODE OVERRIDE]: FORCE_TOOLGEN_ALWAYS_ON is enabled for this run. "
+                "You MUST NOT output action='no_tool'. You MUST choose either "
+                "action='use_tool' for a real fitting existing tool or action='request_new_tool'. "
+                "If you request a new tool, set tool_type='macro' and fully populate the "
+                "required tool-generation fields with the strongest credible KG plan you can build now, "
+                "including target_concept, entity_target_concepts, and a non-empty "
+                "topological_execution_plan."
             )
         return prompt
 
