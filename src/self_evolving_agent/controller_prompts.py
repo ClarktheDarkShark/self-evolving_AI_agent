@@ -403,6 +403,28 @@ LEGALITY PRIORITY RULE
 - If a hard contract violation directly caused failure, keep that violation high in the issue list.
 - But if live evidence also shows no value delivered, do not let formatting/style issues bury the stronger runtime-value failure.
 
+### 1b. MANDATORY GROUNDED HANDOFF (TOP-PRIORITY REPAIR)
+If evidence shows the tool reached a real intermediate-set state but returned final_variable=None:
+
+These "built-set" states REQUIRE a grounded handoff:
+  - built_target_set
+  - built_both_sets
+  - built_intersection_set
+  - built_filter_ready_set
+
+When a tool reaches one of these states AND returns final_variable=None with
+status="MACRO EXHAUSTED" (and the set was not subsequently consumed and emptied):
+- This is a TOP-PRIORITY repair target. It takes precedence over formatting/wording issues.
+- The first item in `issues` MUST be: "missing_grounded_handoff_after_real_progress"
+- Set `repair_mode="rewrite_code"`.
+- Grade MUST be 4 or lower regardless of other quality signals.
+- The fix MUST instruct the tool to return status="SUCCESS" with final_variable=#N (the built set)
+  instead of exhausting.
+
+Do NOT bury this failure under generic wording like "no value delivered." Name it explicitly.
+It is distinct from: tool failed to build any set (which is "no_runtime_progress").
+This is: tool built a real set, then discarded it by continuing into a failing step.
+
 ### 2. COUNT RULE (STRICT)
 For count tasks:
 - The tool must call `extract_var_ids` on the count result.
@@ -499,6 +521,7 @@ Weak reward (5–6)
 - `built_target_set`
 - `built_both_sets`
 - `built_intersection_set`
+- `built_filter_ready_set`
 - `built_attribute_context`
 - `grounded_diagnostic_finding`
 
@@ -521,28 +544,65 @@ Do not treat internal bookkeeping or diagnostic chatter as verified reusable val
   After repeated same-strategy no-progress failures, recommend a strategy pivot, execution-style switch, or alternate tool mode.
 - RETRY-FIT RULE:
   If runtime context indicates a progress-oriented retry, penalize candidates that still behave like full-solve scaffolds or translator-style wrappers rather than stopping at the first grounded useful KG state.
+- INTEGRATION CONTEXT FAILURE (integration_context_invalid):
+  When execution could not start because of missing or incompatible context (e.g., missing payload keys), classify as `failure_family="integration_context_invalid"`. Do NOT recommend a strategy pivot for this failure class — the fix is a local payload/context correction, not a strategy change.
 
 ### 8. KG CODE-SMELL RULES
 Penalize the following when present, especially when usefulness is weak/absent:
 
 - TARGET MISMATCH:
   resolving a starting entity using the downstream answer type instead of the entity’s own natural type or `None`
-- OPERAND ROLE COLLAPSE:
-  flattening mixed-role operands into blanket “resolve all entities” logic when the plan distinguishes anchors from filters/modifiers/categories
-- ATTRIBUTE MISUSE:
-  treating `attribute_target_concept` as a default starting anchor when it should behave as filter/sort/modifier semantics
+- OPERAND ROLE COLLAPSE (HARD PENALTY):
+  flattening mixed-role operands into blanket “resolve all entities” logic when the plan or
+  semantic fields (entity_target_concepts, attribute_target_concept) distinguish anchors from
+  filters/modifiers/categories. When richer semantic fields are present, blanket resolution is
+  a generalization failure — not a minor smell. Penalize with grade cap and repair_mode=”rewrite_code”.
+- ATTRIBUTE MISUSE (HARD PENALTY):
+  treating `attribute_target_concept` as a default starting anchor when it should behave as
+  filter/sort/modifier semantics. Resolving attribute_target_concept with resolve_entity_to_vars
+  alongside entity anchors (when the plan does not explicitly require it) is a role violation.
 - FACADE PROBING:
   `hasattr()`, `getattr()`, `type()`, `isinstance()` on `kg_utils`, primitives, or `actions_spec`
 - ADAPTER ARCHITECTURE:
   dict-vs-object helper branching or shape-probing wrappers
 - REGRESSION BAN:
   later retry regresses into adapter-style probing after an earlier cleaner candidate achieved more value
+- PRESERVED-ANCHOR MISUSE (HARD PENALTY):
+  assigning the same `variable_list`/`resolved_anchors` list to both anchor_a_ids and anchor_b_ids without
+  per-anchor slicing (e.g., `anchor_a_ids = preserved_ids; anchor_b_ids = preserved_ids`). This produces
+  identical operands in walk/intersect steps, making the intersection trivially self-intersect or wrong.
+  The canonical pattern slices the preserved list: anchor i → `preserved_list[i]`.
+  Penalize with grade cap and repair_mode="rewrite_code".
+- PRESERVED-ANCHOR BLOCKING ERROR (HARD PENALTY):
+  returning ERROR or MACRO EXHAUSTED solely because `payload["variable_list"]` or
+  `payload["resolved_anchors"]` is absent. The correct behavior is to re-resolve from payload["entities"]
+  as fallback recovery, then continue to the required stage. Never error on absence of preserved state.
+- POSITIONAL ENTITY ROLE GUESSING (HARD PENALTY):
+  selecting anchor entities by position from `entities` using `entities[0]`, `entities[1]`,
+  `idx < 2`, `counter >= 2`, or equivalent "first N entities are anchors" logic. Entity
+  positions are task-arbitrary and will produce wrong results on any task where the anchor
+  entities are not in that exact order. The correct approach is to use `anchor_operands` from
+  `tool_plan` (all entities in that list are anchors), and to use `filter_operand` for the
+  semantic filter concept type — never searching for a "third entity attribute value."
+  Penalize with grade cap and repair_mode="rewrite_code".
+- TERMINAL ARTIFACT FAMILY MISMATCH (HARD PENALTY):
+  returning a different artifact kind than terminal_artifact_kind for the declared
+  template_family (e.g., returning a raw intersection set when terminal_artifact_kind=count_variable,
+  or returning a scalar when terminal_artifact_kind=filtered_set_variable).
+  Penalize with grade cap and repair_mode="rewrite_code".
 - VERBOSITY / SCAFFOLDING:
   bulky fallback scaffolding, helper proliferation, comment-heavy code, long docstrings, repeated normalization blocks
 - SIZE / DIRECTNESS PREFERENCE:
   prefer small direct tools over generalized frameworks, wrapper layers, speculative helper abstractions, or pseudo-framework code when the same value could be delivered more simply
 - DEAD WEIGHT PENALTY:
   dead branches, preserved legacy code, repeated fallback ladders, one-use helpers that add no runtime value
+- TASK IMPRINTING / HARDCODED ENTITY NAMES (GENERALIZATION FAILURE):
+  any string literal in code logic, candidate_map keys, or observation-building that embeds
+  a task-specific entity name (e.g., "resolved_Milk", "walk_Goat_to_cheese") instead of
+  deriving the label dynamically from payload fields.
+  This is NOT a style issue — it is a real generalization failure that makes the tool
+  non-reusable across tasks. Treat as "hardcoded_entity_in_label" smell.
+  Penalize with grade cap and repair_mode="rewrite_code" when usefulness is otherwise weak.
 
 Do NOT penalize:
 - legal deduplication such as `list(set(ids))`
@@ -572,6 +632,20 @@ CRITICAL INTERPRETATION RULES
 - For `resolve_semantic_filter`, `variable_list` must come from authoritative live context when available
 - Penalize fabricated empty `variable_list=[]` when real live context exists
 - Do not reward code that only appears shape-correct while violating live helper semantics
+
+LIVE-CONTEXT MISUSE (HARD FAIL / MUST FLAG AS RUNTIME_CONTEXT_MISUSE):
+A tool commits live-context misuse when it calls a downstream helper with stale, pre-target,
+or fabricated context after a live target set already exists. Specifically:
+
+- resolve_semantic_filter called with anchor_vars as variable_list when a live target set
+  was already built in a preceding step = RUNTIME_CONTEXT_MISUSE
+- resolve_semantic_filter called with variable_list=[] when real live ids exist = RUNTIME_CONTEXT_MISUSE
+- Any helper passed a hardcoded list instead of the actual live extracted ids = RUNTIME_CONTEXT_MISUSE
+
+This is NOT a minor code smell. It is a helper-contract violation that invalidates the
+downstream operation. Treat it the same as an incorrect argument order / wrong signature.
+Add "runtime_context_misuse: resolve_semantic_filter passed pre-target anchor context"
+(or equivalent) as an issue, set repair_mode="rewrite_code", and reduce grade accordingly.
 
 ### 11. EXHAUSTION GUIDANCE CONSISTENCY
 - If a real actionable anchor exists, next-action guidance should reference that real grounded anchor.
@@ -763,12 +837,13 @@ NO PLAN, NO TOOL RULE
 - Do NOT perform traversal, intersection, filter, or count logic against an empty/absent plan context.
 
 ### 3. CODE SHAPE RULES
-- Write the smallest correct KG tool for this retry.
+- Write the SMALLEST correct tool.
 - Minimize implementation surface area: few helpers, few branches, no scaffolding, no wrappers, no dead fallback frameworks.
 - Prefer direct logic inside `run(payload)` over extra helpers.
 - Prefer exactly two top-level functions: `run(payload)` and `self_test()`.
 - Reuse provided helpers instead of re-implementing KG logic.
-- Do not add explanatory comments, long docstrings, demo code, or no-op framework code.
+- Do NOT add explanatory comments, long docstrings, demo code, or no-op framework code.
+- The retry context will contain `strategy_family`, `execution_style`, and `preferred_tool_mode` — follow them exactly.
 - Keep only:
   - required metadata header block
   - one short module docstring
@@ -798,6 +873,28 @@ CRITICAL:
 - For `resolve_semantic_filter`, `variable_list` must come from live current context (typically current resolved/walked/intersected vars). Use `payload.get("variable_list")` only as a true fallback when it is clearly intended runtime context.
 - Never fabricate empty live context just to satisfy a call.
 
+LIVE-CONTEXT CANONICALIZATION (MANDATORY):
+Immediately after any set-producing helper or primitive, extract and deduplicate IDs:
+  raw_ids = kg_utils.extract_var_ids(env_output)
+  ids = list(dict.fromkeys(v for v in raw_ids if isinstance(v, str) and v.startswith("#")))
+Pass ONLY these canonical deduplicated `ids` lists downstream. Never pass raw helper output.
+
+For `resolve_semantic_filter` specifically:
+- `variable_list` MUST be the actual live current candidate-set from a preceding step.
+- It MUST NOT be the anchor vars from a resolve_entity_to_vars step (those are PRE-target).
+- It MUST NOT be an empty list [] unless the previous step genuinely produced no ids.
+- It MUST NOT be a fabricated or hardcoded list.
+
+RIGHT:  ids_a = ...(resolve step A)...
+        ids_b = ...(walk/filter step B building the target set)...
+        rsf_out = kg_utils.resolve_semantic_filter(ids_b[0], target_concept, ids_b, ...)
+WRONG:  ids_a = ...(anchor resolve)...
+        rsf_out = kg_utils.resolve_semantic_filter(ids_a[0], target_concept, ids_a, ...)
+        # ids_a is the anchor set, not the target set — this is pre-target context misuse.
+
+If the live target set does not yet exist at the resolve_semantic_filter call site, build it
+(with walk_to_target or similar) before calling resolve_semantic_filter.
+
 ### 6. STATIC / SAFETY BANS
 - NO BRACKET INDEXING: do not use `x[0]`, `x[-1]`, etc.
 - NO TUPLE/LIST UNPACKING to bypass the index ban.
@@ -821,6 +918,29 @@ CRITICAL:
 - Use source-grounded keys like:
   `"resolved_Goat"`, `"walk_Goat_to_cheese"`, `"texture_filter"`, `"intersect_animals"`.
 
+LABEL DERIVATION MANDATE (ANTI-HARDCODING CRITICAL):
+All candidate_map keys, observation labels, and variable labels MUST be derived at runtime
+from payload fields. Do NOT embed task entity names as string literals in the code.
+
+WRONG:  candidate_map["resolved_Milk"] = anchor_ids   # hardcoded entity name
+        candidate_map["walk_Goat_to_cheese"] = walked_ids  # hardcoded entities
+
+RIGHT:  for entity in entities:
+            key = f"resolved_{entity}"
+            candidate_map[key] = ...
+
+RIGHT:  anchor_key = f"resolved_{anchor_entity}"   # anchor_entity from payload loop
+        target_key = f"walked_{anchor_entity}_to_{target_concept}"
+
+Specifically:
+- Keys MUST use f-strings with runtime values from payload["entities"],
+  payload["target_concept"], payload.get("attribute_target_concept"), etc.
+- Observation text may reference entity names for human readability but must derive them
+  from payload fields, not hardcode them.
+- Any string literal of the form "resolved_<SpecificEntityName>" or
+  "walk_<SpecificEntityName>_to_<Concept>" is a hardcoding violation if the entity name
+  is not derived from a payload field at that point in the code.
+
 ### 8. KG EXECUTION RULES
 - Never pass raw entity strings directly into traversal helpers. Resolve entities first with `kg_utils.resolve_entity_to_vars`.
 - `resolve_entity_to_vars` expects a SINGLE entity string. Extract that entity using a loop, not indexing.
@@ -834,11 +954,28 @@ CRITICAL:
 - Only apply walk/type-parity logic if the provided plan includes that walk. Do not invent unprompted walks.
 
 OPERAND ROLE PRESERVATION (CRITICAL)
-- Do NOT assume every item in `payload["entities"]` is a starting entity anchor.
+- Do NOT assume every item in `payload[“entities”]` is a starting entity anchor.
 - Treat `entity_target_concepts` as aligned only to the subset of operands used as starting anchors.
 - If the plan or payload includes `attribute_target_concept`, treat it as filter/sort/modifier semantics by default, not as something to resolve alongside anchor entities unless the plan explicitly requires that.
 - Preserve anchor/modifier distinctions exactly.
 - Do NOT write a blanket “resolve all entities” loop unless the plan clearly requires it.
+
+ANCHOR SELECTION FROM PLAN (HARD RULE):
+Anchor operands are determined by topological_execution_plan and entity_target_concepts alignment,
+NOT by raw entity order in payload[“entities”].
+
+- If entity_target_concepts is present and non-empty, use it as aligned per-anchor type hints.
+  The i-th hint maps to the i-th entity in the ordered list. Use that alignment explicitly:
+    for entity, hint in zip(entities, entity_target_concepts or [None]*len(entities)):
+        ... resolve_entity_to_vars(entity, hint or target_concept, ...)
+- If the plan specifies only ONE anchor and ONE filter/category operand, only ONE call to
+  resolve_entity_to_vars should appear. Do not resolve the filter as an anchor.
+- If attribute_target_concept is present in the payload, DO NOT pass it to
+  resolve_entity_to_vars. It is NOT a KG entity to resolve; it is a semantic modifier.
+- If the plan says “resolve Entity A, then walk to target concept”, only Entity A is resolved
+  with resolve_entity_to_vars. The target concept is not.
+- Blanket loops that resolve ALL entities without role discrimination are ONLY acceptable when
+  the plan EXPLICITLY states every entity is a starting anchor of equal role.
 
 ACTIONS SPEC RULE
 - Treat `actions_spec` as the declared primitive map.
@@ -853,7 +990,99 @@ PLAN-SHAPE SAFETY RULE
 - Do NOT assume list-shaped and dict-shaped plan objects are interchangeable.
 - Do NOT call dict-style accessors on a list-shaped plan object.
 
-### 9. COUNT RULE
+### 8b. TYPED OPERAND-ROLE CONTRACT (HARD RULE)
+
+When `tool_plan` contains `template_family`, `anchor_operands`, `filter_operand`, and `terminal_artifact_kind`, these are the authoritative source of truth for operand roles. You MUST use them instead of inferring roles from entity order.
+
+TYPED ROLE SLOTS:
+- `anchor_operands`: List of entities to resolve as KG anchors. Iterate over this list, NOT over `entities` directly. All entities in anchor_operands are anchors — there is no "third entity attribute value."
+- `filter_operand`: A semantic concept type string (e.g. "food.cheese.milk_source"), NOT a KG entity. Pass it as `target_concept` to `resolve_semantic_filter` or `walk_to_target`. Do NOT search for it in `entities`.
+- `terminal_artifact_kind`: The exact artifact type this tool must return. See family rules below.
+- `template_family`: The execution family. Determines legal stage order and terminal artifact.
+
+FAMILY STAGE ORDERS AND TERMINAL ARTIFACTS:
+
+`two_anchor_intersect_filter_set`:
+1. Resolve each entity in anchor_operands → per-anchor #N variable
+2. Walk each anchor to target_concept → per-anchor walked set
+3. Intersect the two walked sets → intersection #N variable
+4. Apply resolve_semantic_filter(base_var=intersection[0], target_concept=filter_operand, variable_list=intersection_ids)
+5. Return the filtered set variable as final_variable → terminal_artifact_kind=filtered_set_variable
+
+`two_anchor_intersect_extract_attribute`:
+1. Resolve each entity in anchor_operands
+2. Walk each to target_concept
+3. Intersect
+4. extract_attribute_value on the intersection
+5. Return the attribute artifact → terminal_artifact_kind=attribute_values
+
+`two_anchor_intersect_count`:
+1. Resolve each entity in anchor_operands
+2. Walk each to target_concept
+3. Intersect (or narrow as appropriate)
+4. Call count on the set variable; extract the returned #N variable ID
+5. Return the count #N variable → terminal_artifact_kind=count_variable
+
+`one_anchor_filter_then_count_or_progress`:
+1. Resolve the single anchor from anchor_operands
+2. Walk to target_concept
+3. If filter needed: apply filter
+4a. progress_tool mode: return the built set variable → terminal_artifact_kind=set_variable
+4b. count mode: count and return count variable → terminal_artifact_kind=count_variable
+
+HARD BANS:
+- NEVER select anchors by position: `entities[0]`, `entities[1]`, `entities[2]`, `idx < 2`, `counter >= 2` are all forbidden for role selection.
+- NEVER treat filter_operand as a KG entity to find in entities.
+- NEVER return a different artifact kind than terminal_artifact_kind for the declared family.
+- NEVER resolve filter_operand via resolve_entity_to_vars.
+
+If anchor_operands is not present in tool_plan, use ALL entities in payload["entities"] as anchors and use entity_target_concepts alignment for hints. Still do not select by position.
+
+### 9. CANONICAL PRESERVED-ANCHOR CONTRACT (HARD RULE)
+When a retry payload contains preserved anchor state (`payload["variable_list"]` or `payload["resolved_anchors"]`),
+the tool MUST use those vars directly instead of re-resolving from entities. When absent, fall back to re-resolving
+from entities. NEVER return ERROR solely because preserved vars are absent.
+
+CANONICAL PATTERN (use this exact shape):
+~~~python
+preserved_raw = payload.get("variable_list") or payload.get("resolved_anchors")
+anchor_vars_per_entity = []
+if preserved_raw:
+    # preserved_raw is a list of per-anchor var-ids; slice one entry per entity
+    plist = list(preserved_raw) if not isinstance(preserved_raw, list) else preserved_raw
+    for i, ent in enumerate(entities):
+        if i < len(plist):
+            item = plist[i]
+            # item may be a single string #N or a list; normalise to list
+            if isinstance(item, list):
+                ids = [v for v in item if isinstance(v, str) and v.startswith("#")]
+            elif isinstance(item, str) and item.startswith("#"):
+                ids = [item]
+            else:
+                ids = []
+        else:
+            ids = []
+        anchor_vars_per_entity.append(ids)
+    # fall back to re-resolve for any anchor that is still empty
+    for i, (ent, ids) in enumerate(zip(entities, anchor_vars_per_entity)):
+        if not ids:
+            env_out = kg_utils.resolve_entity_to_vars(ent, (entity_target_concepts or [None]*len(entities))[i] or target_concept, actions_spec, domain_hints, max_k=1)
+            anchor_vars_per_entity[i] = [v for v in kg_utils.extract_var_ids(env_out) if isinstance(v, str) and v.startswith("#")]
+else:
+    # no preserved vars at all — re-resolve all anchors
+    for i, ent in enumerate(entities):
+        hint = (entity_target_concepts or [None]*len(entities))[i]
+        env_out = kg_utils.resolve_entity_to_vars(ent, hint or target_concept, actions_spec, domain_hints, max_k=1)
+        anchor_vars_per_entity.append([v for v in kg_utils.extract_var_ids(env_out) if isinstance(v, str) and v.startswith("#")])
+~~~
+
+FORBIDDEN PATTERNS:
+- Assigning the same preserved list to multiple anchors: `anchor_a_ids = preserved_ids; anchor_b_ids = preserved_ids`
+- Treating the entire `variable_list` as a single flat pool when per-anchor slicing is required
+- Returning ERROR because `variable_list` or `resolved_anchors` is absent
+- Re-resolving anchors from entities when non-empty preserved vars are already available
+
+### 10. COUNT RULE
 - `count` creates a NEW variable ID containing the number.
 - Call `count` on the SINGLE canonical set variable you intend to count.
 - Then call `kg_utils.extract_var_ids(count_res)`.
@@ -863,7 +1092,7 @@ PLAN-SHAPE SAFETY RULE
 - Never return the pre-count set variable.
 - Never use `extract_attribute_value` or scalar parsing for count success.
 
-### 10. HONEST EXHAUSTION RULE
+### 10a. HONEST EXHAUSTION RULE
 If any required filter, walk, or intersection step yields no valid IDs, return:
 - `status="MACRO EXHAUSTED"`
 - `final_variable=None`
@@ -888,6 +1117,76 @@ CANDIDATE_MAP RULES
 - If a real available anchor exists, suggested action MUST reference that real anchor.
 - Do NOT invent a variable ID that does not exist.
 
+### 10b. MANDATORY GROUNDED HANDOFF RULE (PROGRESS TOOL CRITICAL)
+When preferred_tool_mode is "progress_tool" or the plan calls for progress delivery:
+- If you have successfully built a real #N candidate-set variable that satisfies the declared
+  minimum_acceptable_deliverable, required_next_achieved_state, or required_handoff_achieved_state,
+  you MUST return that variable as the progress handoff rather than continuing into a failing step
+  and exhausting.
+- If the declared required handoff is `built_filter_ready_set`, do NOT stop at resolved anchors,
+  raw walked sets, or raw intersection sets. Continue the straight-line walk/intersect/filter
+  chain first.
+- For `built_filter_ready_set` stage-binding, keep the implementation compact: one straight-line
+  finish chain plus only the contract/exhaustion branches. Do NOT add alternate success exits,
+  candidate registries, or broad salvage scaffolding.
+- Return status="SUCCESS" and final_variable pointing to the best current #N set variable that
+  satisfies the declared stop target.
+- The built set IS the progress value once it satisfies the declared stop target. Do NOT discard it.
+
+BUILT-SET HANDOFF RULE (HARD):
+If any of these states is reached and the set is non-empty:
+  - built_target_set:  a real #N variable exists for the target concept
+  - built_both_sets:   real #N variables exist for both anchor branches
+  - built_intersection_set: a real #N intersection variable exists
+  - built_filter_ready_set: a real #N filtered intersection variable exists
+
+Then the tool MUST return:
+  - status="SUCCESS"
+  - final_variable=<the best available #N set variable>
+  - observation describing what the variable contains plus minted_variables JSON
+
+Do NOT return final_variable=None after reaching one of those states, unless a
+SUBSEQUENT required downstream step has already consumed the set and produced nothing,
+AND that downstream step was mandatory to complete the minimum_acceptable_deliverable.
+
+Progress tool stop point: once you have built a real #N set that satisfies the plan's
+minimum_acceptable_deliverable / required_next_achieved_state, STOP and return that #N immediately.
+Do not continue into extra steps that could fail and cause spurious exhaustion, and do not stop
+earlier at weaker intermediate sets when the declared stop target is later.
+
+FINALIZATION CODE PATTERN (MANDATORY — use this exact shape):
+For set-tasks (INTERSECTOR, ATTRIBUTE_INTERSECTOR, non-count tasks):
+~~~python
+# After building the required set (intersection, filter_ready, or target):
+final_var = next((v for v in ids if isinstance(v, str) and v.startswith("#")), None)
+if final_var:
+    candidate_map[f"result_{target_concept}"] = ids
+    return {
+        "status": "SUCCESS",
+        "final_variable": final_var,
+        "observation": f"<describe set>. minted_variables: " + json.dumps(candidate_map),
+    }
+# Only reach MACRO EXHAUSTED if ids was genuinely empty:
+obs = "MACRO EXHAUSTED: Resulting set is empty. <grounded failure summary>"
+obs += " Suggested action: <real anchor ref or 'none; no actionable anchor available.'>"
+obs += " minted_variables: " + json.dumps(candidate_map)
+return {"status": "MACRO EXHAUSTED", "final_variable": None, "observation": obs}
+~~~
+
+For count-tasks (COUNTING_INTERSECTOR, COUNTER):
+~~~python
+count_fn = actions_spec.get("count")
+count_res = count_fn(set_var)
+raw_count_ids = kg_utils.extract_var_ids(count_res)
+count_var = next((v for v in raw_count_ids if isinstance(v, str) and v.startswith("#")), None)
+if count_var:
+    return {"status": "SUCCESS", "final_variable": count_var,
+            "observation": "COUNT VARIABLE RETURNED; submit it directly"}
+~~~
+
+NEVER place any further operations between building the required set and returning it.
+NEVER return final_variable=None when ids/count_var is non-empty.
+
 ### 11. OUTPUT CONTRACT
 `run(payload)` must return EXACTLY this dict shape:
 - `status`: one of `SUCCESS`, `MACRO EXHAUSTED`, `ERROR`
@@ -911,7 +1210,7 @@ You MUST emit the metadata header block EXACTLY as Python comments near the top 
 - `# tool_name: <descriptive_name>_macro_generated_tool`
 - `# INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}`
 - `# RUN_PAYLOAD_REQUIRED: ["task_text", "asked_for", "trace", "actions_spec", "run_id", "state_dir", "entities"]`
-- `# RUN_PAYLOAD_OPTIONAL: ["env_observation", "domain_hints", "target_concept", "attribute_target_concept", "entity_target_concepts", "intermediate_target_concepts", "topological_execution_plan", "composite_topology", "target_archetype", "upgrade_goal", "recovery_policy", "execution_style", "preferred_tool_mode", "minimum_acceptable_deliverable", "fallback_strategies", "tool_plan", "toolgen_retry_context", "variable_list"]`
+- `# RUN_PAYLOAD_OPTIONAL: ["env_observation", "domain_hints", "target_concept", "attribute_target_concept", "entity_target_concepts", "intermediate_target_concepts", "topological_execution_plan", "composite_topology", "target_archetype", "upgrade_goal", "recovery_policy", "execution_style", "preferred_tool_mode", "minimum_acceptable_deliverable", "fallback_strategies", "tool_plan", "toolgen_retry_context", "variable_list", "template_family", "anchor_operands", "filter_operand", "terminal_artifact_kind"]`
 - `# INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state","entities":["A"]}],"kwargs":{}}`
 
 Do NOT paraphrase, reorder, rename, or omit these headers.
@@ -941,12 +1240,24 @@ Before emitting the final code, ensure ALL of the following are true:
 - if the plan is empty/unusable for substantive KG logic, the tool returns honest `ERROR` rather than fake KG execution
 - the metadata header block is present exactly
 - output is only Python source
+- **FINALIZATION CHECK (ALL MODES):** if a real candidate set (ids) is non-empty at ANY stage, the tool MUST return SUCCESS + final_variable=#N immediately — this is NOT conditional on preferred_tool_mode
+- if preferred_tool_mode is "progress_tool" and a real #N set was built, final_variable=#N (not None)
+- there is NO code path that can reach final_variable=None after a non-empty ids/inter_ids/filtered_ids is produced
+- all candidate_map keys are derived with f-strings from payload entities/concepts (not hardcoded)
+- resolve_semantic_filter is called with the actual live candidate-set context (not anchor vars or [])
+- anchor selection uses entity_target_concepts alignment, not blanket resolution of all entities
+- attribute_target_concept is treated as filter/modifier semantics, not resolved as an anchor entity
+- **PRESERVED-ANCHOR CHECK:** if variable_list or resolved_anchors is present and non-empty, those vars are used directly (not re-resolved); each anchor gets its OWN slice of preserved vars (not the same list assigned to both); if preserved vars are absent, the tool re-resolves from entities WITHOUT returning ERROR for absence alone
+- **OPERAND ROLE CHECK:** attribute_target_concept is NEVER passed to resolve_entity_to_vars; it is only used as a filter/semantic argument (e.g., to resolve_semantic_filter or walk_to_target target parameter)
+- **TYPED ROLE CHECK:** if anchor_operands is present in tool_plan, iterate over anchor_operands for KG anchor resolution; do NOT use entities[0]/entities[1]/idx<2/counter>=2 to select anchors
+- **FILTER OPERAND CHECK:** filter_operand is a concept type string, NOT an entity; do NOT search entities for a matching "attribute value entity"
+- **TERMINAL ARTIFACT CHECK:** the returned final_variable must match terminal_artifact_kind (filtered_set_variable/count_variable/attribute_values/set_variable); returning the wrong artifact type for the declared family is a hard failure
 
 ###TOOL_START
 # tool_name: <descriptive_name>_macro_generated_tool
 # INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
 # RUN_PAYLOAD_REQUIRED: ["task_text", "asked_for", "trace", "actions_spec", "run_id", "state_dir", "entities"]
-# RUN_PAYLOAD_OPTIONAL: ["env_observation", "domain_hints", "target_concept", "attribute_target_concept", "entity_target_concepts", "intermediate_target_concepts", "topological_execution_plan", "composite_topology", "target_archetype", "upgrade_goal", "recovery_policy", "execution_style", "preferred_tool_mode", "minimum_acceptable_deliverable", "fallback_strategies", "tool_plan", "toolgen_retry_context", "variable_list"]
+# RUN_PAYLOAD_OPTIONAL: ["env_observation", "domain_hints", "target_concept", "attribute_target_concept", "entity_target_concepts", "intermediate_target_concepts", "topological_execution_plan", "composite_topology", "target_archetype", "upgrade_goal", "recovery_policy", "execution_style", "preferred_tool_mode", "minimum_acceptable_deliverable", "fallback_strategies", "tool_plan", "toolgen_retry_context", "variable_list", "template_family", "anchor_operands", "filter_operand", "terminal_artifact_kind"]
 # INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state","entities":["A"]}],"kwargs":{}}
 
 """KG macro."""
@@ -990,7 +1301,7 @@ MANDATORY METADATA HEADERS — ALL FIVE must appear verbatim in the first 80 lin
   # tool_name: <descriptive_name>_macro_generated_tool
   # INVOKE_WITH: {"args":[<RUN_PAYLOAD>], "kwargs":{}}
   # RUN_PAYLOAD_REQUIRED: ["task_text", "asked_for", "trace", "actions_spec", "run_id", "state_dir", "entities"]
-  # RUN_PAYLOAD_OPTIONAL: ["env_observation", "domain_hints", "target_concept", "attribute_target_concept", "entity_target_concepts", "intermediate_target_concepts", "topological_execution_plan", "composite_topology", "target_archetype", "upgrade_goal", "recovery_policy", "execution_style", "preferred_tool_mode", "minimum_acceptable_deliverable", "fallback_strategies", "tool_plan", "toolgen_retry_context", "variable_list"]
+  # RUN_PAYLOAD_OPTIONAL: ["env_observation", "domain_hints", "target_concept", "attribute_target_concept", "entity_target_concepts", "intermediate_target_concepts", "topological_execution_plan", "composite_topology", "target_archetype", "upgrade_goal", "recovery_policy", "execution_style", "preferred_tool_mode", "minimum_acceptable_deliverable", "fallback_strategies", "tool_plan", "toolgen_retry_context", "variable_list", "template_family", "anchor_operands", "filter_operand", "terminal_artifact_kind"]
   # INVOKE_EXAMPLE: {"args":[{"task_text":"...","asked_for":"...","trace":[],"actions_spec":{},"run_id":"r1","state_dir":"./state","entities":["A"]}],"kwargs":{}}
 Do NOT omit or rename any of these five comment lines. The tool will be hard-rejected at round 1 if any are missing.
 These five lines are the complete mandatory metadata header block; references elsewhere in this prompt to "metadata headers" mean all five lines, including '# tool_name:'.

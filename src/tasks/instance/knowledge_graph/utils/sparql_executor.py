@@ -1,5 +1,6 @@
 from typing import List, Tuple, Any
 import os
+import re
 import time
 from SPARQLWrapper import SPARQLWrapper, JSON
 import urllib
@@ -100,6 +101,38 @@ SELECT DISTINCT ?e WHERE {{
             binding_count,
         )
         return results
+
+    def get_entity_names(self, mids: List[str]) -> dict[str, str]:
+        """Return a {mid: english_name} dict for the given MIDs, best-effort.
+
+        Non-MID values (literals, counts, dates) are silently skipped; callers
+        should fall back to the raw MID string when a key is absent.
+        """
+        freebase_mids = [m for m in mids if re.match(r"^[mg]\.", m)]
+        if not freebase_mids:
+            return {}
+        values_clause = " ".join(f"ns:{mid}" for mid in freebase_mids)
+        query = (
+            "PREFIX ns: <http://rdf.freebase.com/ns/>\n"
+            "SELECT ?x ?name WHERE {\n"
+            f"  VALUES ?x {{ {values_clause} }}\n"
+            "  ?x ns:type.object.name ?name .\n"
+            '  FILTER(LANG(?name) = "en")\n'
+            "}"
+        )
+        try:
+            results = self._query_endpoint(query)
+        except Exception:
+            return {}
+        name_dict: dict[str, str] = {}
+        for binding in results.get("results", {}).get("bindings", []):
+            mid_uri = binding.get("x", {}).get("value", "")
+            name = binding.get("name", {}).get("value", "")
+            if mid_uri and name:
+                mid = mid_uri.replace("http://rdf.freebase.com/ns/", "")
+                if mid not in name_dict:
+                    name_dict[mid] = name
+        return name_dict
 
     def execute_raw(self, query: str) -> dict[str, Any]:
         return self._query_endpoint(query)

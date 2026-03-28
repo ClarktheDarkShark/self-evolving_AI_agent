@@ -1,0 +1,14 @@
+import:
+- ./standard.yaml
+assignment_config:
+  sample_order:
+  - "0"
+  - "1"
+  - "4"
+  - "5"
+  - "7"
+  - "9"
+  - "10"
+  - "29"
+  - "101"
+  - "118"

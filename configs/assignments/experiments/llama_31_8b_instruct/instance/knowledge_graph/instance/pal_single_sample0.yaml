@@ -1,0 +1,6 @@
+import:
+- ./standard.yaml
+
+assignment_config:
+  sample_order:
+    - "0"

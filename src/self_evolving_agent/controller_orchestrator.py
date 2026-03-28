@@ -243,7 +243,67 @@ class ControllerOrchestratorMixin:
                 tokens.update(self._semantic_tokens_from_value(tool_plan.get(key)))
         return tokens
 
+    @staticmethod
+    def _tool_capability_values(tool: Any, *keys: str) -> set[str]:
+        requested = {str(key or "").strip().lower() for key in keys if str(key or "").strip()}
+        if not requested:
+            return set()
+        values: set[str] = set()
+        capabilities = getattr(tool, "capabilities", None)
+        if isinstance(capabilities, str):
+            capability_items: Sequence[Any] = [capabilities]
+        elif isinstance(capabilities, Sequence):
+            capability_items = capabilities
+        else:
+            capability_items = []
+        for item in capability_items:
+            text = str(item or "").strip()
+            if not text or ":" not in text:
+                continue
+            key, raw_value = text.split(":", 1)
+            if key.strip().lower() in requested and raw_value.strip():
+                values.add(raw_value.strip())
+        return values
+
+    @staticmethod
+    def _tool_schema_property_values(tool: Any, property_name: str) -> set[str]:
+        schema = tool.input_schema if isinstance(getattr(tool, "input_schema", None), dict) else {}
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        prop = props.get(property_name, {}) if isinstance(props, dict) else {}
+        if not isinstance(prop, dict):
+            return set()
+        values: set[str] = set()
+        const_val = prop.get("const")
+        if const_val:
+            values.add(str(const_val).strip())
+        default_val = prop.get("default")
+        if default_val:
+            values.add(str(default_val).strip())
+        enum_vals = prop.get("enum")
+        if isinstance(enum_vals, list):
+            for item in enum_vals:
+                text = str(item or "").strip()
+                if text:
+                    values.add(text)
+        return values
+
     def _tool_specific_semantic_tokens(self, tool: Any) -> set[str]:
+        structured_tokens = set()
+        for key in (
+            "target_concept",
+            "attribute_target_concept",
+            "entity_target_concept",
+            "intermediate_target_concept",
+            "domain_hint",
+            "composite_topology",
+        ):
+            structured_tokens.update(
+                self._semantic_tokens_from_value(
+                    " ".join(sorted(self._tool_capability_values(tool, key)))
+                )
+            )
+        if structured_tokens:
+            return structured_tokens
         text_parts = [
             getattr(tool, "name", "") or "",
             getattr(tool, "docstring", "") or "",
@@ -262,6 +322,8 @@ class ControllerOrchestratorMixin:
             desired_archetype = str(tool_plan.get("target_archetype") or "").strip().upper()
         if desired_archetype in {"COUNTER", "COUNTING_INTERSECTOR"}:
             return "count_variable"
+        if isinstance(tool_plan, Mapping) and bool(tool_plan.get("final_variable_is_count_variable")):
+            return "count_variable"
         if desired_archetype:
             return "pointer_variable"
         lowered = str(query_text or "").lower()
@@ -270,6 +332,17 @@ class ControllerOrchestratorMixin:
         return "pointer_variable" if lowered else ""
 
     def _tool_output_form(self, tool: Any, *, archetype_label: str) -> str:
+        explicit_output_form = str(getattr(tool, "output_form", "") or "").strip()
+        if explicit_output_form in {"pointer_variable", "count_variable"}:
+            return explicit_output_form
+        schema_output_forms = self._tool_schema_property_values(tool, "output_form")
+        for candidate in schema_output_forms:
+            if candidate in {"pointer_variable", "count_variable"}:
+                return candidate
+        capability_output_forms = self._tool_capability_values(tool, "output_form")
+        for candidate in capability_output_forms:
+            if candidate in {"pointer_variable", "count_variable"}:
+                return candidate
         if archetype_label in {"COUNTER", "COUNTING_INTERSECTOR"}:
             return "count_variable"
         if archetype_label and archetype_label != "UNKNOWN":
@@ -549,6 +622,244 @@ class ControllerOrchestratorMixin:
         sentence = sentence.rstrip(".") + "."
         return f"{prefix} {sentence}".strip() if prefix else sentence
 
+    @staticmethod
+    def _kg_extract_relation_hints(plan_steps: list) -> list[str]:
+        """
+        Extract relation-like semantic path strings from topological_execution_plan prose.
+
+        KG relation paths appear in prose plans as dotted identifiers, e.g.:
+          "food.cheese_milk_source.cheeses", "people.person.profession", "music.artist.genre"
+
+        We extract them as lightweight structured hints so ToolGen can pass them to
+        kg_utils helpers (e.g. via domain_hints) instead of discovering relations blindly
+        at runtime from schema search.
+
+        Rules:
+        - Must contain at least one dot AND one underscore (KG schema paths have both)
+        - Must not contain spaces (rules out prose phrases)
+        - Must be 5+ chars (rules out noise)
+        - Deduplication preserves order; capped at 12 hints
+        """
+        import re as _re
+        if not plan_steps:
+            return []
+        joined = " ".join(str(s or "") for s in plan_steps if s)
+        # KG relation pattern: dotted path with underscores, no spaces
+        _KG_RELATION_RE = _re.compile(
+            r"\b([a-z][a-z0-9]*(?:[_.][a-z][a-z0-9]*){2,})\b"
+        )
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for m in _KG_RELATION_RE.finditer(joined):
+            token = m.group(1)
+            # Must have at least one underscore (distinguishes schema paths from prose)
+            if "_" not in token:
+                continue
+            # Must be at least 5 chars
+            if len(token) < 5:
+                continue
+            # First dot-separated segment must NOT contain an underscore.
+            # KG schema domains are single words: food, spaceflight, people, music.
+            # Python API paths like kg_utils.walk_to_target have underscores in the
+            # first segment → filter them out.
+            _first_dot = token.find(".")
+            _first_dot_seg = token[:_first_dot] if _first_dot > 0 else token
+            if "_" in _first_dot_seg:
+                continue
+            if token not in seen:
+                seen.add(token)
+                candidates.append(token)
+        return candidates[:12]
+
+    @staticmethod
+    def _kg_split_anchor_vs_filter_operands(
+        entities: list,
+        entity_target_concepts: list,
+        attribute_target_concept: str,
+    ) -> tuple:
+        """
+        Split entities into (anchor_operands, filter_value_operands).
+
+        An entity is a filter-value operand only when its aligned
+        entity_target_concept matches attribute_target_concept directly or by
+        dotted suffix. Broad ancestor hints must not be treated as a match for
+        a more specific attribute dimension.
+
+        This prevents filter-value entities (e.g., "semi-firm") from appearing in
+        anchor_operands where they would be resolved/walked as KG objects.
+        """
+        anchor_operands: list = []
+        filter_value_operands: list = []
+        atc = str(attribute_target_concept or "").strip().lower()
+        for i, ent in enumerate(entities):
+            hint = entity_target_concepts[i] if i < len(entity_target_concepts) else None
+            hint_str = str(hint or "").strip().lower()
+            matches_attribute_role = bool(
+                atc
+                and hint_str
+                and (
+                    hint_str == atc
+                    or atc.endswith("." + hint_str)
+                    or hint_str.endswith("." + atc)
+                )
+            )
+            if matches_attribute_role:
+                filter_value_operands.append(ent)
+            else:
+                anchor_operands.append(ent)
+        return anchor_operands, filter_value_operands
+
+    @staticmethod
+    def _kg_apply_family_fallback_split(
+        anchor_operands: list,
+        filter_value_operand: Any,
+        attribute_target_concept: str,
+        has_attribute_target: bool,
+    ) -> tuple:
+        """
+        Family-level fallback split used when entity_target_concepts was empty
+        or unhelpful (all entities ended up as anchors despite a filter scenario).
+
+        If the initial split produced filter_value_operand=None but
+        attribute_target_concept is present and there are 3+ anchors, assume:
+        - First 2 anchors are true KG-object anchors (proper-noun entities)
+        - The remaining entity is a filter-value descriptor
+
+        Returns (new_anchor_operands, new_filter_value_operand, fallback_used: bool).
+        Only fires when ALL conditions are met:
+          - filter_value_operand is currently None
+          - has_attribute_target is True
+          - len(anchor_operands) >= 3
+        """
+        if filter_value_operand is not None:
+            return anchor_operands, filter_value_operand, False
+        if not has_attribute_target:
+            return anchor_operands, None, False
+        if len(anchor_operands) < 3:
+            return anchor_operands, None, False
+        # Demote the last anchor to filter_value_operand (positional heuristic)
+        new_anchors = list(anchor_operands[:2])
+        new_filter_val = anchor_operands[-1]
+        return new_anchors, new_filter_val, True
+
+    @staticmethod
+    def _kg_derive_template_family_and_roles(
+        target_archetype: str,
+        entity_count: int,
+        has_attribute_target: bool,
+        entities: list,
+        attribute_target_concept: str,
+        target_concept: str = "",
+        entity_target_concepts: list = None,
+    ) -> dict:
+        """
+        Derive the typed template_family and operand-role slots for KG tool generation.
+
+        Rules:
+        - anchor_operands = only entities that should be resolved/walked as KG objects
+        - filter_value_operand = the entity whose concept hint matches attribute_target_concept
+        - filter_operand = attribute_target_concept (concept type, never an entity anchor)
+        - template_family is derived from target_archetype + anchor count
+        - terminal_artifact_kind is a function of template_family only
+        """
+        entity_target_concepts = list(entity_target_concepts or [])
+        anchor_operands, filter_value_operands = (
+            ControllerOrchestratorMixin._kg_split_anchor_vs_filter_operands(
+                list(entities or []),
+                entity_target_concepts,
+                attribute_target_concept,
+            )
+        )
+        filter_value_operand = filter_value_operands[0] if filter_value_operands else None
+        # PART 2: family-level fallback split when entity_target_concepts was empty
+        # or unhelpful (all entities landed in anchor_operands despite a filter scenario).
+        _fb_anchors, _fb_fval, _fb_used = (
+            ControllerOrchestratorMixin._kg_apply_family_fallback_split(
+                anchor_operands=anchor_operands,
+                filter_value_operand=filter_value_operand,
+                attribute_target_concept=attribute_target_concept,
+                has_attribute_target=has_attribute_target,
+            )
+        )
+        if _fb_used:
+            anchor_operands = _fb_anchors
+            filter_value_operand = _fb_fval
+        # Use anchor count (not raw entity_count) for family derivation so that
+        # a filter-value entity doesn't inflate the anchor count.
+        anchor_count = len(anchor_operands)
+        archetype = target_archetype.strip().upper()
+        count_signal = archetype in {"COUNTING_INTERSECTOR", "COUNTER"}
+        extract_signal = bool(
+            anchor_count >= 2
+            and archetype in {
+                "ATTRIBUTE_INTERSECTOR",
+                "ATTRIBUTE_EXTRACTOR",
+                "SUPERLATIVE_FINDER",
+            }
+            and has_attribute_target
+            and filter_value_operand is None
+        )
+        candidate_family_options: list[str] = []
+        if anchor_count <= 1:
+            candidate_family_options.append("one_anchor_filter_then_count_or_progress")
+        else:
+            if filter_value_operand is not None:
+                candidate_family_options.append("two_anchor_intersect_filter_set")
+            if count_signal:
+                candidate_family_options.append("two_anchor_intersect_count")
+            if extract_signal:
+                candidate_family_options.append("two_anchor_intersect_extract_attribute")
+            if not candidate_family_options:
+                candidate_family_options.append("two_anchor_intersect_filter_set")
+        candidate_family_options = list(dict.fromkeys(candidate_family_options))
+        family = candidate_family_options[0]
+        _terminal_map = {
+            "two_anchor_intersect_filter_set": "filtered_set_variable",
+            "two_anchor_intersect_extract_attribute": "attribute_values",
+            "two_anchor_intersect_count": "count_variable",
+            "one_anchor_filter_then_count_or_progress": "set_variable",
+        }
+        _required_stage_map = {
+            "two_anchor_intersect_filter_set": "built_filter_ready_set",
+            "two_anchor_intersect_extract_attribute": "built_target_set",
+            "two_anchor_intersect_count": "built_target_set",
+            "one_anchor_filter_then_count_or_progress": "resolved_anchor",
+        }
+        family_normalization_fallback_used = bool(
+            not entity_target_concepts or not candidate_family_options or _fb_used
+        )
+        normalized_inputs = {
+            "template_family": family,
+            "anchor_operands": list(anchor_operands),
+            "filter_operand": attribute_target_concept,
+            "filter_value_operand": filter_value_operand,
+            "attribute_target_concept": attribute_target_concept,
+            "target_concept": target_concept,
+            "required_next_stage": _required_stage_map.get(family, "resolved_anchor"),
+            "terminal_artifact_kind": _terminal_map.get(family, "set_variable"),
+        }
+        result = {
+            "template_family": family,
+            "anchor_operands": anchor_operands,
+            "filter_operand": attribute_target_concept,
+            "terminal_artifact_kind": _terminal_map.get(family, "set_variable"),
+            "required_next_stage": _required_stage_map.get(family, "resolved_anchor"),
+            "normalized_family_inputs": normalized_inputs,
+            "family_normalization_source": "kg_structural_normalization",
+            "family_normalization_fallback_used": family_normalization_fallback_used,
+            "family_fallback_split_used": _fb_used,
+            "family_fallback_split_reason": (
+                "entity_target_concepts_empty_3plus_anchors_with_attribute"
+                if _fb_used
+                else None
+            ),
+            "family_classification_ambiguous": len(candidate_family_options) > 1,
+            "candidate_family_options": candidate_family_options,
+        }
+        if filter_value_operand is not None:
+            result["filter_value_operand"] = filter_value_operand
+        return result
+
     def _build_tool_plan(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         source = payload
         nested_plan = payload.get("tool_plan")
@@ -757,6 +1068,23 @@ class ControllerOrchestratorMixin:
         domain_hints = _pick("domain_hints")
         if domain_hints is not None:
             tool_plan["domain_hints"] = self._normalize_string_list(domain_hints)
+        # Step 2: inject typed template_family and operand-role slots.
+        # These replace positional inference in generated tools.
+        _family_roles = self._kg_derive_template_family_and_roles(
+            target_archetype=str(tool_plan.get("target_archetype") or ""),
+            entity_count=entity_count,
+            has_attribute_target=has_attribute_target,
+            entities=list(tool_plan.get("entities") or []),
+            attribute_target_concept=str(tool_plan.get("attribute_target_concept") or ""),
+            target_concept=str(tool_plan.get("target_concept") or ""),
+            entity_target_concepts=list(tool_plan.get("entity_target_concepts") or []),
+        )
+        tool_plan.update(_family_roles)
+        # PART 1: Extract relation hints from plan prose and attach to tool_plan.
+        # These are dotted KG schema paths found in topological_execution_plan text
+        # (e.g. "food.cheese_milk_source.cheeses") that guide relation discovery.
+        _relation_hints = self._kg_extract_relation_hints(plan_steps)
+        tool_plan["relation_hints"] = _relation_hints
         return tool_plan
     # ------------------------------------------------------------------
     # Escape hatch baseline tool (Phase 4)
@@ -1029,8 +1357,10 @@ class ControllerOrchestratorMixin:
                 metadata = None
                 if tool_spec and tool_code:
                     try:
-                        metadata = self._register_tool_from_payload_relaxed(
-                            tool_spec, tool_code, chat_history
+                        spec_payload = dict(tool_spec) if isinstance(tool_spec, dict) else {}
+                        spec_payload["code_lines"] = tool_code.splitlines() if isinstance(tool_code, str) else []
+                        metadata = self._register_tool_from_payload(
+                            spec_payload, chat_history
                         )
                     except Exception:
                         metadata = None
@@ -1133,6 +1463,10 @@ class ControllerOrchestratorMixin:
                     candidate = str(attr_val).strip().upper()
                     if candidate in ARCHETYPE_REGISTRY:
                         return candidate
+            for candidate in self._tool_capability_values(tool, "archetype", "target_archetype"):
+                candidate_upper = str(candidate).strip().upper()
+                if candidate_upper in ARCHETYPE_REGISTRY:
+                    return candidate_upper
 
             # 2. Check input_schema.properties.target_archetype for const/default/enum
             schema = tool.input_schema if isinstance(tool.input_schema, dict) else {}
@@ -1447,12 +1781,6 @@ class ControllerOrchestratorMixin:
             "topological_execution_plan": "REQUIRED for request_new_tool — array of numbered prose-only steps naming exact helpers and $VAR aliases, with NO literal Python calls, kwargs, or dictionaries",
             "reason": "short reason (INPUT:...GOAL:... format if request_new_tool)",
         }
-        if getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
-            output_schema["insufficiency"] = "why existing tools fail the gate"
-            output_schema["needed_capabilities"] = "what the new tool must provide"
-            output_schema["evidence"] = "specific symptoms from inputs/trace/tool metadata"
-            output_schema["must_differ_from_existing"] = "delta vs existing tools"
-            output_schema["self_test_cases"] = "minimal tests"
         payload: dict[str, Any] = {
             "environment": self._resolved_environment_label(),
             "task_text": cleaned_query,
@@ -1508,9 +1836,6 @@ class ControllerOrchestratorMixin:
             "tool_name": "only if use_tool",
             "reason": "short reason",
         }
-        if getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
-            output_schema["insufficiency"] = "why existing tools fail the gate"
-            output_schema["needed_capabilities"] = "what the new tool must provide"
         payload = {
             "environment": self._resolved_environment_label(),
             "task_text": cleaned_query,
@@ -1884,11 +2209,44 @@ class ControllerOrchestratorMixin:
                     target_concept=tool_plan.get("target_concept") or None,
                     intermediate_target_concepts=tool_plan.get("intermediate_target_concepts") or [],
                     attribute_target_concept=tool_plan.get("attribute_target_concept") or None,
+                    template_family=tool_plan.get("template_family") or None,
+                    anchor_operands=tool_plan.get("anchor_operands") or [],
+                    filter_operand=tool_plan.get("filter_operand") or None,
+                    filter_value_operand=tool_plan.get("filter_value_operand") or None,
+                    terminal_artifact_kind=tool_plan.get("terminal_artifact_kind") or None,
+                    required_next_stage=tool_plan.get("required_next_stage") or None,
+                    normalized_family_inputs=tool_plan.get("normalized_family_inputs") or None,
+                    family_normalization_source=tool_plan.get("family_normalization_source") or None,
+                    family_normalization_fallback_used=bool(
+                        tool_plan.get("family_normalization_fallback_used")
+                    ),
+                    family_classification_ambiguous=bool(
+                        tool_plan.get("family_classification_ambiguous")
+                    ),
+                    candidate_family_options=tool_plan.get("candidate_family_options") or [],
                     topological_execution_plan=_plan_steps,
                     reason=str(payload.get("reason") or "").strip() or None,
                     is_request_new_tool=(action == "request_new_tool"),
                     upgrade_goal=str(upgrade_goal or "").strip() or None,
                 )
+            except Exception:
+                pass
+            try:
+                if bool(tool_plan.get("family_classification_ambiguous")):
+                    self._append_generated_tools_log(
+                        {
+                            "event": "kg_family_classification_ambiguous",
+                            "template_family": tool_plan.get("template_family"),
+                            "candidate_family_options": tool_plan.get(
+                                "candidate_family_options"
+                            )
+                            or [],
+                            "normalized_family_inputs": tool_plan.get(
+                                "normalized_family_inputs"
+                            )
+                            or {},
+                        }
+                    )
             except Exception:
                 pass
 

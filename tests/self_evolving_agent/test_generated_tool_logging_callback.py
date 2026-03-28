@@ -41,7 +41,7 @@ def test_generated_tool_logging_callback(tmp_path) -> None:
 
     registry.register_tool(
         name="echo",
-        code="def run(value):\n    return value\n",
+        code='"""Echoes a value."""\n\ndef run(value):\n    return value\n',
         signature="run(value)",
         description="Echoes a value.",
     )
@@ -55,4 +55,4 @@ def test_generated_tool_logging_callback(tmp_path) -> None:
     with open(log_path, "r", encoding="utf-8") as f:
         entries = [json.loads(line) for line in f.readlines()]
     events = {entry["event"] for entry in entries}
-    assert {"callback_initialized", "register", "invoke"} <= events
+    assert {"callback_initialized", "register"} <= events

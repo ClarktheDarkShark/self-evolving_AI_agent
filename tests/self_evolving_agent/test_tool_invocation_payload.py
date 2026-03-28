@@ -1,3 +1,4 @@
+import os
 import pathlib
 import sys
 
@@ -20,120 +21,129 @@ class _NoOpLanguageModel(LanguageModel):
 
 
 def test_payload_tool_invocation_contract(tmp_path) -> None:
-    registry_base = tmp_path / "registry"
-    get_registry(str(registry_base), force_reset=True)
+    prev = os.environ.get("LIFELONG_OUTPUT_DIR")
+    os.environ["LIFELONG_OUTPUT_DIR"] = str(tmp_path)
+    try:
+        registry_dir = tmp_path / "tool_library"
+        get_registry(str(registry_dir), force_reset=True)
 
-    controller = SelfEvolvingController(
-        language_model=_NoOpLanguageModel(),
-        tool_registry_path=str(registry_base),
-        use_orchestrator=False,
-    )
-    registry = get_registry(str(registry_base))
+        controller = SelfEvolvingController(
+            language_model=_NoOpLanguageModel(),
+            tool_registry_path=str(registry_dir),
+            use_orchestrator=False,
+        )
+        registry = controller._registry  # noqa: SLF001
 
-    code = (
-        '"""Payload echo tool."""\n'
-        "\n"
-        "def run(payload: dict) -> dict:\n"
-        "    try:\n"
-        "        missing = []\n"
-        "        for key in ('task_text', 'asked_for', 'trace', 'actions_spec', 'run_id', 'state_dir'):\n"
-        "            if key not in payload:\n"
-        "                missing.append(key)\n"
-        "        if missing:\n"
-        "            return {\n"
-        "                'status': 'blocked',\n"
-        "                'errors': ['missing_payload_key:' + k for k in missing],\n"
-        "                'warnings': [],\n"
-        "            }\n"
-        "        return {'status': 'ok', 'errors': [], 'warnings': []}\n"
-        "    except Exception as exc:\n"
-        "        return {'status': 'error', 'errors': [str(exc)], 'warnings': []}\n"
-        "\n"
-        "def self_test() -> bool:\n"
-        "    try:\n"
-        "        out = run({'task_text': 'x', 'asked_for': 'y', 'trace': [], 'actions_spec': {}, 'run_id': 'r1', 'state_dir': '/tmp'})\n"
-        "        return isinstance(out, dict)\n"
-        "    except Exception:\n"
-        "        return False\n"
-    )
+        code = (
+            '"""Payload echo tool."""\n'
+            "\n"
+            "def run(payload: dict) -> dict:\n"
+            "    try:\n"
+            "        missing = []\n"
+            "        for key in ('task_text', 'asked_for', 'trace', 'actions_spec', 'run_id', 'state_dir'):\n"
+            "            if key not in payload:\n"
+            "                missing.append(key)\n"
+            "        if missing:\n"
+            "            return {\n"
+            "                'status': 'blocked',\n"
+            "                'errors': ['missing_payload_key:' + k for k in missing],\n"
+            "                'warnings': [],\n"
+            "            }\n"
+            "        return {'status': 'ok', 'errors': [], 'warnings': []}\n"
+            "    except Exception as exc:\n"
+            "        return {'status': 'error', 'errors': [str(exc)], 'warnings': []}\n"
+            "\n"
+            "def self_test() -> bool:\n"
+            "    try:\n"
+            "        out = run({'task_text': 'x', 'asked_for': 'y', 'trace': [], 'actions_spec': {}, 'run_id': 'r1', 'state_dir': '/tmp'})\n"
+            "        return isinstance(out, dict)\n"
+            "    except Exception:\n"
+            "        return False\n"
+        )
 
-    input_schema = {
-        "type": "object",
-        "required": [
-            "task_text",
-            "asked_for",
-            "trace",
-            "actions_spec",
-            "run_id",
-            "state_dir",
-        ],
-        "properties": {
-            "task_text": {"type": "string"},
-            "asked_for": {"type": "string"},
-            "trace": {"type": "array"},
-            "actions_spec": {"type": "object"},
-            "run_id": {"type": "string"},
-            "state_dir": {"type": "string"},
-        },
-    }
+        input_schema = {
+            "type": "object",
+            "required": [
+                "task_text",
+                "asked_for",
+                "trace",
+                "actions_spec",
+                "run_id",
+                "state_dir",
+            ],
+            "properties": {
+                "task_text": {"type": "string"},
+                "asked_for": {"type": "string"},
+                "trace": {"type": "array"},
+                "actions_spec": {"type": "object"},
+                "run_id": {"type": "string"},
+                "state_dir": {"type": "string"},
+            },
+        }
 
-    metadata = registry.register_tool(
-        name="payload_echo_tool",
-        code=code,
-        signature="run(payload: dict) -> dict",
-        description="Echo payload tool.",
-        tool_type="utility",
-        tool_category="validator",
-        input_schema=input_schema,
-        capabilities=[],
-    )
-    assert metadata is not None
+        metadata = registry.register_tool(
+            name="payload_echo_tool",
+            code=code,
+            signature="run(payload: dict) -> dict",
+            description="Echo payload tool.",
+            tool_type="utility",
+            tool_category="validator",
+            input_schema=input_schema,
+            capabilities=[],
+        )
+        assert metadata is not None
 
-    tool_meta = controller._get_tool_metadata("payload_echo_tool")  # noqa: SLF001
-    assert tool_meta is not None
-    assert tool_meta.input_schema == input_schema
+        tool_meta = controller._get_tool_metadata("payload_echo_tool")  # noqa: SLF001
+        assert tool_meta is not None
+        assert tool_meta.input_schema == input_schema
 
-    payload = {
-        "task_text": "t",
-        "asked_for": "a",
-        "trace": [],
-        "actions_spec": {},
-        "run_id": "r1",
-        "state_dir": str(tmp_path),
-    }
-    tool_args = {"args": [payload], "kwargs": {}}
+        payload = {
+            "task_text": "t",
+            "asked_for": "a",
+            "trace": [],
+            "actions_spec": {},
+            "run_id": "r1",
+            "state_dir": str(tmp_path),
+        }
+        tool_args = {"args": [payload], "kwargs": {}}
 
-    result = controller._invoke_tool_by_payload(  # noqa: SLF001
-        "payload_echo_tool", tool_args, reason="test"
-    )
-    assert result.success
-    assert isinstance(result.output, dict)
-    assert result.output.get("status") == "ok"
+        result = controller._invoke_tool_by_payload(  # noqa: SLF001
+            "payload_echo_tool", tool_args, reason="test"
+        )
+        assert result.success
+        assert isinstance(result.output, dict)
+        assert result.output.get("status") == "ok"
 
-    wrapped_args = {"args": [{"payload": payload}], "kwargs": {}}
-    wrapped = controller._invoke_tool_by_payload(  # noqa: SLF001
-        "payload_echo_tool", wrapped_args, reason="test"
-    )
-    assert wrapped.success
-    assert isinstance(wrapped.output, dict)
-    assert wrapped.output.get("status") == "ok"
+        wrapped_args = {"args": [{"payload": payload}], "kwargs": {}}
+        wrapped = controller._invoke_tool_by_payload(  # noqa: SLF001
+            "payload_echo_tool", wrapped_args, reason="test"
+        )
+        assert wrapped.success
+        assert isinstance(wrapped.output, dict)
+        assert wrapped.output.get("status") == "ok"
 
-    direct_flat = registry.invoke_tool("payload_echo_tool", payload)
-    assert direct_flat.success
-    assert isinstance(direct_flat.output, dict)
-    assert direct_flat.output.get("status") == "ok"
+        direct_flat = registry.invoke_tool("payload_echo_tool", payload)
+        assert direct_flat.success
+        assert isinstance(direct_flat.output, dict)
+        assert direct_flat.output.get("status") == "ok"
 
-    direct_wrapped = registry.invoke_tool("payload_echo_tool", {"payload": payload})
-    assert direct_wrapped.success
-    assert isinstance(direct_wrapped.output, dict)
-    assert direct_wrapped.output.get("status") == "ok"
+        direct_wrapped = registry.invoke_tool("payload_echo_tool", {"payload": payload})
+        assert direct_wrapped.success
+        assert isinstance(direct_wrapped.output, dict)
+        assert direct_wrapped.output.get("status") == "ok"
 
-    missing_payload = dict(payload)
-    missing_payload.pop("run_id")
-    missing_args = {"args": [missing_payload], "kwargs": {}}
-    missing_result = controller._invoke_tool_by_payload(  # noqa: SLF001
-        "payload_echo_tool", missing_args, reason="test"
-    )
-    assert not missing_result.success
-    assert "missing_required_keys:run_id" in (missing_result.error or "")
-    assert "tool=payload_echo_tool" in (missing_result.error or "")
+        missing_payload = dict(payload)
+        missing_payload.pop("run_id")
+        missing_args = {"args": [missing_payload], "kwargs": {}}
+        missing_result = controller._invoke_tool_by_payload(  # noqa: SLF001
+            "payload_echo_tool", missing_args, reason="test"
+        )
+        assert not missing_result.success
+        assert "missing_required_keys:run_id" in (missing_result.error or "")
+        assert "tool=payload_echo_tool" in (missing_result.error or "")
+    finally:
+        if prev is None:
+            os.environ.pop("LIFELONG_OUTPUT_DIR", None)
+        else:
+            os.environ["LIFELONG_OUTPUT_DIR"] = prev
+        get_registry(force_reset=True)

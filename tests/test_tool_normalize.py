@@ -78,9 +78,17 @@ def test_normalize_code_lines_compile():
         "capabilities": ["ok"],
         "code_lines": [
             '"""Test tool"""',
-            '"def run(payload: dict) -> dict:"',
-            '"    \\"\\\"\\\"Return payload\\\"\\\\"\\\""',
-            '"    return {\'ok\': payload}"',
+            "",
+            "def run(payload: dict) -> dict:",
+            '    """Return payload"""',
+            "    return {'ok': payload}",
+            "",
+            "def self_test() -> bool:",
+            "    try:",
+            "        out = run({'foo': 'x'})",
+            "        return isinstance(out, dict)",
+            "    except Exception:",
+            "        return False",
         ],
     }
 
@@ -119,9 +127,10 @@ def test_register_and_invoke_normalized_tool(tmp_path):
         "capabilities": ["ok"],
         "code_lines": [
             '"""Test tool"""',
-            "\"def run(payload: dict) -> dict:\"",
-            "\"    \\\"\\\"\\\"Doc\\\"\\\"\\\"\"",
-            "\"    return {'ok': payload}\"",
+            "",
+            "def run(payload: dict) -> dict:",
+            '    """Doc"""',
+            "    return {'ok': payload}",
         ],
     }
 

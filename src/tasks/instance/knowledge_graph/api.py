@@ -3,7 +3,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Union, Optional, Sequence, Any
+from typing import Union, Optional, Sequence, Any, Mapping
 from pydantic import BaseModel
 import inspect
 from enum import StrEnum
@@ -339,6 +339,41 @@ class KnowledgeGraphAPI:
         sparql_query = LogicFormUtil.lisp_to_sparql(processed_code)
         return self.sparql_executor.execute_query(sparql_query)
 
+    @staticmethod
+    def _normalize_pal_scalar(value: Any) -> str:
+        if isinstance(value, bool):
+            return str(value).lower()
+        return str(value)
+
+    def _execute_pal_synthetic(self, variable: Variable) -> list[str]:
+        try:
+            payload = json.loads(variable.program)
+        except Exception as exc:
+            raise KnowledgeGraphAPIException(
+                f"pal_synthetic_decode_failed:{exc}"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise KnowledgeGraphAPIException("pal_synthetic_payload_not_mapping")
+
+        kind = str(payload.get("kind") or "").strip()
+        value = payload.get("value")
+        if kind == "entity_id":
+            return self._normalize_entity_list([value], cap=1)
+        if kind == "entity_set":
+            values = value if isinstance(value, Sequence) and not isinstance(value, str) else [value]
+            return self._normalize_entity_list(values)
+        if kind in {"count_scalar", "scalar_literal", "text_literal", "unresolved"}:
+            if isinstance(value, Sequence) and not isinstance(value, str):
+                return [self._normalize_pal_scalar(item) for item in value]
+            if value is None:
+                return []
+            return [self._normalize_pal_scalar(value)]
+        if kind == "boolean":
+            return [self._normalize_pal_scalar(bool(value))]
+        if kind == "empty":
+            return []
+        raise KnowledgeGraphAPIException(f"pal_synthetic_kind_unsupported:{kind}")
+
     def _query_relations_for_entities(self, entity_ids: Sequence[Any]) -> list[str]:
         mids = self._normalize_entity_list(entity_ids)
         if not mids:
@@ -448,6 +483,8 @@ class KnowledgeGraphAPI:
         return self._execute_plain_lisp(lisp_program)
 
     def final_execute(self, variable: Variable) -> list[str]:
+        if variable.type.startswith("pal."):
+            return self._execute_pal_synthetic(variable)
         program = variable.program
         try:
             expression = SemanticParserUtil.lisp_to_nested_expression(program)

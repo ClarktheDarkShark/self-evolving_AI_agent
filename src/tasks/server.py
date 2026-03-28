@@ -54,7 +54,21 @@ class TaskServer(Server):
             last_agent,
         )
         try:
-            self.task.interact(data.session)
+            try:
+                self.task.interact(data.session)
+            except AssertionError:
+                resume_fn = getattr(self.task, "resume_for_interact", None)
+                resumed = False
+                if callable(resume_fn):
+                    resumed = bool(resume_fn(data.session))
+                if not resumed:
+                    raise
+                SafeLogger.warning(
+                    "Task interact resumed task=%s sample=%s after state assertion failure.",
+                    getattr(data.session, "task_name", None),
+                    getattr(data.session, "sample_index", None),
+                )
+                self.task.interact(data.session)
         except Exception as exc:
             elapsed_ms = (time.monotonic() - start_time) * 1000.0
             SafeLogger.error(

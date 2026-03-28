@@ -129,6 +129,20 @@ def _is_stdlib_module(name: str) -> bool:
     return False
 
 
+def _check_module_string_expr_count(tree: ast.AST) -> list[str]:
+    """Exactly one module-level standalone string expression (the docstring) is allowed."""
+    count = sum(
+        1
+        for node in tree.body  # type: ignore[attr-defined]
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+    if count != 1:
+        return ["B:docstring_triple_quotes_invalid"]
+    return []
+
+
 def _check_run_docstring_invariant(_code: str, tree: ast.AST) -> list[str]:
     errors: list[str] = []
     run_fn = None
@@ -285,6 +299,7 @@ def validate_toolgen_output(raw_text: str) -> ToolgenContractResult:
             errors.append("F:syntax_error")
         else:
             errors.extend(_check_imports(tree))
+            errors.extend(_check_module_string_expr_count(tree))
             errors.extend(_check_run_docstring_invariant(normalized, tree))
             errors.extend(_check_run_try_except(tree))
         errors.extend(_check_output_schema_presence(normalized))

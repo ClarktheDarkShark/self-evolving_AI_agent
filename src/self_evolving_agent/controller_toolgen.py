@@ -37,8 +37,6 @@ from .controller_prompts import (
 from .toolgen_contracts import TOOL_START, TOOL_END, validate_toolgen_output
 from src.toolgen.prompts import get_toolgen_system_prompt
 from src.toolgen.prompting.build_task_pack import build_task_pack
-from src.toolgen_staged import get_toolgen_mode, run_staged_toolgen
-from src.toolgen_staged.auditor import FORBIDDEN_SUBSTRINGS
 from src.utils.output_paths import prefix_filename
 
 
@@ -231,15 +229,16 @@ class ControllerToolgenMixin:
         return {
             "none": 0,
             "resolved_anchor": 1,
-            "resolved_both_anchors": 1,
-            "built_target_set": 2,
-            "built_both_sets": 2,
-            "built_intersection_set": 2,
-            "built_attribute_context": 2,
-            "identified_relation_candidates": 3,
-            "identified_relation_family": 3,
-            "produced_actionable_handoff": 3,
-            "produced_final_variable": 4,
+            "resolved_both_anchors": 2,
+            "built_target_set": 3,
+            "built_both_sets": 3,
+            "built_intersection_set": 4,
+            "built_filter_ready_set": 4,
+            "built_attribute_context": 4,
+            "identified_relation_candidates": 5,
+            "identified_relation_family": 5,
+            "produced_actionable_handoff": 5,
+            "produced_final_variable": 6,
         }.get(str(value_delivered or ""), 0)
 
     @staticmethod
@@ -272,22 +271,29 @@ class ControllerToolgenMixin:
         if value in {
             "built_target_set",
             "built_both_sets",
+            "built_filter_ready_set",
             "built_intersection_set",
             "built_attribute_context",
         }:
+            if value in {"built_intersection_set", "built_filter_ready_set"}:
+                return "built_filter_ready_set"
             return "built_target_set"
-        if value in {"resolved_anchor", "resolved_both_anchors"}:
-            return "resolved_anchors"
+        if value == "resolved_both_anchors":
+            return "resolved_both_anchors"
+        if value == "resolved_anchor":
+            return "resolved_anchor"
         return "none"
 
     @staticmethod
     def _toolgen_achieved_state_rank(state: str) -> int:
         return {
             "none": 0,
-            "resolved_anchors": 1,
-            "built_target_set": 2,
-            "produced_actionable_handoff": 3,
-            "produced_final_variable": 4,
+            "resolved_anchor": 1,
+            "resolved_both_anchors": 2,
+            "built_target_set": 3,
+            "built_filter_ready_set": 4,
+            "produced_actionable_handoff": 5,
+            "produced_final_variable": 6,
         }.get(str(state or ""), 0)
 
     @staticmethod
@@ -314,6 +320,29 @@ class ControllerToolgenMixin:
         validation: Optional[Mapping[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         summary = dict(live_progress_summary or {})
+        # Special case: tool built a real candidate set but exhausted without returning it.
+        # This is a distinct repair target from "no value at all".
+        _BUILT_SET_STATES_BRIEF = frozenset({
+            "built_target_set", "built_both_sets", "built_intersection_set",
+            "built_filter_ready_set",
+        })
+        _val = str(summary.get("value_delivered") or "none")
+        _exec_status = str(summary.get("execution_status") or "")
+        _has_fv = bool(summary.get("has_final_variable", False))
+        if (
+            _val in _BUILT_SET_STATES_BRIEF
+            and _exec_status == "MACRO EXHAUSTED"
+            and not _has_fv
+        ):
+            return {
+                "runtime_failure_summary": (
+                    f"Tool reached {_val} (built a real candidate set) but returned "
+                    "final_variable=None. The built set must be returned as final_variable."
+                ),
+                "missing_value_type": "missing_grounded_handoff_after_real_progress",
+                "redesign_direction": "emit_grounded_handoff_from_built_set",
+                "secondary_issues": [],
+            }
         if not self._toolgen_is_runtime_no_value_pattern(summary):
             return None
         round_context = dict(round_context or {})
@@ -360,11 +389,218 @@ class ControllerToolgenMixin:
             f"Observed runtime outcome: {execution_status} produced no classified value, "
             "no final variable, and no solver-usable handoff."
         )
-        return {
+        brief: dict = {
             "runtime_failure_summary": runtime_failure_summary,
             "missing_value_type": missing_value_type,
             "redesign_direction": redesign_direction,
             "secondary_issues": secondary_issues,
+        }
+        # Inject template_family from round_context so repair instruction can be family-aware.
+        _tf = str(round_context.get("template_family") or "").strip()
+        if _tf:
+            brief["template_family"] = _tf
+        _tak = str(round_context.get("terminal_artifact_kind") or "").strip()
+        if _tak:
+            brief["terminal_artifact_kind"] = _tak
+        _ao = round_context.get("anchor_operands")
+        if _ao is not None:
+            brief["anchor_operands"] = _ao
+        _fo = str(round_context.get("filter_operand") or "").strip()
+        if _fo:
+            brief["filter_operand"] = _fo
+        _fvo = str(round_context.get("filter_value_operand") or "").strip()
+        if _fvo:
+            brief["filter_value_operand"] = _fvo
+        _target = str(round_context.get("target_concept") or "").strip()
+        if _target:
+            brief["target_concept"] = _target
+        _required_stage = str(
+            validation.get("required_next_achieved_state")
+            or round_context.get("required_next_achieved_state")
+            or ""
+        ).strip()
+        if _required_stage:
+            brief["required_next_stage"] = _required_stage
+        return brief
+
+    @staticmethod
+    def _toolgen_family_repair_instruction(
+        *,
+        template_family: str,
+        anchor_operands: Optional[Sequence[Any]] = None,
+        filter_operand: str = "",
+        filter_value_operand: str = "",
+        target_concept: str = "",
+        required_next_stage: str = "",
+        terminal_artifact_kind: str = "",
+        relation_hints: Optional[Sequence[str]] = None,
+        prefix: str = "",
+    ) -> str:
+        family = str(template_family or "").strip()
+        if not family:
+            return ""
+        anchor_ops = list(anchor_operands or [])
+        filter_op = str(filter_operand or "").strip()
+        filter_value = str(filter_value_operand or "").strip()
+        target = str(target_concept or "").strip()
+        required_stage = str(required_next_stage or "").strip()
+        terminal = str(terminal_artifact_kind or "").strip()
+        rh = list(relation_hints or [])
+        intro = (
+            str(prefix).strip()
+            if str(prefix or "").strip()
+            else "FAMILY REPAIR TARGET: Follow the typed family contract exactly. "
+        )
+        if not intro.endswith(" "):
+            intro += " "
+        shared = (
+            f"template_family={family}. "
+            + (f"anchor_operands={anchor_ops}. " if anchor_ops else "")
+            + (f"target_concept='{target}'. " if target else "")
+            + (f"attribute_target_concept/filter_operand='{filter_op}'. " if filter_op else "")
+            + (f"filter_value_operand='{filter_value}'. " if filter_value else "")
+            + (f"required_next_stage={required_stage}. " if required_stage else "")
+            + (f"terminal_artifact_kind={terminal}. " if terminal else "")
+            + (
+                f"relation_hints={rh} (prefer these KG schema paths first during "
+                "get_relations / walk_to_target calls). "
+                if rh
+                else ""
+            )
+        )
+        if anchor_ops:
+            shared += (
+                "If preserved anchor vars exist, use them first; if they are absent, "
+                "re-resolve anchors only as fallback recovery. Do not return ERROR solely "
+                "because preserved anchors are absent. "
+            )
+        if family == "two_anchor_intersect_filter_set":
+            return (
+                intro
+                + shared
+                + "Legal stage order: resolve anchor A, resolve anchor B, walk A to the target set, "
+                "walk B to the target set, intersect the two anchor-derived target sets, apply resolve_semantic_filter to the intersection "
+                "using attribute_target_concept/filter_operand together with filter_value_operand, and "
+                "return the filtered set variable immediately. Do NOT treat filter_value_operand as an anchor. "
+                "Do NOT use blanket entity loops. Do NOT return a single member when the terminal artifact is a set variable."
+            )
+        if family == "two_anchor_intersect_extract_attribute":
+            return (
+                intro
+                + shared
+                + "Legal stage order: resolve anchor A, resolve anchor B, walk A, walk B, intersect the "
+                "two anchor-derived target sets, extract_attribute_value from the intersection, and return the attribute-values "
+                "artifact immediately. Do NOT apply count. Do NOT stop at the raw intersection when the terminal "
+                "artifact is attribute_values."
+            )
+        if family == "two_anchor_intersect_count":
+            return (
+                intro
+                + shared
+                + "Legal stage order: resolve anchor A, resolve anchor B, walk A, walk B, intersect the two "
+                "anchor-derived target sets, call count on the intersection set, extract the new #N count variable, and return "
+                "that count variable immediately. Do NOT return a scalar integer. Do NOT union or count the anchors separately."
+            )
+        if family == "one_anchor_filter_then_count_or_progress":
+            return (
+                intro
+                + shared
+                + "Legal stage order: resolve the single anchor only, walk it to the target set, apply the filter "
+                "or downstream narrowing step if required, and stop at the terminal artifact for the active mode. "
+                "If the terminal artifact is a set variable, return the built set variable immediately. If the terminal "
+                "artifact is a count variable, count the narrowed set and return the new #N count variable. Do NOT invent a second anchor."
+            )
+        return ""
+
+    @staticmethod
+    def _toolgen_supported_kg_template_families() -> frozenset[str]:
+        return frozenset(
+            {
+                "two_anchor_intersect_filter_set",
+                "two_anchor_intersect_extract_attribute",
+                "two_anchor_intersect_count",
+                "one_anchor_filter_then_count_or_progress",
+            }
+        )
+
+    def _toolgen_kg_family_binding_context(
+        self,
+        *,
+        tool_plan: Optional[Mapping[str, Any]],
+        round_context: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        plan = self._build_tool_plan(tool_plan or {})
+        context = dict(round_context or {})
+        family = str(
+            context.get("template_family")
+            or plan.get("template_family")
+            or ""
+        ).strip()
+        supported_families = self._toolgen_supported_kg_template_families()
+        supported_family = family in supported_families
+        family_binding_active = bool(
+            self._resolved_environment_label() == "knowledge_graph"
+            and supported_family
+        )
+        if self._resolved_environment_label() != "knowledge_graph":
+            family_binding_reason = "non_kg_environment"
+        elif not family:
+            family_binding_reason = "missing_template_family"
+        elif not supported_family:
+            family_binding_reason = f"unsupported_template_family:{family}"
+        else:
+            family_binding_reason = f"supported_template_family:{family}"
+        normalized_family_inputs = plan.get("normalized_family_inputs")
+        if not isinstance(normalized_family_inputs, Mapping):
+            normalized_family_inputs = {
+                "template_family": family or None,
+                "anchor_operands": list(plan.get("anchor_operands") or []),
+                "filter_operand": plan.get("filter_operand"),
+                "filter_value_operand": plan.get("filter_value_operand"),
+                "attribute_target_concept": plan.get("attribute_target_concept"),
+                "target_concept": plan.get("target_concept"),
+                "required_next_stage": plan.get("required_next_stage"),
+                "terminal_artifact_kind": plan.get("terminal_artifact_kind"),
+            }
+        skeleton_context = dict(context)
+        for key in (
+            "template_family",
+            "anchor_operands",
+            "filter_operand",
+            "filter_value_operand",
+            "target_concept",
+            "attribute_target_concept",
+            "terminal_artifact_kind",
+        ):
+            if key not in skeleton_context and key in plan:
+                skeleton_context[key] = plan.get(key)
+        family_skeleton = self._toolgen_kg_family_skeleton_block(skeleton_context)
+        family_generation_path_used = bool(
+            family_binding_active and family_skeleton
+        )
+        return {
+            "family_binding_active": family_binding_active,
+            "family_binding_reason": family_binding_reason,
+            "generic_path_blocked_for_family_bound_attempt": family_binding_active,
+            "family_skeleton_selected": family if family_generation_path_used else None,
+            "family_generation_path_used": family_generation_path_used,
+            "generic_generation_blocked": family_binding_active,
+            "generic_repair_blocked": family_binding_active,
+            "family_repair_template_name": family if family_binding_active else None,
+            "family_validator_path_used": family_binding_active,
+            "normalized_family_inputs": dict(normalized_family_inputs or {}),
+            "family_normalization_source": str(
+                plan.get("family_normalization_source") or "kg_structural_normalization"
+            ),
+            "family_normalization_fallback_used": bool(
+                plan.get("family_normalization_fallback_used")
+            ),
+            "family_classification_ambiguous": bool(
+                plan.get("family_classification_ambiguous")
+            ),
+            "candidate_family_options": list(
+                plan.get("candidate_family_options") or []
+            ),
         }
 
     @staticmethod
@@ -384,6 +620,33 @@ class ControllerToolgenMixin:
             "RUNTIME-FIRST REPAIR TARGET: The previous candidate followed the plan but "
             f"delivered no accepted value. Missing value type: {missing_value_type}. "
         )
+        family_instruction = ControllerToolgenMixin._toolgen_family_repair_instruction(
+            template_family=str(runtime_repair_brief.get("template_family") or ""),
+            anchor_operands=runtime_repair_brief.get("anchor_operands"),
+            filter_operand=str(runtime_repair_brief.get("filter_operand") or ""),
+            filter_value_operand=str(runtime_repair_brief.get("filter_value_operand") or ""),
+            target_concept=str(runtime_repair_brief.get("target_concept") or ""),
+            required_next_stage=str(runtime_repair_brief.get("required_next_stage") or ""),
+            terminal_artifact_kind=str(runtime_repair_brief.get("terminal_artifact_kind") or ""),
+            prefix=base,
+        )
+        if family_instruction:
+            return family_instruction
+        if redesign_direction == "emit_grounded_handoff_from_built_set":
+            return (
+                base
+                + "The tool built a real candidate set but then returned "
+                "final_variable=None. Fix: immediately after extracting ids from the "
+                "required set (intersection, filter_ready, or target set), add the "
+                "grounded return BEFORE any subsequent failing step:\n"
+                "  final_var = next((v for v in ids if isinstance(v, str) and v.startswith('#')), None)\n"
+                "  if final_var:\n"
+                "      return {'status': 'SUCCESS', 'final_variable': final_var,\n"
+                "              'observation': '<describe set> minted_variables: ' + json.dumps(candidate_map)}\n"
+                "Do NOT continue into downstream steps after the required set is built. "
+                "The built set variable IS the final_variable — stop and return it immediately. "
+                "Do NOT return final_variable=None when ids is non-empty."
+            )
         if redesign_direction == "replace_exhausted_full_solve_shape":
             return (
                 base
@@ -477,6 +740,11 @@ class ControllerToolgenMixin:
             "override_preferred_tool_mode": None,
             "minimum_acceptable_deliverable": None,
             "primary_repair_dominates": False,
+            "required_next_achieved_state": None,
+            "required_handoff_achieved_state": None,
+            "stage_binding_instruction": None,
+            "forbidden_fallback_shapes": [],
+            "force_structural_stage_rewrite": False,
         }
         if not feedback_note:
             return dict(_default)
@@ -494,9 +762,21 @@ class ControllerToolgenMixin:
             str(payload.get("PRIMARY_REPAIR_TARGET") or "").strip()
             or str(payload.get("primary_repair_instruction") or "").strip()
         )
+        phase = str(payload.get("phase") or "").strip()
+        best_achieved_state = str(payload.get("best_achieved_state") or "").strip()
+        patch_path_preservation = bool(
+            phase in {"patch_apply", "patch_plan_parse"}
+            and best_achieved_state not in {"", "none"}
+            and primary
+        )
+        stage_binding_predeclared = bool(
+            payload.get("required_next_achieved_state")
+            or payload.get("stage_binding_instruction")
+            or payload.get("force_structural_stage_rewrite")
+        )
 
         # Nothing to bind — not a runtime-repair feedback payload.
-        if not brief and not primary:
+        if not brief and not primary and not stage_binding_predeclared:
             return dict(_default)
 
         # Detect no-value trigger condition.
@@ -513,9 +793,86 @@ class ControllerToolgenMixin:
         else:
             # No live summary present — treat runtime_repair_brief as
             # sufficient signal (it is only synthesised for no-value outcomes).
-            no_value = bool(brief)
+            no_value = bool(brief) or patch_path_preservation
 
-        if not no_value:
+        validation_payload = payload.get("validation")
+        if not isinstance(validation_payload, Mapping):
+            validation_payload = {}
+        required_next_achieved_state = str(
+            payload.get("required_next_achieved_state")
+            or validation_payload.get("required_next_achieved_state")
+            or ""
+        ).strip()
+        required_handoff_achieved_state = str(
+            payload.get("required_handoff_achieved_state")
+            or validation_payload.get("required_handoff_achieved_state")
+            or ""
+        ).strip()
+        stage_binding_instruction = str(
+            payload.get("stage_binding_instruction")
+            or validation_payload.get("stage_binding_instruction")
+            or ""
+        ).strip()
+        forbidden_fallback_shapes = payload.get("forbidden_fallback_shapes")
+        if not isinstance(forbidden_fallback_shapes, list):
+            forbidden_fallback_shapes = validation_payload.get(
+                "forbidden_fallback_shapes"
+            )
+        if not isinstance(forbidden_fallback_shapes, list):
+            forbidden_fallback_shapes = []
+        forbidden_fallback_shapes = [
+            str(item or "").strip()
+            for item in forbidden_fallback_shapes
+            if str(item or "").strip()
+        ]
+        force_structural_stage_rewrite = bool(
+            payload.get("force_structural_stage_rewrite")
+            or validation_payload.get("force_structural_stage_rewrite")
+        )
+        issues_text = " ".join(
+            str(item or "").strip()
+            for item in (validation_payload.get("issues") or [])
+            if str(item or "").strip()
+        )
+        floor_or_handoff_trigger = False
+        if isinstance(lps, dict):
+            floor_or_handoff_trigger = str(lps.get("reason") or "").strip() in {
+                "resolved_anchor_only_insufficient_for_plan",
+                "below_minimum_useful_floor_for_plan",
+                "plan_stage_handoff_too_broad",
+            }
+        if not floor_or_handoff_trigger:
+            combined = " ".join(
+                part
+                for part in (
+                    primary,
+                    issues_text,
+                    str(validation_payload.get("summary") or "").strip(),
+                )
+                if part
+            ).lower()
+            floor_or_handoff_trigger = any(
+                token in combined
+                for token in (
+                    "resolved_anchor_only_insufficient_for_plan",
+                    "below_minimum_useful_floor_for_plan",
+                    "missing_grounded_handoff_after_real_progress",
+                    "plan_stage_handoff_too_broad",
+                )
+            )
+
+        stage_binding_trigger = bool(
+            required_next_achieved_state
+            or stage_binding_instruction
+            or force_structural_stage_rewrite
+        )
+
+        if (
+            not no_value
+            and not patch_path_preservation
+            and not floor_or_handoff_trigger
+            and not stage_binding_trigger
+        ):
             return dict(_default)
 
         redesign = str((brief or {}).get("redesign_direction") or "").strip()
@@ -529,14 +886,27 @@ class ControllerToolgenMixin:
 
         return {
             "active": True,
-            "omit_prior_code": structural,
-            "override_preferred_tool_mode": "progress_tool" if first_value else None,
+            "omit_prior_code": structural or force_structural_stage_rewrite,
+            "override_preferred_tool_mode": (
+                "progress_tool"
+                if (first_value or floor_or_handoff_trigger or stage_binding_trigger)
+                else None
+            ),
             "minimum_acceptable_deliverable": (
-                ControllerToolgenMixin._PHASE1_GENERIC_MIN_DELIVERABLE
-                if first_value
+                str(
+                    payload.get("minimum_acceptable_deliverable")
+                    or validation_payload.get("minimum_acceptable_deliverable")
+                    or ControllerToolgenMixin._PHASE1_GENERIC_MIN_DELIVERABLE
+                ).strip()
+                if (first_value or floor_or_handoff_trigger or stage_binding_trigger)
                 else None
             ),
             "primary_repair_dominates": bool(primary),
+            "required_next_achieved_state": required_next_achieved_state or None,
+            "required_handoff_achieved_state": required_handoff_achieved_state or None,
+            "stage_binding_instruction": stage_binding_instruction or None,
+            "forbidden_fallback_shapes": forbidden_fallback_shapes,
+            "force_structural_stage_rewrite": force_structural_stage_rewrite,
         }
 
     @staticmethod
@@ -553,6 +923,772 @@ class ControllerToolgenMixin:
             "3. Stop immediately after producing that value or solver-usable handoff; do not continue to full solve.",
         ]
         return steps, "\n".join(steps)
+
+    @staticmethod
+    def _toolgen_value_has_grounded_pointer(value: Any) -> bool:
+        if isinstance(value, str):
+            return bool(re.fullmatch(r"#\d+", value.strip()))
+        if isinstance(value, Mapping):
+            return any(
+                ControllerToolgenMixin._toolgen_value_has_grounded_pointer(item)
+                for item in value.values()
+            )
+        if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            return any(
+                ControllerToolgenMixin._toolgen_value_has_grounded_pointer(item)
+                for item in value
+            )
+        return False
+
+    @staticmethod
+    def _toolgen_is_resolutionish_minted_label(label: str) -> bool:
+        lowered = str(label or "").strip().lower()
+        return bool(lowered) and (
+            lowered.startswith("resolved")
+            or "_resolved_" in lowered
+            or lowered.startswith("anchor_resolved")
+        )
+
+    @staticmethod
+    def _toolgen_progress_plan_requires_multi_anchor_floor(
+        tool_plan: Optional[Mapping[str, Any]],
+    ) -> bool:
+        plan = tool_plan or {}
+        if isinstance(plan, Mapping) and isinstance(plan.get("tool_plan"), Mapping):
+            plan = dict(plan.get("tool_plan") or {})
+        plan_steps = plan.get("topological_execution_plan_steps") or plan.get(
+            "topological_execution_plan"
+        ) or []
+        plan_text = " ".join(str(step or "") for step in plan_steps).lower()
+        archetype = str(plan.get("target_archetype") or "").upper()
+        entity_target_concepts = [
+            str(item or "").strip().lower()
+            for item in (plan.get("entity_target_concepts") or [])
+            if str(item or "").strip()
+        ]
+        attribute_target_concept = str(
+            plan.get("attribute_target_concept") or ""
+        ).strip().lower()
+        anchor_hint_count = sum(
+            1 for hint in entity_target_concepts if hint != attribute_target_concept
+        )
+        entity_count = len(plan.get("entities") or [])
+        estimated_anchor_count = anchor_hint_count or max(
+            0, entity_count - (1 if attribute_target_concept and entity_count > 0 else 0)
+        )
+        has_intersection = any(
+            token in plan_text
+            for token in (
+                "cross_intersect",
+                "intersect",
+                "intersection",
+            )
+        )
+        has_downstream_narrowing = any(
+            token in plan_text
+            for token in (
+                "walk_to_target",
+                "resolve_semantic_filter",
+                "filter",
+                "count",
+                "argmax",
+                "argmin",
+            )
+        )
+        return bool(
+            "INTERSECTOR" in archetype
+            or has_intersection
+            or (estimated_anchor_count >= 2 and has_downstream_narrowing)
+        )
+
+    @staticmethod
+    def _toolgen_progress_plan_has_attribute_filter(
+        tool_plan: Optional[Mapping[str, Any]],
+    ) -> bool:
+        plan = tool_plan or {}
+        if isinstance(plan, Mapping) and isinstance(plan.get("tool_plan"), Mapping):
+            plan = dict(plan.get("tool_plan") or {})
+        template_family = str(plan.get("template_family") or "").strip()
+        if template_family == "two_anchor_intersect_extract_attribute":
+            return False
+        plan_steps = plan.get("topological_execution_plan_steps") or plan.get(
+            "topological_execution_plan"
+        ) or []
+        plan_text = " ".join(str(step or "") for step in plan_steps).lower()
+        attribute_target = str(plan.get("attribute_target_concept") or "").strip()
+        return bool(
+            attribute_target
+            or "resolve_semantic_filter" in plan_text
+            or "semantic filter" in plan_text
+            or "attribute map" in plan_text
+            or "attribute context" in plan_text
+        )
+
+    @classmethod
+    def _toolgen_plan_requires_helper_discipline_guard(
+        cls,
+        tool_plan: Optional[Mapping[str, Any]],
+    ) -> bool:
+        plan = tool_plan or {}
+        if cls._toolgen_progress_plan_requires_multi_anchor_floor(plan):
+            return True
+        if cls._toolgen_progress_plan_has_attribute_filter(plan):
+            return True
+        plan_steps = plan.get("topological_execution_plan_steps") or plan.get(
+            "topological_execution_plan"
+        ) or []
+        plan_text = " ".join(str(step or "") for step in plan_steps).lower()
+        archetype = str(plan.get("target_archetype") or "").upper()
+        execution_style = str(plan.get("execution_style") or "").strip().lower()
+        return bool(
+            archetype == "SUPERLATIVE_FINDER"
+            or execution_style == "attribute_mapping_first"
+            or any(
+                token in plan_text
+                for token in (
+                    "extract_attribute_value",
+                    "argmax",
+                    "argmin",
+                    "attribute map",
+                    "attribute value",
+                )
+            )
+        )
+
+    @classmethod
+    def _toolgen_progress_minimum_bankable_state_for_plan(
+        cls,
+        tool_plan: Optional[Mapping[str, Any]],
+    ) -> str:
+        if cls._toolgen_progress_plan_requires_multi_anchor_floor(tool_plan):
+            return "resolved_both_anchors"
+        return "resolved_anchor"
+
+    @classmethod
+    def _toolgen_progress_minimum_handoff_state_for_plan(
+        cls,
+        tool_plan: Optional[Mapping[str, Any]],
+    ) -> str:
+        plan = tool_plan or {}
+        if isinstance(plan, Mapping) and isinstance(plan.get("tool_plan"), Mapping):
+            plan = dict(plan.get("tool_plan") or {})
+        template_family = str(plan.get("template_family") or "").strip()
+        if template_family == "two_anchor_intersect_filter_set":
+            return "built_filter_ready_set"
+        if not cls._toolgen_progress_plan_requires_multi_anchor_floor(tool_plan):
+            return "resolved_anchor"
+        if cls._toolgen_progress_plan_has_attribute_filter(tool_plan):
+            return "built_filter_ready_set"
+        return "built_target_set"
+
+    @classmethod
+    def _toolgen_achieved_state_meets_floor(
+        cls,
+        achieved_state: str,
+        minimum_state: str,
+    ) -> bool:
+        return cls._toolgen_achieved_state_rank(achieved_state) >= cls._toolgen_achieved_state_rank(
+            minimum_state
+        )
+
+    def _toolgen_progress_minimum_deliverable_for_plan(
+        self,
+        tool_plan: Optional[Mapping[str, Any]],
+        *,
+        round_context: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[str]:
+        plan = self._build_tool_plan(tool_plan or {})
+        preferred_tool_mode = str(plan.get("preferred_tool_mode") or "")
+        best_achieved_state = str(
+            (round_context or {}).get("best_achieved_state") or ""
+        ).strip()
+        bank_floor = self._toolgen_progress_minimum_bankable_state_for_plan(plan)
+        handoff_floor = self._toolgen_progress_minimum_handoff_state_for_plan(plan)
+        template_family = str(plan.get("template_family") or "").strip()
+        terminal_artifact_kind = str(plan.get("terminal_artifact_kind") or "").strip()
+        filter_operand = str(plan.get("filter_operand") or "").strip()
+        filter_value_operand = str(plan.get("filter_value_operand") or "").strip()
+        family_progress_mode = bool(
+            preferred_tool_mode in {"progress_tool", "diagnostic_probe"}
+            or str((round_context or {}).get("required_next_achieved_state") or "").strip()
+            or best_achieved_state
+        )
+        if template_family == "two_anchor_intersect_filter_set" and family_progress_mode:
+            deliverable = (
+                "Family-routed minimum deliverable: a single resolved anchor variable is NOT sufficient. "
+                f"The minimum useful partial state is {bank_floor}. Use ONLY anchor_operands as anchors, "
+                "use kg_utils.walk_to_target to walk both anchors to target_concept, use "
+                "kg_utils.cross_intersect to intersect the two anchor-derived target sets, apply "
+                "resolve_semantic_filter to the intersection using "
+                f"attribute_target_concept/filter_operand={filter_operand or '<unset>'} and "
+                f"filter_value_operand={filter_value_operand or '<unset>'}, and stop at the filtered set "
+                f"variable. The minimum solver handoff for the active plan stage is {handoff_floor or bank_floor or 'built_filter_ready_set'}. "
+                "It is NOT acceptable to echo tool_plan or payload fields instead of producing grounded KG state."
+            )
+            if best_achieved_state and best_achieved_state not in {"", "none"}:
+                deliverable += (
+                    f" Current best-achieved state: {best_achieved_state}. Preserve or improve it."
+                )
+            return deliverable
+        if template_family == "two_anchor_intersect_extract_attribute" and family_progress_mode:
+            return (
+                "Family-routed minimum deliverable: a single resolved anchor variable is NOT sufficient. "
+                f"The minimum useful partial state is {bank_floor}. Use ONLY anchor_operands as anchors, "
+                "use kg_utils.walk_to_target to walk both anchors to target_concept, use "
+                "kg_utils.cross_intersect to intersect the two anchor-derived target sets, "
+                "extract_attribute_value from the intersection, and stop at the attribute-values artifact. "
+                f"The minimum solver handoff for the active plan stage is {handoff_floor or 'produced_final_variable'}. "
+                "It is NOT acceptable to echo tool_plan or payload fields instead of producing grounded KG state."
+            )
+        if template_family == "two_anchor_intersect_count" and family_progress_mode:
+            return (
+                "Family-routed minimum deliverable: a single resolved anchor variable is NOT sufficient. "
+                f"The minimum useful partial state is {bank_floor}. Use ONLY anchor_operands as anchors, "
+                "use kg_utils.walk_to_target to walk both anchors to target_concept, use "
+                "kg_utils.cross_intersect to intersect the two anchor-derived target sets, count "
+                "the intersection, and stop at the new count variable ID. "
+                f"The minimum solver handoff for the active plan stage is {handoff_floor or 'produced_final_variable'}. "
+                "It is NOT acceptable to echo tool_plan or payload fields instead of producing grounded KG state."
+            )
+        if template_family == "one_anchor_filter_then_count_or_progress" and family_progress_mode:
+            return (
+                "Family-routed minimum deliverable: resolve only the single anchor from anchor_operands, "
+                "walk to target_concept, apply any filter/narrowing step required by the plan, and stop at "
+                f"terminal_artifact_kind={terminal_artifact_kind or 'set_variable'} for the active plan stage."
+            )
+        if self._toolgen_progress_plan_requires_multi_anchor_floor(plan) and family_progress_mode:
+            deliverable = (
+                "For multi-anchor/intersector KG retries, a single resolved anchor "
+                f"variable is NOT sufficient. The minimum useful partial state is {bank_floor}. "
+                "For the returned solver handoff, do NOT stop at broad raw anchor sets when "
+                f"the plan still requires downstream narrowing; return at least {handoff_floor} "
+                "or the best current grounded narrowed/intersected/filter-ready set relevant "
+                "to the active plan stage."
+            )
+            if best_achieved_state and self._toolgen_achieved_state_rank(
+                best_achieved_state
+            ) > self._toolgen_achieved_state_rank(bank_floor):
+                deliverable += (
+                    f" Current best-achieved state: {best_achieved_state}. Preserve or "
+                    "improve that state; do not regress below it."
+                )
+            return deliverable
+        if (
+            preferred_tool_mode in {"progress_tool", "diagnostic_probe"}
+            and best_achieved_state
+            and best_achieved_state not in {"", "none"}
+        ):
+            return (
+                f"Preserve or improve the current best-achieved state "
+                f"({best_achieved_state}); do not regress below it."
+            )
+        return None
+
+    @classmethod
+    def _toolgen_required_next_achieved_state_for_plan(
+        cls,
+        tool_plan: Optional[Mapping[str, Any]],
+        *,
+        achieved_state: str,
+    ) -> str:
+        current_state = str(achieved_state or "none").strip() or "none"
+        minimum_handoff_state = cls._toolgen_progress_minimum_handoff_state_for_plan(
+            tool_plan
+        )
+        if cls._toolgen_achieved_state_rank(current_state) < cls._toolgen_achieved_state_rank(
+            minimum_handoff_state
+        ):
+            return minimum_handoff_state
+        return ""
+
+    def _toolgen_stage_binding_instruction(
+        self,
+        tool_plan: Optional[Mapping[str, Any]],
+        *,
+        current_achieved_state: str,
+        required_next_achieved_state: str,
+    ) -> str:
+        plan = self._build_tool_plan(tool_plan or {})
+        current_state = str(current_achieved_state or "none").strip() or "none"
+        required_state = str(required_next_achieved_state or "").strip()
+        if not required_state:
+            return ""
+        template_family = str(plan.get("template_family") or "").strip()
+        if template_family:
+            family_instruction = self._toolgen_family_repair_instruction(
+                template_family=template_family,
+                anchor_operands=plan.get("anchor_operands"),
+                filter_operand=str(plan.get("filter_operand") or ""),
+                filter_value_operand=str(plan.get("filter_value_operand") or ""),
+                target_concept=str(plan.get("target_concept") or ""),
+                required_next_stage=required_state,
+                terminal_artifact_kind=str(plan.get("terminal_artifact_kind") or ""),
+                prefix=(
+                    f"Current best achieved state is {current_state}. "
+                    "Preserve family semantics, reuse preserved anchors when available, "
+                    "re-resolve only as fallback recovery, and advance only the missing stage. "
+                ),
+            )
+            if family_instruction:
+                return family_instruction
+        if self._toolgen_progress_plan_requires_multi_anchor_floor(
+            plan
+        ) and self._toolgen_progress_plan_has_attribute_filter(plan):
+            return (
+                f"Current best achieved state is {current_state}. Preserve that anchor-resolution "
+                "topology and advance only the missing stage: if preserved anchor vars "
+                "(payload['variable_list'] / payload['resolved_anchors']) exist, use them; "
+                "if they are absent, re-resolve anchors from payload['entities'] only as "
+                "fallback recovery and continue. Walk each resolved anchor to its target-set, "
+                "intersect the two anchor-derived target sets, then apply "
+                "resolve_semantic_filter to the intersection. Return status='SUCCESS' with "
+                f"final_variable=#N for the {required_state} set as soon as it exists. Do not "
+                "return ERROR solely because preserved anchors are absent. Do not re-solve "
+                "anchors as the main work product. Do not return raw anchor variables, raw "
+                "walked sets, or intersection-only fallbacks below the required filter-ready state."
+            )
+        if self._toolgen_progress_plan_requires_multi_anchor_floor(plan):
+            return (
+                f"Current best achieved state is {current_state}. Preserve that anchor-resolution "
+                "topology and advance only the missing stage: if preserved anchor vars "
+                "(payload['variable_list'] / payload['resolved_anchors']) exist, use them; "
+                "if they are absent, re-resolve anchors from payload['entities'] only as "
+                "fallback recovery and continue. Walk each resolved anchor to its target-set, "
+                "intersect the anchor-derived target sets, and return the grounded "
+                f"{required_state} handoff as soon as it exists. Do not return ERROR solely "
+                "because preserved anchors are absent. Do not re-solve anchors as the main "
+                "work product and do not return raw anchor or raw walk fallbacks below the "
+                "required stage."
+            )
+        return (
+            f"Preserve the current achieved state ({current_state}) and advance directly to "
+            f"{required_state}. Do not stop early at weaker fallback handoffs."
+        )
+
+    def _toolgen_stage_binding_execution_plan(
+        self,
+        tool_plan: Optional[Mapping[str, Any]],
+        *,
+        required_next_achieved_state: str,
+    ) -> tuple[list[str], str]:
+        plan = self._build_tool_plan(tool_plan or {})
+        required_state = str(required_next_achieved_state or "").strip()
+        template_family = str(plan.get("template_family") or "").strip()
+        if template_family == "two_anchor_intersect_filter_set":
+            steps = [
+                "1. Read anchor_operands only; do not infer anchors from raw entity order.",
+                "2. Use preserved anchor vars when available; re-resolve only as fallback recovery.",
+                "3. Walk anchor A to target_concept.",
+                "4. Walk anchor B to target_concept.",
+                "5. Intersect the two anchor-derived target sets.",
+                "6. Apply resolve_semantic_filter to the intersection using filter_operand + filter_value_operand.",
+                f"7. Return status='SUCCESS' with final_variable=#N for the {required_state or 'filtered_set_variable'} artifact immediately.",
+            ]
+            return steps, "\n".join(steps)
+        if template_family == "two_anchor_intersect_extract_attribute":
+            steps = [
+                "1. Read anchor_operands only; do not infer anchors from raw entity order.",
+                "2. Use preserved anchor vars when available; re-resolve only as fallback recovery.",
+                "3. Walk anchor A to target_concept.",
+                "4. Walk anchor B to target_concept.",
+                "5. Intersect the two anchor-derived target sets.",
+                "6. Extract attribute values from the intersection.",
+                f"7. Return status='SUCCESS' with final_variable=#N for the {required_state or 'attribute_values'} artifact immediately.",
+            ]
+            return steps, "\n".join(steps)
+        if template_family == "two_anchor_intersect_count":
+            steps = [
+                "1. Read anchor_operands only; do not infer anchors from raw entity order.",
+                "2. Use preserved anchor vars when available; re-resolve only as fallback recovery.",
+                "3. Walk anchor A to target_concept.",
+                "4. Walk anchor B to target_concept.",
+                "5. Intersect the two anchor-derived target sets.",
+                "6. Count the intersection set and extract the returned count variable ID.",
+                f"7. Return status='SUCCESS' with final_variable=#N for the {required_state or 'count_variable'} artifact immediately.",
+            ]
+            return steps, "\n".join(steps)
+        if template_family == "one_anchor_filter_then_count_or_progress":
+            steps = [
+                "1. Read the single anchor from anchor_operands only.",
+                "2. Use preserved anchor vars when available; re-resolve only as fallback recovery.",
+                "3. Walk the anchor to target_concept.",
+                "4. Apply the required narrowing/filter stage if the plan requires it.",
+                f"5. Return the {required_state or plan.get('terminal_artifact_kind') or 'set_variable'} artifact immediately.",
+            ]
+            return steps, "\n".join(steps)
+        if (
+            required_state
+            and self._toolgen_progress_plan_requires_multi_anchor_floor(plan)
+            and self._toolgen_progress_plan_has_attribute_filter(plan)
+        ):
+            steps = [
+                "1. If preserved anchor vars (payload['variable_list'] / payload['resolved_anchors']) exist, use them; otherwise re-resolve anchors from payload['entities'] as fallback recovery.",
+                "2. Do not spend the retry re-resolving anchors as the main output and do not return ERROR solely because preserved anchors are absent.",
+                "3. Walk anchor A to the target concept candidate set.",
+                "4. Walk anchor B to the target concept candidate set.",
+                "5. Intersect the two anchor-derived target sets.",
+                "6. Apply resolve_semantic_filter to the intersection, not to a raw walked set or raw anchor set.",
+                f"7. Return status='SUCCESS' with final_variable=#N for the {required_state} set as soon as it is built.",
+                "8. Do not return raw anchor variables, raw walked sets, or intersection-only fallbacks below the required stage.",
+            ]
+            return steps, "\n".join(steps)
+        if required_state and self._toolgen_progress_plan_requires_multi_anchor_floor(plan):
+            steps = [
+                "1. If preserved anchor vars (payload['variable_list'] / payload['resolved_anchors']) exist, use them; otherwise re-resolve anchors from payload['entities'] as fallback recovery.",
+                "2. Do not spend the retry re-resolving anchors as the main output and do not return ERROR solely because preserved anchors are absent.",
+                "3. Walk anchor A to the target concept candidate set.",
+                "4. Walk anchor B to the target concept candidate set.",
+                "5. Intersect the two anchor-derived target sets.",
+                f"6. Return status='SUCCESS' with final_variable=#N for the {required_state} set as soon as it is built.",
+                "7. Do not return raw anchor variables or raw walked-set fallbacks below the required stage.",
+            ]
+            return steps, "\n".join(steps)
+        return self._toolgen_phase1_retry_execution_plan(
+            self._toolgen_progress_minimum_deliverable_for_plan(plan) or ""
+        )
+
+    @staticmethod
+    def _toolgen_live_admission_blocked(
+        live_progress_summary: Optional[Mapping[str, Any]],
+    ) -> bool:
+        summary = dict(live_progress_summary or {})
+        status = str(summary.get("execution_status") or "").strip()
+        final_variable = summary.get("final_variable")
+        has_final = bool(summary.get("has_final_variable", False))
+        preferred_tool_mode = str(summary.get("preferred_tool_mode") or "").strip()
+        if (
+            status == "MACRO EXHAUSTED"
+            and not has_final
+            and preferred_tool_mode in {"progress_tool", "diagnostic_probe"}
+            and bool(summary.get("partial_value_usable", False))
+            and bool(summary.get("bankable_partial_progress", False))
+            and str(summary.get("semantic_trust_level") or "").strip()
+            in {"verified", "partial_unverified"}
+        ):
+            return False
+        return bool(
+            status == "MACRO EXHAUSTED"
+            and not has_final
+            and (final_variable is None or str(final_variable).strip() in {"", "None"})
+        )
+
+    def _toolgen_output_form_for_plan(
+        self,
+        tool_plan: Optional[Mapping[str, Any]],
+    ) -> str:
+        plan = self._build_tool_plan(tool_plan or {})
+        if bool(plan.get("final_variable_is_count_variable")):
+            return "count_variable"
+        archetype = str(plan.get("target_archetype") or "").strip().upper()
+        if archetype in {"COUNTER", "COUNTING_INTERSECTOR"}:
+            return "count_variable"
+        if archetype:
+            return "pointer_variable"
+        return ""
+
+    @staticmethod
+    def _toolgen_merge_structured_capabilities(
+        existing: Any,
+        additions: Sequence[str],
+    ) -> list[str]:
+        merged: list[str] = []
+        for source in (existing or [], additions or []):
+            if isinstance(source, str):
+                values = [source]
+            elif isinstance(source, Sequence):
+                values = [
+                    str(item or "").strip()
+                    for item in source
+                    if str(item or "").strip()
+                ]
+            else:
+                values = [str(source or "").strip()] if source else []
+            for value in values:
+                if value and value not in merged:
+                    merged.append(value)
+        return merged
+
+    def _toolgen_registration_capabilities_for_plan(
+        self,
+        tool_plan: Optional[Mapping[str, Any]],
+    ) -> list[str]:
+        plan = self._build_tool_plan(tool_plan or {})
+        capabilities: list[str] = []
+        target_archetype = str(plan.get("target_archetype") or "").strip().upper()
+        output_form = self._toolgen_output_form_for_plan(plan)
+        if target_archetype:
+            capabilities.append(f"archetype:{target_archetype}")
+        if output_form:
+            capabilities.append(f"output_form:{output_form}")
+        if str(plan.get("target_concept") or "").strip():
+            capabilities.append(f"target_concept:{plan['target_concept']}")
+        if str(plan.get("attribute_target_concept") or "").strip():
+            capabilities.append(
+                f"attribute_target_concept:{plan['attribute_target_concept']}"
+            )
+        for item in plan.get("entity_target_concepts") or []:
+            text = str(item or "").strip()
+            if text:
+                capabilities.append(f"entity_target_concept:{text}")
+        for item in plan.get("intermediate_target_concepts") or []:
+            text = str(item or "").strip()
+            if text:
+                capabilities.append(f"intermediate_target_concept:{text}")
+        for item in plan.get("domain_hints") or []:
+            text = str(item or "").strip()
+            if text:
+                capabilities.append(f"domain_hint:{text}")
+        for item in plan.get("composite_topology") or []:
+            text = str(item or "").strip().upper()
+            if text:
+                capabilities.append(f"composite_topology:{text}")
+        return capabilities
+
+    def _toolgen_enrich_registration_payload(
+        self,
+        creation_request: Mapping[str, Any],
+        *,
+        registration_exec_payload: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        enriched = dict(creation_request or {})
+        tool_plan = self._build_tool_plan(
+            registration_exec_payload
+            if isinstance(registration_exec_payload, Mapping)
+            else getattr(self, "_toolgen_execution_payload", None) or {}
+        )
+        target_archetype = str(
+            enriched.get("target_archetype")
+            or tool_plan.get("target_archetype")
+            or ""
+        ).strip().upper()
+        if target_archetype:
+            enriched["target_archetype"] = target_archetype
+        output_form = str(
+            enriched.get("output_form")
+            or self._toolgen_output_form_for_plan(tool_plan)
+            or ""
+        ).strip()
+        if output_form:
+            enriched["output_form"] = output_form
+        enriched["capabilities"] = self._toolgen_merge_structured_capabilities(
+            enriched.get("capabilities"),
+            self._toolgen_registration_capabilities_for_plan(tool_plan),
+        )
+        return enriched
+
+    def _toolgen_retry_anchor_selection_key(
+        self,
+        candidate: Optional[Mapping[str, Any]],
+    ) -> tuple[int, int, int, int, int, int, int, int, int]:
+        validation = self._toolgen_candidate_validation(candidate)
+        value_delivered = str(validation.get("value_delivered") or "none")
+        achieved_state = str(
+            validation.get("achieved_state")
+            or self._toolgen_achieved_state_for_value(value_delivered)
+        )
+        return (
+            self._toolgen_achieved_state_rank(achieved_state),
+            1 if value_delivered == "produced_final_variable" else 0,
+            1 if self._toolgen_candidate_bankable_partial_progress(candidate) else 0,
+            *self._toolgen_candidate_selection_key(candidate),
+        )
+
+    def _toolgen_bind_best_partial_retry_context(
+        self,
+        round_context: Mapping[str, Any],
+        *,
+        tool_plan: Optional[Mapping[str, Any]] = None,
+        round_history: Sequence[Mapping[str, Any]],
+        best_candidate: Optional[Mapping[str, Any]],
+        best_live_candidate: Optional[Mapping[str, Any]],
+        best_partial_candidate: Optional[Mapping[str, Any]],
+        best_partial_live_candidate: Optional[Mapping[str, Any]],
+    ) -> tuple[dict[str, Any], Optional[Mapping[str, Any]]]:
+        context = dict(round_context or {})
+        best_achieved = self._toolgen_best_achieved_state_summary(round_history)
+        for key, value in best_achieved.items():
+            if value is not None:
+                context[key] = value
+        best_partial_choice = best_partial_candidate
+        if self._toolgen_candidate_is_better(
+            best_partial_live_candidate,
+            best_partial_choice,
+            partial_bank=True,
+        ):
+            best_partial_choice = best_partial_live_candidate
+        best_overall_choice = best_candidate
+        if self._toolgen_candidate_is_better(
+            best_live_candidate,
+            best_overall_choice,
+        ):
+            best_overall_choice = best_live_candidate
+        best_retry_anchor = best_partial_choice
+        for candidate in (best_overall_choice, best_partial_choice):
+            if not isinstance(candidate, Mapping):
+                continue
+            if not isinstance(best_retry_anchor, Mapping):
+                best_retry_anchor = candidate
+                continue
+            if self._toolgen_retry_anchor_selection_key(
+                candidate
+            ) > self._toolgen_retry_anchor_selection_key(best_retry_anchor):
+                best_retry_anchor = candidate
+        preserve = bool(
+            str(best_achieved.get("best_achieved_state") or "none")
+            not in {"", "none"}
+            and not bool(context.get("pivot_required"))
+        )
+        required_next_achieved_state = self._toolgen_required_next_achieved_state_for_plan(
+            tool_plan,
+            achieved_state=str(best_achieved.get("best_achieved_state") or "none"),
+        )
+        if required_next_achieved_state:
+            context["required_next_achieved_state"] = required_next_achieved_state
+            context["required_handoff_achieved_state"] = (
+                self._toolgen_progress_minimum_handoff_state_for_plan(tool_plan)
+            )
+            context["stage_binding_instruction"] = self._toolgen_stage_binding_instruction(
+                tool_plan,
+                current_achieved_state=str(
+                    best_achieved.get("best_achieved_state") or "none"
+                ),
+                required_next_achieved_state=required_next_achieved_state,
+            )
+            context["forbidden_fallback_shapes"] = [
+                "raw_anchor_handoff",
+                "raw_walk_set_handoff",
+                "intersection_only_handoff_below_required_stage",
+                "re_resolve_anchors_as_main_output",
+            ]
+        if preserve:
+            context["preserve_best_partial_candidate"] = True
+            context["do_not_regress_below_best_achieved_state"] = best_achieved.get(
+                "best_achieved_state"
+            )
+            if isinstance(best_retry_anchor, Mapping):
+                best_partial_validation = self._toolgen_candidate_validation(
+                    best_retry_anchor
+                )
+                context["best_partial_candidate_value_delivered"] = (
+                    best_partial_validation.get("value_delivered")
+                )
+                context["best_partial_code_shape_signature"] = (
+                    best_partial_validation.get("code_shape_signature")
+                    or self._toolgen_code_shape_signature(
+                        str(best_retry_anchor.get("tool_code") or "")
+                    )
+                )
+                context["best_retry_anchor_value_delivered"] = best_partial_validation.get(
+                    "value_delivered"
+                )
+                context["best_retry_anchor_achieved_state"] = best_partial_validation.get(
+                    "achieved_state"
+                ) or self._toolgen_achieved_state_for_value(
+                    str(best_partial_validation.get("value_delivered") or "none")
+                )
+        return (
+            context,
+            best_retry_anchor if preserve and isinstance(best_retry_anchor, Mapping) else None,
+        )
+
+    def _toolgen_feedback_note_with_authoritative_baseline(
+        self,
+        feedback_note: str,
+        *,
+        failed_validation: Optional[Mapping[str, Any]],
+        retry_anchor_candidate: Optional[Mapping[str, Any]],
+    ) -> str:
+        if not isinstance(failed_validation, Mapping):
+            return feedback_note
+        has_stage_binding = bool(
+            failed_validation.get("required_next_achieved_state")
+            or failed_validation.get("stage_binding_instruction")
+            or failed_validation.get("force_structural_stage_rewrite")
+        )
+        has_authoritative_anchor = bool(
+            failed_validation.get("prefer_best_retry_anchor")
+            or (
+                has_stage_binding
+                and isinstance(retry_anchor_candidate, Mapping)
+            )
+        )
+        if not has_authoritative_anchor and not has_stage_binding:
+            return feedback_note
+        try:
+            payload = json.loads(feedback_note) if feedback_note else {}
+        except Exception:
+            payload = {
+                "phase": "validator",
+                "raw_feedback_note": str(feedback_note or ""),
+            }
+        if not isinstance(payload, dict):
+            payload = {
+                "phase": "validator",
+                "raw_feedback_note": str(feedback_note or ""),
+            }
+        if has_stage_binding:
+            for key in (
+                "required_next_achieved_state",
+                "required_handoff_achieved_state",
+                "minimum_acceptable_deliverable",
+                "stage_binding_instruction",
+                "forbidden_fallback_shapes",
+                "force_structural_stage_rewrite",
+            ):
+                value = failed_validation.get(key)
+                if value not in (None, "", []):
+                    payload[key] = value
+        if has_authoritative_anchor and isinstance(retry_anchor_candidate, Mapping):
+            anchor_validation = dict(
+                self._toolgen_candidate_validation(retry_anchor_candidate) or {}
+            )
+            anchor_spec = retry_anchor_candidate.get("tool_spec")
+            anchor_tool_name = (
+                str(anchor_spec.get("name") or "").strip()
+                if isinstance(anchor_spec, Mapping)
+                else ""
+            )
+            anchor_tool_code = str(retry_anchor_candidate.get("tool_code") or "")
+            payload["prefer_best_retry_anchor"] = True
+            payload["authoritative_retry_baseline"] = {
+                "tool_name": anchor_tool_name or None,
+                "value_delivered": anchor_validation.get("value_delivered"),
+                "achieved_state": anchor_validation.get("achieved_state")
+                or self._toolgen_achieved_state_for_value(
+                    str(anchor_validation.get("value_delivered") or "none")
+                ),
+                "summary": anchor_validation.get("summary"),
+                "issues": anchor_validation.get("issues"),
+                "fixes": anchor_validation.get("fixes"),
+                "code_shape_signature": anchor_validation.get("code_shape_signature")
+                or self._toolgen_code_shape_signature(anchor_tool_code),
+            }
+            payload["regressed_candidate_validation"] = dict(failed_validation)
+            if "validation" in payload:
+                payload["validation"] = anchor_validation
+            if anchor_tool_name:
+                payload["last_tool_name"] = anchor_tool_name
+        payload["primary_repair_instruction"] = str(
+            failed_validation.get("primary_repair_instruction")
+            or payload.get("primary_repair_instruction")
+            or failed_validation.get("stage_binding_instruction")
+            or ""
+        ).strip() or None
+        critical_parts: list[str] = []
+        if has_authoritative_anchor:
+            critical_parts.append(
+                "Use AUTHORITATIVE_RETRY_BASELINE as the code and plan baseline. Treat the current regressed round as a local repair target only; do not let it redefine the overall approach."
+            )
+        if has_stage_binding:
+            critical_parts.append(
+                "Stage binding is mandatory: preserve the achieved topology and advance only the missing plan stage. Do not stop again below REQUIRED_NEXT_ACHIEVED_STATE."
+            )
+            if failed_validation.get("stage_binding_instruction"):
+                critical_parts.append(str(failed_validation.get("stage_binding_instruction") or "").strip())
+        payload["CRITICAL_INSTRUCTION"] = " ".join(critical_parts).strip() or None
+        return json.dumps(payload, ensure_ascii=True, default=str)
 
     # -----------------------------------------------------------------------
 
@@ -598,6 +1734,20 @@ class ControllerToolgenMixin:
             return int(validation.get("grade") or -1)
         except Exception:
             return -1
+
+    def _toolgen_candidate_bankable_partial_progress(
+        self,
+        candidate: Optional[Mapping[str, Any]],
+    ) -> bool:
+        validation = self._toolgen_candidate_validation(candidate)
+        if "bankable_partial_progress" in validation:
+            return bool(validation.get("bankable_partial_progress", False))
+        return bool(
+            validation.get("partial_value_usable", False)
+            and str(validation.get("value_delivered") or "none")
+            != "produced_final_variable"
+            and validation.get("usefulness_passed", True)
+        )
 
     def _toolgen_has_cleaner_prior_candidate(
         self,
@@ -695,7 +1845,9 @@ class ControllerToolgenMixin:
     ) -> tuple[int, int, int, int, int, int, int]:
         validation = self._toolgen_candidate_validation(candidate)
         value_delivered = str(validation.get("value_delivered") or "none")
-        partial_value_usable = bool(validation.get("partial_value_usable", False))
+        partial_value_usable = self._toolgen_candidate_bankable_partial_progress(
+            candidate
+        )
         trust_level = str(validation.get("semantic_trust_level") or "")
         failure_bucket = str(validation.get("failure_bucket") or "")
         smells = self._toolgen_candidate_semantic_code_smells(candidate)
@@ -755,10 +1907,9 @@ class ControllerToolgenMixin:
     ) -> bool:
         validation = self._toolgen_candidate_validation(candidate)
         return bool(
-            validation.get("partial_value_usable", False)
+            self._toolgen_candidate_bankable_partial_progress(candidate)
             and str(validation.get("value_delivered") or "none")
             != "produced_final_variable"
-            and validation.get("usefulness_passed", True)
         )
 
     def _toolgen_candidate_is_full_solve(
@@ -798,6 +1949,11 @@ class ControllerToolgenMixin:
             state = self._toolgen_achieved_state_for_value(
                 str(entry.get("value_delivered") or "none")
             )
+            if (
+                state != "produced_final_variable"
+                and entry.get("bankable_partial_progress") is False
+            ):
+                continue
             rank = self._toolgen_achieved_state_rank(state)
             if rank > best_rank:
                 best_rank = rank
@@ -1081,6 +2237,13 @@ class ControllerToolgenMixin:
         previous_failure_bucket = str(
             previous.get("failure_bucket") or previous.get("previous_failure_bucket") or ""
         )
+        previous_achieved_state = str(
+            previous.get("achieved_state")
+            or self._toolgen_achieved_state_for_value(
+                str(previous.get("value_delivered") or "none")
+            )
+            or "none"
+        )
         strategy_sequence = self._normalize_vocab_list(
             previous.get("strategy_sequence"),
             STRATEGY_FAMILY_VOCAB,
@@ -1288,6 +2451,7 @@ class ControllerToolgenMixin:
             "fallback_strategies": fallback_strategies,
             "previous_strategy_family": previous_strategy_family or None,
             "previous_failure_family": previous_failure_family or None,
+            "previous_achieved_state": previous_achieved_state or None,
             "failure_bucket": previous_failure_bucket or None,
             "same_strategy_as_previous": bool(
                 previous_strategy_family
@@ -1316,6 +2480,7 @@ class ControllerToolgenMixin:
         phase1_retry_state: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         payload = dict(exec_payload or {})
+        round_context = dict(round_context or {})
         tool_plan = self._build_tool_plan(payload)
         tool_plan["execution_style"] = (
             round_context.get("active_execution_style")
@@ -1332,11 +2497,72 @@ class ControllerToolgenMixin:
             or tool_plan.get("fallback_strategies")
             or []
         )
+        required_next_achieved_state = str(
+            round_context.get("required_next_achieved_state")
+            or (phase1_retry_state or {}).get("required_next_achieved_state")
+            or ""
+        ).strip()
+        required_handoff_achieved_state = str(
+            round_context.get("required_handoff_achieved_state")
+            or (phase1_retry_state or {}).get("required_handoff_achieved_state")
+            or ""
+        ).strip()
+        stage_binding_instruction = str(
+            round_context.get("stage_binding_instruction")
+            or (phase1_retry_state or {}).get("stage_binding_instruction")
+            or ""
+        ).strip()
+        forbidden_fallback_shapes = round_context.get("forbidden_fallback_shapes")
+        if not isinstance(forbidden_fallback_shapes, list):
+            forbidden_fallback_shapes = (phase1_retry_state or {}).get(
+                "forbidden_fallback_shapes"
+            )
+        if not isinstance(forbidden_fallback_shapes, list):
+            forbidden_fallback_shapes = []
+        forbidden_fallback_shapes = [
+            str(item or "").strip()
+            for item in forbidden_fallback_shapes
+            if str(item or "").strip()
+        ]
+        if required_next_achieved_state:
+            round_context["required_next_achieved_state"] = required_next_achieved_state
+            tool_plan["required_next_achieved_state"] = required_next_achieved_state
+        if required_handoff_achieved_state:
+            round_context["required_handoff_achieved_state"] = (
+                required_handoff_achieved_state
+            )
+            tool_plan["required_handoff_achieved_state"] = (
+                required_handoff_achieved_state
+            )
+        if stage_binding_instruction:
+            round_context["stage_binding_instruction"] = stage_binding_instruction
+            tool_plan["stage_binding_instruction"] = stage_binding_instruction
+        if forbidden_fallback_shapes:
+            round_context["forbidden_fallback_shapes"] = list(
+                forbidden_fallback_shapes
+            )
+            tool_plan["forbidden_fallback_shapes"] = list(
+                forbidden_fallback_shapes
+            )
         # Phase 1: propagate minimum_acceptable_deliverable from round_context
         # into tool_plan and top-level payload so ToolGen can read it from
         # both payload['tool_plan'] and payload directly.
         _mad = round_context.get("minimum_acceptable_deliverable")
-        if _mad and not tool_plan.get("minimum_acceptable_deliverable"):
+        _plan_mad = self._toolgen_progress_minimum_deliverable_for_plan(
+            tool_plan,
+            round_context=round_context,
+        )
+        if _plan_mad and (
+            not _mad
+            or str(_mad).strip() == self._PHASE1_GENERIC_MIN_DELIVERABLE
+        ):
+            _mad = _plan_mad
+            round_context["minimum_acceptable_deliverable"] = _mad
+        if _mad and (
+            not tool_plan.get("minimum_acceptable_deliverable")
+            or str(tool_plan.get("minimum_acceptable_deliverable") or "").strip()
+            == self._PHASE1_GENERIC_MIN_DELIVERABLE
+        ):
             tool_plan["minimum_acceptable_deliverable"] = _mad
         phase1_active = bool((phase1_retry_state or {}).get("active"))
         phase1_progress_retry = phase1_active and (
@@ -1344,16 +2570,45 @@ class ControllerToolgenMixin:
             or bool(tool_plan.get("minimum_acceptable_deliverable"))
             or bool(_mad)
         )
+        # Multi-anchor + attribute-filter plans need stage-binding from round 1.
+        # full_solve generates oversized code that exhausts at resolved_both_anchors
+        # because walk_to_target from an animal anchor can return empty and the full
+        # 7-step chain exceeds the code budget. Force progress_tool + built_filter_ready_set
+        # binding so the LLM emits a compact finish-chain macro instead.
+        if (
+            not phase1_active
+            and self._toolgen_progress_plan_requires_multi_anchor_floor(tool_plan)
+            and self._toolgen_progress_plan_has_attribute_filter(tool_plan)
+        ):
+            tool_plan["preferred_tool_mode"] = "progress_tool"
+            required_next_achieved_state = required_next_achieved_state or "built_filter_ready_set"
+            if not stage_binding_instruction:
+                stage_binding_instruction = self._toolgen_stage_binding_instruction(
+                    tool_plan,
+                    current_achieved_state="none",
+                    required_next_achieved_state="built_filter_ready_set",
+                )
+            phase1_progress_retry = True
         if phase1_progress_retry:
-            progress_steps, progress_text = (
-                self._toolgen_phase1_retry_execution_plan(
-                    str(
-                        tool_plan.get("minimum_acceptable_deliverable")
-                        or _mad
-                        or ""
+            _use_stage_binding = bool(
+                required_next_achieved_state
+                and self._toolgen_progress_plan_has_attribute_filter(tool_plan)
+            )
+            if _use_stage_binding:
+                progress_steps, progress_text = self._toolgen_stage_binding_execution_plan(
+                    tool_plan,
+                    required_next_achieved_state=required_next_achieved_state,
+                )
+            else:
+                progress_steps, progress_text = (
+                    self._toolgen_phase1_retry_execution_plan(
+                        str(
+                            tool_plan.get("minimum_acceptable_deliverable")
+                            or _mad
+                            or ""
+                        )
                     )
                 )
-            )
             tool_plan["topological_execution_plan"] = list(progress_steps)
             tool_plan["topological_execution_plan_raw"] = list(progress_steps)
             tool_plan["topological_execution_plan_steps"] = list(progress_steps)
@@ -1363,6 +2618,14 @@ class ControllerToolgenMixin:
         payload["fallback_strategies"] = tool_plan.get("fallback_strategies")
         if _mad:
             payload["minimum_acceptable_deliverable"] = _mad
+        if required_next_achieved_state:
+            payload["required_next_achieved_state"] = required_next_achieved_state
+        if required_handoff_achieved_state:
+            payload["required_handoff_achieved_state"] = required_handoff_achieved_state
+        if stage_binding_instruction:
+            payload["stage_binding_instruction"] = stage_binding_instruction
+        if forbidden_fallback_shapes:
+            payload["forbidden_fallback_shapes"] = list(forbidden_fallback_shapes)
         if phase1_progress_retry:
             payload["topological_execution_plan"] = tool_plan.get(
                 "topological_execution_plan"
@@ -1377,6 +2640,28 @@ class ControllerToolgenMixin:
                 "topological_execution_plan_text"
             )
         payload["tool_plan"] = tool_plan
+        # Step 2: propagate typed family/role slots so they reach ToolGen and repair logic.
+        for _fkey in (
+            "template_family", "anchor_operands", "filter_operand",
+            "filter_value_operand", "terminal_artifact_kind",
+            "target_concept", "attribute_target_concept",
+            "required_next_stage", "normalized_family_inputs",
+            "family_normalization_source", "family_normalization_fallback_used",
+            "family_fallback_split_used", "family_fallback_split_reason",
+            "family_classification_ambiguous", "candidate_family_options",
+            "relation_hints",
+        ):
+            if _fkey in tool_plan:
+                payload[_fkey] = tool_plan[_fkey]
+                round_context[_fkey] = tool_plan[_fkey]
+        family_binding = self._toolgen_kg_family_binding_context(
+            tool_plan=tool_plan,
+            round_context=round_context,
+        )
+        for _binding_key, _binding_value in family_binding.items():
+            payload[_binding_key] = _binding_value
+            round_context[_binding_key] = _binding_value
+            tool_plan[_binding_key] = _binding_value
         payload["toolgen_retry_context"] = dict(round_context)
         return payload
 
@@ -1473,12 +2758,25 @@ class ControllerToolgenMixin:
         labels = [str(key or "") for key in minted.keys()]
         lowered = observation.lower()
         preferred_tool_mode = str(tool_plan.get("preferred_tool_mode") or "")
+        terminal_artifact_kind = str(tool_plan.get("terminal_artifact_kind") or "").strip()
         if (
             summary.get("has_final_variable")
             and str(summary.get("execution_status") or "") == "SUCCESS"
+            and terminal_artifact_kind in {"count_variable", "attribute_values"}
             and (
-                preferred_tool_mode == "full_solve"
-                or bool(summary.get("final_operation_safe", False))
+                bool(summary.get("final_operation_safe", False))
+                or any(
+                    token in lowered
+                    for token in (
+                        "count result",
+                        "count variable",
+                        "submit it directly",
+                        "attribute value",
+                        "attribute-values",
+                        "maximum",
+                        "minimum",
+                    )
+                )
             )
         ):
             return "produced_final_variable"
@@ -1509,27 +2807,100 @@ class ControllerToolgenMixin:
         ) and preferred_tool_mode == "diagnostic_probe":
             return "produced_actionable_handoff"
         resolved_anchor_count = 0
-        for label in labels:
-            lowered_label = label.lower()
-            if "resolved" in lowered_label and "anchor" in lowered_label:
-                resolved_anchor_count += 1
+        target_set_count = 0
+        intersection_count = 0
+        filter_ready_count = 0
+        for label, minted_value in minted.items():
+            if not self._toolgen_value_has_grounded_pointer(minted_value):
+                continue
+            lowered_label = str(label or "").lower()
+            if any(
+                token in lowered_label
+                for token in (
+                    "semantic_filter",
+                    "filter_",
+                    "filter_ready",
+                    "filtered",
+                    "attribute_context",
+                    "attribute_map",
+                    "filter_result",
+                )
+            ):
+                filter_ready_count += 1
+                continue
+            if any(
+                token in lowered_label
+                for token in (
+                    "intersect",
+                    "intersection",
+                    "overlap",
+                    "shared_set",
+                )
+            ):
+                intersection_count += 1
+                continue
+            if not self._toolgen_is_resolutionish_minted_label(str(label or "")):
+                if any(
+                    token in lowered_label
+                    for token in (
+                        "walk",
+                        "walked",
+                        "target_set",
+                        "candidate_set",
+                        "candidates",
+                        "branch",
+                        "subset",
+                        "set",
+                    )
+                ):
+                    target_set_count += 1
+                continue
+            if "filter" in lowered_label or "intersect" in lowered_label or "walk" in lowered_label:
+                continue
+            if "semantic" in lowered_label:
+                continue
+            resolved_anchor_count += 1
+        if filter_ready_count:
+            return "built_filter_ready_set"
+        if intersection_count:
+            return "built_intersection_set"
         if resolved_anchor_count >= 2:
             return "resolved_both_anchors"
         if resolved_anchor_count == 1:
             return "resolved_anchor"
         if any("intersection" in str(label or "").lower() for label in labels) or "intersected set" in lowered:
             return "built_intersection_set"
-        set_like_count = 0
-        for label in labels:
-            lowered_label = label.lower()
-            if any(token in lowered_label for token in ("set", "branch", "vars_", "walked", "filtered")):
-                set_like_count += 1
         if any(token in lowered for token in ("attribute context", "attribute map", "argmax", "argmin")):
             return "built_attribute_context"
-        if set_like_count >= 2:
+        if target_set_count >= 2:
             return "built_both_sets"
-        if set_like_count == 1:
+        if target_set_count == 1:
             return "built_target_set"
+        if (
+            summary.get("has_final_variable")
+            and str(summary.get("execution_status") or "") == "SUCCESS"
+            and (
+                bool(summary.get("final_operation_safe", False))
+                or (
+                    preferred_tool_mode == "full_solve"
+                    and not self._toolgen_progress_plan_requires_multi_anchor_floor(
+                        tool_plan
+                    )
+                )
+                or any(
+                    token in lowered
+                    for token in (
+                        "count result",
+                        "final answer",
+                        "argmax result",
+                        "argmin result",
+                        "maximum",
+                        "minimum",
+                    )
+                )
+            )
+        ):
+            return "produced_final_variable"
         if summary.get("has_context") and any(
             token in lowered
             for token in (
@@ -1576,6 +2947,7 @@ class ControllerToolgenMixin:
                 "built_target_set",
                 "built_both_sets",
                 "built_intersection_set",
+                "built_filter_ready_set",
                 "built_attribute_context",
                 "produced_actionable_handoff",
             }
@@ -1642,11 +3014,19 @@ class ControllerToolgenMixin:
             )
         ):
             return "runtime_dependency_error"
+        # Code-local failure families that are reliably identified from validator text —
+        # check these BEFORE the runtime-first stabilization so that specific code-local
+        # issues are not collapsed into the generic "no_runtime_progress" bucket.
+        if "count" in lowered and any(
+            token in lowered for token in ("wrong count", "pre-count", "count variable")
+        ):
+            return "count_target_wrong"
         # Runtime-first family stabilization: anchor on no_runtime_progress when the
         # live summary already establishes exhausted/no-value/no-final, BEFORE checking
         # incidental validator text that can drift the family each round.
         # Only skipped when a durable execution-level root cause was matched above
-        # (integration_context_invalid, server_validation_blocked, runtime_dependency_error).
+        # (integration_context_invalid, server_validation_blocked, runtime_dependency_error)
+        # or a specific code-local pattern was matched above.
         # General rule: applies to any environment where live outcome is authoritative.
         _lps_ffam = live_progress_summary or {}
         if (
@@ -1656,10 +3036,6 @@ class ControllerToolgenMixin:
             and str(_lps_ffam.get("achieved_state") or "none") == "none"
         ):
             return "no_runtime_progress"
-        if "count" in lowered and any(
-            token in lowered for token in ("wrong count", "pre-count", "count variable")
-        ):
-            return "count_target_wrong"
         if any(token in lowered for token in ("argmax", "argmin")) and "input" in lowered:
             return "argmax_input_wrong"
         if "variable_list" in lowered and any(
@@ -1718,6 +3094,10 @@ class ControllerToolgenMixin:
         result = dict(validation)
         summary = dict(live_progress_summary or {})
         round_context = dict(round_context or {})
+        family_binding = self._toolgen_kg_family_binding_context(
+            tool_plan=tool_plan,
+            round_context=round_context,
+        )
         strategy_family = self._normalize_vocab_value(
             round_context.get("active_strategy_family")
             or round_context.get("strategy_family"),
@@ -1742,6 +3122,20 @@ class ControllerToolgenMixin:
             PREFERRED_TOOL_MODE_VOCAB,
             default="full_solve",
         )
+        achieved_state = str(
+            summary.get("achieved_state")
+            or self._toolgen_achieved_state_for_value(
+                str(summary.get("value_delivered") or "none")
+            )
+        )
+        minimum_bankable_state = self._toolgen_progress_minimum_bankable_state_for_plan(
+            tool_plan
+        )
+        minimum_handoff_state = self._toolgen_progress_minimum_handoff_state_for_plan(
+            tool_plan
+        )
+        plan_requires_strict_bank_floor = minimum_bankable_state != "resolved_anchor"
+        plan_requires_strict_handoff_floor = minimum_handoff_state != "resolved_anchor"
         value_delivered = self._toolgen_classify_value_delivered(
             tool_plan=tool_plan,
             execution_validation=execution_validation,
@@ -1752,6 +3146,22 @@ class ControllerToolgenMixin:
             summary,
             preferred_tool_mode=preferred_tool_mode,
         )
+        if "partial_value_usable" in summary:
+            partial_value_usable = partial_value_usable and bool(
+                summary.get("partial_value_usable", False)
+            )
+        achieved_state = self._toolgen_achieved_state_for_value(value_delivered)
+        bankable_partial_progress = bool(
+            value_delivered not in {"", "none", "produced_final_variable"}
+            and self._toolgen_achieved_state_meets_floor(
+                achieved_state,
+                minimum_bankable_state,
+            )
+        )
+        if "bankable_partial_progress" in summary:
+            bankable_partial_progress = bool(
+                summary.get("bankable_partial_progress", False)
+            )
         failure_family = self._toolgen_classify_failure_family(
             failure_phase=failure_phase,
             execution_validation=execution_validation,
@@ -1795,6 +3205,49 @@ class ControllerToolgenMixin:
         result["failure_bucket"] = failure_bucket
         result["value_delivered"] = value_delivered
         result["partial_value_usable"] = partial_value_usable
+        result["achieved_state"] = achieved_state
+        result["minimum_bankable_achieved_state"] = minimum_bankable_state
+        result["minimum_handoff_achieved_state"] = minimum_handoff_state
+        result["bankable_partial_progress"] = bankable_partial_progress
+        comparison_state = str(round_context.get("best_achieved_state") or "").strip()
+        if not comparison_state or self._toolgen_achieved_state_rank(
+            comparison_state
+        ) < self._toolgen_achieved_state_rank(achieved_state):
+            comparison_state = achieved_state
+        required_next_achieved_state = self._toolgen_required_next_achieved_state_for_plan(
+            tool_plan,
+            achieved_state=comparison_state,
+        )
+        if required_next_achieved_state:
+            result["required_next_achieved_state"] = required_next_achieved_state
+            result["required_handoff_achieved_state"] = minimum_handoff_state
+            result["stage_binding_instruction"] = self._toolgen_stage_binding_instruction(
+                tool_plan,
+                current_achieved_state=comparison_state,
+                required_next_achieved_state=required_next_achieved_state,
+            )
+            result["forbidden_fallback_shapes"] = [
+                "raw_anchor_handoff",
+                "raw_walk_set_handoff",
+                "intersection_only_handoff_below_required_stage",
+                "re_resolve_anchors_as_main_output",
+            ]
+        minimum_acceptable_deliverable = self._toolgen_progress_minimum_deliverable_for_plan(
+            tool_plan,
+            round_context={
+                **dict(round_context or {}),
+                "required_next_achieved_state": required_next_achieved_state,
+            },
+        )
+        if minimum_acceptable_deliverable:
+            result["minimum_acceptable_deliverable"] = minimum_acceptable_deliverable
+        result["below_minimum_useful_floor"] = bool(
+            value_delivered not in {"", "none", "produced_final_variable"}
+            and not self._toolgen_achieved_state_meets_floor(
+                achieved_state,
+                minimum_bankable_state,
+            )
+        )
         runtime_repair_brief = self._toolgen_synthesize_runtime_repair_brief(
             live_progress_summary=summary,
             round_context=round_context,
@@ -1871,6 +3324,52 @@ class ControllerToolgenMixin:
         result["pivot_required"] = bool(round_context.get("pivot_required"))
         result["material_progress"] = bool(summary.get("material_progress", False))
         result["code_shape_signature"] = self._toolgen_code_shape_signature(tool_code)
+        result["family_binding_active"] = bool(
+            family_binding.get("family_binding_active")
+        )
+        result["family_binding_reason"] = family_binding.get("family_binding_reason")
+        result["generic_path_blocked_for_family_bound_attempt"] = bool(
+            family_binding.get("generic_path_blocked_for_family_bound_attempt")
+        )
+        result["family_skeleton_selected"] = family_binding.get(
+            "family_skeleton_selected"
+        )
+        result["family_generation_path_used"] = bool(
+            family_binding.get("family_generation_path_used")
+        )
+        result["generic_generation_blocked"] = bool(
+            family_binding.get("generic_generation_blocked")
+        )
+        result["generic_repair_blocked"] = bool(
+            family_binding.get("generic_repair_blocked")
+        )
+        result["family_repair_template_name"] = family_binding.get(
+            "family_repair_template_name"
+        )
+        result["family_validator_path_used"] = bool(
+            family_binding.get("family_validator_path_used")
+        )
+        result["normalized_family_inputs"] = family_binding.get(
+            "normalized_family_inputs"
+        )
+        result["family_normalization_source"] = family_binding.get(
+            "family_normalization_source"
+        )
+        result["family_normalization_fallback_used"] = bool(
+            family_binding.get("family_normalization_fallback_used")
+        )
+        result["family_classification_ambiguous"] = bool(
+            family_binding.get("family_classification_ambiguous")
+        )
+        result["candidate_family_options"] = list(
+            family_binding.get("candidate_family_options") or []
+        )
+        result["family_patch_path_blocked"] = bool(
+            round_context.get("family_patch_path_blocked")
+        )
+        result["family_regeneration_forced"] = bool(
+            round_context.get("family_regeneration_forced")
+        )
         try:
             grade = int(result.get("grade") or 0)
         except Exception:
@@ -1896,7 +3395,25 @@ class ControllerToolgenMixin:
             "comment_scaffolding",
             "docstring_scaffolding",
         }
-        semantic_smells = set(self._toolgen_semantic_code_smells(tool_code))
+        semantic_smells = set(
+            str(item or "").strip()
+            for item in (
+                result.get("semantic_code_smells")
+                or list(
+                    dict.fromkeys(
+                        self._toolgen_semantic_code_smells(tool_code)
+                        + self._toolgen_dynamic_plan_code_smells(
+                            tool_code,
+                            tool_plan,
+                        )
+                    )
+                )
+            )
+            if str(item or "").strip()
+        )
+        plan_requires_helper_discipline = self._toolgen_plan_requires_helper_discipline_guard(
+            tool_plan
+        )
         bulky_scaffolding = bool(semantic_smells & bulky_scaffolding_smells)
         if bulky_scaffolding and not partial_value_usable and value_delivered != "produced_final_variable":
             grade = min(grade, 5)
@@ -1920,6 +3437,621 @@ class ControllerToolgenMixin:
                 result["repair_mode"] = "rewrite_code"
         if partial_value_usable and value_delivered != "produced_final_variable" and grade < 6:
             grade = 6
+        if (
+            plan_requires_strict_bank_floor
+            and value_delivered not in {"", "none", "produced_final_variable"}
+            and not self._toolgen_achieved_state_meets_floor(
+                achieved_state,
+                minimum_bankable_state,
+            )
+        ):
+            grade = min(grade, 4)
+            result["partial_value_usable"] = False
+            result["bankable_partial_progress"] = False
+            result["repair_mode"] = "rewrite_code"
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(i or "") for i in _issues if str(i or "").strip()]
+            _fixes = [str(f or "") for f in _fixes if str(f or "").strip()]
+            _issues.insert(
+                0,
+                (
+                    "resolved_anchor_only_insufficient_for_plan"
+                    if value_delivered == "resolved_anchor"
+                    else (
+                        "below_minimum_useful_floor_for_plan: candidate delivered "
+                        f"{achieved_state}, but this KG plan requires at least "
+                        f"{minimum_bankable_state} before the state is bankable."
+                    )
+                ),
+            )
+            _fixes.insert(
+                0,
+                f"Advance the tool to at least {minimum_bankable_state} before stopping; "
+                "do not return broad raw anchor state when the plan still requires "
+                "downstream walk/intersection/filter/count work.",
+            )
+            result["issues"] = _issues
+            result["fixes"] = _fixes
+            result["primary_repair_instruction"] = (
+                "PLAN-STAGE REPAIR TARGET: advance to the minimum useful state for this plan "
+                f"({minimum_bankable_state}) and preserve the best prior topology while doing so."
+            )
+            if result.get("stage_binding_instruction"):
+                result["primary_repair_instruction"] += (
+                    " " + str(result.get("stage_binding_instruction") or "")
+                )
+        if (
+            plan_requires_strict_handoff_floor
+            and bool(summary.get("has_final_variable", False))
+            and value_delivered != "produced_final_variable"
+            and not self._toolgen_achieved_state_meets_floor(
+                achieved_state,
+                minimum_handoff_state,
+            )
+        ):
+            grade = min(grade, 4)
+            result["repair_mode"] = "rewrite_code"
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(i or "") for i in _issues if str(i or "").strip()]
+            _fixes = [str(f or "") for f in _fixes if str(f or "").strip()]
+            _issues.insert(
+                0,
+                (
+                    "plan_stage_handoff_too_broad: candidate returned a grounded variable "
+                    f"at achieved_state={achieved_state}, but this plan requires at least "
+                    f"{minimum_handoff_state} before the handoff is solver-usable."
+                ),
+            )
+            _fixes.insert(
+                0,
+                "Keep the best current narrowed/intersected/filter-ready set as the handoff. "
+                "Do not return a broad raw anchor set that bypasses required downstream stages.",
+            )
+            result["issues"] = _issues
+            result["fixes"] = _fixes
+            result["primary_repair_instruction"] = (
+                "PLAN-STAGE REPAIR TARGET: return the best current grounded narrowed/intersected/filter-ready set. "
+                "Do not hand off broad raw anchor variables when the declared plan still requires downstream narrowing."
+            )
+            if result.get("stage_binding_instruction"):
+                result["primary_repair_instruction"] += (
+                    " " + str(result.get("stage_binding_instruction") or "")
+                )
+        # Mandatory grounded handoff enforcement (Priority 1):
+        # A progress tool that built a real candidate set but returned final_variable=None
+        # and exhausted is a top-priority repair target — not an acceptable partial result.
+        _BUILT_SET_STATES = frozenset({
+            "built_target_set", "built_both_sets", "built_intersection_set",
+            "built_filter_ready_set",
+        })
+        _missing_grounded_handoff = (
+            value_delivered in _BUILT_SET_STATES
+            and not bool(summary.get("has_final_variable", False))
+            and str(summary.get("execution_status") or "") == "MACRO EXHAUSTED"
+        )
+        if _missing_grounded_handoff:
+            grade = min(grade, 4)
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(i or "") for i in _issues if str(i or "").strip()]
+            _fixes = [str(f or "") for f in _fixes if str(f or "").strip()]
+            _issues.insert(0, (
+                f"missing_grounded_handoff_after_real_progress: tool reached "
+                f"{value_delivered} but returned final_variable=None with MACRO EXHAUSTED. "
+                "Progress tools must return status='SUCCESS' with final_variable=#N "
+                "pointing to the built candidate set."
+            ))
+            _fixes.insert(0, (
+                "Return status='SUCCESS' with final_variable=#N (the built candidate set) "
+                "instead of exhausting. Stop at the built-set state; do not continue into "
+                "downstream steps that cause spurious exhaustion."
+            ))
+            result["issues"] = _issues
+            result["fixes"] = _fixes
+            result["repair_mode"] = "rewrite_code"
+            result["missing_grounded_handoff_after_real_progress"] = True
+            if result.get("stage_binding_instruction"):
+                result["primary_repair_instruction"] = (
+                    "PLAN-STAGE REPAIR TARGET: "
+                    + str(result.get("stage_binding_instruction") or "")
+                )
+        prior_best_state = str(round_context.get("best_achieved_state") or "none")
+        current_achieved_state = achieved_state
+        previous_achieved_state = str(round_context.get("previous_achieved_state") or "none")
+        preserved_anchor_contract_smells = {
+            "requires_variable_list_in_payload",
+            "requires_payload_resolved_anchors",
+            "does_not_respect_preserved_anchor_vars",
+            "re_resolve_anchors_as_main_output",
+            "preserved_ids_assigned_to_multiple_anchors",
+        }
+        required_next_rank = self._toolgen_achieved_state_rank(required_next_achieved_state)
+        resolved_both_rank = self._toolgen_achieved_state_rank("resolved_both_anchors")
+        tool_code_lower = tool_code.lower()
+        preserved_anchor_state_expected = bool(
+            self._toolgen_progress_plan_requires_multi_anchor_floor(tool_plan)
+            and prior_best_state not in {"", "none"}
+            and self._toolgen_achieved_state_rank(prior_best_state) >= resolved_both_rank
+        )
+        re_resolves_anchors = "resolve_entity_to_vars" in tool_code_lower
+        reads_preserved_anchor_state = bool(
+            "variable_list" in tool_code_lower or "resolved_anchors" in tool_code_lower
+        )
+        if (
+            preserved_anchor_state_expected
+            and re_resolves_anchors
+            and not reads_preserved_anchor_state
+        ):
+            semantic_smells.add("does_not_respect_preserved_anchor_vars")
+        if (
+            preserved_anchor_state_expected
+            and re_resolves_anchors
+            and required_next_rank > 0
+            and self._toolgen_achieved_state_rank(current_achieved_state) <= resolved_both_rank
+            and self._toolgen_achieved_state_rank(current_achieved_state) < required_next_rank
+        ):
+            semantic_smells.add("re_resolve_anchors_as_main_output")
+        result["semantic_code_smells"] = list(dict.fromkeys(semantic_smells))
+        preserved_contract_violations = list(
+            smell
+            for smell in result["semantic_code_smells"]
+            if smell in preserved_anchor_contract_smells
+        )
+        if preserved_contract_violations:
+            grade = min(grade, 4)
+            result["partial_value_usable"] = False
+            result["bankable_partial_progress"] = False
+            result["repair_mode"] = "rewrite_code"
+            if preserved_anchor_state_expected:
+                result["prefer_best_retry_anchor"] = True
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(item or "") for item in _issues if str(item or "").strip()]
+            _fixes = [str(item or "") for item in _fixes if str(item or "").strip()]
+            _contract_issues: list[str] = []
+            if "requires_variable_list_in_payload" in preserved_contract_violations:
+                _contract_issues.append(
+                    "requires_variable_list_in_payload: candidate returns ERROR/MACRO EXHAUSTED when payload['variable_list'] is absent instead of re-resolving anchors as fallback recovery."
+                )
+            if "requires_payload_resolved_anchors" in preserved_contract_violations:
+                _contract_issues.append(
+                    "requires_payload_resolved_anchors: candidate requires payload['resolved_anchors'] and blocks when it is absent instead of re-resolving anchors as fallback recovery."
+                )
+            if "does_not_respect_preserved_anchor_vars" in preserved_contract_violations:
+                _contract_issues.append(
+                    "does_not_respect_preserved_anchor_vars: candidate re-resolves anchors unconditionally instead of using preserved anchor vars when they already exist."
+                )
+            if "re_resolve_anchors_as_main_output" in preserved_contract_violations:
+                _contract_issues.append(
+                    "re_resolve_anchors_as_main_output: candidate spends the retry re-resolving anchors and stops below the required next stage instead of advancing to the missing walk/intersect/filter handoff."
+                )
+            if "preserved_ids_assigned_to_multiple_anchors" in preserved_contract_violations:
+                _contract_issues.append(
+                    "preserved_ids_assigned_to_multiple_anchors: candidate assigns the same preserved variable_list/resolved_anchors to multiple anchor slots without per-anchor slicing, producing identical operands in walk/intersect steps. Each anchor must get its own slice of the preserved list (index i → anchor i)."
+                )
+            _fixes.insert(
+                0,
+                "Use preserved anchor vars when available. If they are absent, re-resolve anchors from payload['entities'] only as fallback recovery, then continue directly to the required walk/intersect/filter stage. Never return ERROR solely because preserved state is missing, and do not stop at anchor re-resolution as the main output.",
+            )
+            result["issues"] = _contract_issues + _issues
+            result["fixes"] = _fixes
+            result["primary_repair_instruction"] = (
+                "PLAN-STAGE REPAIR TARGET: use preserved anchor vars when available; "
+                "if they are absent, re-resolve anchors from payload['entities'] only as "
+                "fallback recovery, then continue directly to the required narrowing stage. "
+                "Do not return ERROR solely because preserved state is missing, and do not "
+                "stop at anchor re-resolution as the main output."
+            )
+            if result.get("stage_binding_instruction"):
+                result["primary_repair_instruction"] += (
+                    " " + str(result.get("stage_binding_instruction") or "")
+                )
+        regression_smells = semantic_smells & (
+            bulky_scaffolding_smells
+            | {
+                "blanket_entity_resolve_loop",
+                "first_candidate_selection_by_index",
+                "requires_variable_list_in_payload",
+                "requires_payload_resolved_anchors",
+                "does_not_respect_preserved_anchor_vars",
+                "re_resolve_anchors_as_main_output",
+                "preserved_ids_assigned_to_multiple_anchors",
+                "attribute_target_concept_resolved_as_anchor",
+                "positional_entity_role_guessing",
+                "filter_value_in_anchor_operands",
+                "wrong_terminal_artifact_for_family",
+                "family_stage_order_violation",
+                "returned_member_not_set_variable",
+            }
+        )
+        if (
+            (
+                preferred_tool_mode in {"progress_tool", "diagnostic_probe"}
+                or plan_requires_strict_bank_floor
+            )
+            and prior_best_state not in {"", "none"}
+            and self._toolgen_achieved_state_rank(prior_best_state)
+            > self._toolgen_achieved_state_rank(current_achieved_state)
+            and (
+                regression_smells
+                or not self._toolgen_achieved_state_meets_floor(
+                    current_achieved_state,
+                    minimum_bankable_state,
+                )
+                or prior_best_state == "produced_final_variable"
+            )
+        ):
+            grade = min(grade, 4)
+            result["partial_value_usable"] = False
+            result["bankable_partial_progress"] = False
+            result["repair_mode"] = "rewrite_code"
+            result["prefer_best_retry_anchor"] = True
+            result["admission_blocked_due_to_regression"] = True
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(item or "") for item in _issues if str(item or "").strip()]
+            _fixes = [str(item or "") for item in _fixes if str(item or "").strip()]
+            _issues.insert(
+                0,
+                (
+                    "regressed_below_best_achieved_state: prior rounds already reached "
+                    f"{prior_best_state}, but this candidate fell back to "
+                    f"{current_achieved_state or 'none'} with weaker topology."
+                ),
+            )
+            _fixes.insert(
+                0,
+                "Preserve or improve the best-achieved partial topology from the earlier round; "
+                "repair the local issue without regressing to anchor-only, blanket-resolve, "
+                "first-candidate, or oversized scaffold behavior.",
+            )
+            result["issues"] = _issues
+            result["fixes"] = _fixes
+            if result.get("stage_binding_instruction"):
+                result["primary_repair_instruction"] = (
+                    "PLAN-STAGE REPAIR TARGET: "
+                    + str(result.get("stage_binding_instruction") or "")
+                )
+        _family_for_validation = str(
+            (tool_plan or {}).get("template_family")
+            or round_context.get("template_family")
+            or ""
+        ).strip()
+        family_smells = semantic_smells & {
+            "filter_value_in_anchor_operands",
+            "wrong_terminal_artifact_for_family",
+            "family_stage_order_violation",
+            "returned_member_not_set_variable",
+            "positional_entity_role_guessing",
+        }
+        # Advisory family smells: reported and included in repair instructions but
+        # do not hard-cap grade to 3 (they cap to 5 below if family is known).
+        advisory_family_smells = semantic_smells & {
+            "wrong_anchor_count_for_family",
+            "relation_hints_ignored",
+        }
+        if _family_for_validation and family_smells:
+            grade = min(grade, 3)
+            result["partial_value_usable"] = False
+            result["bankable_partial_progress"] = False
+            result["repair_mode"] = "rewrite_code"
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(item or "") for item in _issues if str(item or "").strip()]
+            _fixes = [str(item or "") for item in _fixes if str(item or "").strip()]
+            _family_issues: list[str] = []
+            if family_smells & {
+                "filter_value_in_anchor_operands",
+                "positional_entity_role_guessing",
+            }:
+                _family_issues.append(
+                    "family_operand_role_violation: typed family operands are being collapsed. "
+                    "Resolve and walk only anchor_operands. Keep filter_value_operand out of anchor resolution "
+                    "and use attribute_target_concept/filter_operand only for downstream filtering or extraction."
+                )
+            if "wrong_terminal_artifact_for_family" in family_smells:
+                _family_issues.append(
+                    "wrong_terminal_artifact_for_family: the candidate reaches the wrong terminal artifact for the selected family. "
+                    "Return exactly the family terminal and stop there."
+                )
+            if "returned_member_not_set_variable" in family_smells:
+                _family_issues.append(
+                    "returned_member_not_set_variable: the family terminal requires a set variable, but the code returns a single member "
+                    "via next(iter(...)) or index selection."
+                )
+            if "family_stage_order_violation" in family_smells:
+                _family_issues.append(
+                    "family_stage_order_violation: helper calls are out of the legal family stage order. "
+                    "Follow the family skeleton instead of mixing stages."
+                )
+            if "wrong_anchor_count_for_family" in family_smells:
+                _family_issues.append(
+                    "wrong_anchor_count_for_family: two-anchor family requires reading anchor_operands "
+                    "from payload. Do not select anchors from entities by position. "
+                    "Use: anchor_ops = payload.get('anchor_operands') or []"
+                )
+            if "relation_hints_ignored" in family_smells:
+                _rh_in_plan = list(
+                    (tool_plan or {}).get("relation_hints")
+                    or round_context.get("relation_hints")
+                    or []
+                )
+                _family_issues.append(
+                    f"relation_hints_ignored: relation_hints {_rh_in_plan} were provided but not "
+                    "used in the tool. Pass them via domain_hints=payload.get('relation_hints') "
+                    "in walk_to_target calls."
+                )
+            _family_fix = self._toolgen_family_repair_instruction(
+                template_family=_family_for_validation,
+                anchor_operands=(tool_plan or {}).get("anchor_operands")
+                or round_context.get("anchor_operands"),
+                filter_operand=str(
+                    (tool_plan or {}).get("filter_operand")
+                    or round_context.get("filter_operand")
+                    or ""
+                ),
+                filter_value_operand=str(
+                    (tool_plan or {}).get("filter_value_operand")
+                    or round_context.get("filter_value_operand")
+                    or ""
+                ),
+                target_concept=str(
+                    (tool_plan or {}).get("target_concept")
+                    or round_context.get("target_concept")
+                    or ""
+                ),
+                required_next_stage=str(
+                    result.get("required_next_achieved_state")
+                    or round_context.get("required_next_achieved_state")
+                    or ""
+                ),
+                terminal_artifact_kind=str(
+                    (tool_plan or {}).get("terminal_artifact_kind")
+                    or round_context.get("terminal_artifact_kind")
+                    or ""
+                ),
+                relation_hints=list(
+                    (tool_plan or {}).get("relation_hints")
+                    or round_context.get("relation_hints")
+                    or []
+                ),
+                prefix="FAMILY VALIDATOR REPAIR: Correct the family contract violation before any other rewrite. ",
+            )
+            if _family_fix:
+                _fixes.insert(0, _family_fix)
+                result["primary_repair_instruction"] = _family_fix
+                result["family_repair_path_used"] = _family_for_validation
+            result["issues"] = _family_issues + _issues
+            result["fixes"] = _fixes
+            result["family_top_issue_used"] = True
+        # Advisory family smells: record separately, do NOT overwrite result["issues"].
+        # These guide repair without affecting grade or blocking registration.
+        if _family_for_validation and advisory_family_smells:
+            _adv_issues = []
+            if "wrong_anchor_count_for_family" in advisory_family_smells:
+                _adv_issues.append(
+                    "wrong_anchor_count_for_family: two-anchor family requires reading "
+                    "anchor_operands from payload. "
+                    "Use: anchor_ops = payload.get('anchor_operands') or []"
+                )
+            if "relation_hints_ignored" in advisory_family_smells:
+                _rh_adv = list(
+                    (tool_plan or {}).get("relation_hints")
+                    or round_context.get("relation_hints")
+                    or []
+                )
+                _adv_issues.append(
+                    f"relation_hints_ignored: relation_hints {_rh_adv} provided but not "
+                    "used. Pass via domain_hints=payload.get('relation_hints') in "
+                    "walk_to_target calls."
+                )
+            result["advisory_issues"] = _adv_issues
+            result["advisory_family_smells"] = list(advisory_family_smells)
+        targeted_helper_smells = semantic_smells & {
+            "missing_attribute_filter_application",
+            "resolve_semantic_filter_context_misuse",
+            "stale_anchor_filter_context",
+            "helper_signature_mismatch",
+            "walk_to_target_context_misuse",
+            "cross_intersect_context_misuse",
+            "extract_attribute_value_context_misuse",
+            "multi_anchor_filter_order_violation",
+        }
+        _allow_diagnostic_handoff_without_helper_completion = bool(
+            preferred_tool_mode == "diagnostic_probe"
+            and (
+                value_delivered in {
+                    "produced_actionable_handoff",
+                    "identified_relation_candidates",
+                    "identified_relation_family",
+                }
+                or bool(summary.get("has_context"))
+            )
+        )
+        if plan_requires_helper_discipline and targeted_helper_smells and not (
+            _family_for_validation and family_smells
+        ) and not _allow_diagnostic_handoff_without_helper_completion:
+            grade = min(grade, 4)
+            result["partial_value_usable"] = False
+            result["bankable_partial_progress"] = False
+            result["repair_mode"] = "rewrite_code"
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(item or "") for item in _issues if str(item or "").strip()]
+            _fixes = [str(item or "") for item in _fixes if str(item or "").strip()]
+            _issues.insert(
+                0,
+                "helper_discipline_blocks_plan_relevant_handoff: required kg_utils helper usage is malformed or out of plan-stage order, so the tool never reaches a usable narrowed/intersected/filter-ready state.",
+            )
+            _fixes.insert(
+                0,
+                "Use canonical kg_utils helper signatures and plan-stage context: actions_spec-first walk/intersection helpers, env-output-only attribute extraction, and resolve_semantic_filter on the current candidate set instead of stale anchor vars.",
+            )
+            result["issues"] = _issues
+            result["fixes"] = _fixes
+            result["primary_repair_instruction"] = (
+                "PLAN-STAGE REPAIR TARGET: repair helper discipline before any broader rewrite. "
+                "Use canonical walk/intersection/filter/value-extraction helper signatures and contexts so the tool can reach a solver-usable narrowed state."
+            )
+            if result.get("stage_binding_instruction"):
+                result["primary_repair_instruction"] += (
+                    " " + str(result.get("stage_binding_instruction") or "")
+                )
+            if result.get("family_binding_active"):
+                result["generic_validator_fallback_used"] = True
+        # PART C: attribute_target_concept_resolved_as_anchor — hard cap ≤ 3
+        if "attribute_target_concept_resolved_as_anchor" in semantic_smells:
+            grade = min(grade, 3)
+            result["partial_value_usable"] = False
+            result["bankable_partial_progress"] = False
+            result["repair_mode"] = "rewrite_code"
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(item or "") for item in _issues if str(item or "").strip()]
+            _fixes = [str(item or "") for item in _fixes if str(item or "").strip()]
+            _issues.insert(
+                0,
+                "attribute_target_concept_resolved_as_anchor: attribute_target_concept is passed to resolve_entity_to_vars as if it were an anchor entity. It is not a KG entity to resolve — it is a semantic modifier/filter criterion. Resolving it as an anchor produces a semantically wrong second operand and collapses the intersection into a degenerate set.",
+            )
+            _fixes.insert(
+                0,
+                "Remove attribute_target_concept from resolve_entity_to_vars calls. Only payload['entities'] members are anchor operands. Use attribute_target_concept exclusively as: (a) the target_concept or target arg to walk_to_target, or (b) the target_concept arg to resolve_semantic_filter.",
+            )
+            result["issues"] = _issues
+            result["fixes"] = _fixes
+            result["primary_repair_instruction"] = (
+                "OPERAND ROLE REPAIR: attribute_target_concept is a semantic filter criterion, NOT a KG entity anchor. "
+                "Remove it from all resolve_entity_to_vars calls. Only resolve entities from payload['entities']. "
+                "Pass attribute_target_concept only to walk_to_target (as target_concept) or resolve_semantic_filter (as target_concept). "
+                + str(result.get("stage_binding_instruction") or "")
+            )
+        # PART E: positional_entity_role_guessing — hard cap ≤ 3
+        if "positional_entity_role_guessing" in semantic_smells:
+            grade = min(grade, 3)
+            result["partial_value_usable"] = False
+            result["bankable_partial_progress"] = False
+            result["repair_mode"] = "rewrite_code"
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(item or "") for item in _issues if str(item or "").strip()]
+            _fixes = [str(item or "") for item in _fixes if str(item or "").strip()]
+            _template_family_e = str(tool_plan.get("template_family") or round_context.get("template_family") or "")
+            _anchor_ops_e = list(tool_plan.get("anchor_operands") or [])
+            _filter_op_e = str(tool_plan.get("filter_operand") or "")
+            _issues.insert(
+                0,
+                "positional_entity_role_guessing: code selects anchor entities by position "
+                "(entities[0]/entities[1]/idx<2/counter>=2). Entity positions are arbitrary "
+                "across tasks. Use anchor_operands from tool_plan to identify anchors and "
+                "filter_operand for the semantic filter concept type.",
+            )
+            _fix_msg = (
+                "Replace positional entity selection with typed role slots from tool_plan: "
+                "iterate over anchor_operands (not entities) to resolve KG anchors. "
+                "filter_operand is a concept type string, not an entity to find in entities."
+            )
+            if _template_family_e:
+                _fix_msg += (
+                    f" Family: {_template_family_e}."
+                    + (f" anchor_operands={_anchor_ops_e}." if _anchor_ops_e else "")
+                    + (f" filter_operand='{_filter_op_e}'." if _filter_op_e else "")
+                )
+            _fixes.insert(0, _fix_msg)
+            result["issues"] = _issues
+            result["fixes"] = _fixes
+            _pri_e = (
+                "OPERAND ROLE REPAIR (POSITIONAL GUESSING): code selects anchors by position "
+                "using entities[0]/idx<2/counter>=2. Entity order is arbitrary across tasks. "
+                "Use tool_plan['anchor_operands'] for the typed anchor list. "
+                "Use tool_plan['filter_operand'] as the semantic filter concept type (not an entity)."
+            )
+            if _template_family_e:
+                _pri_e += f" Family={_template_family_e}."
+            _sbi_e = str(result.get("stage_binding_instruction") or "")
+            if _sbi_e:
+                _pri_e += " " + _sbi_e
+            result["primary_repair_instruction"] = _pri_e
+        same_stage_below_handoff_stall = bool(
+            result.get("required_next_achieved_state")
+            and previous_achieved_state not in {"", "none"}
+            and previous_achieved_state == current_achieved_state
+            and str(round_context.get("previous_failure_bucket") or "") == failure_bucket
+            and not self._toolgen_achieved_state_meets_floor(
+                current_achieved_state,
+                minimum_handoff_state,
+            )
+        )
+        if same_stage_below_handoff_stall:
+            grade = min(grade, 4)
+            result["repair_mode"] = "rewrite_code"
+            result["prefer_best_retry_anchor"] = True
+            result["force_structural_stage_rewrite"] = True
+            _issues = result.get("issues")
+            _fixes = result.get("fixes")
+            if not isinstance(_issues, list):
+                _issues = [str(_issues or "")] if _issues else []
+            if not isinstance(_fixes, list):
+                _fixes = [str(_fixes or "")] if _fixes else []
+            _issues = [str(item or "") for item in _issues if str(item or "").strip()]
+            _fixes = [str(item or "") for item in _fixes if str(item or "").strip()]
+            _issues.insert(
+                0,
+                (
+                    "repeated_same_stage_below_required_handoff: consecutive rounds stayed at "
+                    f"{current_achieved_state} while the required next stage is "
+                    f"{result.get('required_next_achieved_state')}. Stop patching the same shape."
+                ),
+            )
+            _fixes.insert(
+                0,
+                "Force a structural rewrite around the missing narrowing stage only: preserve the achieved anchor topology, "
+                "then execute the required walk/intersect/filter order and return the narrowed set.",
+            )
+            result["issues"] = _issues
+            result["fixes"] = _fixes
+            if result.get("stage_binding_instruction"):
+                result["primary_repair_instruction"] = (
+                    "PLAN-STAGE REPAIR TARGET: "
+                    + str(result.get("stage_binding_instruction") or "")
+                )
         if repeated_no_progress:
             grade = min(grade, 4 if not code_local_failure else 5)
             result["pivot_required"] = True
@@ -1953,117 +4085,272 @@ class ControllerToolgenMixin:
                     else "repeated_no_progress_same_strategy_failure"
                 )
             )
-        return result
-
-    def _toolgen_build_task_prompt(self, env_name: str, dataset_item: Any) -> str:
-        if env_name == "knowledge_graph":
-            if isinstance(dataset_item, Mapping):
-                question = str(dataset_item.get("question", "") or "")
-                entity_dict = dataset_item.get("entity_dict") or {}
+        # PART 2: Family-specific repair instruction wins over all generic overwrites.
+        # After all policy blocks have run, if template_family is known and a runtime
+        # repair brief is available, regenerate the family-specific instruction so the
+        # final primary_repair_instruction always reflects the family stage order.
+        _final_family_for_repair = str(
+            (tool_plan or {}).get("template_family")
+            or round_context.get("template_family")
+            or ""
+        ).strip()
+        _family_repair = ""
+        if _final_family_for_repair:
+            _family_repair = self._toolgen_family_repair_instruction(
+                template_family=_final_family_for_repair,
+                anchor_operands=(tool_plan or {}).get("anchor_operands")
+                or round_context.get("anchor_operands"),
+                filter_operand=str(
+                    (tool_plan or {}).get("filter_operand")
+                    or round_context.get("filter_operand")
+                    or ""
+                ),
+                filter_value_operand=str(
+                    (tool_plan or {}).get("filter_value_operand")
+                    or round_context.get("filter_value_operand")
+                    or ""
+                ),
+                target_concept=str(
+                    (tool_plan or {}).get("target_concept")
+                    or round_context.get("target_concept")
+                    or ""
+                ),
+                required_next_stage=str(
+                    result.get("required_next_achieved_state")
+                    or round_context.get("required_next_achieved_state")
+                    or ""
+                ),
+                terminal_artifact_kind=str(
+                    (tool_plan or {}).get("terminal_artifact_kind")
+                    or round_context.get("terminal_artifact_kind")
+                    or ""
+                ),
+                relation_hints=list(
+                    (tool_plan or {}).get("relation_hints")
+                    or round_context.get("relation_hints")
+                    or []
+                ),
+                prefix="FAMILY REPAIR TARGET: Follow the typed family contract exactly. ",
+            )
+        if _final_family_for_repair and _family_repair:
+            _pri_current = str(result.get("primary_repair_instruction") or "")
+            _family_override_needed = bool(
+                family_smells
+                or not _pri_current
+                or _final_family_for_repair not in _pri_current
+            )
+            if _family_override_needed:
+                result["primary_repair_instruction"] = _family_repair
+            result["family_repair_path_used"] = _final_family_for_repair
+        # Step 1 diagnostic logging fields
+        _smells_set = set(result.get("semantic_code_smells") or [])
+        _live_summary = result.get("live_progress_summary") or summary or {}
+        _exec_status = str(_live_summary.get("execution_status") or "")
+        _final_var_kind = str(_live_summary.get("final_variable_kind") or "none")
+        # Finalization diagnostics
+        result["required_state_reached"] = bool(
+            self._toolgen_achieved_state_meets_floor(achieved_state, minimum_handoff_state)
+        )
+        _built_set_reached = achieved_state in _BUILT_SET_STATES
+        _finalization_attempted = bool(
+            _exec_status in {"SUCCESS", "MACRO EXHAUSTED"}
+            or "final_variable" in str(tool_code)
+        )
+        result["finalization_attempted"] = _finalization_attempted
+        result["finalization_block_reason"] = (
+            "returned_none_after_built_set"
+            if (_built_set_reached and _exec_status != "SUCCESS" and _finalization_attempted)
+            else (
+                "not_reached"
+                if not _built_set_reached
+                else "none"
+            )
+        )
+        # Preserved-anchor diagnostics
+        _preserved_present = bool(
+            "variable_list" in tool_code_lower or "resolved_anchors" in tool_code_lower
+        )
+        result["preserved_vars_present_in_code"] = _preserved_present
+        result["used_preserved_vars"] = bool(
+            _preserved_present and reads_preserved_anchor_state
+        )
+        result["fallback_reresolve_used"] = bool(
+            re_resolves_anchors and not preserved_anchor_state_expected
+        )
+        result["preserved_state_missing_error"] = bool(
+            "requires_variable_list_in_payload" in _smells_set
+            or "requires_payload_resolved_anchors" in _smells_set
+        )
+        result["reresolve_as_main_output"] = bool(
+            "re_resolve_anchors_as_main_output" in _smells_set
+        )
+        result["preserved_ids_multianchor_collapse"] = bool(
+            "preserved_ids_assigned_to_multiple_anchors" in _smells_set
+        )
+        # Attribute-target-concept operand role diagnostics
+        _atc_in_code = "attribute_target_concept" in tool_code_lower
+        result["attribute_target_present_in_code"] = _atc_in_code
+        result["attribute_used_as_anchor"] = bool(
+            "attribute_target_concept_resolved_as_anchor" in _smells_set
+        )
+        result["operand_role_collapse_detected"] = bool(
+            "attribute_target_concept_resolved_as_anchor" in _smells_set
+            or "blanket_entity_resolve_loop" in _smells_set
+        )
+        # Count finalization diagnostics
+        _count_called = bool(
+            re.search(r"\bcount_fn\s*\(|actions_spec\.get\s*\(\s*['\"]count['\"]", tool_code)
+        )
+        result["count_called"] = _count_called
+        result["count_variable_extracted"] = bool(
+            _count_called and "extract_var_ids" in tool_code_lower
+            and re.search(r"count_(?:var|ids|res|result)", tool_code_lower)
+        )
+        result["returned_count_variable"] = bool(
+            _count_called
+            and _final_var_kind in {"integer", "count"}
+            and _exec_status == "SUCCESS"
+        )
+        # Step 2 diagnostic fields: template family, operand roles, terminal artifact
+        _tf_diag = str(
+            tool_plan.get("template_family")
+            or round_context.get("template_family")
+            or ""
+        ).strip()
+        result["template_family_selected"] = _tf_diag or None
+        result["template_family"] = _tf_diag or None
+        result["anchor_operands"] = list(
+            (tool_plan or {}).get("anchor_operands")
+            or round_context.get("anchor_operands")
+            or []
+        )
+        result["filter_operand"] = str(
+            (tool_plan or {}).get("filter_operand")
+            or round_context.get("filter_operand")
+            or ""
+        ) or None
+        result["attribute_target_concept"] = str(
+            (tool_plan or {}).get("attribute_target_concept")
+            or round_context.get("attribute_target_concept")
+            or ""
+        ) or None
+        result["target_concept"] = str(
+            (tool_plan or {}).get("target_concept")
+            or round_context.get("target_concept")
+            or ""
+        ) or None
+        result["required_next_stage"] = str(
+            result.get("required_next_achieved_state")
+            or round_context.get("required_next_stage")
+            or round_context.get("required_next_achieved_state")
+            or ""
+        ) or None
+        result["terminal_artifact_kind"] = str(
+            tool_plan.get("terminal_artifact_kind")
+            or round_context.get("terminal_artifact_kind")
+            or ""
+        ).strip() or None
+        result["terminal_artifact_expected"] = str(
+            tool_plan.get("terminal_artifact_kind")
+            or round_context.get("terminal_artifact_kind")
+            or ""
+        ).strip() or None
+        _family_diag_ctx = dict(round_context or {})
+        for _diag_key in (
+            "template_family",
+            "anchor_operands",
+            "filter_operand",
+            "filter_value_operand",
+            "target_concept",
+            "attribute_target_concept",
+            "terminal_artifact_kind",
+        ):
+            if _diag_key not in _family_diag_ctx and _diag_key in (tool_plan or {}):
+                _family_diag_ctx[_diag_key] = (tool_plan or {}).get(_diag_key)
+        _family_skeleton_block = (
+            self._toolgen_kg_family_skeleton_block(_family_diag_ctx)
+            if _tf_diag
+            else ""
+        )
+        # terminal_artifact_returned: what the tool actually returned vs expected
+        _actual_artifact = None
+        if _count_called and _final_var_kind in {"integer", "count"}:
+            _actual_artifact = "count_variable"
+        elif _final_var_kind in {"scalar", "string", "attribute"}:
+            _actual_artifact = "attribute_values"
+        elif _exec_status == "SUCCESS" and bool(summary.get("has_final_variable")):
+            if result["terminal_artifact_expected"] in {
+                "filtered_set_variable",
+                "set_variable",
+            }:
+                _actual_artifact = result["terminal_artifact_expected"]
             else:
-                question = str(getattr(dataset_item, "question", "") or "")
-                entity_dict = getattr(dataset_item, "entity_dict", {}) or {}
-            if isinstance(entity_dict, str):
-                try:
-                    parsed = ast.literal_eval(entity_dict)
-                except Exception:
-                    parsed = None
-                if isinstance(parsed, dict):
-                    entity_dict = parsed
-            entity_list = list(entity_dict.keys()) if isinstance(entity_dict, dict) else []
-            return f"Question: {question}, Entities: {entity_list}".strip()
-        if env_name == "db_bench":
-            if isinstance(dataset_item, Mapping):
-                question_prefix = str(dataset_item.get("instruction", "") or "").strip()
-                table_info = dataset_item.get("table_info") or {}
-                table_name = str(table_info.get("name", "") or "").strip()
-                columns = []
-                for column in table_info.get("column_info_list") or []:
-                    if isinstance(column, Mapping):
-                        name = str(column.get("name", "") or "").strip()
-                        if name:
-                            columns.append(name)
-                if question_prefix and table_name and columns:
-                    question_suffix = (
-                        f"The name of this table is {table_name}, and the headers of this table are "
-                        f"{', '.join(columns)}."
-                    )
-                    return f"{question_prefix} {question_suffix}".strip()
-        if isinstance(dataset_item, Mapping):
-            instruction = dataset_item.get("instruction", "") or ""
-        else:
-            instruction = getattr(dataset_item, "instruction", "") or ""
-        if instruction:
-            return str(instruction)
-        question = getattr(dataset_item, "question", "") or ""
-        return str(question)
-
-    def preaggregate_toolgen(
-        self,
-        task: Any,
-        sample_indices: Sequence[Any],
-        *,
-        raw_config: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        if os.environ.get("SKIP_ADVISOR_PREGEN") == "1":
-            return
-        if getattr(self, "_toolgen_pipeline_name", "baseline") != "aggregate3":
-            return
-        if raw_config is None:
-            return
-        task_name = raw_config.get("assignment_config", {}).get("task")
-        if not isinstance(task_name, str) or not task_name:
-            return
-        preagg_envs = getattr(self, "_toolgen_preaggregate_envs", None)
-        if not isinstance(preagg_envs, set):
-            preagg_envs = set()
-            self._toolgen_preaggregate_envs = preagg_envs
-        if task_name in preagg_envs:
-            return
-        task_def = raw_config.get("task_dict", {}).get(task_name)
-        if not isinstance(task_def, Mapping):
-            return
-        parameters = task_def.get("parameters") or {}
-        data_file_path = parameters.get("data_file_path")
-        chat_history_factory = parameters.get("chat_history_item_factory") or {}
-        chat_history_params = chat_history_factory.get("parameters") or {}
-        chat_history_path = chat_history_params.get("chat_history_item_dict_path")
-        dataset_map: dict[str, Any] | None = None
-        if not isinstance(data_file_path, str) or not os.path.exists(data_file_path):
-            getter = None
-            try:
-                getter = object.__getattribute__(task, "_Task__get_dataset_item")
-            except AttributeError:
-                getter = None
-            if callable(getter):
-                dataset_map = {}
-                for sample_index in sample_indices:
-                    try:
-                        dataset_map[str(sample_index)] = getter(sample_index)
-                    except Exception:
-                        continue
-        env_contract = ""
-        if isinstance(chat_history_path, str) and os.path.exists(chat_history_path):
-            try:
-                with open(chat_history_path, "r") as handle:
-                    env_contract = (
-                        (json.load(handle).get("value", {}).get("0", {}) or {})
-                        .get("content", "")
-                        .strip()
-                    )
-            except Exception:
-                env_contract = ""
-        if not isinstance(data_file_path, str) or not os.path.exists(data_file_path):
-            if not dataset_map:
-                return
-        self._toolgen_agg_context = {
-            "env_name": task_name,
-            "data_file_path": data_file_path,
-            "dataset_map": dataset_map,
-            "env_contract": env_contract,
-            "sample_indices": list(sample_indices),
-        }
-        preagg_envs.add(task_name)
+                _actual_artifact = "filtered_set_variable"
+        result["terminal_artifact_returned"] = _actual_artifact
+        result["terminal_artifact_match"] = bool(
+            result["terminal_artifact_expected"]
+            and _actual_artifact
+            and result["terminal_artifact_expected"] == _actual_artifact
+        )
+        result["positional_role_guess_detected"] = bool(
+            "positional_entity_role_guessing" in _smells_set
+        )
+        result["filter_value_in_anchor_operands_detected"] = bool(
+            "filter_value_in_anchor_operands" in _smells_set
+        )
+        result["wrong_terminal_artifact_detected"] = bool(
+            "wrong_terminal_artifact_for_family" in _smells_set
+        )
+        result["wrong_terminal_artifact_for_family"] = result[
+            "wrong_terminal_artifact_detected"
+        ]
+        result["family_stage_order_violation_detected"] = bool(
+            "family_stage_order_violation" in _smells_set
+        )
+        result["returned_member_not_set_variable_detected"] = bool(
+            "returned_member_not_set_variable" in _smells_set
+        )
+        result["family_operand_role_violation_detected"] = bool(
+            result["filter_value_in_anchor_operands_detected"]
+            or result["positional_role_guess_detected"]
+        )
+        result["filter_value_operand"] = (
+            (tool_plan or {}).get("filter_value_operand")
+            or round_context.get("filter_value_operand")
+        )
+        result["operand_roles_source"] = (
+            "typed_slots"
+            if (tool_plan.get("anchor_operands") is not None)
+            else "inferred"
+        )
+        result["family_repair_path_used"] = result.get("family_repair_path_used") or None
+        result["family_skeleton_used"] = bool(_tf_diag and _family_skeleton_block)
+        result["family_validator_checks_used"] = bool(
+            result.get("family_validator_path_used") or _tf_diag
+        )
+        result["family_repair_instruction_emitted"] = bool(
+            _tf_diag
+            and _tf_diag in str(result.get("primary_repair_instruction") or "")
+        )
+        result["generic_repair_used_when_family_known"] = bool(
+            _tf_diag and not result.get("family_repair_path_used")
+        )
+        result["used_generic_repair_when_family_known"] = result[
+            "generic_repair_used_when_family_known"
+        ]
+        result["generic_generation_used_when_family_known"] = bool(
+            _tf_diag and not result.get("family_skeleton_used")
+        )
+        result["family_repair_instruction_mismatch_detected"] = bool(
+            _tf_diag
+            and bool(result.get("primary_repair_instruction"))
+            and _tf_diag not in str(result.get("primary_repair_instruction") or "")
+        )
+        result["family_top_issue_used"] = bool(result.get("family_top_issue_used"))
+        result["generic_validator_fallback_used"] = bool(
+            result.get("generic_validator_fallback_used")
+        )
+        return result
 
     def _normalize_toolgen_content(self, content: Any) -> str:
         if isinstance(content, str):
@@ -2088,66 +4375,6 @@ class ControllerToolgenMixin:
         if fence:
             return fence.group(1).strip()
         return text.strip()
-
-    def _toolgen_relaxed_mode_enabled(self) -> bool:
-        return bool(getattr(self, "_toolgen_relaxed_mode", False))
-
-    def _ensure_module_docstring(self, code: str) -> str:
-        try:
-            tree = ast.parse(code)
-            if ast.get_docstring(tree) is not None:
-                return code
-        except Exception:
-            return code
-        return '"""Auto-generated tool."""\n\n' + code.lstrip()
-
-    def _register_tool_from_payload_relaxed(
-        self,
-        tool_spec: Mapping[str, Any],
-        tool_code: str,
-        chat_history: ChatHistory,
-    ) -> Optional[ToolMetadata]:
-        if self._generated_tool_counter >= self._max_generated_tools_per_run:
-            return None
-        if not isinstance(tool_spec, Mapping) or not tool_code:
-            return None
-        spec_payload = self._normalize_tool_spec(dict(tool_spec))
-        spec_payload["code_lines"] = tool_code.splitlines()
-        spec = ToolSpec.from_payload(spec_payload)
-        code = self._ensure_module_docstring(tool_code)
-        try:
-            current_env = self._resolved_environment_label()
-            explicit_name = not self._is_generic_tool_name(spec.name)
-            metadata = self._registry.register_tool(
-                name=spec.name,
-                code=code,
-                signature=spec.signature,
-                description=spec.description,
-                tool_type=spec.tool_type,
-                tool_category=spec.tool_category,
-                input_schema=spec.input_schema,
-                capabilities=spec.capabilities,
-                environment=current_env,
-                explicit_name=explicit_name,
-            )
-        except Exception:
-            return None
-        if metadata is None:
-            try:
-                issues = []
-                if hasattr(self._registry, "_validate_tool_source"):
-                    issues = self._registry._validate_tool_source(code)
-                print(
-                    f"[TOOLGEN] Relaxed register failed issues={issues}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            except Exception:
-                pass
-        if metadata:
-            self._generated_tool_counter += 1
-            self._mark_tool_invoked(metadata.name)
-        return metadata
 
     def _extract_marked_python(self, text: str) -> Optional[str]:
         if not text:
@@ -2313,6 +4540,136 @@ class ControllerToolgenMixin:
         )
         return code
 
+    @staticmethod
+    def _toolgen_kg_family_skeleton_block(round_context: Mapping[str, Any]) -> str:
+        """
+        Return a binding code skeleton section for the current template_family.
+
+        This block is injected into the generation prompt so the LLM follows the
+        required stage order for the selected family rather than free-forming a macro.
+        The skeleton uses pseudocode-style comments so the LLM fills in real calls,
+        but cannot violate the family's structural contract.
+        """
+        family = str(round_context.get("template_family") or "").strip()
+        if not family:
+            return ""
+        anchor_ops = round_context.get("anchor_operands") or []
+        filter_op = str(round_context.get("filter_operand") or "").strip()
+        filter_val = str(round_context.get("filter_value_operand") or "").strip()
+        terminal = str(round_context.get("terminal_artifact_kind") or "set_variable").strip()
+        target_concept = str(round_context.get("target_concept") or "").strip()
+        attr_concept = str(round_context.get("attribute_target_concept") or "").strip()
+        required_stage = str(round_context.get("required_next_stage") or "").strip()
+        relation_hints = list(round_context.get("relation_hints") or [])
+
+        header = (
+            "\n\nFAMILY_SKELETON (BINDING — supported family route is active; "
+            "free-form KG generation is disabled for this family):\n"
+        )
+        header += f"# template_family: {family}\n"
+        if anchor_ops:
+            header += f"# anchor_operands: {anchor_ops}  <- resolve/walk ONLY these\n"
+        if filter_op:
+            header += f"# filter_operand: '{filter_op}'  <- attribute_target_concept (NOT an entity to anchor)\n"
+        if filter_val:
+            header += f"# filter_value_operand: '{filter_val}'  <- the filter value entity\n"
+        if target_concept:
+            header += f"# target_concept: '{target_concept}'  <- walk each anchor toward this concept type\n"
+        if attr_concept and attr_concept != filter_op:
+            header += f"# attribute_target_concept: '{attr_concept}'\n"
+        if required_stage:
+            header += f"# required_next_stage: '{required_stage}'  <- tool must reach this stage to count as success\n"
+        header += f"# terminal_artifact_kind: {terminal}\n"
+        if relation_hints:
+            header += (
+                f"# relation_hints: {relation_hints}\n"
+                "# ^ Use these KG schema paths as FIRST candidates when selecting relations\n"
+                "#   in get_relations / walk_to_target calls. Pass them via domain_hints\n"
+                "#   or check them directly against get_relations() output before probing.\n"
+            )
+
+        _rh_hint = (
+            f" (prefer relation_hints {relation_hints} first)"
+            if relation_hints
+            else ""
+        )
+        if family == "two_anchor_intersect_filter_set":
+            body = (
+                "# REQUIRED STAGE ORDER:\n"
+                "# [1] Read anchor_operands from payload (do NOT select anchors by position)\n"
+                "#     anchor_ops = payload.get('anchor_operands') or []\n"
+                "# [2] Resolve each anchor: kg_utils.resolve_entity_to_vars(anchor, hint, ...)\n"
+                f"# [3] Walk each resolved anchor to target_concept{_rh_hint}:\n"
+                "#     kg_utils.walk_to_target(actions_spec, base_ids, target_concept,\n"
+                "#         domain_hints=payload.get('relation_hints') or payload.get('domain_hints'), ...)\n"
+                "# [4] Intersect the two walked sets:\n"
+                "#     kg_utils.cross_intersect(actions_spec, walked_0, walked_1, ...)\n"
+                "# [5] Apply semantic filter on intersection using filter_operand as dimension:\n"
+                "#     kg_utils.resolve_semantic_filter(base_var, filter_operand, inter_ids, asked_for=filter_value_operand, ...)\n"
+                "# [6] Return the filtered set variable (terminal: filtered_set_variable):\n"
+                "#     return {'status': 'SUCCESS', 'final_variable': final_var, 'observation': ...}\n"
+                "# HARD BAN: Do NOT pass filter_value_operand to resolve_entity_to_vars as an anchor.\n"
+                "# HARD BAN: Do NOT return next(iter(filtered_ids)), filtered_ids[0], or any single member.\n"
+                "# HARD BAN: Do NOT continue past the filtered set once that family terminal is reached.\n"
+            )
+        elif family == "two_anchor_intersect_count":
+            body = (
+                "# REQUIRED STAGE ORDER:\n"
+                "# [1] Read anchor_operands from payload\n"
+                "#     anchor_ops = payload.get('anchor_operands') or []\n"
+                "# [2] Resolve each anchor: kg_utils.resolve_entity_to_vars(anchor, hint, ...)\n"
+                f"# [3] Walk each to target_concept{_rh_hint}:\n"
+                "#     kg_utils.walk_to_target(actions_spec, base_ids, target_concept,\n"
+                "#         domain_hints=payload.get('relation_hints') or payload.get('domain_hints'), ...)\n"
+                "# [4] Intersect: kg_utils.cross_intersect(...)\n"
+                "# [5] Count the intersection set variable:\n"
+                "#     count_fn = actions_spec.get('count'); count_out = count_fn(set_var)\n"
+                "#     count_var = kg_utils.extract_var_ids(count_out)[0]  # a '#N' Variable ID\n"
+                "# [6] Return count variable ID (terminal: count_variable):\n"
+                "#     return {'status': 'SUCCESS', 'final_variable': count_var, ...}\n"
+                "# HARD BAN: Do NOT return a numeric integer as final_variable.\n"
+                "# HARD BAN: Do NOT union the anchor sets or count each anchor separately.\n"
+            )
+        elif family == "two_anchor_intersect_extract_attribute":
+            body = (
+                "# REQUIRED STAGE ORDER:\n"
+                "# [1] Read anchor_operands from payload\n"
+                "#     anchor_ops = payload.get('anchor_operands') or []\n"
+                "# [2] Resolve each anchor: kg_utils.resolve_entity_to_vars(anchor, hint, ...)\n"
+                f"# [3] Walk each to target_concept{_rh_hint}:\n"
+                "#     kg_utils.walk_to_target(actions_spec, base_ids, target_concept,\n"
+                "#         domain_hints=payload.get('relation_hints') or payload.get('domain_hints'), ...)\n"
+                "# [4] Intersect: kg_utils.cross_intersect(...)\n"
+                "# [5] Extract attribute value from intersection:\n"
+                "#     kg_utils.extract_attribute_value(intersection_var, filter_operand or attribute_target_concept, ...)\n"
+                "# [6] Return the attribute artifact (terminal: attribute_values):\n"
+                "#     return {'status': 'SUCCESS', 'final_variable': attr_var, ...}\n"
+                "# HARD BAN: Do NOT apply resolve_semantic_filter or count in place of attribute extraction.\n"
+                "# HARD BAN: Do NOT stop at the raw intersection when the family requires attribute_values.\n"
+            )
+        elif family == "one_anchor_filter_then_count_or_progress":
+            mode_note = (
+                "count and return count variable ID (terminal: count_variable)"
+                if terminal == "count_variable"
+                else "return the built set variable (terminal: set_variable)"
+            )
+            body = (
+                "# REQUIRED STAGE ORDER:\n"
+                "# [1] Read anchor_operands from payload (single anchor)\n"
+                "#     anchor_ops = payload.get('anchor_operands') or []\n"
+                "#     anchor = anchor_ops[0] if anchor_ops else entities[0]\n"
+                "# [2] Resolve anchor: kg_utils.resolve_entity_to_vars(anchor, hint, ...)\n"
+                f"# [3] Walk to target_concept{_rh_hint}:\n"
+                "#     kg_utils.walk_to_target(actions_spec, base_ids, target_concept,\n"
+                "#         domain_hints=payload.get('relation_hints') or payload.get('domain_hints'), ...)\n"
+                "# [4] Apply semantic filter or other narrowing step only if the plan requires it.\n"
+                f"# [5] {mode_note}\n"
+                "# HARD BAN: Do NOT invent a second anchor or force a two-anchor intersection shape.\n"
+            )
+        else:
+            return ""
+        return header + body
+
     def _toolgen_patch_sanitize_contract_retry_source(
         self,
         code: str,
@@ -2335,7 +4692,24 @@ class ControllerToolgenMixin:
         last_tool_code: Optional[str],
         phase1_retry_state: Optional[Mapping[str, Any]] = None,
     ) -> str:
-        prompt = base_prompt + self._toolgen_round_context_block(round_context)
+        _skeleton_block = self._toolgen_kg_family_skeleton_block(round_context)
+        _family_binding_block = ""
+        if bool(round_context.get("family_binding_active")):
+            _family_binding_block = (
+                "\n\nFAMILY_BINDING_ACTIVE:\n"
+                f"- family_binding_active=true\n"
+                f"- family_binding_reason={round_context.get('family_binding_reason')}\n"
+                f"- family_skeleton_selected={round_context.get('family_skeleton_selected')}\n"
+                "- Generic KG generation, generic repair prose, and generic patch/apply "
+                "surgery are blocked for this attempt.\n"
+                "- Use only normalized typed slots from ROUND_STRATEGY_CONTEXT / tool_plan.\n"
+            )
+        prompt = (
+            base_prompt
+            + self._toolgen_round_context_block(round_context)
+            + _family_binding_block
+            + _skeleton_block
+        )
         if not feedback_note:
             return prompt
         phase1_state = dict(phase1_retry_state or {})
@@ -2353,6 +4727,51 @@ class ControllerToolgenMixin:
                     f"summary={h['summary']}"
                 )
             history_block = "\n\n" + "\n".join(lines)
+        preserve_block = ""
+        if bool(round_context.get("preserve_best_partial_candidate")):
+            best_state = str(round_context.get("best_achieved_state") or "none")
+            if best_state not in {"", "none"}:
+                preserve_block = (
+                    "\n\nBEST_PARTIAL_PRESERVATION:\n"
+                    f"- Best achieved state so far: {best_state}\n"
+                    "- Preserve or improve the best partial topology already discovered.\n"
+                    "- Do NOT regress to anchor-only shortcuts, blanket entity resolve loops, "
+                    "first-candidate-by-index returns, or oversized scaffold rewrites.\n"
+                )
+        stage_binding_block = ""
+        required_next_achieved_state = str(
+            round_context.get("required_next_achieved_state") or ""
+        ).strip()
+        if required_next_achieved_state:
+            stage_binding_block = (
+                "\n\nREQUIRED_NEXT_STAGE:\n"
+                f"- Required next achieved state: {required_next_achieved_state}\n"
+            )
+            required_handoff_achieved_state = str(
+                round_context.get("required_handoff_achieved_state") or ""
+            ).strip()
+            if required_handoff_achieved_state:
+                stage_binding_block += (
+                    f"- Minimum solver-usable handoff state: {required_handoff_achieved_state}\n"
+                )
+            stage_binding_instruction = str(
+                round_context.get("stage_binding_instruction") or ""
+            ).strip()
+            if stage_binding_instruction:
+                stage_binding_block += (
+                    f"- Stage-binding instruction: {stage_binding_instruction}\n"
+                )
+            forbidden_fallback_shapes = round_context.get("forbidden_fallback_shapes")
+            if isinstance(forbidden_fallback_shapes, list) and forbidden_fallback_shapes:
+                stage_binding_block += (
+                    "- Forbidden fallback shapes: "
+                    + ", ".join(
+                        str(item or "").strip()
+                        for item in forbidden_fallback_shapes
+                        if str(item or "").strip()
+                    )
+                    + "\n"
+                )
         if bool(phase1_state.get("primary_repair_dominates")):
             rewrite_instruction = (
                 "\n\nYou must output the ENTIRE file from scratch. "
@@ -2380,10 +4799,14 @@ class ControllerToolgenMixin:
         return (
             base_prompt
             + self._toolgen_round_context_block(round_context)
+            + _family_binding_block
+            + _skeleton_block
             + history_block
             + "\n\nVALIDATOR_FEEDBACK:\n"
             + feedback_note
             + code_block
+            + preserve_block
+            + stage_binding_block
             + "\n\nIf VALIDATOR_FEEDBACK contains PRIMARY_REPAIR_TARGET or "
             + "runtime_repair_brief, those runtime-value directives outrank "
             + "secondary formatting or local compliance issues."
@@ -2729,153 +5152,6 @@ class ControllerToolgenMixin:
             "properties": properties,
         }
 
-    def _toolgen_prebootstrap_once(
-        self,
-        task_query: str,
-        chat_history: ChatHistory,
-        *,
-        tasks: Optional[Sequence[str]] = None,
-    ) -> None:
-        if os.environ.get("SKIP_ADVISOR_PREGEN") == "1":
-            return
-        if getattr(self, "_toolgen_agent", None) is None:
-            print("[TOOLGEN_PREBOOT] Skipping: _toolgen_agent is None")
-            return
-        env_name = self._resolved_environment_label()
-        preboot_envs = getattr(self, "_toolgen_preboot_envs", None)
-
-        print()
-        print("=" * 70)
-        print(f"[TOOLGEN_PREBOOT] env_name: {env_name}")
-        print(f"[TOOLGEN_PREBOOT] preboot_envs: {preboot_envs}")
-        print(f"[TOOLGEN_PREBOOT] pipeline: {getattr(self, '_toolgen_pipeline_name', 'baseline')}")
-        print("=" * 70)
-        print()
-
-
-        if not isinstance(preboot_envs, set):
-            preboot_envs = set()
-            self._toolgen_preboot_envs = preboot_envs
-        if env_name in preboot_envs:
-            print(f"[TOOLGEN_PREBOOT] Env '{env_name}' already bootstrapped, skipping")
-            return
-        if tasks is not None:
-            trimmed = [t.strip() for t in tasks if isinstance(t, str) and t.strip()]
-            if len(trimmed) != 10:
-                print(
-                    f"[TOOLGEN_PREBOOT] ERROR: expected 10 tasks, got {len(trimmed)}"
-                )
-                return
-            user_prompt = build_task_pack(env_name, "", list(trimmed))
-            missing = [t for t in trimmed if t not in user_prompt]
-            if missing:
-                print(
-                    f"[TOOLGEN_PREBOOT] WARNING: {len(missing)} tasks missing from prompt"
-                )
-                return
-            tool = self._toolgen_generate_from_prompt(
-                user_prompt=user_prompt,
-                system_prompt=get_toolgen_system_prompt("aggregate3", env_name),
-                chat_history=chat_history,
-                name_prefix=getattr(self, "_toolgen_name_prefix", ""),
-                prompt_name=f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}",
-                force_max_rounds=2,
-            )
-            if isinstance(tool, Mapping) and tool.get("error"):
-                print(
-                    f"[TOOLGEN_PREBOOT] WARNING: Tool generation aborted ({tool.get('error')}) for env '{env_name}'",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                tool = None
-            if tool:
-                print(
-                    f"[TOOLGEN_PREBOOT] SUCCESS: Tool '{tool.name}' generated for env '{env_name}'"
-                )
-            else:
-                print(
-                    "[TOOLGEN_PREBOOT] WARNING: Tool generation returned None for env "
-                    f"'{env_name}'"
-                )
-            preboot_envs.add(env_name)
-            agg_envs = getattr(self, "_toolgen_agg_bootstrapped_envs", None)
-            if not isinstance(agg_envs, set):
-                agg_envs = set()
-            agg_envs.add(env_name)
-            self._toolgen_agg_bootstrapped_envs = agg_envs
-            return
-        if not task_query.strip():
-            print("[TOOLGEN_PREBOOT] Skipping: empty task_query")
-            return
-        if getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
-            # Check if context is ready
-            context = getattr(self, "_toolgen_agg_context", None)
-            prompt = None
-
-            # Try to build aggregate prompt if context is ready
-            if isinstance(context, dict):
-                print(f"[TOOLGEN_PREBOOT] Context available, building aggregate prompt for env '{env_name}'")
-                prompt = self._toolgen_build_aggregate_prompt_for_env(
-                    env_name, task_query=task_query, chat_history=chat_history
-                )
-                if prompt:
-                    print(f"[TOOLGEN_PREBOOT] Aggregate prompt built successfully")
-                else:
-                    print(f"[TOOLGEN_PREBOOT] Aggregate prompt failed (likely env mismatch)")
-            else:
-                print(f"[TOOLGEN_PREBOOT] WARNING: _toolgen_agg_context not ready (type={type(context).__name__})")
-
-            if not prompt:
-                print(f"[TOOLGEN_PREBOOT] No prompt available for env '{env_name}', skipping tool generation")
-                return
-
-            print(f"[TOOLGEN_PREBOOT] Generating tool for env '{env_name}'")
-            tool = self._toolgen_generate_from_prompt(
-                user_prompt=prompt,
-                system_prompt=get_toolgen_system_prompt("aggregate3", env_name),
-                chat_history=chat_history,
-                name_prefix=getattr(self, "_toolgen_name_prefix", ""),
-                prompt_name=f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}",
-                force_max_rounds=2,
-            )
-
-            if isinstance(tool, Mapping) and tool.get("error"):
-                print(
-                    f"[TOOLGEN_PREBOOT] WARNING: Tool generation aborted ({tool.get('error')}) for env '{env_name}'",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                tool = None
-            if tool:
-                print(f"[TOOLGEN_PREBOOT] SUCCESS: Tool '{tool.name}' generated for env '{env_name}'")
-            else:
-                print(f"[TOOLGEN_PREBOOT] WARNING: Tool generation returned None for env '{env_name}'")
-
-            preboot_envs.add(env_name)
-            agg_envs = getattr(self, "_toolgen_agg_bootstrapped_envs", None)
-            if not isinstance(agg_envs, set):
-                agg_envs = set()
-            agg_envs.add(env_name)
-            self._toolgen_agg_bootstrapped_envs = agg_envs
-            return
-        system_prompt = get_toolgen_system_prompt(
-            getattr(self, "_toolgen_pipeline_name", "baseline"),
-            self._resolved_environment_label(),
-        )
-        prompt_name = (
-            f"TOOLGEN_SYSTEM_PROMPT:{getattr(self, '_toolgen_pipeline_name', 'baseline')}:{self._resolved_environment_label()}"
-        )
-        prompt = self._toolgen_request_prompt(task_query, chat_history)
-        self._toolgen_generate_from_prompt(
-            user_prompt=prompt,
-            system_prompt=system_prompt,
-            chat_history=chat_history,
-            name_prefix=getattr(self, "_toolgen_name_prefix", ""),
-            prompt_name=prompt_name,
-            force_max_rounds=2,
-        )
-        preboot_envs.add(env_name)
-
     def _toolgen_build_system_prompt(self, base_prompt: str) -> str:
         prompt = (base_prompt or "").strip()
         if toolgen_debug_enabled():
@@ -3192,6 +5468,18 @@ class ControllerToolgenMixin:
             extra_comment_lines += 1
         if extra_comment_lines > 2:
             smells.append("comment_scaffolding")
+        if re.search(
+            r"if\s+not\s+variable_list\s*:\s*return\s*\{[\s\S]{0,400}?['\"]status['\"]\s*:\s*['\"](?:ERROR|MACRO EXHAUSTED)['\"]",
+            tool_code,
+            re.IGNORECASE,
+        ):
+            smells.append("requires_variable_list_in_payload")
+        if re.search(
+            r"if\s+not\s+resolved_anchors\s*:\s*return\s*\{[\s\S]{0,400}?['\"]status['\"]\s*:\s*['\"](?:ERROR|MACRO EXHAUSTED)['\"]",
+            tool_code,
+            re.IGNORECASE,
+        ):
+            smells.append("requires_payload_resolved_anchors")
         try:
             tree = ast.parse(tool_code)
         except Exception:
@@ -3242,7 +5530,401 @@ class ControllerToolgenMixin:
                 or len(run_doc.splitlines()) > 7
             ):
                 smells.append("docstring_scaffolding")
+
+            # Hardcoded entity-specific string literals in candidate_map labels.
+            # Pattern: a string constant whose value is "<role_prefix>_<CapitalizedWord>"
+            # where the word is task-specific (not a generic placeholder).
+            _LABEL_ROLE_PREFIXES = frozenset(
+                {"resolved", "walk", "walked", "filter", "intersect", "intersected", "anchor"}
+            )
+            _GENERIC_LABEL_WORDS = frozenset(
+                {
+                    "entity", "anchor", "item", "element", "node", "concept", "result",
+                    "set", "group", "target", "source", "base", "variable", "var",
+                }
+            )
+            _label_pattern = re.compile(
+                r"^([a-z]+)_([A-Z][a-zA-Z]{2,})(?:_.*)?$"
+            )
+            _hardcode_found = False
+            for _ast_node in ast.walk(tree):
+                if not isinstance(_ast_node, ast.Constant) or not isinstance(_ast_node.value, str):
+                    continue
+                _m = _label_pattern.match(_ast_node.value)
+                if _m:
+                    _prefix = _m.group(1).lower()
+                    _word = _m.group(2).lower()
+                    if _prefix in _LABEL_ROLE_PREFIXES and _word not in _GENERIC_LABEL_WORDS:
+                        _hardcode_found = True
+                        break
+            if _hardcode_found:
+                smells.append("hardcoded_entity_in_label")
+
+            # Blanket entity resolve loop: iterates ALL entities calling resolve_entity_to_vars
+            # for each without role discrimination, when the plan distinguishes roles.
+            # Detect: for <var> in entities / payload["entities"]: ... resolve_entity_to_vars
+            _has_resolve = "resolve_entity_to_vars" in tool_code
+            _has_entity_loop = bool(
+                re.search(
+                    r"for\s+\w+\s+in\s+(?:entities|payload\s*\[['\"]entities['\"]\])",
+                    tool_code,
+                )
+            )
+            _has_attribute_target = "attribute_target_concept" in tool_code
+            if _has_resolve and _has_entity_loop and _has_attribute_target:
+                # attribute_target_concept present but code still loops over all entities:
+                # strong signal that role discrimination is absent.
+                smells.append("blanket_entity_resolve_loop")
+
+            # PART C: attribute_target_concept passed to resolve_entity_to_vars.
+            # Pattern: a variable assigned from payload.get("attribute_target_concept")
+            # later appears as the first positional arg of resolve_entity_to_vars.
+            _atc_var_names: set[str] = set()
+            for _ast_node in ast.walk(tree):
+                # Collect assignment targets where RHS is payload.get("attribute_target_concept")
+                if not isinstance(_ast_node, ast.Assign):
+                    continue
+                _rhs = _ast_node.value
+                if not (
+                    isinstance(_rhs, ast.Call)
+                    and isinstance(_rhs.func, ast.Attribute)
+                    and _rhs.func.attr == "get"
+                    and _rhs.args
+                    and isinstance(_rhs.args[0], ast.Constant)
+                    and _rhs.args[0].value == "attribute_target_concept"
+                ):
+                    continue
+                for _tgt in _ast_node.targets:
+                    if isinstance(_tgt, ast.Name):
+                        _atc_var_names.add(_tgt.id)
+            if _atc_var_names:
+                for _ast_node in ast.walk(tree):
+                    if not isinstance(_ast_node, ast.Call):
+                        continue
+                    _func = _ast_node.func
+                    if not (
+                        isinstance(_func, ast.Attribute)
+                        and isinstance(_func.value, ast.Name)
+                        and _func.value.id == "kg_utils"
+                        and _func.attr == "resolve_entity_to_vars"
+                    ):
+                        continue
+                    if _ast_node.args and isinstance(_ast_node.args[0], ast.Name):
+                        if _ast_node.args[0].id in _atc_var_names:
+                            smells.append("attribute_target_concept_resolved_as_anchor")
+                            break
+
+            # PART B: same preserved_ids/variable_list assigned to multiple anchors without slicing.
+            # Pattern: anchor_a_ids = preserved_ids; anchor_b_ids = preserved_ids  (same RHS name)
+            # or per_anchor_vars = [preserved_ids, preserved_ids]
+            _preserved_src_names: set[str] = set()
+            for _ast_node in ast.walk(tree):
+                if not isinstance(_ast_node, ast.Assign):
+                    continue
+                _rhs = _ast_node.value
+                # detect assignment from payload.get("variable_list") or payload.get("resolved_anchors")
+                if (
+                    isinstance(_rhs, ast.Call)
+                    and isinstance(_rhs.func, ast.Attribute)
+                    and _rhs.func.attr == "get"
+                    and _rhs.args
+                    and isinstance(_rhs.args[0], ast.Constant)
+                    and _rhs.args[0].value in ("variable_list", "resolved_anchors")
+                ):
+                    for _tgt in _ast_node.targets:
+                        if isinstance(_tgt, ast.Name):
+                            _preserved_src_names.add(_tgt.id)
+                # also catch `preserved_raw = payload.get(...) or payload.get(...)` BoolOp shapes
+                if isinstance(_rhs, ast.BoolOp) and isinstance(_rhs.op, ast.Or):
+                    for _val in _rhs.values:
+                        if (
+                            isinstance(_val, ast.Call)
+                            and isinstance(_val.func, ast.Attribute)
+                            and _val.func.attr == "get"
+                            and _val.args
+                            and isinstance(_val.args[0], ast.Constant)
+                            and _val.args[0].value in ("variable_list", "resolved_anchors")
+                        ):
+                            for _tgt in _ast_node.targets:
+                                if isinstance(_tgt, ast.Name):
+                                    _preserved_src_names.add(_tgt.id)
+            if _preserved_src_names:
+                # Count how many distinct anchor-like names receive the same preserved source
+                _anchor_assign_count: dict[str, int] = {}
+                for _ast_node in ast.walk(tree):
+                    if not isinstance(_ast_node, ast.Assign):
+                        continue
+                    _rhs = _ast_node.value
+                    if isinstance(_rhs, ast.Name) and _rhs.id in _preserved_src_names:
+                        for _tgt in _ast_node.targets:
+                            if isinstance(_tgt, ast.Name):
+                                _anchor_assign_count[_rhs.id] = (
+                                    _anchor_assign_count.get(_rhs.id, 0) + 1
+                                )
+                if any(v >= 2 for v in _anchor_assign_count.values()):
+                    smells.append("preserved_ids_assigned_to_multiple_anchors")
+
+            # PART E: positional entity role guessing.
+            # Pattern 1 — entities[N] direct integer subscript for role assignment.
+            _positional_by_index = False
+            for _ast_node in ast.walk(tree):
+                if not isinstance(_ast_node, ast.Subscript):
+                    continue
+                _sub_val = _ast_node.value
+                _sub_slice = _ast_node.slice
+                if (
+                    isinstance(_sub_val, ast.Name)
+                    and _sub_val.id == "entities"
+                    and isinstance(_sub_slice, ast.Constant)
+                    and isinstance(_sub_slice.value, int)
+                ):
+                    _positional_by_index = True
+                    break
+            # Pattern 2 — loop-counter-based anchor selection (idx < 2, counter >= 2).
+            _has_entity_loop = bool(re.search(
+                r"for\s+\w+\s+in\s+(?:entities|payload\s*\[['\"]entities['\"]\])",
+                tool_code,
+            ))
+            _positional_by_counter = bool(
+                _has_entity_loop
+                and re.search(
+                    r"\b(?:idx|counter)\s*<\s*[23]\b|\b(?:idx|counter)\s*>=\s*[12]\b",
+                    tool_code,
+                )
+            )
+            if _positional_by_index or _positional_by_counter:
+                smells.append("positional_entity_role_guessing")
+
         return smells
+
+    @staticmethod
+    def _toolgen_ast_nameish(node: Optional[ast.AST]) -> str:
+        if isinstance(node, ast.Name):
+            return str(node.id or "").strip().lower()
+        if isinstance(node, ast.Attribute):
+            parts: list[str] = []
+            current: Optional[ast.AST] = node
+            while isinstance(current, ast.Attribute):
+                parts.append(str(current.attr or "").strip().lower())
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(str(current.id or "").strip().lower())
+            return ".".join(reversed([part for part in parts if part]))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return str(node.value or "").strip().lower()
+        return ""
+
+    def _toolgen_dynamic_plan_code_smells(
+        self,
+        tool_code: str,
+        tool_plan: Optional[Mapping[str, Any]],
+    ) -> list[str]:
+        plan = self._build_tool_plan(tool_plan or {})
+        if not tool_code:
+            return []
+        smells: list[str] = []
+        requires_attribute_filter = self._toolgen_progress_plan_has_attribute_filter(
+            plan
+        )
+        requires_intersection_before_filter = (
+            requires_attribute_filter
+            and self._toolgen_progress_plan_requires_multi_anchor_floor(plan)
+        )
+        if requires_attribute_filter and "resolve_semantic_filter" not in tool_code:
+            smells.append("missing_attribute_filter_application")
+        try:
+            tree = ast.parse(tool_code)
+        except Exception:
+            return smells
+
+        def _looks_actions_spec(name: str) -> bool:
+            return "actions_spec" in name
+
+        def _looks_domain_hints(name: str) -> bool:
+            return "domain_hints" in name
+
+        def _looks_target_concept(name: str) -> bool:
+            return "target_concept" in name or "attribute_target_concept" in name
+
+        def _looks_set_var(name: str) -> bool:
+            return any(
+                token in name
+                for token in (
+                    "vars",
+                    "set",
+                    "walk",
+                    "intersect",
+                    "filtered",
+                    "candidate",
+                    "subset",
+                    "result",
+                    "base_var",
+                )
+            )
+
+        has_resolve_semantic_filter = False
+        has_cross_intersect = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "kg_utils"
+            ):
+                continue
+            if func.attr == "resolve_semantic_filter":
+                has_resolve_semantic_filter = True
+                if len(node.args) < 3:
+                    continue
+                arg0 = self._toolgen_ast_nameish(node.args[0])
+                arg2 = self._toolgen_ast_nameish(node.args[2])
+                if arg0 == arg2 and arg0:
+                    smells.append("resolve_semantic_filter_context_misuse")
+                if any(
+                    token in arg0
+                    for token in (
+                        "variable_list",
+                        "candidate_vars",
+                        "candidate_ids",
+                        # "intersect" intentionally omitted: a loop variable named
+                        # "intersect_id" is the correct base_var pattern for multi-anchor
+                        # plans; conflating it with context-misuse creates a double-bind.
+                        "filtered",
+                        "walk",
+                        "subset",
+                    )
+                ):
+                    smells.append("resolve_semantic_filter_context_misuse")
+                if any(
+                    token in arg2
+                    for token in (
+                        "base_var",
+                        "anchor",
+                        "resolved",
+                        "seed",
+                    )
+                ):
+                    smells.append("stale_anchor_filter_context")
+                # For multi-anchor plans the intersection must happen before semantic
+                # filtering.  The correct signal is whether variable_list (arg2) comes
+                # from an intersection step, not whether base_var (arg0) does.
+                if requires_intersection_before_filter and not any(
+                    token in arg2
+                    for token in (
+                        "intersect",
+                        "intersection",
+                        "overlap",
+                        "shared",
+                    )
+                ):
+                    smells.append("multi_anchor_filter_order_violation")
+                continue
+            if func.attr == "walk_to_target" and len(node.args) >= 4:
+                arg0 = self._toolgen_ast_nameish(node.args[0])
+                arg1 = self._toolgen_ast_nameish(node.args[1])
+                arg2 = self._toolgen_ast_nameish(node.args[2])
+                arg3 = self._toolgen_ast_nameish(node.args[3])
+                if (
+                    (arg0 and not _looks_actions_spec(arg0))
+                    or _looks_actions_spec(arg1)
+                    or _looks_actions_spec(arg2)
+                    or (_looks_domain_hints(arg2) and not _looks_target_concept(arg2))
+                    or (_looks_target_concept(arg3) and not _looks_domain_hints(arg3))
+                ):
+                    smells.append("walk_to_target_context_misuse")
+                continue
+            if func.attr == "cross_intersect" and len(node.args) >= 3:
+                has_cross_intersect = True
+                arg0 = self._toolgen_ast_nameish(node.args[0])
+                arg1 = self._toolgen_ast_nameish(node.args[1])
+                arg2 = self._toolgen_ast_nameish(node.args[2])
+                if (
+                    (arg0 and not _looks_actions_spec(arg0))
+                    or _looks_actions_spec(arg1)
+                    or (_looks_actions_spec(arg2) and not _looks_actions_spec(arg0))
+                ):
+                    smells.append("cross_intersect_context_misuse")
+                continue
+            if func.attr == "extract_attribute_value":
+                arg0 = self._toolgen_ast_nameish(node.args[0]) if node.args else ""
+                if (
+                    not node.args
+                    or _looks_actions_spec(arg0)
+                    or _looks_domain_hints(arg0)
+                    or _looks_target_concept(arg0)
+                    or any(
+                        token in arg0
+                        for token in (
+                            "variable_list",
+                            "base_var",
+                            "anchor",
+                            "resolved",
+                        )
+                    )
+                    or (arg0 and not _looks_set_var(arg0) and "output" not in arg0)
+                ):
+                    smells.append("extract_attribute_value_context_misuse")
+        if requires_attribute_filter and not has_resolve_semantic_filter:
+            smells.append("missing_attribute_filter_application")
+        if requires_intersection_before_filter and has_resolve_semantic_filter and not has_cross_intersect:
+            smells.append("multi_anchor_filter_order_violation")
+        # PART 4: family-aware smells
+        _tf = str(plan.get("template_family") or "").strip()
+        _terminal_expected = str(plan.get("terminal_artifact_kind") or "").strip()
+        _filter_val_op = str(plan.get("filter_value_operand") or "").strip()
+        if _tf:
+            # filter_value_in_anchor_operands: filter value entity used as an anchor
+            if _filter_val_op:
+                _fv_lower = _filter_val_op.lower()
+                # Look for filter value entity being passed to resolve_entity_to_vars
+                if re.search(
+                    r"resolve_entity_to_vars\s*\([^)]*" + re.escape(_fv_lower),
+                    tool_code.lower(),
+                ):
+                    smells.append("filter_value_in_anchor_operands")
+            # wrong_terminal_artifact_for_family: terminal artifact mismatch
+            if _terminal_expected == "count_variable":
+                # Expects count variable; flag if code returns a raw integer literal
+                if re.search(r"['\"]final_variable['\"]\s*:\s*\d+", tool_code):
+                    smells.append("wrong_terminal_artifact_for_family")
+            elif _terminal_expected == "filtered_set_variable":
+                # Expects filtered set; flag if code uses count but no semantic filter
+                if (
+                    re.search(r"\bcount_fn\s*\(|actions_spec\.get\s*\(\s*['\"]count['\"]", tool_code)
+                    and not has_resolve_semantic_filter
+                ):
+                    smells.append("wrong_terminal_artifact_for_family")
+            elif _terminal_expected in {"filtered_set_variable", "set_variable"}:
+                _member_return_patterns = (
+                    r"next\s*\(\s*iter\s*\(\s*(?:filtered|filter|inter|int|candidate|walk)[a-z0-9_]*",
+                    r"(?:filtered|filter|inter|int|candidate|walk)[a-z0-9_]*\s*\[\s*0\s*\]",
+                )
+                if any(
+                    re.search(pattern, tool_code.lower())
+                    for pattern in _member_return_patterns
+                ):
+                    smells.append("returned_member_not_set_variable")
+            # family_stage_order_violation: stages called out of required order
+            if _tf in {"two_anchor_intersect_filter_set", "two_anchor_intersect_count",
+                       "two_anchor_intersect_extract_attribute"}:
+                if has_resolve_semantic_filter and not has_cross_intersect:
+                    # Filter applied without intersection: order violation
+                    smells.append("family_stage_order_violation")
+            # PART 5: wrong_anchor_count_for_family
+            # Two-anchor families require anchor_operands to be read from payload.
+            # If the tool ignores anchor_operands entirely, flag it.
+            if _tf in {"two_anchor_intersect_filter_set", "two_anchor_intersect_count",
+                       "two_anchor_intersect_extract_attribute"}:
+                if "anchor_operands" not in tool_code:
+                    smells.append("wrong_anchor_count_for_family")
+        # PART 5: relation_hints_ignored
+        # If the plan has relation_hints, the tool should reference them.
+        _rh = list(plan.get("relation_hints") or [])
+        if _rh and "relation_hints" not in tool_code:
+            smells.append("relation_hints_ignored")
+        return list(dict.fromkeys(smells))
 
     @staticmethod
     def _toolgen_is_honest_zero_summary(
@@ -3355,6 +6037,7 @@ class ControllerToolgenMixin:
         exec_payload: Optional[Mapping[str, Any]],
     ) -> dict[str, Any]:
         tool_plan = self._build_tool_plan(exec_payload or {})
+        preferred_tool_mode = str(tool_plan.get("preferred_tool_mode") or "").strip()
         plan_steps = tool_plan.get("topological_execution_plan_steps") or []
         if not isinstance(execution_validation, Mapping):
             return {
@@ -3461,6 +6144,9 @@ class ControllerToolgenMixin:
                 "argmax",
                 "argmin",
             )
+        )
+        multi_anchor_progress_floor = self._toolgen_progress_plan_requires_multi_anchor_floor(
+            tool_plan
         )
         narrowed_problem_space = any(
             phrase in lowered
@@ -3651,6 +6337,22 @@ class ControllerToolgenMixin:
             },
             preferred_tool_mode=str(tool_plan.get("preferred_tool_mode") or ""),
         )
+        achieved_state = self._toolgen_achieved_state_for_value(value_delivered)
+        minimum_bankable_state = self._toolgen_progress_minimum_bankable_state_for_plan(
+            tool_plan
+        )
+        minimum_handoff_state = self._toolgen_progress_minimum_handoff_state_for_plan(
+            tool_plan
+        )
+        plan_requires_strict_bank_floor = minimum_bankable_state != "resolved_anchor"
+        plan_requires_strict_handoff_floor = minimum_handoff_state != "resolved_anchor"
+        bankable_partial_progress = bool(
+            value_delivered not in {"", "none", "produced_final_variable"}
+            and self._toolgen_achieved_state_meets_floor(
+                achieved_state,
+                minimum_bankable_state,
+            )
+        )
         if value_delivered != "none" and not looks_shallow_resolution:
             material_progress = True
             if handoff_state == "blocked":
@@ -3719,25 +6421,55 @@ class ControllerToolgenMixin:
             elif reason not in {"exhausted_no_classified_value"}:
                 reason = "exhausted_no_actionable_handoff"
 
-        # Progress-tool minimum-deliverable tightening: when the active plan
-        # requires downstream narrowing/intersection/filter/count AND the tool
-        # is in progress_tool mode, a SUCCESS that only delivered a resolved
-        # anchor (no actual downstream operation observed) is insufficient.
-        # Demote it so it does not register as acceptable partial progress and
-        # force the next round to do real downstream work.
-        _pt_mode = str((tool_plan or {}).get("preferred_tool_mode") or "")
         if (
-            _pt_mode == "progress_tool"
-            and plan_requires_narrowing_or_final_op
-            and value_delivered in {"resolved_anchor", "resolved_both_anchors"}
-            and not downstream_op_signal
-            and not verified_narrowing_signal
-            and status == "SUCCESS"
+            plan_requires_strict_bank_floor
+            and value_delivered not in {"", "none", "produced_final_variable"}
+            and not self._toolgen_achieved_state_meets_floor(
+                achieved_state,
+                minimum_bankable_state,
+            )
             and material_progress
         ):
             material_progress = False
-            reason = "resolved_anchor_only_insufficient_for_plan"
+            partial_value_usable = False
+            bankable_partial_progress = False
+            reason = (
+                "resolved_anchor_only_insufficient_for_plan"
+                if value_delivered == "resolved_anchor"
+                else "below_minimum_useful_floor_for_plan"
+            )
             semantic_trust_level = "fallback_unverified"
+        usefulness_passed = material_progress or (not has_plan and has_final)
+        if (
+            plan_requires_strict_handoff_floor
+            and status == "SUCCESS"
+            and has_final
+            and value_delivered != "produced_final_variable"
+            and not downstream_op_signal
+            and not verified_narrowing_signal
+            and material_progress
+            and not self._toolgen_achieved_state_meets_floor(
+                achieved_state,
+                minimum_handoff_state,
+            )
+        ):
+            usefulness_passed = False
+            handoff_state = "partial_fallback_not_final"
+            reason = "plan_stage_handoff_too_broad"
+            semantic_trust_level = "fallback_unverified"
+        admission_blocked = self._toolgen_live_admission_blocked(
+            {
+                "execution_status": status,
+                "final_variable": final_variable,
+                "has_final_variable": has_final,
+                "partial_value_usable": partial_value_usable,
+                "bankable_partial_progress": bankable_partial_progress,
+                "semantic_trust_level": semantic_trust_level,
+                "preferred_tool_mode": preferred_tool_mode,
+            }
+        )
+        if admission_blocked:
+            usefulness_passed = False
 
         return {
             "has_live_result": True,
@@ -3760,11 +6492,15 @@ class ControllerToolgenMixin:
             "final_operation_safe": final_operation_safe,
             "plan_requires_narrowing_or_final_op": plan_requires_narrowing_or_final_op,
             "material_progress": material_progress,
-            "usefulness_passed": material_progress or (not has_plan and has_final),
+            "usefulness_passed": usefulness_passed,
+            "admission_blocked": admission_blocked,
             "reason": reason,
             "looks_shallow_resolution": looks_shallow_resolution,  # Phase 0
             "value_delivered": value_delivered,
             "partial_value_usable": partial_value_usable,
+            "bankable_partial_progress": bankable_partial_progress,
+            "minimum_bankable_achieved_state": minimum_bankable_state,
+            "minimum_handoff_achieved_state": minimum_handoff_state,
             "value_mode": (
                 "full_solve"
                 if value_delivered == "produced_final_variable"
@@ -3775,7 +6511,7 @@ class ControllerToolgenMixin:
                     else ("progress_tool" if value_delivered != "none" else "none")
                 )
             ),
-            "achieved_state": self._toolgen_achieved_state_for_value(value_delivered),
+            "achieved_state": achieved_state,
         }
 
     def _toolgen_validate_candidate_tool(
@@ -3789,6 +6525,12 @@ class ControllerToolgenMixin:
         if not tool_code:
             return None
         exec_payload = getattr(self, "_toolgen_execution_payload", None)
+        tool_plan = self._build_tool_plan(exec_payload or {})
+        semantic_code_smells = self._toolgen_semantic_code_smells(tool_code)
+        semantic_code_smells.extend(
+            self._toolgen_dynamic_plan_code_smells(tool_code, tool_plan)
+        )
+        semantic_code_smells = list(dict.fromkeys(semantic_code_smells))
         # Live execution check — usefulness-gated admission mode.
         # We still surface hard runtime errors directly, but we also summarize
         # whether the live result produced final utility or an actionable partial
@@ -3813,16 +6555,66 @@ class ControllerToolgenMixin:
             "handoff_state": "blocked",
             "reason": "no_live_context",
         }
+        is_kg_env = self._resolved_environment_label() == "knowledge_graph"
+        preferred_tool_mode = str(tool_plan.get("preferred_tool_mode") or "").strip()
+        targeted_helper_smells = {
+            "missing_attribute_filter_application",
+            "resolve_semantic_filter_context_misuse",
+            "stale_anchor_filter_context",
+            "helper_signature_mismatch",
+            "walk_to_target_context_misuse",
+            "cross_intersect_context_misuse",
+            "extract_attribute_value_context_misuse",
+            "multi_anchor_filter_order_violation",
+            "blanket_entity_resolve_loop",
+            "first_candidate_selection_by_index",
+        }
+        preserved_state_blocking_smells = {
+            "requires_variable_list_in_payload",
+            "requires_payload_resolved_anchors",
+        }
+        precheck_blocking_smells = (
+            targeted_helper_smells | preserved_state_blocking_smells
+        )
+        if preferred_tool_mode == "diagnostic_probe":
+            precheck_blocking_smells = set(precheck_blocking_smells)
+            precheck_blocking_smells.discard("missing_attribute_filter_application")
+        precheck_helper_block = bool(
+            is_kg_env
+            and self._toolgen_plan_requires_helper_discipline_guard(tool_plan)
+            and any(
+                smell in semantic_code_smells
+                for smell in precheck_blocking_smells
+            )
+        )
         if isinstance(exec_payload, Mapping):
-            execution_validation = self._toolgen_execution_check(tool_code, exec_payload)
+            if precheck_helper_block:
+                smell_list = ", ".join(
+                    smell
+                    for smell in semantic_code_smells
+                    if smell in precheck_blocking_smells
+                )
+                execution_validation = {
+                    "status": "ERROR",
+                    "final_variable": None,
+                    "observation": (
+                        "precheck_helper_discipline_block: "
+                        f"{smell_list}. Repair helper usage before live execution."
+                    ),
+                }
+            else:
+                execution_validation = self._toolgen_execution_check(
+                    tool_code, exec_payload
+                )
             usefulness_summary = self._summarize_toolgen_live_progress(
                 execution_validation, exec_payload
             )
-        semantic_code_smells = self._toolgen_semantic_code_smells(tool_code)
         severe_semantic_smell = False
         trust_level = str(usefulness_summary.get("semantic_trust_level") or "blocked")
         usefulness_reason = str(usefulness_summary.get("reason") or "unknown")
-        if semantic_code_smells:
+        _ADVISORY_SMELL_NAMES = {"wrong_anchor_count_for_family", "relation_hints_ignored"}
+        _non_advisory_smells = [s for s in semantic_code_smells if s not in _ADVISORY_SMELL_NAMES]
+        if _non_advisory_smells:
             trust_level = trust_level if trust_level != "verified" else "partial_unverified"
         if (
             usefulness_summary.get("plan_requires_narrowing_or_final_op")
@@ -3838,11 +6630,11 @@ class ControllerToolgenMixin:
             severe_semantic_smell = True
             trust_level = "fallback_unverified"
             usefulness_reason = "definitive_result_after_failed_semantic_narrowing"
-        is_kg_env = self._resolved_environment_label() == "knowledge_graph"
         blocking_kg_smells = {
             "kg_utils_import_forbidden",  # import will raise ModuleNotFoundError at runtime
             "base_group_selected_by_position",
             "first_nonempty_group_selected_heuristically",
+            "blanket_entity_resolve_loop",
             "candidate_map_salvage_without_role_proof",
             "semantic_filter_empty_success_path",
             "broad_exception_success_fallback",
@@ -3853,7 +6645,26 @@ class ControllerToolgenMixin:
             "custom_streaming_or_bucketing_architecture",
             "noncanonical_helper_surface",
             "helper_signature_mismatch",  # wrong positional-arg count → runtime TypeError
+            "missing_attribute_filter_application",
+            "resolve_semantic_filter_context_misuse",
+            "stale_anchor_filter_context",
+            "walk_to_target_context_misuse",
+            "cross_intersect_context_misuse",
+            "extract_attribute_value_context_misuse",
+            "multi_anchor_filter_order_violation",
+            "requires_variable_list_in_payload",
+            "requires_payload_resolved_anchors",
+            "attribute_target_concept_resolved_as_anchor",
+            "preserved_ids_assigned_to_multiple_anchors",
+            "positional_entity_role_guessing",
+            "filter_value_in_anchor_operands",
+            "wrong_terminal_artifact_for_family",
+            "family_stage_order_violation",
+            "returned_member_not_set_variable",
         }
+        if preferred_tool_mode == "diagnostic_probe":
+            blocking_kg_smells = set(blocking_kg_smells)
+            blocking_kg_smells.discard("missing_attribute_filter_application")
         if (
             usefulness_summary.get("plan_requires_narrowing_or_final_op")
             and not usefulness_summary.get("final_operation_safe", False)
@@ -3868,6 +6679,9 @@ class ControllerToolgenMixin:
                 trust_level = "partial_unverified"
             usefulness_reason = "blocking_semantic_code_smells"
         usefulness_passed = bool(usefulness_summary.get("usefulness_passed", False))
+        if bool(usefulness_summary.get("admission_blocked", False)):
+            usefulness_passed = False
+            usefulness_reason = "live_admission_blocked_exhausted_without_final_variable"
         if severe_semantic_smell or (
             usefulness_summary.get("has_live_result")
             and trust_level in {"fallback_unverified", "blocked"}
@@ -3975,7 +6789,7 @@ class ControllerToolgenMixin:
             "tool_code": tool_code,
             "plan_repair_cycle": plan_repair_cycle,
             "tool_context": {
-                "tool_plan": self._build_tool_plan(exec_payload or {}),
+                "tool_plan": tool_plan,
                 "round_context": round_context,
                 "live_progress_summary": usefulness_summary,
             },
@@ -3988,7 +6802,7 @@ class ControllerToolgenMixin:
             execution_validation=execution_validation,
             live_progress_summary=usefulness_summary,
             round_context=round_context,
-            tool_plan=self._build_tool_plan(exec_payload or {}),
+            tool_plan=tool_plan,
             tool_code=tool_code,
             failure_phase="validator",
         )
@@ -3997,6 +6811,9 @@ class ControllerToolgenMixin:
         validation["semantic_trust_level"] = trust_level
         validation["usefulness_passed"] = usefulness_passed
         validation["usefulness_reason"] = usefulness_reason
+        validation["admission_blocked"] = bool(
+            usefulness_summary.get("admission_blocked", False)
+        )
         validation["final_operation_safe"] = bool(
             usefulness_summary.get("final_operation_safe", False)
         )
@@ -4006,6 +6823,45 @@ class ControllerToolgenMixin:
         validation["achieved_state"] = str(
             usefulness_summary.get("achieved_state") or "none"
         )
+        family_binding_bypassed = bool(
+            validation.get("family_binding_active")
+            and (
+                validation.get("generic_generation_used_when_family_known")
+                or validation.get("generic_repair_used_when_family_known")
+                or not validation.get("family_generation_path_used")
+                or not validation.get("family_validator_path_used")
+                or bool(round_context.get("current_round_patch_mode"))
+            )
+        )
+        validation["family_binding_bypassed"] = family_binding_bypassed
+        if family_binding_bypassed:
+            usefulness_passed = False
+            usefulness_reason = "family_binding_bypassed"
+            validation["usefulness_passed"] = False
+            validation["usefulness_reason"] = usefulness_reason
+            validation["admission_blocked"] = True
+            try:
+                validation["grade"] = min(int(validation.get("grade") or 0), 3)
+            except Exception:
+                validation["grade"] = 3
+            issues = validation.get("issues")
+            fixes = validation.get("fixes")
+            if not isinstance(issues, list):
+                issues = [str(issues or "")] if issues else []
+            if not isinstance(fixes, list):
+                fixes = [str(fixes or "")] if fixes else []
+            issues = [str(item or "").strip() for item in issues if str(item or "").strip()]
+            fixes = [str(item or "").strip() for item in fixes if str(item or "").strip()]
+            issues.insert(
+                0,
+                "family_binding_bypassed: a supported KG template_family was active, but the attempt still used a generic generation/repair/validator path.",
+            )
+            fixes.insert(
+                0,
+                "Regenerate from the selected family skeleton and keep repair/validator routing on the family-bound path. Do not use generic patch/apply or generic fallback prose.",
+            )
+            validation["issues"] = issues
+            validation["fixes"] = fixes
         try:
             reported_grade = int(validation.get("grade") or 0)
         except Exception:
@@ -4065,6 +6921,84 @@ class ControllerToolgenMixin:
                     "primary_repair_instruction": validation.get(
                         "primary_repair_instruction"
                     ),
+                    "template_family": validation.get("template_family_selected")
+                    or tool_plan.get("template_family"),
+                    "anchor_operands": tool_plan.get("anchor_operands"),
+                    "filter_value_operand": validation.get("filter_value_operand")
+                    or tool_plan.get("filter_value_operand"),
+                    "attribute_target_concept": tool_plan.get(
+                        "attribute_target_concept"
+                    ),
+                    "required_next_stage": validation.get(
+                        "required_next_achieved_state"
+                    ),
+                    "terminal_artifact_kind": validation.get(
+                        "terminal_artifact_expected"
+                    )
+                    or tool_plan.get("terminal_artifact_kind"),
+                    "family_repair_path_used": validation.get(
+                        "family_repair_path_used"
+                    ),
+                    "family_skeleton_used": validation.get("family_skeleton_used"),
+                    "family_validator_checks_used": validation.get(
+                        "family_validator_checks_used"
+                    ),
+                    "filter_value_in_anchor_operands_detected": validation.get(
+                        "filter_value_in_anchor_operands_detected"
+                    ),
+                    "generic_repair_used_when_family_known": validation.get(
+                        "generic_repair_used_when_family_known"
+                    ),
+                    "generic_generation_used_when_family_known": validation.get(
+                        "generic_generation_used_when_family_known"
+                    ),
+                    "wrong_terminal_artifact_for_family": validation.get(
+                        "wrong_terminal_artifact_detected"
+                    ),
+                    "family_binding_active": validation.get("family_binding_active"),
+                    "family_binding_reason": validation.get("family_binding_reason"),
+                    "generic_path_blocked_for_family_bound_attempt": validation.get(
+                        "generic_path_blocked_for_family_bound_attempt"
+                    ),
+                    "family_generation_path_used": validation.get(
+                        "family_generation_path_used"
+                    ),
+                    "generic_generation_blocked": validation.get(
+                        "generic_generation_blocked"
+                    ),
+                    "generic_repair_blocked": validation.get(
+                        "generic_repair_blocked"
+                    ),
+                    "family_repair_template_name": validation.get(
+                        "family_repair_template_name"
+                    ),
+                    "family_validator_path_used": validation.get(
+                        "family_validator_path_used"
+                    ),
+                    "family_top_issue_used": validation.get(
+                        "family_top_issue_used"
+                    ),
+                    "generic_validator_fallback_used": validation.get(
+                        "generic_validator_fallback_used"
+                    ),
+                    "family_patch_path_blocked": validation.get(
+                        "family_patch_path_blocked"
+                    ),
+                    "family_regeneration_forced": validation.get(
+                        "family_regeneration_forced"
+                    ),
+                    "normalized_family_inputs": validation.get(
+                        "normalized_family_inputs"
+                    ),
+                    "family_normalization_source": validation.get(
+                        "family_normalization_source"
+                    ),
+                    "family_normalization_fallback_used": validation.get(
+                        "family_normalization_fallback_used"
+                    ),
+                    "family_binding_bypassed": validation.get(
+                        "family_binding_bypassed"
+                    ),
                     "grade": validation.get("grade"),
                     "uncapped_grade": validation.get("uncapped_grade"),
                     "grade_cap_reason": validation.get("grade_cap_reason"),
@@ -4073,6 +7007,19 @@ class ControllerToolgenMixin:
             )
         except Exception:
             pass
+        if family_binding_bypassed:
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_family_binding_bypassed",
+                        "tool_name": tool_spec.get("name"),
+                        "template_family": validation.get("template_family_selected")
+                        or tool_plan.get("template_family"),
+                        "reason": "family_binding_bypassed",
+                    }
+                )
+            except Exception:
+                pass
         try:
             self._append_toolgen_strategy_classification(
                 tool_name=tool_spec.get("name"),
@@ -4312,6 +7259,27 @@ class ControllerToolgenMixin:
         _attr_domain_hints: list[str] = list(
             canonical_tool_plan.get("attribute_domain_hints") or []
         )
+
+        # Canonicalize plain-label targets (e.g. "cheese" → "food.cheese").
+        # KG helpers score relations/types against target_concept; dotted types
+        # yield far better matches than plain English labels, and reduce the
+        # likelihood that ToolGen generates variable names that fail the static
+        # helper-discipline checks.
+        if _live_target_concept and "." not in _live_target_concept:
+            _canon = _kg_utils.resolve_concept_to_types(
+                _live_target_concept,
+                domain_hints=_live_domain_hints or None,
+                max_candidates=1,
+            )
+            if _canon:
+                _live_target_concept = _canon[0]
+                canonical_tool_plan["target_concept"] = _live_target_concept
+        # Gate: walk_first requires a dotted KG type to score relations reliably.
+        if (
+            canonical_tool_plan.get("execution_style") == "walk_first"
+            and "." not in _live_target_concept
+        ):
+            canonical_tool_plan["execution_style"] = "relation_first"
 
         # Semantic fields come strictly from the canonical tool_plan.
         # Do not fall back to regex parsing of upgrade_goal or failure_context.
@@ -4714,6 +7682,39 @@ class ControllerToolgenMixin:
         query: str,
         chat_history: ChatHistory,
     ) -> Optional[ToolMetadata]:
+        turn_policy_allowed, turn_policy_reason = (
+            self._toolgen_current_turn_allows_fresh_attempt(chat_history)
+        )
+        if not turn_policy_allowed:
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_attempt_blocked_policy",
+                        "source": "escape_hatch",
+                        "query": self._truncate(query, 300),
+                        "task_key": list(self._toolgen_current_task_session_key()),
+                        "policy_reason": turn_policy_reason,
+                    }
+                )
+            except Exception:
+                pass
+            return None
+        if not self._toolgen_fresh_attempt_allowed_for_current_task():
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_attempt_blocked_same_task",
+                        "source": "escape_hatch",
+                        "query": self._truncate(query, 300),
+                        "task_key": list(self._toolgen_current_task_session_key()),
+                        "attempt_count": self._toolgen_fresh_attempt_count_for_current_task(),
+                        "max_attempts": self._toolgen_max_fresh_attempts_per_task(),
+                    }
+                )
+            except Exception:
+                pass
+            return None
+        self._toolgen_mark_fresh_attempt_started_for_current_task()
         reason = self._toolgen_stringify_prompt_value(decision.get("reason"))
         upgrade_goal = self._toolgen_stringify_prompt_value(
             decision.get("upgrade_goal")
@@ -4734,17 +7735,13 @@ class ControllerToolgenMixin:
         toolgen_query = "\n".join(parts)
 
         env_contract = ""
-        context = getattr(self, "_toolgen_agg_context", None)
-        if isinstance(context, Mapping):
-            env_contract = str(context.get("env_contract") or "")
-        if not env_contract:
-            try:
-                for item in self._history_items(chat_history):
-                    if item.role == Role.USER:
-                        env_contract = (item.content or "").strip()
-                        break
-            except Exception:
-                env_contract = ""
+        try:
+            for item in self._history_items(chat_history):
+                if item.role == Role.USER:
+                    env_contract = (item.content or "").strip()
+                    break
+        except Exception:
+            env_contract = ""
 
         final_user_prompt = self._toolgen_build_blueprint_prompt(
             query=query,
@@ -4863,6 +7860,32 @@ class ControllerToolgenMixin:
             "functionality. The existing tools failed or were insufficient. You must identify the GAP "
             "and write a specialized tool that performs a NEW graph computation or filter.\n\n"
         )
+        compact_finish_chain_block = ""
+        required_handoff_state = str(
+            normalized_tool_plan.get("required_handoff_achieved_state")
+            or normalized_tool_plan.get("required_next_achieved_state")
+            or ""
+        ).strip()
+        if (
+            required_handoff_state == "built_filter_ready_set"
+            and self._toolgen_progress_plan_requires_multi_anchor_floor(
+                normalized_tool_plan
+            )
+            and self._toolgen_progress_plan_has_attribute_filter(
+                normalized_tool_plan
+            )
+        ):
+            compact_finish_chain_block = (
+                "FILTER-READY FINISH-CHAIN OVERRIDE:\n"
+                "This plan is stage-bound to built_filter_ready_set. Do not stop at "
+                "resolved anchors, walked target sets, or raw intersection sets. Use a "
+                "compact straight-line macro shape: resolve anchor A, resolve anchor B, "
+                "walk anchor A, walk anchor B, intersect the walked sets, apply "
+                "resolve_semantic_filter to the intersection, and return status='SUCCESS' "
+                "with final_variable=#N as soon as the filter-ready set exists. Avoid "
+                "alternate fallback branches, candidate-map salvage paths, or progress-"
+                "handoff exits before the filter-ready set.\n\n"
+            )
         blueprint_header = (
             "=== ORCHESTRATOR BLUEPRINT ===\n"
             f"TOOL TYPE REQUIRED: {tool_type}\n"
@@ -4877,14 +7900,17 @@ class ControllerToolgenMixin:
             "compatibility adapters, helper-shape probes, streaming/bucketing "
             "architectures, or pseudo-solver fallback trees. Write the smallest "
             "correct KG tool that calls real kg_utils.* primitives on the provided "
-            "entities; stop at the first grounded useful KG state. Do NOT echo "
+            "entities; stop at the first grounded useful KG state that satisfies "
+            "the declared minimum_acceptable_deliverable / required_next_achieved_state. "
+            "Do NOT echo "
             "tool_plan, payload fields, or entity strings as a substitute for real "
             "KG results. Return only the canonical 3-key dict with status, "
             "final_variable, and observation; never return a raw string or bare "
             "variable ID. If the effective plan is empty or unusable, return an "
             "honest ERROR result instead of inventing KG traversal. Give the tool "
             "a generic descriptive name.\n"
-            "==============================\n\n"
+            + compact_finish_chain_block
+            + "==============================\n\n"
             + catalog_block
         )
         plan_str = self._toolgen_stringify_prompt_value(
@@ -4968,31 +7994,29 @@ class ControllerToolgenMixin:
             if isinstance(exec_payload, Mapping)
             else {}
         )
-        requested_mode = get_toolgen_mode()
-        mode = requested_mode
-        mode_override_reason = ""
-        if requested_mode == "staged":
-            current_tool_plan = self._build_tool_plan(base_exec_payload)
-            if (
-                self._resolved_environment_label() == "knowledge_graph"
-                and (
-                    bool(current_tool_plan.get("topological_execution_plan"))
-                    or "PLAN-FIRST AUTHORITY" in system_prompt
-                    or "SSOT OUTPUT SCHEMA" in system_prompt
+        _requested_mode = (os.getenv("AGG_TOOLGEN_MODE", "staged") or "staged").strip().lower()
+        if _requested_mode not in ("staged", "legacy"):
+            _requested_mode = "staged"
+        mode = "legacy"
+        if _requested_mode != mode:
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_mode_override",
+                        "requested_mode": _requested_mode,
+                        "effective_mode": mode,
+                        "reason": "staged_toolgen_not_available",
+                    }
                 )
-            ):
-                mode = "legacy"
-                mode_override_reason = (
-                    "knowledge_graph_macro_prompt_requires_ssot_legacy_path"
-                )
+            except Exception:
+                pass
         validate = self._toolgen_should_validate()
         max_rounds = (
             force_max_rounds
             if force_max_rounds is not None
             else (self.MAX_TOOLGEN_ROUNDS if validate else 1)
         )
-        relaxed_mode = False if force_strict else self._toolgen_relaxed_mode_enabled()
-        patch_mode = self._toolgen_patch_mode_enabled() and mode == "legacy" and validate
+        patch_mode = self._toolgen_patch_mode_enabled() and validate
         base_prompt = user_prompt
         last_candidate: Optional[Mapping[str, Any]] = None
         last_validation: Optional[Mapping[str, Any]] = None
@@ -5022,8 +8046,6 @@ class ControllerToolgenMixin:
                 {
                     "event": "toolgen_attempt",
                     "mode": mode,
-                    "requested_mode": requested_mode,
-                    "mode_override_reason": mode_override_reason or None,
                     "max_rounds": max_rounds,
                     "prompt_chars": len(base_prompt or ""),
                     "system_prompt_name": prompt_name or "custom",
@@ -5034,19 +8056,6 @@ class ControllerToolgenMixin:
             )
         except Exception:
             pass
-        if mode_override_reason:
-            try:
-                self._append_generated_tools_log(
-                    {
-                        "event": "toolgen_mode_override",
-                        "requested_mode": requested_mode,
-                        "effective_mode": mode,
-                        "reason": mode_override_reason,
-                        "environment": self._resolved_environment_label(),
-                    }
-                )
-            except Exception:
-                pass
 
         def _record_round_history(
             *,
@@ -5064,6 +8073,8 @@ class ControllerToolgenMixin:
             failure_bucket: str = "strategy_mismatch_no_progress",
             value_delivered: str = "none",
             partial_value_usable: bool = False,
+            bankable_partial_progress: Optional[bool] = None,
+            achieved_state: str = "none",
             semantic_code_smells: Optional[Sequence[str]] = None,
             runtime_repair_brief: Optional[Mapping[str, Any]] = None,
             tool_code: str = "",
@@ -5107,6 +8118,8 @@ class ControllerToolgenMixin:
                     "failure_bucket": failure_bucket,
                     "value_delivered": value_delivered,
                     "partial_value_usable": partial_value_usable,
+                    "bankable_partial_progress": bankable_partial_progress,
+                    "achieved_state": achieved_state,
                     "semantic_code_smells": list(semantic_code_smells or []),
                     "runtime_repair_brief": dict(runtime_repair_brief or {})
                     if isinstance(runtime_repair_brief, Mapping)
@@ -5321,6 +8334,17 @@ class ControllerToolgenMixin:
                 exec_payload=base_exec_payload,
                 round_history=round_history,
             )
+            round_context, best_partial_retry_candidate = (
+                self._toolgen_bind_best_partial_retry_context(
+                    round_context,
+                    tool_plan=base_exec_payload,
+                    round_history=round_history,
+                    best_candidate=best_candidate,
+                    best_live_candidate=best_live_candidate,
+                    best_partial_candidate=best_partial_candidate,
+                    best_partial_live_candidate=best_partial_live_candidate,
+                )
+            )
 
             # ── Phase 1: bind runtime-repair directives into retry state ──
             # Must happen BEFORE _toolgen_apply_round_strategy_context so that
@@ -5354,7 +8378,7 @@ class ControllerToolgenMixin:
                         ],
                     })
                 except Exception:
-                    pass
+                        pass
 
             current_exec_payload = self._toolgen_apply_round_strategy_context(
                 base_exec_payload,
@@ -5363,12 +8387,77 @@ class ControllerToolgenMixin:
             )
             setattr(self, "_toolgen_execution_payload", current_exec_payload)
             current_tool_plan = self._build_tool_plan(current_exec_payload)
+            if isinstance(current_exec_payload.get("toolgen_retry_context"), Mapping):
+                round_context = dict(
+                    current_exec_payload.get("toolgen_retry_context") or {}
+                )
+            else:
+                round_context = dict(round_context)
+            for _ctx_key in (
+                "template_family",
+                "anchor_operands",
+                "filter_operand",
+                "filter_value_operand",
+                "target_concept",
+                "attribute_target_concept",
+                "terminal_artifact_kind",
+            ):
+                if _ctx_key not in round_context and _ctx_key in current_tool_plan:
+                    round_context[_ctx_key] = current_tool_plan.get(_ctx_key)
+            family_binding = self._toolgen_kg_family_binding_context(
+                tool_plan=current_tool_plan,
+                round_context=round_context,
+            )
+            for _binding_key, _binding_value in family_binding.items():
+                round_context[_binding_key] = _binding_value
+                current_tool_plan[_binding_key] = _binding_value
+                current_exec_payload[_binding_key] = _binding_value
+            if isinstance(current_exec_payload.get("tool_plan"), Mapping):
+                current_exec_payload["tool_plan"] = dict(
+                    current_exec_payload.get("tool_plan") or {}
+                )
+                current_exec_payload["tool_plan"].update(family_binding)
+            if isinstance(current_exec_payload.get("toolgen_retry_context"), Mapping):
+                current_exec_payload["toolgen_retry_context"] = dict(
+                    current_exec_payload.get("toolgen_retry_context") or {}
+                )
+                current_exec_payload["toolgen_retry_context"].update(family_binding)
+            if bool(family_binding.get("family_classification_ambiguous")):
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "kg_family_classification_ambiguous",
+                            "round": round_idx,
+                            "template_family": round_context.get("template_family"),
+                            "candidate_family_options": round_context.get(
+                                "candidate_family_options"
+                            )
+                            or [],
+                            "normalized_family_inputs": round_context.get(
+                                "normalized_family_inputs"
+                            )
+                            or {},
+                        }
+                    )
+                except Exception:
+                    pass
             round_base_prompt = self._toolgen_refresh_retry_prompt_scaffold(
                 fallback_prompt=base_prompt,
                 exec_payload=current_exec_payload,
             )
             last_round_context = dict(round_context)
             last_round_tool_plan = dict(current_tool_plan)
+            retry_anchor_tool_code = last_tool_code
+            retry_anchor_tool_spec = last_tool_spec
+            if isinstance(best_partial_retry_candidate, Mapping):
+                retry_anchor_tool_code = str(
+                    best_partial_retry_candidate.get("tool_code")
+                    or retry_anchor_tool_code
+                    or ""
+                )
+                _retry_anchor_spec = best_partial_retry_candidate.get("tool_spec")
+                if isinstance(_retry_anchor_spec, Mapping):
+                    retry_anchor_tool_spec = _retry_anchor_spec
             if (
                 round_context.get("pivot_required")
                 and round_context.get("strategy_source") == "pivot_policy"
@@ -5418,6 +8507,78 @@ class ControllerToolgenMixin:
                     )
                 except Exception:
                     pass
+            print(f"{round_label} starting", file=sys.stderr, flush=True)
+            # Hard pivot enforcement: when a strategy pivot is required, omit the
+            # prior tool code from the generation prompt so the LLM cannot anchor
+            # on the disallowed-strategy implementation.  Patch mode is already
+            # blocked by the current_round_patch_mode guard below; this closes the
+            # full-rewrite path where LAST_TOOL_CODE would otherwise still appear.
+            _effective_phase1_state = phase1_retry_state
+            if (
+                round_context.get("pivot_required")
+                or bool(round_context.get("family_binding_active"))
+                or bool(
+                    round_context.get("generic_path_blocked_for_family_bound_attempt")
+                )
+                or bool(
+                    round_context.get("family_regeneration_forced")
+                )
+                or bool(
+                    phase1_retry_state.get("force_structural_stage_rewrite")
+                )
+            ):
+                _effective_phase1_state = dict(phase1_retry_state)
+                _effective_phase1_state["omit_prior_code"] = True
+            last_tool_has_patchable_run = self._toolgen_has_patchable_run(
+                retry_anchor_tool_code
+            )
+            family_binding_active = bool(round_context.get("family_binding_active"))
+            family_patch_path_blocked = family_binding_active
+            family_regeneration_forced = family_binding_active
+            current_round_patch_mode = (
+                patch_mode
+                and round_idx > 1
+                and not force_full_rewrite_next_round
+                # Strategy pivots change the semantics of the tool, not just its
+                # implementation.  Patching prior-strategy code against a new strategy
+                # produces incoherent diffs; always use a full rewrite after a pivot.
+                and not round_context.get("pivot_required")
+                and not family_binding_active
+                and not bool(phase1_retry_state.get("force_structural_stage_rewrite"))
+                and last_tool_has_patchable_run
+                and isinstance(retry_anchor_tool_spec, Mapping)
+            )
+            round_context["family_patch_path_blocked"] = family_patch_path_blocked
+            round_context["family_regeneration_forced"] = family_regeneration_forced
+            round_context["current_round_patch_mode"] = current_round_patch_mode
+            current_tool_plan["family_patch_path_blocked"] = family_patch_path_blocked
+            current_tool_plan["family_regeneration_forced"] = family_regeneration_forced
+            current_tool_plan["current_round_patch_mode"] = current_round_patch_mode
+            current_exec_payload["family_patch_path_blocked"] = family_patch_path_blocked
+            current_exec_payload["family_regeneration_forced"] = family_regeneration_forced
+            current_exec_payload["current_round_patch_mode"] = current_round_patch_mode
+            if isinstance(current_exec_payload.get("tool_plan"), Mapping):
+                current_exec_payload["tool_plan"] = dict(
+                    current_exec_payload.get("tool_plan") or {}
+                )
+                current_exec_payload["tool_plan"].update(
+                    {
+                        "family_patch_path_blocked": family_patch_path_blocked,
+                        "family_regeneration_forced": family_regeneration_forced,
+                        "current_round_patch_mode": current_round_patch_mode,
+                    }
+                )
+            if isinstance(current_exec_payload.get("toolgen_retry_context"), Mapping):
+                current_exec_payload["toolgen_retry_context"] = dict(
+                    current_exec_payload.get("toolgen_retry_context") or {}
+                )
+                current_exec_payload["toolgen_retry_context"].update(
+                    {
+                        "family_patch_path_blocked": family_patch_path_blocked,
+                        "family_regeneration_forced": family_regeneration_forced,
+                        "current_round_patch_mode": current_round_patch_mode,
+                    }
+                )
             try:
                 self._append_generated_tools_log(
                     {
@@ -5426,6 +8587,7 @@ class ControllerToolgenMixin:
                         "round": round_idx,
                         "round_label": round_label,
                         "patch_mode": patch_mode,
+                        "current_round_patch_mode": current_round_patch_mode,
                         "strategy_family": round_context.get("strategy_family"),
                         "execution_style": round_context.get("execution_style"),
                         "preferred_tool_mode": round_context.get(
@@ -5436,48 +8598,123 @@ class ControllerToolgenMixin:
                         "strategy_epoch": round_context.get("strategy_epoch"),
                         "failure_bucket": round_context.get("previous_failure_bucket"),
                         "pivot_required": round_context.get("pivot_required"),
+                        "template_family": round_context.get("template_family"),
+                        "anchor_operands": round_context.get("anchor_operands"),
+                        "filter_operand": round_context.get("filter_operand"),
+                        "filter_value_operand": round_context.get("filter_value_operand"),
+                        "attribute_target_concept": round_context.get(
+                            "attribute_target_concept"
+                        ),
+                        "target_concept": round_context.get("target_concept"),
+                        "terminal_artifact_kind": round_context.get("terminal_artifact_kind"),
+                        "required_next_stage": round_context.get("required_next_stage")
+                        or round_context.get("required_next_achieved_state"),
+                        "normalized_family_inputs": round_context.get(
+                            "normalized_family_inputs"
+                        ),
+                        "family_normalization_source": round_context.get(
+                            "family_normalization_source"
+                        ),
+                        "family_normalization_fallback_used": bool(
+                            round_context.get("family_normalization_fallback_used")
+                        ),
+                        "family_classification_ambiguous": bool(
+                            round_context.get("family_classification_ambiguous")
+                        ),
+                        "candidate_family_options": round_context.get(
+                            "candidate_family_options"
+                        )
+                        or [],
+                        "relation_hints": round_context.get("relation_hints") or [],
+                        "relation_hints_count": len(
+                            round_context.get("relation_hints") or []
+                        ),
+                        "family_fallback_split_used": bool(
+                            round_context.get("family_fallback_split_used")
+                        ),
+                        "family_fallback_split_reason": round_context.get(
+                            "family_fallback_split_reason"
+                        ),
+                        "family_binding_active": family_binding_active,
+                        "family_binding_reason": round_context.get("family_binding_reason"),
+                        "generic_path_blocked_for_family_bound_attempt": bool(
+                            round_context.get(
+                                "generic_path_blocked_for_family_bound_attempt"
+                            )
+                        ),
+                        "family_skeleton_selected": round_context.get(
+                            "family_skeleton_selected"
+                        ),
+                        "family_generation_path_used": bool(
+                            round_context.get("family_generation_path_used")
+                        ),
+                        "family_skeleton_used": bool(
+                            round_context.get("family_generation_path_used")
+                        ),
+                        "generic_generation_blocked": bool(
+                            round_context.get("generic_generation_blocked")
+                        ),
+                        "generic_generation_used_when_family_known": bool(
+                            round_context.get("template_family")
+                            and not round_context.get("family_generation_path_used")
+                        ),
+                        "family_repair_path_used": family_binding_active,
+                        "family_repair_template_name": round_context.get(
+                            "family_repair_template_name"
+                        ),
+                        "generic_repair_blocked": bool(
+                            round_context.get("generic_repair_blocked")
+                        ),
+                        "generic_repair_used_when_family_known": False,
+                        "family_validator_path_used": bool(
+                            round_context.get("family_validator_path_used")
+                        ),
+                        "family_validator_checks_used": bool(
+                            round_context.get("family_validator_path_used")
+                        ),
+                        "family_patch_path_blocked": family_patch_path_blocked,
+                        "family_regeneration_forced": family_regeneration_forced,
                     }
                 )
             except Exception:
                 pass
-            print(f"{round_label} starting", file=sys.stderr, flush=True)
-            # Hard pivot enforcement: when a strategy pivot is required, omit the
-            # prior tool code from the generation prompt so the LLM cannot anchor
-            # on the disallowed-strategy implementation.  Patch mode is already
-            # blocked by the current_round_patch_mode guard below; this closes the
-            # full-rewrite path where LAST_TOOL_CODE would otherwise still appear.
-            _effective_phase1_state = phase1_retry_state
-            if round_context.get("pivot_required"):
-                _effective_phase1_state = dict(phase1_retry_state)
-                _effective_phase1_state["omit_prior_code"] = True
+            if family_binding_active and not bool(
+                round_context.get("family_generation_path_used")
+            ):
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_family_binding_bypassed",
+                            "round": round_idx,
+                            "mode": mode,
+                            "reason": "family_binding_bypassed",
+                            "template_family": round_context.get("template_family"),
+                            "family_binding_reason": round_context.get(
+                                "family_binding_reason"
+                            ),
+                            "family_binding_active": family_binding_active,
+                            "generic_path_blocked_for_family_bound_attempt": bool(
+                                round_context.get(
+                                    "generic_path_blocked_for_family_bound_attempt"
+                                )
+                            ),
+                        }
+                    )
+                except Exception:
+                    pass
             # --- Full file rewrite every round ---
             prompt = self._toolgen_build_full_rewrite_prompt(
                 base_prompt=round_base_prompt,
                 round_context=round_context,
                 feedback_note=feedback_note or "",
                 round_history=round_history,
-                last_tool_code=last_tool_code,
+                last_tool_code=retry_anchor_tool_code,
                 phase1_retry_state=_effective_phase1_state,
-            )
-            last_tool_has_patchable_run = self._toolgen_has_patchable_run(last_tool_code)
-            current_round_patch_mode = (
-                patch_mode
-                and round_idx > 1
-                and not force_full_rewrite_next_round
-                # Strategy pivots change the semantics of the tool, not just its
-                # implementation.  Patching prior-strategy code against a new strategy
-                # produces incoherent diffs; always use a full rewrite after a pivot.
-                and not round_context.get("pivot_required")
-                # Phase 1: structural-rewrite directions must not patch; there is
-                # no prior code in the prompt to patch against.
-                and not phase1_retry_state["omit_prior_code"]
-                and last_tool_has_patchable_run
-                and isinstance(last_tool_spec, Mapping)
             )
             force_full_rewrite_next_round = False
             if current_round_patch_mode:
                 patch_current_code = self._toolgen_patch_sanitize_contract_retry_source(
-                    last_tool_code,
+                    retry_anchor_tool_code,
                     feedback_note=feedback_note or "",
                 )
                 patch_plan, patch_raw = self._toolgen_generate_patch_plan_legacy(
@@ -5512,12 +8749,24 @@ class ControllerToolgenMixin:
                             failure_family="patch_plan_parse_error",
                         ),
                     )
+                    _patch_parse_note: dict[str, Any] = {
+                        "phase": "patch_plan_parse",
+                        "error": "Patch plan was not valid JSON with a non-empty operations list.",
+                        "raw": (patch_raw or "")[:2000],
+                    }
+                    _best_achieved = self._toolgen_best_achieved_state_summary(round_history)
+                    if _best_achieved.get("best_achieved_state", "none") != "none":
+                        _best_round = _best_achieved.get("best_achieved_round")
+                        _best_state = _best_achieved["best_achieved_state"]
+                        _patch_parse_note["best_achieved_state"] = _best_state
+                        _patch_parse_note["best_achieved_round"] = _best_round
+                        _patch_parse_note["primary_repair_instruction"] = (
+                            f"Round {_best_round} achieved '{_best_state}'. "
+                            "Recovery must preserve or improve that partial-success shape. "
+                            "Do not regress to broader rewrite or lower-value first-attempt behavior."
+                        )
                     feedback_note = json.dumps(
-                        {
-                            "phase": "patch_plan_parse",
-                            "error": "Patch plan was not valid JSON with a non-empty operations list.",
-                            "raw": (patch_raw or "")[:2000],
-                        },
+                        _patch_parse_note,
                         ensure_ascii=True,
                         default=str,
                     )
@@ -5551,12 +8800,24 @@ class ControllerToolgenMixin:
                             failure_family="patch_apply_error",
                         ),
                     )
+                    _patch_apply_note: dict[str, Any] = {
+                        "phase": "patch_apply",
+                        "error": patch_err or "unknown_patch_apply_error",
+                        "plan": patch_plan,
+                    }
+                    _best_achieved = self._toolgen_best_achieved_state_summary(round_history)
+                    if _best_achieved.get("best_achieved_state", "none") != "none":
+                        _best_round = _best_achieved.get("best_achieved_round")
+                        _best_state = _best_achieved["best_achieved_state"]
+                        _patch_apply_note["best_achieved_state"] = _best_state
+                        _patch_apply_note["best_achieved_round"] = _best_round
+                        _patch_apply_note["primary_repair_instruction"] = (
+                            f"Round {_best_round} achieved '{_best_state}'. "
+                            "Recovery must preserve or improve that partial-success shape. "
+                            "Do not regress to broader rewrite or lower-value first-attempt behavior."
+                        )
                     feedback_note = json.dumps(
-                        {
-                            "phase": "patch_apply",
-                            "error": patch_err or "unknown_patch_apply_error",
-                            "plan": patch_plan,
-                        },
+                        _patch_apply_note,
                         ensure_ascii=True,
                         default=str,
                     )
@@ -5571,7 +8832,7 @@ class ControllerToolgenMixin:
                     "tool_code": patched_code,
                     "patch_plan": patch_plan,
                 }
-            elif mode == "legacy":
+            else:
                 try:
                     candidate = self._toolgen_generate_from_prompt_legacy(
                         user_prompt=prompt,
@@ -5581,37 +8842,6 @@ class ControllerToolgenMixin:
                     )
                 except Exception as _gen_exc:
                     # LLM call or extraction crashed — persist artifact and continue
-                    _gen_exc_str = str(_gen_exc)
-                    try:
-                        self._append_generated_tools_log(
-                            {
-                                "event": "tool_generation_failed",
-                                "phase": "llm_call_exception",
-                                "mode": mode,
-                                "round": round_idx,
-                                "error": _gen_exc_str,
-                            }
-                        )
-                    except Exception:
-                        pass
-                    self._write_failed_tool_artifact(
-                        stage="llm_call_exception",
-                        error=_gen_exc_str,
-                        metadata=self._toolgen_round_failure_metadata(
-                            round_context=round_context,
-                            tool_plan=current_tool_plan,
-                        ),
-                    )
-                    candidate = {"error": f"llm_call_exception: {_gen_exc_str}"}
-            else:
-                try:
-                    candidate = self._toolgen_generate_from_prompt_staged(
-                        user_prompt=prompt,
-                        system_prompt=system_prompt,
-                        chat_history=chat_history,
-                        name_prefix=name_prefix,
-                    )
-                except Exception as _gen_exc:
                     _gen_exc_str = str(_gen_exc)
                     try:
                         self._append_generated_tools_log(
@@ -5672,24 +8902,6 @@ class ControllerToolgenMixin:
                     )
                 except Exception:
                     pass
-                if relaxed_mode and isinstance(raw_output, str):
-                    salvage = self._extract_marked_python(raw_output)
-                    if not salvage:
-                        salvage = self._strip_code_fences(raw_output)
-                    if salvage and self._validate_run_ast(salvage) is None:
-                        tool_spec = self._wrap_marker_tool_spec(salvage)
-                        tool_name = str(tool_spec.get("name") or "")
-                        tool_spec["name"] = self._apply_tool_name_prefix(tool_name, name_prefix)
-                        metadata = self._register_tool_from_payload_relaxed(
-                            tool_spec, salvage, chat_history
-                        )
-                        if metadata:
-                            print(
-                                f"[TOOLGEN] Salvaged registration succeeded: {metadata.name}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                            return metadata
                 try:
                     self._append_generated_tools_log(
                         {
@@ -5727,7 +8939,6 @@ class ControllerToolgenMixin:
             last_candidate = candidate
             tool_spec = candidate.get("tool_spec")
             tool_code = candidate.get("tool_code")
-            staged_meta = candidate.get("staged_meta")
             if not isinstance(tool_spec, Mapping) or not isinstance(tool_code, str):
                 try:
                     self._append_generated_tools_log(
@@ -5752,6 +8963,13 @@ class ControllerToolgenMixin:
                     ),
                 )
                 continue
+            tool_spec = self._toolgen_enrich_registration_payload(
+                tool_spec,
+                registration_exec_payload=current_exec_payload,
+            )
+            if isinstance(candidate, Mapping):
+                candidate = dict(candidate)
+                candidate["tool_spec"] = tool_spec
             try:
                 self._append_generated_tools_log(
                     {
@@ -5953,18 +9171,6 @@ class ControllerToolgenMixin:
                         "code": None,
                         "error": "aborted_duplicate",
                     }
-
-            if relaxed_mode:
-                metadata = self._register_tool_from_payload_relaxed(
-                    tool_spec, tool_code, chat_history
-                )
-                if metadata:
-                    print(
-                        f"[TOOLGEN] Relaxed registration succeeded: {metadata.name}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    return metadata
 
             static_ok = True
             static_err = ""
@@ -6187,9 +9393,11 @@ class ControllerToolgenMixin:
                 pass
 
             if not validate:
-                metadata = self._register_tool_from_payload(tool_spec, chat_history)
-                if staged_meta:
-                    self._toolgen_log_staged_registration(staged_meta, metadata)
+                metadata = self._register_tool_from_payload(
+                    tool_spec,
+                    chat_history,
+                    registration_exec_payload=current_exec_payload,
+                )
                 if metadata:
                     return metadata
                 # Registration failed (likely spec_alignment) — surface it
@@ -6292,6 +9500,18 @@ class ControllerToolgenMixin:
             usefulness_passed = bool(validation.get("usefulness_passed", True))
             usefulness_reason = str(validation.get("usefulness_reason") or "")
             live_progress_summary = validation.get("live_progress_summary")
+            admission_blocked = bool(validation.get("admission_blocked", False)) or bool(
+                validation.get("admission_blocked_due_to_regression", False)
+            ) or bool(
+                isinstance(live_progress_summary, Mapping)
+                and live_progress_summary.get("admission_blocked", False)
+            )
+            if admission_blocked:
+                usefulness_passed = False
+                validation["usefulness_passed"] = False
+                if not usefulness_reason:
+                    usefulness_reason = "live_admission_blocked"
+                    validation["usefulness_reason"] = usefulness_reason
             blocked_no_progress = self._toolgen_is_blocked_no_progress(
                 live_progress_summary
             )
@@ -6347,6 +9567,10 @@ class ControllerToolgenMixin:
                     partial_value_usable=bool(
                         validation.get("partial_value_usable", False)
                     ),
+                    bankable_partial_progress=bool(
+                        validation.get("bankable_partial_progress", False)
+                    ),
+                    achieved_state=str(validation.get("achieved_state") or "none"),
                     semantic_code_smells=validation.get("semantic_code_smells") or [],
                     runtime_repair_brief=validation.get("runtime_repair_brief"),
                     tool_code=tool_code,
@@ -6523,6 +9747,46 @@ class ControllerToolgenMixin:
                     "failure_bucket": validation.get("failure_bucket"),
                     "value_delivered": validation.get("value_delivered"),
                     "pivot_required": validation.get("pivot_required"),
+                    "template_family": validation.get("template_family_selected")
+                    or validation.get("template_family"),
+                    "anchor_operands": validation.get("anchor_operands"),
+                    "filter_operand": validation.get("filter_operand"),
+                    "filter_value_operand": validation.get("filter_value_operand"),
+                    "attribute_target_concept": validation.get(
+                        "attribute_target_concept"
+                    ),
+                    "target_concept": validation.get("target_concept"),
+                    "required_next_stage": validation.get(
+                        "required_next_achieved_state"
+                    )
+                    or validation.get("required_next_stage"),
+                    "terminal_artifact_kind": validation.get(
+                        "terminal_artifact_expected"
+                    )
+                    or validation.get("terminal_artifact_kind"),
+                    "family_binding_active": validation.get("family_binding_active"),
+                    "family_binding_reason": validation.get("family_binding_reason"),
+                    "generic_path_blocked_for_family_bound_attempt": validation.get(
+                        "generic_path_blocked_for_family_bound_attempt"
+                    ),
+                    "family_generation_path_used": validation.get(
+                        "family_generation_path_used"
+                    ),
+                    "family_repair_path_used": validation.get(
+                        "family_repair_path_used"
+                    ),
+                    "family_validator_path_used": validation.get(
+                        "family_validator_path_used"
+                    ),
+                    "family_patch_path_blocked": validation.get(
+                        "family_patch_path_blocked"
+                    ),
+                    "family_regeneration_forced": validation.get(
+                        "family_regeneration_forced"
+                    ),
+                    "family_binding_bypassed": validation.get(
+                        "family_binding_bypassed"
+                    ),
                 }
                 self._append_generated_tools_log(
                     {
@@ -6562,6 +9826,85 @@ class ControllerToolgenMixin:
                         "partial_value_usable": validation.get("partial_value_usable"),
                         "usefulness_passed": usefulness_passed,
                         "usefulness_reason": usefulness_reason,
+                        "template_family": validation.get("template_family_selected")
+                        or validation.get("template_family"),
+                        "anchor_operands": validation.get("anchor_operands"),
+                        "filter_operand": validation.get("filter_operand"),
+                        "filter_value_operand": validation.get("filter_value_operand"),
+                        "attribute_target_concept": validation.get(
+                            "attribute_target_concept"
+                        ),
+                        "target_concept": validation.get("target_concept"),
+                        "required_next_stage": validation.get(
+                            "required_next_achieved_state"
+                        )
+                        or validation.get("required_next_stage"),
+                        "terminal_artifact_kind": validation.get(
+                            "terminal_artifact_expected"
+                        )
+                        or validation.get("terminal_artifact_kind"),
+                        "normalized_family_inputs": validation.get(
+                            "normalized_family_inputs"
+                        ),
+                        "family_normalization_source": validation.get(
+                            "family_normalization_source"
+                        ),
+                        "family_normalization_fallback_used": validation.get(
+                            "family_normalization_fallback_used"
+                        ),
+                        "family_classification_ambiguous": validation.get(
+                            "family_classification_ambiguous"
+                        ),
+                        "candidate_family_options": validation.get(
+                            "candidate_family_options"
+                        ),
+                        "family_binding_active": validation.get("family_binding_active"),
+                        "family_binding_reason": validation.get("family_binding_reason"),
+                        "generic_path_blocked_for_family_bound_attempt": validation.get(
+                            "generic_path_blocked_for_family_bound_attempt"
+                        ),
+                        "family_skeleton_selected": validation.get(
+                            "family_skeleton_selected"
+                        ),
+                        "family_generation_path_used": validation.get(
+                            "family_generation_path_used"
+                        ),
+                        "generic_generation_blocked": validation.get(
+                            "generic_generation_blocked"
+                        ),
+                        "generic_generation_used_when_family_known": validation.get(
+                            "generic_generation_used_when_family_known"
+                        ),
+                        "family_repair_path_used": validation.get(
+                            "family_repair_path_used"
+                        ),
+                        "family_repair_template_name": validation.get(
+                            "family_repair_template_name"
+                        ),
+                        "generic_repair_blocked": validation.get(
+                            "generic_repair_blocked"
+                        ),
+                        "generic_repair_used_when_family_known": validation.get(
+                            "generic_repair_used_when_family_known"
+                        ),
+                        "family_validator_path_used": validation.get(
+                            "family_validator_path_used"
+                        ),
+                        "family_top_issue_used": validation.get(
+                            "family_top_issue_used"
+                        ),
+                        "generic_validator_fallback_used": validation.get(
+                            "generic_validator_fallback_used"
+                        ),
+                        "family_patch_path_blocked": validation.get(
+                            "family_patch_path_blocked"
+                        ),
+                        "family_regeneration_forced": validation.get(
+                            "family_regeneration_forced"
+                        ),
+                        "family_binding_bypassed": validation.get(
+                            "family_binding_bypassed"
+                        ),
                         "best_achieved_state": current_best_achieved.get("best_achieved_state"),
                         "best_achieved_round": current_best_achieved.get("best_achieved_round"),
                         "best_achieved_tool_name": current_best_achieved.get("best_achieved_tool_name"),
@@ -6675,6 +10018,11 @@ class ControllerToolgenMixin:
                         validator_top_issue=_v_top,
                         validator_fixes=list(_v_fixes) if _v_fixes else None,
                     )
+                    feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                        feedback_note,
+                        failed_validation=validation,
+                        retry_anchor_candidate=best_partial_retry_candidate,
+                    )
                     # Force full rewrite when:
                     #   a) tool was truly blocked (ERROR/SHAPE_MISMATCH → "blocked"), OR
                     #   b) 2+ consecutive exhausted-no-classified-value rounds — local
@@ -6741,6 +10089,11 @@ class ControllerToolgenMixin:
                                 validator_top_issue=_v_top,
                                 validator_fixes=list(_v_fixes) if _v_fixes else None,
                             )
+                            feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                                feedback_note,
+                                failed_validation=validation,
+                                retry_anchor_candidate=best_partial_retry_candidate,
+                            )
                             # Force full rewrite when:
                             #   a) tool was truly blocked (ERROR/SHAPE_MISMATCH → "blocked"), OR
                             #   b) 2+ consecutive exhausted-no-classified-value rounds.
@@ -6789,6 +10142,11 @@ class ControllerToolgenMixin:
                                 },
                                 ensure_ascii=True,
                                 default=str,
+                            )
+                            feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                                feedback_note,
+                                failed_validation=validation,
+                                retry_anchor_candidate=best_partial_retry_candidate,
                             )
                             force_full_rewrite_next_round = False
                         try:
@@ -6854,6 +10212,22 @@ class ControllerToolgenMixin:
                     live_usefulness_reason = str(
                         live_validation.get("usefulness_reason") or ""
                     )
+                    live_admission_blocked = bool(
+                        live_validation.get("admission_blocked", False)
+                    ) or bool(
+                        live_validation.get("admission_blocked_due_to_regression", False)
+                    ) or bool(
+                        isinstance(live_validation.get("live_progress_summary"), Mapping)
+                        and (live_validation.get("live_progress_summary") or {}).get(
+                            "admission_blocked", False
+                        )
+                    )
+                    if live_admission_blocked:
+                        live_usefulness_passed = False
+                        live_validation["usefulness_passed"] = False
+                        if not live_usefulness_reason:
+                            live_usefulness_reason = "live_admission_blocked"
+                            live_validation["usefulness_reason"] = live_usefulness_reason
                     try:
                         live_issues = live_validation.get("issues", [])
                         if not isinstance(live_issues, list):
@@ -6984,7 +10358,11 @@ class ControllerToolgenMixin:
                             )
                             force_full_rewrite_next_round = True
                             continue
-                        metadata = self._register_tool_from_payload(tool_spec, chat_history)
+                        metadata = self._register_tool_from_payload(
+                            tool_spec,
+                            chat_history,
+                            registration_exec_payload=current_exec_payload,
+                        )
                         if metadata:
                             chosen_live_candidate = (
                                 live_candidate
@@ -7121,6 +10499,11 @@ class ControllerToolgenMixin:
                             validator_top_issue=_lv_top,
                             validator_fixes=list(_lv_fixes) if _lv_fixes else None,
                         )
+                        feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                            feedback_note,
+                            failed_validation=live_validation,
+                            retry_anchor_candidate=best_partial_retry_candidate,
+                        )
                         # Force full rewrite when:
                         #   a) the tool was truly blocked, OR
                         #   b) 2+ consecutive exhausted-no-classified-value rounds were
@@ -7180,6 +10563,11 @@ class ControllerToolgenMixin:
                             ensure_ascii=True,
                             default=str,
                         )
+                        feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                            feedback_note,
+                            failed_validation=live_validation,
+                            retry_anchor_candidate=best_partial_retry_candidate,
+                        )
                         force_full_rewrite_next_round = False
                     continue
                 try:
@@ -7199,6 +10587,11 @@ class ControllerToolgenMixin:
                     ),
                 )
                 feedback_note = json.dumps(feedback_payload, ensure_ascii=True, default=str)
+                feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                    feedback_note,
+                    failed_validation=validation,
+                    retry_anchor_candidate=best_partial_retry_candidate,
+                )
                 force_full_rewrite_next_round = False
                 continue
             if grade >= min_grade:
@@ -7235,6 +10628,11 @@ class ControllerToolgenMixin:
                             validator_top_issue=_v_top2,
                             validator_fixes=list(_v_fixes2) if _v_fixes2 else None,
                         )
+                        feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                            feedback_note,
+                            failed_validation=validation,
+                            retry_anchor_candidate=best_partial_retry_candidate,
+                        )
                     else:
                         feedback_note = json.dumps(
                             {
@@ -7256,6 +10654,11 @@ class ControllerToolgenMixin:
                         ensure_ascii=True,
                         default=str,
                     )
+                        feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                            feedback_note,
+                            failed_validation=validation,
+                            retry_anchor_candidate=best_partial_retry_candidate,
+                        )
                     try:
                         _spec_obj = ToolSpec.from_payload(dict(tool_spec))
                     except Exception:
@@ -7284,9 +10687,11 @@ class ControllerToolgenMixin:
                     )
                 except Exception:
                     pass
-                metadata = self._register_tool_from_payload(tool_spec, chat_history)
-                if staged_meta:
-                    self._toolgen_log_staged_registration(staged_meta, metadata)
+                metadata = self._register_tool_from_payload(
+                    tool_spec,
+                    chat_history,
+                    registration_exec_payload=current_exec_payload,
+                )
                 if metadata:
                     selection_source = (
                         "best_full_candidate"
@@ -7388,6 +10793,11 @@ class ControllerToolgenMixin:
                 feedback_note = json.dumps(
                     reg_feedback, ensure_ascii=True, default=str
                 )
+                feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                    feedback_note,
+                    failed_validation=validation,
+                    retry_anchor_candidate=best_partial_retry_candidate,
+                )
                 force_full_rewrite_next_round = True
                 continue
             print(
@@ -7399,6 +10809,7 @@ class ControllerToolgenMixin:
                 "validation": validation,
                 "last_tool_name": tool_spec.get("name"),
                 "last_tool_signature": tool_spec.get("signature"),
+                **self._toolgen_best_achieved_state_summary(round_history),
             }
             try:
                 spec_obj = ToolSpec.from_payload(dict(tool_spec))
@@ -7541,6 +10952,11 @@ class ControllerToolgenMixin:
                     validator_top_issue=_vf_top,
                     validator_fixes=list(_vf_fixes) if _vf_fixes else None,
                 )
+                feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                    feedback_note,
+                    failed_validation=validation,
+                    retry_anchor_candidate=best_partial_retry_candidate,
+                )
             else:
                 # Pass the full validation dict (all issues and fixes) intact.
                 feedback_payload["CRITICAL_INSTRUCTION"] = (
@@ -7561,6 +10977,11 @@ class ControllerToolgenMixin:
                 )
                 feedback_note = json.dumps(
                     feedback_payload, ensure_ascii=True, default=str
+                )
+                feedback_note = self._toolgen_feedback_note_with_authoritative_baseline(
+                    feedback_note,
+                    failed_validation=validation,
+                    retry_anchor_candidate=best_partial_retry_candidate,
                 )
         # Clear round tracker so post-loop artifact writes don't carry a stale round number.
         setattr(self, "_toolgen_current_round_idx", None)
@@ -7679,30 +11100,6 @@ class ControllerToolgenMixin:
                 selection_source = "best_live_candidate"
         effective_best_grade = self._toolgen_candidate_grade(use_candidate)
         if not use_candidate:
-            if relaxed_mode and last_tool_spec and last_tool_code:
-                if (last_grade or 0) < self.MIN_REGISTRATION_GRADE:
-                    print(
-                        f"[TOOLGEN] Relaxed fallback blocked: grade={last_grade} "
-                        f"< MIN_REGISTRATION_GRADE={self.MIN_REGISTRATION_GRADE}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                else:
-                    metadata = self._register_tool_from_payload_relaxed(
-                        last_tool_spec, last_tool_code, chat_history
-                    )
-                    if metadata:
-                        print(
-                            f"[TOOLGEN] Relaxed fallback registration succeeded: {metadata.name}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        return metadata
-                return {
-                    "error": "relaxed_registration_failed",
-                    "tool_spec": last_tool_spec,
-                    "tool_code": last_tool_code,
-                }
             try:
                 self._append_generated_tools_log(
                     {
@@ -7783,29 +11180,26 @@ class ControllerToolgenMixin:
         tool_spec = use_candidate.get("tool_spec")
         if not isinstance(tool_spec, Mapping):
             return None
-        # Phase 1: Persist target_archetype into input_schema.properties so
-        # _extract_tool_archetype recovers a concrete label from the registry
-        # instead of falling back to "UNKNOWN" via name scanning.
-        _reg_arch = str((base_exec_payload or {}).get("target_archetype") or "").strip().upper()
-        if _reg_arch and _reg_arch in ARCHETYPE_REGISTRY:
-            tool_spec = dict(tool_spec)
-            _reg_schema = dict(tool_spec.get("input_schema") or {})
-            _reg_props = dict(_reg_schema.get("properties") or {})
-            _reg_props["target_archetype"] = {"const": _reg_arch, "type": "string"}
-            _reg_schema["properties"] = _reg_props
-            tool_spec["input_schema"] = _reg_schema
+        tool_spec = self._toolgen_enrich_registration_payload(
+            tool_spec,
+            registration_exec_payload=base_exec_payload,
+        )
         chosen_validation = (
             use_candidate.get("validation")
             if isinstance(use_candidate.get("validation"), Mapping)
             else {}
         )
+        if bool(chosen_validation.get("admission_blocked_due_to_regression", False)):
+            return None
         _append_best_candidate_summary(
             chosen_candidate=use_candidate,
             selection_source=selection_source,
         )
-        metadata = self._register_tool_from_payload(tool_spec, chat_history)
-        if use_candidate.get("staged_meta"):
-            self._toolgen_log_staged_registration(use_candidate.get("staged_meta"), metadata)
+        metadata = self._register_tool_from_payload(
+            tool_spec,
+            chat_history,
+            registration_exec_payload=base_exec_payload,
+        )
         _persist_validated_candidate(
             candidate_obj=use_candidate,
             validation_obj=chosen_validation,
@@ -7965,370 +11359,6 @@ class ControllerToolgenMixin:
         tool_name = str(tool_spec.get("name") or "")
         tool_spec["name"] = self._apply_tool_name_prefix(tool_name, name_prefix)
         return {"tool_spec": tool_spec, "tool_code": extracted}
-
-    def _toolgen_generate_from_prompt_staged(
-        self,
-        *,
-        user_prompt: str,
-        system_prompt: str,
-        chat_history: ChatHistory,
-        name_prefix: str,
-    ) -> Optional[Mapping[str, Any]]:
-        if getattr(self, "_toolgen_agent", None) is None:
-            print("[TOOLGEN] ERROR: _toolgen_agent is None, cannot generate tool")
-            self._write_failed_tool_artifact(
-                stage="toolgen_generation_failed",
-                error="missing_toolgen_agent",
-            )
-            return {"error": "missing_toolgen_agent"}
-
-        if not user_prompt or not user_prompt.strip():
-            print("[TOOLGEN] ERROR: user_prompt is empty, cannot generate tool")
-            self._write_failed_tool_artifact(
-                stage="toolgen_generation_failed",
-                error="empty_user_prompt",
-            )
-            return {"error": "empty_user_prompt"}
-
-        final_system_prompt = self._toolgen_build_system_prompt(system_prompt)
-        log_path = None
-        if getattr(self, "_generated_tools_log_path", None):
-            log_path = (
-                self._generated_tools_log_path.parent
-                / prefix_filename("toolgen_staged.log")
-            )
-        tool_build_span_id = self._toolgen_build_span_id()
-
-        def _call_llm(phase_system_prompt: str, phase_user_prompt: str) -> str:
-            tool_history = ChatHistory()
-            tool_history = self._safe_inject(
-                tool_history, ChatHistoryItem(role=Role.USER, content=phase_user_prompt)
-            )
-            original_prompt = getattr(self._toolgen_agent, "_system_prompt", "") or ""
-            self._toolgen_agent._system_prompt = phase_system_prompt
-            try:
-                response = self._toolgen_agent._inference(tool_history)
-            finally:
-                self._toolgen_agent._system_prompt = original_prompt
-            return self._normalize_toolgen_content(response.content)
-
-        task_context = {
-            "system_prompt": final_system_prompt,
-            "user_prompt": user_prompt,
-            "environment": self._resolved_environment_label(),
-            "note": "chat_history is embedded in user_prompt history for recent actions.",
-        }
-        print(f"[DEBUG] Sending ToolGen prompt. Length: {len(str(final_system_prompt)) + len(str(user_prompt))} chars")
-        raw_text_full = ""
-        extracted = None
-        for attempt in range(3):
-            tool_text = run_staged_toolgen(
-                task_context,
-                _call_llm,
-                log_path=str(log_path) if log_path else None,
-                tool_build_span_id=tool_build_span_id,
-            )
-            raw_text_full = self._normalize_toolgen_content(tool_text)
-            extracted = self._extract_marked_python(raw_text_full)
-            if extracted:
-                break
-            if attempt < 2:
-                continue
-        if not extracted:
-            fallback = self._strip_code_fences(raw_text_full)
-            if fallback and "def run" in fallback:
-                extracted = fallback
-            else:
-                self._write_failed_tool_artifact(
-                    stage="toolgen_markers_missing",
-                    error="marker_block_not_found",
-                    raw_output=raw_text_full,
-                )
-                return {"error": "toolgen_markers_missing", "raw_output": raw_text_full}
-        tool_name = self._extract_tool_name_from_code(extracted) or "unknown_generated_tool"
-        final_sha256 = hashlib.sha256(extracted.encode("utf-8")).hexdigest()
-        line_count = len(extracted.splitlines())
-        triple_quote_count = extracted.count('"""') + extracted.count("'''")
-        forbidden_hits = [s for s in FORBIDDEN_SUBSTRINGS if s in extracted]
-
-        run_sig_error = self._validate_run_ast(extracted)
-        self._toolgen_staged_log_event(
-            {
-                "event": "run_signature",
-                "tool_build_span_id": tool_build_span_id,
-                "tool_name": tool_name,
-                "run_signature_ok": run_sig_error is None,
-                "run_signature_error": run_sig_error,
-                "final_sha256": final_sha256,
-            }
-        )
-        if run_sig_error:
-            try:
-                print(
-                    f"[TOOLGEN] run signature error: {run_sig_error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            except Exception:
-                pass
-            return {"error": "run_signature", "raw_output": raw_text_full}
-
-        def _excerpt(code: str, lineno: Optional[int], window: int = 5) -> list[str]:
-            if not lineno:
-                return []
-            lines = code.splitlines()
-            start = max(lineno - window - 1, 0)
-            end = min(lineno + window, len(lines))
-            snippet = []
-            for i in range(start, end):
-                snippet.append(f"{i+1}: {lines[i]}")
-            return snippet
-
-        try:
-            ast.parse(extracted)
-        except SyntaxError as exc:
-            self._toolgen_staged_log_event(
-                {
-                    "event": "tool_ast_parse_failed",
-                    "tool_build_span_id": tool_build_span_id,
-                    "tool_name": tool_name,
-                    "final_sha256": final_sha256,
-                    "error_type": type(exc).__name__,
-                    "msg": str(exc),
-                    "lineno": exc.lineno,
-                    "col_offset": exc.offset,
-                    "excerpt": _excerpt(extracted, exc.lineno),
-                    "audit_gate": "ast_parse_ok",
-                    "audit_gate_reason": "audit_ast_parse_ok=false",
-                }
-            )
-            return None
-        except Exception as exc:
-            self._toolgen_staged_log_event(
-                {
-                    "event": "tool_ast_parse_failed",
-                    "tool_build_span_id": tool_build_span_id,
-                    "tool_name": tool_name,
-                    "final_sha256": final_sha256,
-                    "error_type": type(exc).__name__,
-                    "msg": str(exc),
-                    "excerpt": [],
-                    "audit_gate": "ast_parse_ok",
-                    "audit_gate_reason": "audit_ast_parse_ok=false",
-                }
-            )
-            return None
-
-        try:
-            compile(extracted, "<toolgen_staged>", "exec")
-        except SyntaxError as exc:
-            self._toolgen_staged_log_event(
-                {
-                    "event": "tool_compile_failed",
-                    "tool_build_span_id": tool_build_span_id,
-                    "tool_name": tool_name,
-                    "final_sha256": final_sha256,
-                    "error_type": type(exc).__name__,
-                    "msg": str(exc),
-                    "lineno": exc.lineno,
-                    "col_offset": exc.offset,
-                    "excerpt": _excerpt(extracted, exc.lineno),
-                }
-            )
-            return None
-        except Exception as exc:
-            self._toolgen_staged_log_event(
-                {
-                    "event": "tool_compile_failed",
-                    "tool_build_span_id": tool_build_span_id,
-                    "tool_name": tool_name,
-                    "final_sha256": final_sha256,
-                    "error_type": type(exc).__name__,
-                    "msg": str(exc),
-                    "excerpt": [],
-                }
-            )
-            return None
-
-        tool_spec = self._wrap_marker_tool_spec(extracted)
-        tool_spec["name"] = self._apply_tool_name_prefix(tool_name, name_prefix)
-        return {
-            "tool_spec": tool_spec,
-            "tool_code": extracted,
-            "staged_meta": {
-                "tool_build_span_id": tool_build_span_id,
-                "tool_name": tool_spec.get("name"),
-                "final_sha256": final_sha256,
-                "line_count": line_count,
-                "triple_quote_count": triple_quote_count,
-                "forbidden_hits": forbidden_hits,
-            },
-        }
-
-    def _toolgen_log_staged_registration(
-        self, staged_meta: Any, metadata: Optional[ToolMetadata]
-    ) -> None:
-        if not isinstance(staged_meta, Mapping):
-            return
-        tool_build_span_id = staged_meta.get("tool_build_span_id")
-        final_sha256 = staged_meta.get("final_sha256")
-        line_count = staged_meta.get("line_count")
-        triple_quote_count = staged_meta.get("triple_quote_count")
-        forbidden_hits = staged_meta.get("forbidden_hits")
-        tool_name = staged_meta.get("tool_name")
-        if not metadata:
-            self._toolgen_staged_log_event(
-                {
-                    "event": "tool_register_failed",
-                    "tool_build_span_id": tool_build_span_id,
-                    "tool_name": tool_name,
-                    "final_sha256": final_sha256,
-                    "line_count": line_count,
-                    "triple_quote_count": triple_quote_count,
-                    "forbidden_hits": forbidden_hits,
-                    "ast_ok": True,
-                }
-            )
-            return
-
-        self._toolgen_staged_log_event(
-            {
-                "event": "tool_register",
-                "tool_build_span_id": tool_build_span_id,
-                "tool_name": metadata.name,
-                "final_sha256": final_sha256,
-                "line_count": line_count,
-                "triple_quote_count": triple_quote_count,
-                "forbidden_hits": forbidden_hits,
-                "ast_ok": True,
-            }
-        )
-
-        try:
-            tool_path = getattr(
-                self._registry,
-                "_get_tool_path",
-                lambda n, environment=None: None
-            )(metadata.name, environment=getattr(metadata, "environment", None))
-            if tool_path and os.path.exists(tool_path):
-                data = Path(tool_path).read_bytes()
-                sha256_bytes = hashlib.sha256(data).hexdigest()
-                sha256_readback = hashlib.sha256(Path(tool_path).read_bytes()).hexdigest()
-                self._toolgen_staged_log_event(
-                    {
-                        "event": "tool_file_written",
-                        "tool_build_span_id": tool_build_span_id,
-                        "tool_name": metadata.name,
-                        "file_path": str(tool_path),
-                        "bytes_written": len(data),
-                        "sha256_of_bytes": sha256_bytes,
-                        "sha256_readback": sha256_readback,
-                        "final_sha256": final_sha256,
-                    }
-                )
-        except Exception:
-            pass
-
-    def _toolgen_build_aggregate_prompt_for_env(
-        self,
-        env_name: str,
-        *,
-        task_query: Optional[str] = None,
-        chat_history: Optional[ChatHistory] = None,
-    ) -> Optional[str]:
-        print(f"[BUILD_AGG_PROMPT] Building prompt for env '{env_name}'")
-        context = getattr(self, "_toolgen_agg_context", None)
-        if not isinstance(context, Mapping):
-            print(f"[BUILD_AGG_PROMPT] ERROR: _toolgen_agg_context is not a Mapping (type={type(context).__name__})")
-            return None
-        context_env = context.get("env_name")
-        if context_env != env_name:
-            print(f"[BUILD_AGG_PROMPT] ERROR: Context env mismatch - expected '{env_name}', got '{context_env}'")
-            return None
-
-        data_file_path = context.get("data_file_path")
-        dataset_map = context.get("dataset_map")
-        env_contract = context.get("env_contract") or ""
-
-        print(f"[BUILD_AGG_PROMPT] data_file_path: {data_file_path}")
-        print(f"[BUILD_AGG_PROMPT] dataset_map type: {type(dataset_map).__name__ if dataset_map else 'None'}")
-        print(f"[BUILD_AGG_PROMPT] env_contract length: {len(env_contract) if env_contract else 0}")
-
-        if not env_contract and chat_history is not None:
-            print(f"[BUILD_AGG_PROMPT] env_contract empty, extracting from chat_history")
-            try:
-                for item in self._history_items(chat_history):
-                    if item.role == Role.USER:
-                        env_contract = (item.content or "").strip()
-                        break
-                print(f"[BUILD_AGG_PROMPT] Extracted env_contract length: {len(env_contract)}")
-            except Exception as e:
-                print(f"[BUILD_AGG_PROMPT] WARNING: Failed to extract env_contract from history: {e}")
-                env_contract = ""
-
-        sample_indices = context.get("sample_indices") or []
-        print(f"[BUILD_AGG_PROMPT] sample_indices: {sample_indices}")
-
-        if not isinstance(data_file_path, str) or not os.path.exists(data_file_path):
-            if not isinstance(dataset_map, Mapping):
-                print(f"[BUILD_AGG_PROMPT] ERROR: No valid data_file_path and dataset_map is not a Mapping")
-                return None
-            print(f"[BUILD_AGG_PROMPT] Using dataset_map (data_file_path not available)")
-
-        if not isinstance(sample_indices, list):
-            print(f"[BUILD_AGG_PROMPT] ERROR: sample_indices is not a list (type={type(sample_indices).__name__})")
-            return None
-        if len(sample_indices) == 0:
-            print(f"[BUILD_AGG_PROMPT] ERROR: sample_indices is empty")
-            return None
-        dataset: Mapping[str, Any]
-        if isinstance(dataset_map, Mapping):
-            dataset = dataset_map
-        else:
-            try:
-                with open(data_file_path, "r") as handle:
-                    dataset = json.load(handle)
-            except Exception:
-                return None
-            if not isinstance(dataset, Mapping):
-                return None
-        candidates: list[Any] = []
-        for sample_index in sample_indices:
-            key = str(sample_index)
-            entry = dataset.get(key)
-            if entry is None:
-                continue
-            candidates.append(sample_index)
-        agg_n = int(getattr(self, "_toolgen_agg_n", 10) or 10)
-        if agg_n < 1:
-            agg_n = 1
-        if len(candidates) < agg_n:
-            agg_n = len(candidates)
-        if agg_n < 1:
-            return None
-        selected_indices = random.sample(candidates, agg_n)
-        tasks: list[str] = []
-        used_indices: list[Any] = []
-        for sample_index in selected_indices:
-            key = str(sample_index)
-            entry = dataset.get(key)
-            if entry is None:
-                continue
-            task_prompt = self._toolgen_build_task_prompt(env_name, entry)
-            if not task_prompt:
-                continue
-            tasks.append(task_prompt.strip())
-            used_indices.append(sample_index)
-            print(
-                f"agg3 buffer env={env_name} size={len(tasks)} sample_index={sample_index}"
-            )
-        if len(tasks) < agg_n:
-            return None
-        print(f"agg3 trigger env={env_name} sample_indexes={used_indices}")
-        user_prompt = build_task_pack(env_name, env_contract, tasks)
-
-        print(f"[BUILD_AGG_PROMPT] SUCCESS: Prompt built for env '{env_name}' (length={len(user_prompt)})")
-        return user_prompt
 
     def _toolgen_tool_list_appendix(self) -> str:
         # Filter tools by current environment
@@ -8536,31 +11566,6 @@ class ControllerToolgenMixin:
                 ["constraints", "output_contract", "draft_response", "candidate_output", "env_observation"],
             )
         normalized.setdefault("capabilities", [])
-        # Phase 1: persist archetype into input_schema.properties.target_archetype.const
-        # so _extract_tool_archetype (tier-2) reliably recovers it from the registry on
-        # future loads — without this, the extraction falls back to name scanning and
-        # often returns "UNKNOWN", which Phase 1's reuse gate now treats as incompatible.
-        _arch_from_spec = str(
-            normalized.get("target_archetype") or normalized.get("archetype") or ""
-        ).strip().upper()
-        if not _arch_from_spec or _arch_from_spec not in ARCHETYPE_REGISTRY:
-            # Infer archetype from tool name via substring scan when the spec
-            # doesn't declare it explicitly.  Generated KG tool names embed the
-            # archetype key (e.g. "attribute_intersector_macro_generated_tool"),
-            # but the boundary-regex in _extract_tool_archetype rejects matches
-            # where the key is followed by "_" — so we do a simple substring scan
-            # here at registration time and persist the result into the schema.
-            _name_upper = str(normalized.get("name") or "").upper()
-            for _arch_key in ARCHETYPE_REGISTRY:
-                if _arch_key in _name_upper:
-                    _arch_from_spec = _arch_key
-                    break
-        if _arch_from_spec and _arch_from_spec in ARCHETYPE_REGISTRY:
-            _schema = normalized.get("input_schema")
-            if isinstance(_schema, dict):
-                _props = _schema.setdefault("properties", {})
-                if isinstance(_props, dict):
-                    _props["target_archetype"] = {"const": _arch_from_spec, "type": "string"}
         # Extract module docstring from code and use as description for dedup/retrieval
         code_lines = normalized.get("code_lines")
         if isinstance(code_lines, list):
@@ -8598,6 +11603,35 @@ class ControllerToolgenMixin:
                 and payload_schema.get("type") == "object"
             ):
                 normalized["input_schema"] = payload_schema
+        _arch_from_spec = str(
+            normalized.get("target_archetype") or normalized.get("archetype") or ""
+        ).strip().upper()
+        if not _arch_from_spec or _arch_from_spec not in ARCHETYPE_REGISTRY:
+            _name_upper = str(normalized.get("name") or "").upper()
+            for _arch_key in ARCHETYPE_REGISTRY:
+                if _arch_key in _name_upper:
+                    _arch_from_spec = _arch_key
+                    break
+        _output_form = str(normalized.get("output_form") or "").strip()
+        if _output_form and _output_form not in {
+            "pointer_variable",
+            "count_variable",
+        }:
+            _output_form = ""
+        _schema = normalized.get("input_schema")
+        if isinstance(_schema, dict):
+            _props = _schema.setdefault("properties", {})
+            if isinstance(_props, dict):
+                if _arch_from_spec and _arch_from_spec in ARCHETYPE_REGISTRY:
+                    _props["target_archetype"] = {
+                        "const": _arch_from_spec,
+                        "type": "string",
+                    }
+                if _output_form:
+                    _props["output_form"] = {
+                        "const": _output_form,
+                        "type": "string",
+                    }
         return normalized
 
     def _validate_spec_alignment(self, spec: ToolSpec) -> Optional[str]:
@@ -8801,48 +11835,6 @@ class ControllerToolgenMixin:
         if base_path is None:
             base_path = Path("outputs")
         return base_path / "callback_state" / "callback_generated_tool_calling"
-
-    def _toolgen_staged_log_path(self) -> Optional[Path]:
-        log_path = getattr(self, "_generated_tools_log_path", None)
-        if log_path is None:
-            return None
-        return log_path.parent / prefix_filename("toolgen_staged.log")
-
-    def _toolgen_staged_log_event(self, payload: Mapping[str, Any]) -> None:
-        log_path = self._toolgen_staged_log_path()
-        if log_path is None:
-            return
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            seq = 1
-            if log_path.exists():
-                with log_path.open("r", encoding="utf-8") as handle:
-                    lines = handle.readlines()
-                for line in reversed(lines):
-                    if not line.strip():
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    if isinstance(obj, dict) and isinstance(obj.get("t"), int):
-                        seq = obj["t"] + 1
-                    break
-            data = dict(payload)
-            data.pop("t", None)
-            data["t"] = seq
-            with log_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(data, ensure_ascii=True, default=str) + "\n")
-        except Exception:
-            return
-
-    def _toolgen_build_span_id(self) -> str:
-        meta = self._get_run_task_metadata()
-        task_name = str(meta.get("task_name") or self._resolved_environment_label())
-        sample_index = str(meta.get("sample_index") or "")
-        run_id = str(getattr(self, "_run_id", "") or "")
-        raw = f"{task_name}|{sample_index}|{run_id}"
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def _cleanup_failed_draft_files(self, filepaths: Optional[Sequence[Path]]) -> None:
         if not filepaths:
@@ -9102,13 +12094,21 @@ class ControllerToolgenMixin:
         return metadata
 
     def _register_tool_from_payload(
-        self, creation_request: Mapping[str, Any], chat_history: ChatHistory
+        self,
+        creation_request: Mapping[str, Any],
+        chat_history: ChatHistory,
+        *,
+        registration_exec_payload: Optional[Mapping[str, Any]] = None,
     ) -> Optional[ToolMetadata]:
         if self._generated_tool_counter >= self._max_generated_tools_per_run:
             return None
         if not isinstance(creation_request, Mapping):
             return None
-        tool_spec = self._normalize_tool_spec(dict(creation_request))
+        tool_spec = self._toolgen_enrich_registration_payload(
+            creation_request,
+            registration_exec_payload=registration_exec_payload,
+        )
+        tool_spec = self._normalize_tool_spec(dict(tool_spec))
         code_lines = tool_spec.get("code_lines") or []
         if isinstance(code_lines, str):
             tool_spec["code_lines"] = code_lines.splitlines()
@@ -9146,21 +12146,115 @@ class ControllerToolgenMixin:
     def _consider_tool_generation(
         self, query: str, chat_history: ChatHistory
     ) -> Optional[ToolMetadata]:
-        if (
-            getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3"
-            and self._resolved_environment_label()
-            not in getattr(self, "_toolgen_agg_bootstrapped_envs", set())
-        ):
-            return None
         if not query.strip():
             return None
         if not self._force_tool_generation_if_missing:
+            return None
+        self._toolgen_refresh_attempt_lifecycle_for_current_task()
+        if not self._toolgen_fresh_attempt_allowed_for_current_task():
             return None
         normalized = self._normalize_retrieval_query(query)
         if not normalized or normalized in self._toolgen_attempted_queries:
             return None
         self._toolgen_attempted_queries.add(normalized)
         return self._maybe_generate_tool_for_query(query, chat_history)
+
+    def _toolgen_current_task_session_key(self) -> tuple[str, str]:
+        task_name = ""
+        sample_index = ""
+        current_session = getattr(self, "_current_session", None)
+        if current_session is not None:
+            task_name = str(getattr(current_session, "task_name", "") or "")
+            sample_index = str(getattr(current_session, "sample_index", "") or "")
+        if not task_name and not sample_index:
+            meta = self._get_run_task_metadata() or {}
+            task_name = str(meta.get("task_name") or "")
+            sample_index = str(meta.get("sample_index") or "")
+        if not task_name:
+            task_name = str(getattr(self, "_current_task_label", "") or self._resolved_environment_label())
+        return task_name, sample_index
+
+    def _toolgen_refresh_attempt_lifecycle_for_current_task(self) -> tuple[str, str]:
+        session_key = self._toolgen_current_task_session_key()
+        if getattr(self, "_toolgen_attempt_lifecycle_session_key", None) != session_key:
+            setattr(self, "_toolgen_attempt_lifecycle_session_key", session_key)
+            setattr(self, "_toolgen_attempt_lifecycle_count", 0)
+            attempted = getattr(self, "_toolgen_attempted_queries", None)
+            if isinstance(attempted, set):
+                attempted.clear()
+        return session_key
+
+    def _toolgen_max_fresh_attempts_per_task(self) -> int:
+        return max(1, int(getattr(self, "_max_generated_tools_per_task", 2) or 2))
+
+    def _toolgen_fresh_attempt_count_for_current_task(self) -> int:
+        self._toolgen_refresh_attempt_lifecycle_for_current_task()
+        return int(getattr(self, "_toolgen_attempt_lifecycle_count", 0) or 0)
+
+    def _toolgen_fresh_attempt_allowed_for_current_task(self) -> bool:
+        self._toolgen_refresh_attempt_lifecycle_for_current_task()
+        return (
+            self._toolgen_fresh_attempt_count_for_current_task()
+            < self._toolgen_max_fresh_attempts_per_task()
+        )
+
+    def _toolgen_mark_fresh_attempt_started_for_current_task(self) -> None:
+        self._toolgen_refresh_attempt_lifecycle_for_current_task()
+        current = self._toolgen_fresh_attempt_count_for_current_task()
+        setattr(self, "_toolgen_attempt_lifecycle_count", current + 1)
+
+    def _toolgen_set_current_turn_policy_context(
+        self,
+        *,
+        is_turn_zero: bool,
+        observation_triggers: Sequence[Mapping[str, Any]] | None,
+    ) -> None:
+        node_explosion_reason = ""
+        for trigger in observation_triggers or ():
+            if not isinstance(trigger, Mapping):
+                continue
+            trigger_type = str(trigger.get("type") or "").strip().lower()
+            if trigger_type == "size_trigger":
+                node_explosion_reason = str(
+                    trigger.get("reason") or trigger.get("type") or "size_trigger"
+                )
+                break
+        setattr(self, "_toolgen_current_turn_is_turn_zero", bool(is_turn_zero))
+        setattr(
+            self,
+            "_toolgen_current_turn_node_explosion",
+            bool(node_explosion_reason),
+        )
+        setattr(
+            self,
+            "_toolgen_current_turn_node_explosion_reason",
+            node_explosion_reason,
+        )
+
+    def _toolgen_current_turn_allows_fresh_attempt(
+        self,
+        chat_history: Optional[ChatHistory] = None,
+    ) -> tuple[bool, str]:
+        history_len = None
+        if chat_history is not None and hasattr(chat_history, "get_value_length"):
+            try:
+                history_len = int(chat_history.get_value_length())
+            except Exception:
+                history_len = None
+        if history_len is not None and history_len <= 1:
+            return True, "turn_zero"
+        if bool(getattr(self, "_toolgen_current_turn_is_turn_zero", False)):
+            return True, "turn_zero"
+        if bool(getattr(self, "_toolgen_current_turn_node_explosion", False)):
+            return True, str(
+                getattr(
+                    self,
+                    "_toolgen_current_turn_node_explosion_reason",
+                    "node_explosion",
+                )
+                or "node_explosion"
+            )
+        return False, "not_turn_zero_or_node_explosion"
 
     def _maybe_generate_tool_for_query(
         self,
@@ -9170,6 +12264,7 @@ class ControllerToolgenMixin:
         allow_reuse: bool = True,
         force: bool = False,
         use_pipeline: bool = True,
+        _same_attempt: bool = False,
     ) -> Optional[ToolMetadata]:
         negative_trigger = self._toolgen_negative_mark_triggered()
         if (
@@ -9184,47 +12279,6 @@ class ControllerToolgenMixin:
             allow_reuse = False
             force = True
             use_pipeline = False
-        if force and getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
-            use_pipeline = False
-        if (
-            getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3"
-            and not negative_trigger
-            and True
-        ):
-            env_name = self._resolved_environment_label()
-            agg_envs = getattr(self, "_toolgen_agg_bootstrapped_envs", None)
-            if not isinstance(agg_envs, set):
-                agg_envs = set()
-                self._toolgen_agg_bootstrapped_envs = agg_envs
-            if env_name not in agg_envs:
-                prompt = self._toolgen_build_aggregate_prompt_for_env(
-                    env_name, task_query=query, chat_history=chat_history
-                )
-                if not prompt:
-                    return None
-                tool = self._toolgen_generate_from_prompt(
-                    user_prompt=prompt,
-                    system_prompt=get_toolgen_system_prompt("aggregate3", env_name),
-                    chat_history=chat_history,
-                    name_prefix=getattr(self, "_toolgen_name_prefix", ""),
-                    prompt_name=f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}",
-                )
-                if isinstance(tool, Mapping) and tool.get("error"):
-                    print(
-                        f"agg3 bootstrapped env={env_name} aborted={tool.get('error')}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                elif tool:
-                    print(f"agg3 bootstrapped env={env_name} tools=1")
-                agg_envs.add(env_name)
-                return tool
-        if (
-            getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3"
-            and self._resolved_environment_label()
-            in getattr(self, "_toolgen_agg_bootstrapped_envs", set())
-        ):
-            use_pipeline = False
         if allow_reuse:
             reuse_query = self._normalize_retrieval_query(query)
             candidate_output = self._get_candidate_output(chat_history, query)
@@ -9238,6 +12292,39 @@ class ControllerToolgenMixin:
             return None
         if self._generated_tool_counter >= self._max_generated_tools_per_run and not force:
             return None
+        if not _same_attempt:
+            turn_policy_allowed, turn_policy_reason = (
+                self._toolgen_current_turn_allows_fresh_attempt(chat_history)
+            )
+            if not turn_policy_allowed:
+                try:
+                    self._append_generated_tools_log(
+                        {
+                            "event": "toolgen_attempt_blocked_policy",
+                            "query": self._truncate(query, 300),
+                            "task_key": list(self._toolgen_current_task_session_key()),
+                            "policy_reason": turn_policy_reason,
+                        }
+                    )
+                except Exception:
+                    pass
+                return None
+        if not _same_attempt and not self._toolgen_fresh_attempt_allowed_for_current_task():
+            try:
+                self._append_generated_tools_log(
+                    {
+                        "event": "toolgen_attempt_blocked_same_task",
+                        "query": self._truncate(query, 300),
+                        "task_key": list(self._toolgen_current_task_session_key()),
+                        "attempt_count": self._toolgen_fresh_attempt_count_for_current_task(),
+                        "max_attempts": self._toolgen_max_fresh_attempts_per_task(),
+                    }
+                )
+            except Exception:
+                pass
+            return None
+        if not _same_attempt:
+            self._toolgen_mark_fresh_attempt_started_for_current_task()
 
         self._toolgen_last_query = query
         pipeline = getattr(self, "_toolgen_pipeline", None)
@@ -9253,6 +12340,7 @@ class ControllerToolgenMixin:
                     allow_reuse=allow_reuse,
                     force=force,
                     use_pipeline=False,
+                    _same_attempt=True,
                 )
             return None
 
@@ -9270,4 +12358,5 @@ class ControllerToolgenMixin:
         )
 
     def _reuse_matches_request(self, tool: ToolMetadata) -> bool:
+
         return True

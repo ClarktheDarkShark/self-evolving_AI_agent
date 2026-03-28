@@ -1,3 +1,4 @@
+import os
 import pathlib
 import sys
 
@@ -20,64 +21,73 @@ class _NoOpLanguageModel(LanguageModel):
 
 
 def test_trace_normalization_and_actions_spec(tmp_path) -> None:
-    registry_base = tmp_path / "registry"
-    get_registry(str(registry_base), force_reset=True)
+    prev = os.environ.get("LIFELONG_OUTPUT_DIR")
+    os.environ["LIFELONG_OUTPUT_DIR"] = str(tmp_path)
+    try:
+        registry_dir = tmp_path / "tool_library"
+        get_registry(str(registry_dir), force_reset=True)
 
-    controller = SelfEvolvingController(
-        language_model=_NoOpLanguageModel(),
-        tool_registry_path=str(registry_base),
-        use_orchestrator=False,
-    )
-    registry = get_registry(str(registry_base))
+        controller = SelfEvolvingController(
+            language_model=_NoOpLanguageModel(),
+            tool_registry_path=str(registry_dir),
+            use_orchestrator=False,
+        )
+        registry = controller._registry  # noqa: SLF001
 
-    code = (
-        '"""Trace normalization checker."""\n'
-        "\n"
-        "def run(payload: dict) -> dict:\n"
-        "    try:\n"
-        "        trace = payload.get('trace') or []\n"
-        "        actions = payload.get('actions_spec') or {}\n"
-        "        first_type = type(trace[0]).__name__ if trace else 'none'\n"
-        "        return {'trace_item_type': first_type, 'actions_spec_keys': list(actions.keys())}\n"
-        "    except Exception as exc:\n"
-        "        return {'trace_item_type': 'error', 'error': str(exc)}\n"
-        "\n"
-        "def self_test() -> bool:\n"
-        "    try:\n"
-        "        out = run({'trace': [], 'actions_spec': {}})\n"
-        "        return isinstance(out, dict)\n"
-        "    except Exception:\n"
-        "        return False\n"
-    )
+        code = (
+            '"""Trace normalization checker."""\n'
+            "\n"
+            "def run(payload: dict) -> dict:\n"
+            "    try:\n"
+            "        trace = payload.get('trace') or []\n"
+            "        actions = payload.get('actions_spec') or {}\n"
+            "        first_type = type(trace[0]).__name__ if trace else 'none'\n"
+            "        return {'trace_item_type': first_type, 'actions_spec_keys': list(actions.keys())}\n"
+            "    except Exception as exc:\n"
+            "        return {'trace_item_type': 'error', 'error': str(exc)}\n"
+            "\n"
+            "def self_test() -> bool:\n"
+            "    try:\n"
+            "        out = run({'trace': [], 'actions_spec': {}})\n"
+            "        return isinstance(out, dict)\n"
+            "    except Exception:\n"
+            "        return False\n"
+        )
 
-    metadata = registry.register_tool(
-        name="payload_analyzer_generated_tool",
-        code=code,
-        signature="run(payload: dict) -> dict",
-        description="Trace normalization checker.",
-        tool_type="utility",
-        tool_category="validator",
-        input_schema={"type": "object", "required": ["trace"], "properties": {"trace": {"type": "array"}}},
-        capabilities=[],
-    )
-    assert metadata is not None
+        metadata = registry.register_tool(
+            name="payload_analyzer_generated_tool",
+            code=code,
+            signature="run(payload: dict) -> dict",
+            description="Trace normalization checker.",
+            tool_type="utility",
+            tool_category="validator",
+            input_schema={"type": "object", "required": ["trace"], "properties": {"trace": {"type": "array"}}},
+            capabilities=[],
+        )
+        assert metadata is not None
 
-    tool_args = {
-        "args": [
-            {
-                "payload": {
-                    "task_text": "x",
-                    "asked_for": "y",
-                    "trace": ["Action: foo(bar)", "baz(qux)"],
-                    "actions_spec": {},
+        tool_args = {
+            "args": [
+                {
+                    "payload": {
+                        "task_text": "x",
+                        "asked_for": "y",
+                        "trace": ["Action: foo(bar)", "baz(qux)"],
+                        "actions_spec": {},
+                    }
                 }
-            }
-        ]
-    }
-    result = controller._invoke_tool_by_payload(  # noqa: SLF001
-        "payload_analyzer_generated_tool", tool_args, reason="test"
-    )
-    assert result.success
-    assert isinstance(result.output, dict)
-    assert result.output.get("trace_item_type") == "str"
-    assert result.output.get("actions_spec_keys", []) == []
+            ]
+        }
+        result = controller._invoke_tool_by_payload(  # noqa: SLF001
+            "payload_analyzer_generated_tool", tool_args, reason="test"
+        )
+        assert result.success
+        assert isinstance(result.output, dict)
+        assert result.output.get("trace_item_type") == "str"
+        assert result.output.get("actions_spec_keys", []) == []
+    finally:
+        if prev is None:
+            os.environ.pop("LIFELONG_OUTPUT_DIR", None)
+        else:
+            os.environ["LIFELONG_OUTPUT_DIR"] = prev
+        get_registry(force_reset=True)

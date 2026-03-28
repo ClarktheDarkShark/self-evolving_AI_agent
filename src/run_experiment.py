@@ -21,7 +21,6 @@ from src.typings import (
     PathConfig,
     GeneralInstanceFactory,
     SessionMetricCalculationPartial,
-    ChatHistory,
     ChatHistoryItem,
     Role,
 )
@@ -42,6 +41,15 @@ from src.callbacks import (
 # task is skipped.  The mid-run Orchestrator escape-hatch
 # (request_new_tool) remains fully operational regardless of this flag.
 ENABLE_POST_TASK_REFLECTION = False
+ENABLE_PAL_AGENT = os.environ.get("ENABLE_PAL_AGENT") == "1"
+PAL_AGENT_NAME = "pal_agent_controller"
+PAL_AGENT_COMPONENT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "configs",
+    "components",
+    "agents",
+    "pal_agent_controller.yaml",
+)
 
 # ---------------------------------------------------------------------------
 # HTML Trace Viewer
@@ -415,12 +423,43 @@ class ConfigUtility:
         )
 
 
+def _maybe_enable_pal_agent(raw_config: Mapping[str, Any]) -> dict[str, Any]:
+    if not ENABLE_PAL_AGENT:
+        return copy.deepcopy(raw_config)
+
+    updated_raw_config = copy.deepcopy(raw_config)
+    pal_agent_component = ConfigLoader().load_from(PAL_AGENT_COMPONENT_CONFIG_PATH)
+    updated_raw_config.setdefault("agent_dict", {})
+    updated_raw_config["agent_dict"].update(pal_agent_component)
+
+    current_agent_info = updated_raw_config["assignment_config"].get("agent") or {}
+    current_custom_parameters = current_agent_info.get("custom_parameters") or {}
+    language_model_name = current_custom_parameters.get("language_model")
+    if language_model_name is None:
+        assignment_language_model_list = (
+            updated_raw_config["assignment_config"].get("language_model_list") or []
+        )
+        if assignment_language_model_list:
+            language_model_name = assignment_language_model_list[0]["name"]
+    if language_model_name is None:
+        raise ValueError("ENABLE_PAL_AGENT=1 requires an assignment language model.")
+
+    updated_raw_config["assignment_config"]["agent"] = {
+        "name": PAL_AGENT_NAME,
+        "custom_parameters": {
+            "language_model": language_model_name,
+        },
+    }
+    return updated_raw_config
+
+
 def main() -> None:
     # region Prepare variables
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str)
     args = parser.parse_args()
     raw_config = ConfigLoader().load_from(args.config_path)
+    raw_config = _maybe_enable_pal_agent(raw_config)
     assignment_config, environment_config, logger_config, path_config = (
         ConfigUtility.read_raw_config(raw_config, ConfigUtilityCaller.CLIENT)
     )
@@ -493,48 +532,6 @@ def main() -> None:
         session_list = []
         unfinished_sample_order = assignment_config.sample_order
     callback_handler = CallbackHandler(callback_dict)
-    if hasattr(agent, "preaggregate_toolgen"):
-        try:
-            agent.preaggregate_toolgen(
-                task, unfinished_sample_order, raw_config=raw_config
-            )
-        except Exception:
-            logger.exception("Pre-aggregation tool generation failed.")
-            raise
-    # Hardwired pre-boot tool generation (blocking, 10-task aggregate)
-    bootstrap_indices = list(unfinished_sample_order)[:10]
-    if hasattr(agent, "_toolgen_prebootstrap_once") and bootstrap_indices:
-        try:
-            env_name = getattr(getattr(task, "task_name", None), "value", None) or str(
-                getattr(task, "task_name", "")
-            )
-            getter = None
-            try:
-                getter = object.__getattribute__(task, "_Task__get_dataset_item")
-            except AttributeError:
-                getter = None
-            bootstrap_tasks: list[str] = []
-            if callable(getter) and hasattr(agent, "_toolgen_build_task_prompt"):
-                for sample_index in bootstrap_indices:
-                    try:
-                        dataset_item = getter(sample_index)
-                        task_prompt = agent._toolgen_build_task_prompt(
-                            env_name, dataset_item
-                        )
-                        if task_prompt:
-                            bootstrap_tasks.append(task_prompt.strip())
-                    except Exception:
-                        continue
-            if len(bootstrap_tasks) == 10:
-                agent._toolgen_prebootstrap_once(
-                    "bootstrap",
-                    ChatHistory(),
-                    tasks=bootstrap_tasks,
-                )
-                if hasattr(agent, "_registry") and hasattr(agent._registry, "refresh"):
-                    agent._registry.refresh()
-        except Exception:
-            logger.exception("Hardwired pre-boot tool generation failed.")
     # endregion
     # region Run experiment
     logger.info(

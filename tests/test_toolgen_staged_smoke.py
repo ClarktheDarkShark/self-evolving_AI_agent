@@ -6,6 +6,9 @@ from src.toolgen_staged.runner import run_staged_toolgen
 
 PHASE1_SKELETON = '''###TOOL_START
 # tool_name: staged_smoke_generated_tool
+# INVOKE_WITH: payload dict
+# RUN_PAYLOAD_REQUIRED: task_text, asked_for, trace, actions_spec, run_id, state_dir
+# RUN_PAYLOAD_OPTIONAL: constraints, output_contract, draft_response, candidate_output, env_observation
 """
 Tool helper with contract guard, prereqs, next-action suggestion, limitations. INPUT_SCHEMA: required=task_text,asked_for,trace,actions_spec,run_id,state_dir; optional=constraints,output_contract,draft_response,candidate_output,env_observation; limitations (no external calls; local JSON state only; analyzes payload; does not call tools).
 """
@@ -158,16 +161,18 @@ PHASE5_SNIPPET = """
 
 
 def _fake_llm(system_prompt: str, user_prompt: str) -> str:
-    if "Phase 1" in system_prompt:
-        return PHASE1_SKELETON
-    if "Phase 2" in system_prompt:
-        return PHASE2_SNIPPET
-    if "Phase 3" in system_prompt:
-        return PHASE3_SNIPPET
-    if "Phase 4" in system_prompt:
-        return PHASE4_SNIPPET
+    # Check higher phase numbers first: prompts often reference earlier phases
+    # (e.g. phase5 prompt mentions "Phase 3"), so ascending order would misfire.
     if "Phase 5" in system_prompt:
         return PHASE5_SNIPPET
+    if "Phase 4" in system_prompt:
+        return PHASE4_SNIPPET
+    if "Phase 3" in system_prompt:
+        return PHASE3_SNIPPET
+    if "Phase 2" in system_prompt:
+        return PHASE2_SNIPPET
+    if "Phase 1" in system_prompt:
+        return PHASE1_SKELETON
     return PHASE1_SKELETON
 
 

@@ -190,6 +190,110 @@ class _KGSemanticRediscoveryVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+class _KGHardcodedEntityInLabelVisitor(ast.NodeVisitor):
+    """Detect hardcoded entity-specific string literals used as candidate_map / dict keys.
+
+    A string literal like "resolved_Milk" or "walk_Goat_to_cheese" embedded directly in
+    code (not derived via f-string from payload fields) is a task-imprinting generalization
+    failure.  We flag string constants whose value matches the pattern
+    ``<role_prefix>_<CapitalizedWord>`` where the capitalized word is not a known generic
+    placeholder like Entity, Anchor, Item, etc.
+    """
+
+    _ROLE_PREFIXES = frozenset(
+        {"resolved", "walk", "walked", "filter", "intersect", "intersected", "anchor"}
+    )
+    # Generic placeholder words that are acceptable as non-task-specific labels.
+    _GENERIC_WORDS = frozenset(
+        {
+            "entity", "anchor", "item", "element", "node", "concept", "result",
+            "set", "group", "target", "source", "base", "variable", "var",
+        }
+    )
+    _PATTERN = re.compile(
+        r"^(?P<prefix>[a-z]+)_(?P<word>[A-Z][a-zA-Z]{2,})(?:_.*)?$"
+    )
+
+    def __init__(self) -> None:
+        self.violations: list[str] = []
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if not isinstance(node.value, str):
+            self.generic_visit(node)
+            return
+        m = self._PATTERN.match(node.value)
+        if m:
+            prefix = m.group("prefix").lower()
+            word = m.group("word").lower()
+            if prefix in self._ROLE_PREFIXES and word not in self._GENERIC_WORDS:
+                self.violations.append(
+                    f"hardcoded_entity_in_label:{node.value}"
+                )
+        self.generic_visit(node)
+
+
+def _kg_hardcoded_entity_in_label_issues(code: str) -> list[str]:
+    """Return hardcoded-entity-in-label violations for KG macro tools."""
+    if not _looks_like_kg_macro(code):
+        return []
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+    visitor = _KGHardcodedEntityInLabelVisitor()
+    visitor.visit(tree)
+    return visitor.violations
+
+
+def _kg_attribute_target_as_anchor_issues(code: str) -> list[str]:
+    """Return violations where attribute_target_concept is passed to resolve_entity_to_vars."""
+    if not _looks_like_kg_macro(code):
+        return []
+    if "attribute_target_concept" not in code or "resolve_entity_to_vars" not in code:
+        return []
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+    # Collect variable names assigned from payload.get("attribute_target_concept")
+    atc_var_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        rhs = node.value
+        if (
+            isinstance(rhs, ast.Call)
+            and isinstance(rhs.func, ast.Attribute)
+            and rhs.func.attr == "get"
+            and rhs.args
+            and isinstance(rhs.args[0], ast.Constant)
+            and rhs.args[0].value == "attribute_target_concept"
+        ):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    atc_var_names.add(tgt.id)
+    if not atc_var_names:
+        return []
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "kg_utils"
+            and func.attr == "resolve_entity_to_vars"
+        ):
+            continue
+        if node.args and isinstance(node.args[0], ast.Name):
+            if node.args[0].id in atc_var_names:
+                violations.append(
+                    f"attribute_target_concept var '{node.args[0].id}' passed to resolve_entity_to_vars as entity anchor"
+                )
+    return violations
+
+
 def _kg_semantic_rediscovery_issues(code: str) -> list[str]:
     if not _looks_like_kg_macro(code):
         return []
@@ -228,6 +332,18 @@ def validate_tool_code(
         return ToolValidationResult(
             success=False,
             error="kg_semantic_rediscovery:" + ",".join(kg_semantic_issues),
+        )
+    kg_hardcode_issues = _kg_hardcoded_entity_in_label_issues(code or "")
+    if kg_hardcode_issues:
+        return ToolValidationResult(
+            success=False,
+            error="kg_hardcoded_entity_in_label:" + ",".join(kg_hardcode_issues),
+        )
+    kg_atc_anchor_issues = _kg_attribute_target_as_anchor_issues(code or "")
+    if kg_atc_anchor_issues:
+        return ToolValidationResult(
+            success=False,
+            error="kg_attribute_target_as_anchor:" + ",".join(kg_atc_anchor_issues),
         )
     # Strip any stray `import kg_utils` lines — kg_utils is a pre-injected global
     # and a bare import would raise ModuleNotFoundError at exec time.

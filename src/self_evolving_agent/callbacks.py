@@ -289,6 +289,10 @@ class GeneratedToolLoggingCallback(Callback):
     def on_session_create(self, callback_args: CallbackArguments) -> None:
         # Only subscribe when the first session is created to ensure the registry is ready.
         self._ensure_subscription()
+        log_key = self._get_log_path()
+        if log_key in self._logged_callback_runs:
+            return
+        self._logged_callback_runs.add(log_key)
         # Log the initial role dictionary for traceability.
         role_dict = callback_args.session_context.agent.get_role_dict()
         payload = {

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional
 
-from huggingface_hub import HfApi, hf_hub_download
 from datasets import load_dataset, Dataset
 import os
 

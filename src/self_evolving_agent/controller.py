@@ -149,14 +149,6 @@ class SelfEvolvingController(
         self._toolgen_registry_root = os.path.abspath(pipeline_config.registry_root)
         self._toolgen_registry_dir = tool_registry_path
         self._toolgen_registry_root_from_env = pipeline_config.registry_root_from_env
-        if self._toolgen_pipeline_name == "aggregate3":
-            print(
-                "[ToolGen] aggregate3 pipeline enabled; registry_dir="
-                f"{self._toolgen_registry_dir}"
-            )
-        self._toolgen_preboot_envs: set[str] = set()
-        self._toolgen_agg_bootstrapped_envs: set[str] = set()
-        self._toolgen_preaggregate_envs: set[str] = set()
         self._force_toolgen_always_on = (
             os.getenv("FORCE_TOOLGEN_ALWAYS_ON", "0") == "1"
         )
@@ -366,6 +358,7 @@ class SelfEvolvingController(
             self._state_dir = str(Path("outputs") / self._run_id / "tool_state")
         self._toolgen_debug_logger = None
         self._max_generated_tools_per_run = max_generated_tools_per_run
+        self._max_generated_tools_per_task = 2
         self._generated_tool_counter = 0
         self._force_tool_generation_if_missing = force_tool_generation_if_missing
         self._tool_match_min_score = tool_match_min_score
@@ -388,6 +381,7 @@ class SelfEvolvingController(
         self._tool_invoked_in_last_inference = False
         self._environment_label = environment_label
         self._toolgen_attempted_queries: set[str] = set()
+        self._toolgen_attempt_lifecycle_count = 0
         self._toolgen_debug_registered_tools: dict[str, int] = {}
         self._last_toolgen_parse_source: Optional[str] = None
         self._toolgen_last_recommendation: Optional[str] = None
@@ -1302,93 +1296,47 @@ class SelfEvolvingController(
         try:
             # NOTE: force_strict=True ensures the full 8-round gen→val→repair
             # loop runs.  No relaxed-mode bypass for reflection forges.
-            if getattr(self, "_toolgen_pipeline_name", "baseline") == "aggregate3":
-                env_name = self._resolved_environment_label()
+            env_name = self._resolved_environment_label()
+            env_contract = ""
+            try:
+                for item in self._history_items(chat_history):
+                    if item.role == Role.USER:
+                        env_contract = (item.content or "").strip()
+                        break
+            except Exception:
                 env_contract = ""
-                context = getattr(self, "_toolgen_agg_context", None)
-                if isinstance(context, Mapping):
-                    env_contract = str(context.get("env_contract") or "")
-                if not env_contract:
-                    try:
-                        for item in self._history_items(chat_history):
-                            if item.role == Role.USER:
-                                env_contract = (item.content or "").strip()
-                                break
-                    except Exception:
-                        env_contract = ""
-                user_prompt = build_task_pack(
-                    env_name, env_contract, [enriched_query]
-                )
-                final_user_prompt = reflection_header + user_prompt
-                exec_payload = self._build_toolgen_execution_payload(
-                    task_text=enriched_query,
-                    trace=trace_tail,
-                    failure_context=last_obs.get("output") if isinstance(last_obs, dict) else "",
-                    active_variables=None,
-                )
-                prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
-                setattr(self, "_toolgen_execution_payload", exec_payload)
-                requested_tool_type = "macro"
-                if env_name == "knowledge_graph":
-                    system_prompt = MACRO_TOOLGEN_USER_KG
-                    prompt_name = "MACRO_TOOLGEN_USER_KG"
-                else:
-                    system_prompt = get_toolgen_system_prompt("aggregate3", env_name)
-                    prompt_name = f"TOOLGEN_SYSTEM_PROMPT:aggregate3:{env_name}"
-                try:
-                    result = self._toolgen_generate_from_prompt(
-                        user_prompt=final_user_prompt,
-                        system_prompt=system_prompt,
-                        chat_history=chat_history,
-                        name_prefix=getattr(self, "_toolgen_name_prefix", ""),
-                        prompt_name=prompt_name,
-                        force_strict=True,
-                        force_max_rounds=self.MAX_TOOLGEN_ROUNDS,
-                    )
-                finally:
-                    setattr(self, "_toolgen_execution_payload", prev_exec_payload)
+            user_prompt = build_task_pack(env_name, env_contract, [enriched_query])
+            final_user_prompt = reflection_header + user_prompt
+            requested_tool_type = "macro"
+            if env_name == "knowledge_graph":
+                system_prompt = MACRO_TOOLGEN_USER_KG
+                prompt_name = "MACRO_TOOLGEN_USER_KG"
             else:
-                env_name = self._resolved_environment_label()
-                env_contract = ""
-                try:
-                    for item in self._history_items(chat_history):
-                        if item.role == Role.USER:
-                            env_contract = (item.content or "").strip()
-                            break
-                except Exception:
-                    env_contract = ""
-                user_prompt = build_task_pack(env_name, env_contract, [enriched_query])
-                final_user_prompt = reflection_header + user_prompt
-                requested_tool_type = "macro"
-                if env_name == "knowledge_graph":
-                    system_prompt = MACRO_TOOLGEN_USER_KG
-                    prompt_name = "MACRO_TOOLGEN_USER_KG"
-                else:
-                    system_prompt = get_toolgen_system_prompt(
-                        getattr(self, "_toolgen_pipeline_name", "baseline"),
-                        env_name,
-                    )
-                    prompt_name = f"TOOLGEN_SYSTEM_PROMPT:{getattr(self, '_toolgen_pipeline_name', 'baseline')}:{env_name}"
-                prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
-                exec_payload = self._build_toolgen_execution_payload(
-                    task_text=enriched_query,
-                    trace=trace_tail,
-                    failure_context=last_obs.get("output") if isinstance(last_obs, dict) else "",
-                    active_variables=None,
+                system_prompt = get_toolgen_system_prompt(
+                    getattr(self, "_toolgen_pipeline_name", "baseline"),
+                    env_name,
                 )
-                setattr(self, "_toolgen_execution_payload", exec_payload)
-                try:
-                    result = self._toolgen_generate_from_prompt(
-                        user_prompt=final_user_prompt,
-                        system_prompt=system_prompt,
-                        chat_history=chat_history,
-                        name_prefix=getattr(self, "_toolgen_name_prefix", ""),
-                        prompt_name=prompt_name,
-                        force_strict=True,
-                        force_max_rounds=self.MAX_TOOLGEN_ROUNDS,
-                    )
-                finally:
-                    setattr(self, "_toolgen_execution_payload", prev_exec_payload)
+                prompt_name = f"TOOLGEN_SYSTEM_PROMPT:{getattr(self, '_toolgen_pipeline_name', 'baseline')}:{env_name}"
+            prev_exec_payload = getattr(self, "_toolgen_execution_payload", None)
+            exec_payload = self._build_toolgen_execution_payload(
+                task_text=enriched_query,
+                trace=trace_tail,
+                failure_context=last_obs.get("output") if isinstance(last_obs, dict) else "",
+                active_variables=None,
+            )
+            setattr(self, "_toolgen_execution_payload", exec_payload)
+            try:
+                result = self._toolgen_generate_from_prompt(
+                    user_prompt=final_user_prompt,
+                    system_prompt=system_prompt,
+                    chat_history=chat_history,
+                    name_prefix=getattr(self, "_toolgen_name_prefix", ""),
+                    prompt_name=prompt_name,
+                    force_strict=True,
+                    force_max_rounds=self.MAX_TOOLGEN_ROUNDS,
+                )
+            finally:
+                setattr(self, "_toolgen_execution_payload", prev_exec_payload)
 
             tool_name = None
             if result is not None:
@@ -1502,25 +1450,6 @@ class SelfEvolvingController(
 
         print("\n[DEBUG] --- TURN START ---", file=sys.stderr, flush=True)
         print("[DEBUG] Prompt Name Tracing active.", file=sys.stderr, flush=True)
-        # Pre-boot ToolGen must run before any orchestrator decision on first loop.
-        try:
-            preboot_tasks = getattr(self, "_preboot_tasks", None)
-            if isinstance(preboot_tasks, list) and preboot_tasks:
-                self._toolgen_prebootstrap_once(
-                    task_query, working_history, tasks=preboot_tasks
-                )
-                self._preboot_tasks = []
-            else:
-                self._toolgen_prebootstrap_once(task_query, working_history)
-            if getattr(self, "_registry", None) is not None and hasattr(
-                self._registry, "refresh"
-            ):
-                try:
-                    self._registry.refresh()
-                except Exception:
-                    pass
-        except Exception:
-            pass
         forced_decision: Optional[Mapping[str, Any]] = None
         try:
             forced_decision = self._orchestrate_decision(
@@ -1544,6 +1473,11 @@ class SelfEvolvingController(
         _loop_start = time.perf_counter()
         turn_start_time = time.time()
         _hist_len = chat_history.get_value_length()
+        # Turn-zero detection: use the user-message count rather than raw history length
+        # so that tasks with a preamble (e.g. KG instructions + "OK" = 2 messages before
+        # the first question) are still correctly identified as turn 0.
+        # ≤ 2 covers: no preamble (1 user msg) and single-message preamble (2 user msgs).
+        _is_task_turn_zero = len(user_items) <= 2
         _task_meta = self._get_run_task_metadata() or {}
         turn_id = _task_meta.get("sample_index") if isinstance(_task_meta, dict) else None
         if turn_id is None:
@@ -1654,6 +1588,13 @@ class SelfEvolvingController(
             self._append_loop_log(
                 f"  triggers: {[t.get('type') for t in observation_triggers]}"
             )
+        self._toolgen_set_current_turn_policy_context(
+            is_turn_zero=_is_task_turn_zero,
+            observation_triggers=observation_triggers,
+        )
+        toolgen_turn_allowed, toolgen_turn_reason = (
+            self._toolgen_current_turn_allows_fresh_attempt(working_history)
+        )
 
         try:
             print(
@@ -1764,6 +1705,8 @@ class SelfEvolvingController(
                         "real_existing_tools_count": real_existing_tools_count,
                         "blocked_stuck_for_forge": blocked_stuck_for_forge,
                         "blocked_stuck_reason": blocked_stuck_reason,
+                        "toolgen_turn_allowed": toolgen_turn_allowed,
+                        "toolgen_turn_reason": toolgen_turn_reason,
                         "forge_allowed": forge_allowed,
                         "forge_denied_reason": forge_denied_reason,
                     }
@@ -1785,18 +1728,7 @@ class SelfEvolvingController(
                 )
                 _mid_task = bool(pre_orch_trace)
 
-                if self._force_toolgen_always_on:
-                    # Bypass all forge-denial gates when testing flag is set.
-                    # Production gates (existing tools, circuit breakers,
-                    # not-stuck) are intentionally skipped so every task
-                    # exercises the full ToolGen loop when the orchestrator
-                    # explicitly requests a new tool under the test-mode prompt.
-                    forge_allowed = True
-                    forge_denied_reason = None
-                    self._append_loop_log(
-                        "  [FORCE_TOOLGEN_ALWAYS_ON] All forge denial gates bypassed."
-                    )
-                elif real_existing_tools_count > 0:
+                if real_existing_tools_count > 0:
                     action = "use_tool"
                     forge_denied_reason = "real_tools_available"
                     self._append_loop_log(
@@ -1840,24 +1772,24 @@ class SelfEvolvingController(
                             "A tool for this exact sample/archetype/target_concept already failed. "
                             "Backtrack manually or try a different candidate path; do NOT trigger ToolGen again."
                         )
-                elif _mid_task and not blocked_stuck_for_forge:
+                elif not toolgen_turn_allowed:
                     action = "no_tool"
-                    forge_denied_reason = "not_blocked"
+                    forge_denied_reason = toolgen_turn_reason
                     self._append_loop_log(
-                        "  [FORGE POLICY] Mid-task Forge denied because the agent is not "
-                        "currently blocked/stuck enough to justify generation."
+                        "  [FORGE POLICY] Fresh ToolGen denied: only turn 0 or "
+                        "node-explosion recovery can start a new tool session."
                     )
                 else:
                     forge_allowed = True
                     forge_denied_reason = None
-                    if _mid_task:
+                    if toolgen_turn_reason == "turn_zero":
                         self._append_loop_log(
-                            f"  [FORGE POLICY] Mid-task Forge allowed "
-                            f"(blocked/stuck reason={blocked_stuck_reason})."
+                            "  [FORGE POLICY] Turn-0 Forge allowed."
                         )
                     else:
                         self._append_loop_log(
-                            "  [FORGE POLICY] Turn-0 Forge allowed."
+                            "  [FORGE POLICY] Mid-task Forge allowed "
+                            f"(node-explosion trigger={toolgen_turn_reason})."
                         )
                     self._append_loop_log(
                         {
@@ -1868,6 +1800,8 @@ class SelfEvolvingController(
                             "real_existing_tools_count": real_existing_tools_count,
                             "blocked_stuck_for_forge": blocked_stuck_for_forge,
                             "blocked_stuck_reason": blocked_stuck_reason,
+                            "toolgen_turn_allowed": toolgen_turn_allowed,
+                            "toolgen_turn_reason": toolgen_turn_reason,
                             "forge_allowed": forge_allowed,
                             "forge_denied_reason": forge_denied_reason,
                         }
@@ -1950,6 +1884,11 @@ class SelfEvolvingController(
                         and action in {"create_tool", "request_new_tool"}
                     ):
                         action = "use_tool"
+                    if (
+                        action in {"create_tool", "request_new_tool"}
+                        and not toolgen_turn_allowed
+                    ):
+                        action = "no_tool"
                     # Hard blacklist: suppress re-invocation of exhausted macros post-escape too.
                     if action == "use_tool" and decision.get("tool_name") in self._exhausted_macros:
                         self._append_loop_log(
@@ -2103,7 +2042,19 @@ class SelfEvolvingController(
                     "domain_hints": tool_plan.get("domain_hints"),
                 }
 
-                if tool_action == "create_tool":
+                if tool_action == "create_tool" and not toolgen_turn_allowed:
+                    self._append_loop_log(
+                        "  create_tool: blocked (fresh ToolGen only allowed at turn 0 "
+                        "or after a node explosion)"
+                    )
+                    tool_error = (
+                        "toolgen blocked: only allowed at turn 0 or after a node explosion"
+                    )
+                    _record_tool_error("create_tool", tool_error)
+                    tool_result = ToolResult.failure(tool_error)
+                    solver_sidecar.append(self._format_tool_result("create_tool", tool_result))
+                    tool_result_injected = True
+                elif tool_action == "create_tool":
                     self._append_loop_log("  create_tool: generating new tool via ToolGen...")
                     self._toolgen_last_recommendation = solver_recommendation
                     selected_tool = self._maybe_generate_tool_for_query(
@@ -3049,14 +3000,6 @@ class SelfEvolvingController(
             query = last_user.content if last_user else ""
 
             task_query = (original_query or "").strip() or (query or "").strip()
-            self._toolgen_prebootstrap_once(task_query, working_history)
-            # Refresh registry so freshly registered pre-boot tool is visible
-            if getattr(self, "_registry", None) is not None and hasattr(self._registry, "refresh"):
-                try:
-                    self._registry.refresh()
-                except Exception:
-                    pass
-
             self._consider_tool_generation(task_query, working_history)
 
             if task_query:

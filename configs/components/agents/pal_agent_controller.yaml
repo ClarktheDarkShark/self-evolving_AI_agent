@@ -1,0 +1,4 @@
+pal_agent_controller:
+  module: "src.agents.instance.pal_agent_controller.PALAgentController"
+  parameters:
+    language_model: "Fill the parameter 'language_model_name' in assignment config."

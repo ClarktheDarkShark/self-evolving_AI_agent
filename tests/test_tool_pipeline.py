@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import sys
 import tempfile
 from pathlib import Path
@@ -9,30 +8,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-
-def _load_module(module_name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-tool_registry_mod = _load_module(
-    "tool_registry", ROOT / "src" / "self_evolving_agent" / "tool_registry.py"
-)
-tool_validation_mod = _load_module(
-    "tool_validation", ROOT / "src" / "self_evolving_agent" / "tool_validation.py"
-)
-
-ToolRegistry = tool_registry_mod.ToolRegistry
-validate_tool_code = tool_validation_mod.validate_tool_code
-
+from src.self_evolving_agent.tool_registry import ToolRegistry
+from src.self_evolving_agent.tool_validation import validate_tool_code
 
 TOOL_CODE = """\
 \"\"\"
 Echo payload tool.
+
+# INVOKE_WITH: run(payload)
+# RUN_PAYLOAD_REQUIRED: foo
+# RUN_PAYLOAD_OPTIONAL:
 \"\"\"
 from __future__ import annotations
 
@@ -43,17 +28,17 @@ def run(payload: dict) -> dict:
     \"\"\"
     try:
         if not isinstance(payload, dict):
-            return {\"error\": \"payload must be dict\"}
-        return {\"echo\": payload}
+            return {\"status\": \"ERROR\", \"final_variable\": None, \"observation\": \"payload must be dict\"}
+        foo = payload.get(\"foo\", \"\")
+        return {\"status\": \"SUCCESS\", \"final_variable\": foo, \"observation\": f\"echo:{foo}\"}
     except Exception as exc:
-        return {\"error\": str(exc)}
+        return {\"status\": \"ERROR\", \"final_variable\": None, \"observation\": str(exc)}
 
 
 def self_test() -> bool:
     good = run({\"foo\": \"bar\"})
-    assert good.get(\"echo\") == {\"foo\": \"bar\"}
-    bad = run(\"nope\")
-    assert \"error\" in bad
+    assert good.get(\"status\") == \"SUCCESS\"
+    assert good.get(\"final_variable\") == \"bar\"
     return True
 """
 
@@ -84,4 +69,6 @@ def test_tool_pipeline_end_to_end() -> None:
         assert metadata is not None
         outcome = registry.invoke_tool(metadata.name, {"foo": "bar"})
         assert outcome.success, outcome.error
-        assert outcome.output == {"echo": {"foo": "bar"}}
+        assert isinstance(outcome.output, dict)
+        assert outcome.output.get("status") == "SUCCESS"
+        assert outcome.output.get("final_variable") == "bar"

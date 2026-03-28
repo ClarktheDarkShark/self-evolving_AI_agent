@@ -12,7 +12,7 @@ def test_tool_registry_persistence_and_invocation(tmp_path) -> None:
     registry = ToolRegistry(str(tmp_path))
     metadata = registry.register_tool(
         name="adder_tool",
-        code="def run(x, y):\n    return x + y\n",
+        code='"""Adds two numbers."""\n\ndef run(x, y):\n    return x + y\n',
         signature="run(x, y)",
         description="Adds two numbers.",
     )

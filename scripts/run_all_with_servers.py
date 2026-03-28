@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -106,6 +107,28 @@ def sparql_probe(endpoint: str, timeout_s: int = 5) -> tuple[bool, bool, str | N
         return True, False, f"HTTPError {e.code}: {detail[:200]}"
     except Exception as e:
         return False, False, str(e)
+
+
+def _sparql_health(timeout_s: float = 5.0) -> kg_sparql_server.SparqlHealth:
+    return kg_sparql_server.sparql_health(SPARQL_ENDPOINT, timeout_s=timeout_s)
+
+
+def _log_sparql_health(
+    *,
+    context: str,
+    health: kg_sparql_server.SparqlHealth,
+    fuseki_log_path: Path | None = None,
+) -> None:
+    base_message = (
+        f"[KG endpoint] context={context} endpoint={SPARQL_ENDPOINT} "
+        f"reachable={health.reachable} has_data={health.has_data}"
+    )
+    print(base_message)
+    _append_log(fuseki_log_path, base_message)
+    if health.error:
+        error_message = f"[KG endpoint] context={context} error={health.error}"
+        print(error_message)
+        _append_log(fuseki_log_path, error_message)
 
 
 def _wait_for_server(url: str, timeout_s: int = 60) -> bool:
@@ -421,29 +444,45 @@ def _start_fuseki_serve_only(repo_root: Path, fuseki_log_path: Path) -> bool:
 
 
 
-def _ensure_fuseki_ready(repo_root: Path, fuseki_log_path: Path) -> tuple[bool, bool]:
+def _ensure_fuseki_ready(
+    repo_root: Path,
+    fuseki_log_path: Path,
+    *,
+    context: str,
+    runtime_state: dict[str, bool] | None = None,
+) -> tuple[bool, bool]:
     """
     Returns: (started_by_script, ok)
     """
-    # First probe
-    reachable, has_data, err = sparql_probe(SPARQL_ENDPOINT)
-    print(f"[KG preflight] endpoint={SPARQL_ENDPOINT}")
-    print(f"[KG preflight] reachable={reachable}, has_data={has_data}")
-    if err:
-        print(f"[KG preflight] error={err}")
-        pass
-
-    if reachable and has_data:
+    initial_health = _sparql_health()
+    _log_sparql_health(
+        context=f"{context}:preflight",
+        health=initial_health,
+        fuseki_log_path=fuseki_log_path,
+    )
+    if initial_health.reachable and initial_health.has_data:
         return False, True
 
-    # If it isn't healthy, start it (serve-only)
+    restart_message = (
+        f"[run_all_with_servers] KG endpoint unhealthy during {context}; "
+        "starting or restarting Fuseki."
+    )
+    print(restart_message)
+    _append_log(fuseki_log_path, restart_message)
+
     started = True
     ok = _start_fuseki_serve_only(repo_root, fuseki_log_path)
     if not ok:
         return started, False
+    if runtime_state is not None:
+        runtime_state["managed_by_script"] = True
 
-    # Now wait for readiness
     health = kg_sparql_server.wait_for_sparql_ready(SPARQL_ENDPOINT, timeout_s=120)
+    _log_sparql_health(
+        context=f"{context}:post_start",
+        health=health,
+        fuseki_log_path=fuseki_log_path,
+    )
     if not (health.reachable and health.has_data):
         print("[run_all_with_servers] SPARQL readiness failed after starting Fuseki.")
         print(f"[run_all_with_servers] Expected endpoint: {SPARQL_ENDPOINT}")
@@ -470,6 +509,59 @@ def _ensure_fuseki_ready(repo_root: Path, fuseki_log_path: Path) -> tuple[bool, 
     return started, True
 
 
+def _ensure_kg_endpoint_available(
+    repo_root: Path,
+    fuseki_log_path: Path,
+    *,
+    context: str,
+    runtime_state: dict[str, bool],
+) -> bool:
+    _, ok = _ensure_fuseki_ready(
+        repo_root,
+        fuseki_log_path,
+        context=context,
+        runtime_state=runtime_state,
+    )
+    return ok
+
+
+def _fuseki_watchdog_loop(
+    repo_root: Path,
+    fuseki_log_path: Path,
+    runtime_state: dict[str, bool],
+    stop_event: threading.Event,
+    *,
+    interval_s: float = 5.0,
+    recovery_cooldown_s: float = 15.0,
+) -> None:
+    last_recovery_attempt = 0.0
+    while not stop_event.wait(interval_s):
+        health = _sparql_health(timeout_s=3.0)
+        if health.reachable and health.has_data:
+            continue
+
+        _log_sparql_health(
+            context="runtime_watchdog:unhealthy",
+            health=health,
+            fuseki_log_path=fuseki_log_path,
+        )
+        now = time.time()
+        if now - last_recovery_attempt < recovery_cooldown_s:
+            continue
+        last_recovery_attempt = now
+        try:
+            _ensure_kg_endpoint_available(
+                repo_root,
+                fuseki_log_path,
+                context="runtime_watchdog",
+                runtime_state=runtime_state,
+            )
+        except Exception as exc:
+            message = f"[run_all_with_servers] Fuseki watchdog recovery failed: {exc}"
+            print(message)
+            _append_log(fuseki_log_path, message)
+
+
 def _run_one(config_path: str, combined_dir: Path) -> int:
     is_kg = "knowledge_graph" in config_path
 
@@ -487,9 +579,16 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
     config_name = Path(config_path).stem
 
     # SELF-CONTAINED: ensure Fuseki is up BEFORE anything else for KG
-    started_fuseki = False
+    fuseki_runtime_state = {"managed_by_script": False}
+    fuseki_watchdog_stop: threading.Event | None = None
+    fuseki_watchdog_thread: threading.Thread | None = None
     if is_kg:
-        started_fuseki, ok = _ensure_fuseki_ready(repo_root, fuseki_log_path)
+        _, ok = _ensure_fuseki_ready(
+            repo_root,
+            fuseki_log_path,
+            context="startup",
+            runtime_state=fuseki_runtime_state,
+        )
         if not ok:
             return 1
 
@@ -517,6 +616,7 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
             env["KG_ONTOLOGY_DIR"] = ontology_dir
         if not env.get("LIFELONG_KG_ONTOLOGY_DIR"):
             env["LIFELONG_KG_ONTOLOGY_DIR"] = ontology_dir
+        env["PAL_SPARQL_ENDPOINT_URL"] = SPARQL_ENDPOINT
 
     print(f"[run_all_with_servers] Starting server: {config_path}")
     _preflight_kill_ports([8000, 8001])
@@ -545,6 +645,31 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
             print(_tail_file(log_path))
             return 1
 
+        if is_kg:
+            ok = _ensure_kg_endpoint_available(
+                repo_root,
+                fuseki_log_path,
+                context="pre_client",
+                runtime_state=fuseki_runtime_state,
+            )
+            if not ok:
+                print("[run_all_with_servers] KG endpoint unavailable after server startup.")
+                print(f"[run_all_with_servers] Fuseki log: {fuseki_log_path}")
+                print(_tail_file(fuseki_log_path))
+                return 1
+            fuseki_watchdog_stop = threading.Event()
+            fuseki_watchdog_thread = threading.Thread(
+                target=_fuseki_watchdog_loop,
+                args=(
+                    repo_root,
+                    fuseki_log_path,
+                    fuseki_runtime_state,
+                    fuseki_watchdog_stop,
+                ),
+                daemon=True,
+            )
+            fuseki_watchdog_thread.start()
+
         print(f"[run_all_with_servers] Running client: {config_path}")
         result = subprocess.run(client_cmd, cwd=repo_root, env=env, check=False)
         if result.returncode != 0:
@@ -555,6 +680,10 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
 
 
     finally:
+        if fuseki_watchdog_stop is not None:
+            fuseki_watchdog_stop.set()
+        if fuseki_watchdog_thread is not None:
+            fuseki_watchdog_thread.join(timeout=5)
         if server_proc.poll() is None:
             try:
                 os.killpg(server_proc.pid, signal.SIGTERM)
@@ -574,7 +703,7 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
             pass
 
         # Stop Fuseki only if THIS script started it.
-        if is_kg and started_fuseki:
+        if is_kg and fuseki_runtime_state["managed_by_script"]:
             try:
                 _run(["docker", "rm", "-f", FUSEKI_CONTAINER], log_path=fuseki_log_path)
             except Exception:

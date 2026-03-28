@@ -164,6 +164,12 @@ def test_kg_prompt_pushes_minimal_tool_shape() -> None:
     assert "INPUT_SCHEMA:" not in MACRO_TOOLGEN_USER_KG
 
 
+def test_kg_prompt_has_filter_ready_finish_chain_override() -> None:
+    assert "If the declared required handoff is `built_filter_ready_set`" in MACRO_TOOLGEN_USER_KG
+    assert "one straight-line" in MACRO_TOOLGEN_USER_KG
+    assert "do NOT stop at resolved anchors" in MACRO_TOOLGEN_USER_KG
+
+
 def test_force_toolgen_prompt_requires_tool_or_generation(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -833,6 +839,54 @@ def test_live_progress_recognizes_partial_value_modes(tmp_path: pathlib.Path) ->
     assert diagnostic_summary["material_progress"] is True
     assert diagnostic_summary["value_delivered"] == "produced_actionable_handoff"
     assert diagnostic_summary["value_mode"] == "diagnostic_probe"
+
+
+def test_live_progress_exhausted_partial_progress_is_admission_blocked(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+
+    result = controller._summarize_toolgen_live_progress(
+        {
+            "status": "MACRO EXHAUSTED",
+            "final_variable": None,
+            "observation": (
+                "MACRO EXHAUSTED: Resulting set is empty. "
+                'minted_variables: {"resolved_CNES": "#1", "resolved_Astrium": "#2"}'
+            ),
+        },
+        {"tool_plan": _kg_plan(preferred_tool_mode="full_solve")},
+    )
+
+    assert result["material_progress"] is True
+    assert result["bankable_partial_progress"] is True
+    assert result["admission_blocked"] is True
+    assert result["usefulness_passed"] is False
+
+
+def test_value_delivered_recognizes_resolved_entity_labels_with_grounded_pointers(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    value = controller._toolgen_classify_value_delivered(
+        tool_plan=_kg_plan(preferred_tool_mode="progress_tool"),
+        execution_validation={
+            "status": "SUCCESS",
+            "final_variable": "#1",
+            "observation": (
+                "Resolved producer anchors. "
+                'minted_variables: {"resolved_Goat": "#1", "resolved_cows": ["#2"]}'
+            ),
+        },
+        live_progress_summary={
+            "execution_status": "SUCCESS",
+            "has_final_variable": True,
+            "has_context": True,
+            "material_progress": True,
+            "final_operation_safe": False,
+        },
+    )
+    assert value == "resolved_both_anchors"
 
 
 def test_validation_policy_penalizes_repetition_and_rewards_partial_value(
@@ -2187,6 +2241,25 @@ def _run_live_toolgen_case(
     }
 
 
+def _disable_family_binding(controller: SelfEvolvingController) -> None:
+    controller._toolgen_kg_family_binding_context = lambda *args, **kwargs: {  # noqa: SLF001
+        "family_binding_active": False,
+        "family_binding_reason": "test_override_generic_path",
+        "generic_path_blocked_for_family_bound_attempt": False,
+        "family_skeleton_selected": None,
+        "family_generation_path_used": False,
+        "generic_generation_blocked": False,
+        "generic_repair_blocked": False,
+        "family_repair_template_name": None,
+        "family_validator_path_used": False,
+        "normalized_family_inputs": {},
+        "family_normalization_source": "test_override_generic_path",
+        "family_normalization_fallback_used": False,
+        "family_classification_ambiguous": False,
+        "candidate_family_options": [],
+    }
+
+
 class _PromptCaptureLanguageModel(_LivePathLanguageModel):
     def __init__(self) -> None:
         super().__init__(fail_toolgen=False)
@@ -2484,10 +2557,10 @@ def test_live_path_phase1_retry_prompt_scaffold_matches_mutated_retry_state(
     retry_execution_plan = _prompt_execution_plan(retry_prompt)
     assert retry_plan["preferred_tool_mode"] == "progress_tool"
     assert retry_plan["execution_style"] == "relation_first"
-    assert (
-        retry_plan["minimum_acceptable_deliverable"]
-        == ControllerToolgenMixin._PHASE1_GENERIC_MIN_DELIVERABLE
-    )
+    assert "single resolved anchor variable is NOT sufficient" in retry_plan[
+        "minimum_acceptable_deliverable"
+    ]
+    assert "resolved_both_anchors" in retry_plan["minimum_acceptable_deliverable"]
     assert "Follow the declared strategy only until the first acceptable value state is reached." in retry_execution_plan
     assert "Stop immediately after producing that value or solver-usable handoff" in retry_execution_plan
     assert "Count the intersection." not in retry_execution_plan
@@ -2495,6 +2568,127 @@ def test_live_path_phase1_retry_prompt_scaffold_matches_mutated_retry_state(
     assert '"execution_style": "walk_first"' not in scaffold_prefix
     assert "LAST_TOOL_CODE:" not in retry_prompt
     assert "PRIMARY_REPAIR_TARGET" in retry_prompt
+
+
+def test_same_task_toolgen_allows_turn_zero_and_one_node_explosion_then_blocks_third(
+    tmp_path: pathlib.Path,
+    monkeypatch,
+) -> None:
+    controller = _build_live_controller(tmp_path, monkeypatch)
+    controller._reuse_existing_tool = lambda *args, **kwargs: None  # noqa: SLF001
+    controller._get_candidate_output = lambda *args, **kwargs: None  # noqa: SLF001
+    controller._force_toolgen_always_on = True  # noqa: SLF001
+    calls: list[str] = []
+
+    def _fake_generate_from_prompt(**kwargs):
+        calls.append(str(kwargs.get("user_prompt") or ""))
+        return types.SimpleNamespace(name=f"generated_{len(calls)}")
+
+    monkeypatch.setattr(
+        controller,
+        "_toolgen_generate_from_prompt",
+        _fake_generate_from_prompt,
+    )
+
+    controller._run_task_metadata = {"task_name": "knowledge_graph", "sample_index": "0"}  # noqa: SLF001
+    turn_zero_history = ChatHistory()
+    first = controller._maybe_generate_tool_for_query(  # noqa: SLF001
+        "Question: first task turn", turn_zero_history
+    )
+    later_history = ChatHistory()
+    later_history.inject(
+        ChatHistoryItem(role=Role.USER, content="Question: first task turn")
+    )
+    later_history.inject(
+        ChatHistoryItem(role=Role.AGENT, content="Tool output: #0")
+    )
+    controller._toolgen_set_current_turn_policy_context(  # noqa: SLF001
+        is_turn_zero=False,
+        observation_triggers=[],
+    )
+    second = controller._maybe_generate_tool_for_query(  # noqa: SLF001
+        "Question: later same-task solver step", later_history, force=True
+    )
+    controller._toolgen_set_current_turn_policy_context(  # noqa: SLF001
+        is_turn_zero=False,
+        observation_triggers=[
+            {
+                "type": "size_trigger",
+                "reason": "observation has 21 items (>15 threshold)",
+            }
+        ],
+    )
+    third = controller._maybe_generate_tool_for_query(  # noqa: SLF001
+        "Question: node explosion recovery", later_history, force=True
+    )
+    fourth = controller._maybe_generate_tool_for_query(  # noqa: SLF001
+        "Question: second node explosion retry", later_history, force=True
+    )
+
+    assert first is not None
+    assert second is None
+    assert third is not None
+    assert fourth is None
+    assert len(calls) == 2
+
+    controller._run_task_metadata = {"task_name": "knowledge_graph", "sample_index": "1"}  # noqa: SLF001
+    controller._toolgen_set_current_turn_policy_context(  # noqa: SLF001
+        is_turn_zero=True,
+        observation_triggers=[],
+    )
+    fifth = controller._maybe_generate_tool_for_query(  # noqa: SLF001
+        "Question: next task boundary", ChatHistory()
+    )
+
+    assert fifth is not None
+    assert len(calls) == 3
+
+    generated_events = _jsonl_events(controller._generated_tools_log_path)  # noqa: SLF001
+    policy_blocks = [
+        event
+        for event in generated_events
+        if event.get("event") == "toolgen_attempt_blocked_policy"
+    ]
+    same_task_blocks = [
+        event
+        for event in generated_events
+        if event.get("event") == "toolgen_attempt_blocked_same_task"
+    ]
+    assert policy_blocks
+    assert policy_blocks[0]["policy_reason"] == "not_turn_zero_or_node_explosion"
+    assert same_task_blocks
+    assert same_task_blocks[0]["attempt_count"] == 2
+    assert same_task_blocks[0]["max_attempts"] == 2
+
+
+def test_toolgen_current_turn_policy_only_opens_for_turn_zero_or_size_trigger(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    later_history = ChatHistory()
+    later_history.inject(ChatHistoryItem(role=Role.USER, content="Question"))
+    later_history.inject(ChatHistoryItem(role=Role.AGENT, content="Observation"))
+
+    controller._toolgen_set_current_turn_policy_context(  # noqa: SLF001
+        is_turn_zero=False,
+        observation_triggers=[],
+    )
+    allowed, reason = controller._toolgen_current_turn_allows_fresh_attempt(later_history)  # noqa: SLF001
+    assert allowed is False
+    assert reason == "not_turn_zero_or_node_explosion"
+
+    controller._toolgen_set_current_turn_policy_context(  # noqa: SLF001
+        is_turn_zero=False,
+        observation_triggers=[
+            {
+                "type": "size_trigger",
+                "reason": "observation has 18 items (>15 threshold)",
+            }
+        ],
+    )
+    allowed, reason = controller._toolgen_current_turn_allows_fresh_attempt(later_history)  # noqa: SLF001
+    assert allowed is True
+    assert reason == "observation has 18 items (>15 threshold)"
 
 
 def test_live_path_sticky_pivot_inherits_strategy_after_pivot(
@@ -2632,7 +2826,7 @@ def test_live_path_verified_progress_tool_can_stop_early(
     ]
     assert early_stop_events
     assert early_stop_events[0]["preferred_tool_mode"] == "progress_tool"
-    assert early_stop_events[0]["best_achieved_state"] == "resolved_anchors"
+    assert early_stop_events[0]["best_achieved_state"] == "resolved_both_anchors"
     best_summary = [
         event
         for event in result["generated_events"]
@@ -2640,15 +2834,95 @@ def test_live_path_verified_progress_tool_can_stop_early(
     ]
     assert best_summary
     assert best_summary[-1]["selection_source"] == "best_partial_candidate"
-    assert best_summary[-1]["best_achieved_state"] == "resolved_anchors"
+    assert best_summary[-1]["best_achieved_state"] == "resolved_both_anchors"
     assert best_summary[-1]["best_achieved_round"] == 1
     assert best_summary[-1]["best_achieved_tool_name"]
     admitted_metadata = [
         item for item in result["candidate_metadata"] if item.get("registered") is True
     ]
     assert admitted_metadata
-    assert admitted_metadata[-1]["best_achieved_state"] == "resolved_anchors"
-    assert admitted_metadata[-1]["best_achieved_round"] == 1
+    assert admitted_metadata[-1]["best_achieved_state"] == "resolved_both_anchors"
+
+
+def test_live_round_start_logs_family_routing_fields(
+    tmp_path: pathlib.Path,
+    monkeypatch,
+) -> None:
+    controller = _build_live_controller(
+        tmp_path,
+        monkeypatch,
+        language_model=_ProgressToolLanguageModel(),
+        kg_task_ref=_ProgressToolKGTaskRef(),
+    )
+    result = _run_live_toolgen_case(controller, _COUNT_QUERY)
+
+    round_starts = [
+        event
+        for event in result["generated_events"]
+        if event.get("event") == "toolgen_round_start"
+    ]
+    assert round_starts
+    first = round_starts[0]
+    assert first["template_family"] == "two_anchor_intersect_count"
+    assert first["anchor_operands"] == ["CNES", "Astrium"]
+    assert first["terminal_artifact_kind"] == "count_variable"
+    assert first["required_next_stage"] == "built_target_set"
+    assert first["family_binding_active"] is True
+    assert first["family_binding_reason"] == "supported_template_family:two_anchor_intersect_count"
+    assert first["generic_path_blocked_for_family_bound_attempt"] is True
+    assert first["family_skeleton_selected"] == "two_anchor_intersect_count"
+    assert first["family_generation_path_used"] is True
+    assert first["family_skeleton_used"] is True
+    assert first["family_repair_path_used"] is True
+    assert first["family_repair_template_name"] == "two_anchor_intersect_count"
+    assert first["generic_repair_blocked"] is True
+    assert first["family_validator_path_used"] is True
+    assert first["family_validator_checks_used"] is True
+    assert first["family_patch_path_blocked"] is True
+    assert first["family_regeneration_forced"] is True
+    assert first["current_round_patch_mode"] is False
+    assert first["generic_generation_used_when_family_known"] is False
+    assert first["normalized_family_inputs"]["template_family"] == "two_anchor_intersect_count"
+
+
+def test_family_bound_patch_mode_forces_full_regeneration(
+    tmp_path: pathlib.Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LIFELONG_TOOLGEN_PATCH_MODE", "1")
+    lm = _MissingRunThenRewriteLanguageModel()
+    controller = _build_live_controller(
+        tmp_path,
+        monkeypatch,
+        language_model=lm,
+        kg_task_ref=_AlwaysSuccessKGTaskRef(),
+    )
+    result = _run_live_toolgen_case(controller, _COUNT_QUERY)
+
+    assert result["tool"] is not None
+    round_starts = [
+        event
+        for event in result["generated_events"]
+        if event.get("event") == "toolgen_round_start"
+    ]
+    assert len(round_starts) >= 2
+    assert all(event["family_binding_active"] is True for event in round_starts)
+    assert all(event["family_patch_path_blocked"] is True for event in round_starts)
+    assert all(event["family_regeneration_forced"] is True for event in round_starts)
+    assert all(event["current_round_patch_mode"] is False for event in round_starts)
+    assert lm.patch_calls == 0
+    candidate_events = [
+        event
+        for event in result["generated_events"]
+        if event.get("event") == "toolgen_candidate"
+    ]
+    assert candidate_events
+    assert all(event["patch_round"] is False for event in candidate_events)
+    assert not any(
+        event.get("event") == "toolgen_round_failed"
+        and event.get("phase") in {"patch_plan_parse", "patch_apply"}
+        for event in result["generated_events"]
+    )
 
 
 def test_patch_mode_keeps_patch_round_after_validator_feedback(
@@ -2662,6 +2936,7 @@ def test_patch_mode_keeps_patch_round_after_validator_feedback(
         language_model=_PatchLoopLanguageModel(),
         kg_task_ref=_PatchLoopKGTaskRef(),
     )
+    _disable_family_binding(controller)
     result = _run_live_toolgen_case(controller, _COUNT_QUERY)
 
     assert result["tool"] is not None
@@ -2722,6 +2997,7 @@ def test_patch_mode_clears_kg_utils_import_contract_failure(
         language_model=_ImportKgUtilsPatchLanguageModel(),
         kg_task_ref=_PatchLoopKGTaskRef(),
     )
+    _disable_family_binding(controller)
     result = _run_live_toolgen_case(controller, _COUNT_QUERY)
 
     critical_fails = [
@@ -2915,6 +3191,7 @@ def test_fix1_precheck_fires_on_patch_rounds(
         language_model=_BadHeaderPatchLanguageModel(),
         kg_task_ref=_PatchLoopKGTaskRef(),
     )
+    _disable_family_binding(controller)
     result = _run_live_toolgen_case(controller, _COUNT_QUERY)
 
     precheck_fail_events = [
@@ -3212,7 +3489,7 @@ def test_phase1_retry_state_no_trigger_when_achieved_state_present(
         _p1_feedback(
             redesign_direction="replace_exhausted_full_solve_shape",
             value_delivered="none",
-            achieved_state="resolved_anchors",
+            achieved_state="resolved_both_anchors",
             partial_value_usable=False,
             has_final_variable=False,
             handoff_state="exhausted",
@@ -3259,7 +3536,7 @@ def test_phase1_minimum_acceptable_deliverable_injected_in_payload(
     """MAD from round_context flows through _toolgen_apply_round_strategy_context
     into both payload and payload['tool_plan']."""
     controller = _DummyController(tmp_path)
-    mad = ControllerToolgenMixin._PHASE1_GENERIC_MIN_DELIVERABLE
+    mad = "Return the first grounded #N and stop."
     round_context = {
         "active_execution_style": "relation_first",
         "active_preferred_tool_mode": "progress_tool",
@@ -3289,6 +3566,26 @@ def test_phase1_minimum_acceptable_deliverable_not_injected_when_absent(
     assert "minimum_acceptable_deliverable" not in result or not result["minimum_acceptable_deliverable"]
 
 
+def test_progress_floor_tightens_generic_minimum_deliverable_for_multi_anchor_plan(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    result = controller._toolgen_apply_round_strategy_context(
+        {"tool_plan": _kg_plan(execution_style="relation_first")},
+        {
+            "active_execution_style": "relation_first",
+            "active_preferred_tool_mode": "progress_tool",
+            "minimum_acceptable_deliverable": ControllerToolgenMixin._PHASE1_GENERIC_MIN_DELIVERABLE,
+            "best_achieved_state": "resolved_both_anchors",
+            "fallback_strategies": [],
+        },
+    )
+    mad = str(result.get("minimum_acceptable_deliverable") or "")
+    assert "single resolved anchor variable is NOT sufficient" in mad
+    assert "resolved_both_anchors" in mad
+    assert "active plan stage" in mad
+
+
 def test_phase1_retry_prompt_scaffold_rebuilt_from_mutated_exec_payload(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -3311,7 +3608,7 @@ def test_phase1_retry_prompt_scaffold_rebuilt_from_mutated_exec_payload(
         env_name="knowledge_graph",
         env_contract="Question: count shared spacecraft, Entities: ['CNES', 'Astrium']",
     )
-    mad = ControllerToolgenMixin._PHASE1_GENERIC_MIN_DELIVERABLE
+    mad = "Return the first grounded #N and stop."
     mutated_payload = controller._toolgen_apply_round_strategy_context(
         stale_payload,
         {
@@ -3802,6 +4099,28 @@ def test_phase1b_omit_prior_code_false_for_emit_grounded_intermediate(
     assert state["minimum_acceptable_deliverable"] is not None
 
 
+def test_phase1_patch_failure_with_best_achieved_anchor_activates_primary_binding(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    feedback = json.dumps(
+        {
+            "phase": "patch_apply",
+            "error": "hunk mismatch",
+            "best_achieved_state": "produced_actionable_handoff",
+            "best_achieved_round": 3,
+            "primary_repair_instruction": (
+                "Round 3 achieved 'produced_actionable_handoff'. Recovery must preserve "
+                "or improve that partial-success shape."
+            ),
+        }
+    )
+    state = controller._toolgen_phase1_retry_state(feedback)
+    assert state["active"] is True
+    assert state["omit_prior_code"] is False
+    assert state["primary_repair_dominates"] is True
+
+
 # ---------------------------------------------------------------------------
 # Pre-Phase-2 stabilization tests (A/B/C/D)
 # ---------------------------------------------------------------------------
@@ -3831,7 +4150,7 @@ def test_stabilization_a_progress_tool_anchor_only_insufficient_for_narrowing_pl
             "final_variable": "#1",
             "observation": (
                 "Variable #1 contains the resolved anchor node for CNES. "
-                'minted_variables: {"resolved_anchor": "#1"}'
+                'minted_variables: {"resolved_CNES": "#1"}'
             ),
         },
         {"tool_plan": plan},
@@ -3856,6 +4175,705 @@ def test_stabilization_a_progress_tool_anchor_only_insufficient_for_narrowing_pl
         {"tool_plan": plan},
     )
     assert with_downstream["material_progress"] is True
+
+
+def test_stabilization_a_full_solve_multi_anchor_plan_uses_strong_bank_floor(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    plan = _kg_plan(
+        preferred_tool_mode="full_solve",
+        execution_style="relation_first",
+    )
+
+    anchor_only_result = controller._summarize_toolgen_live_progress(
+        {
+            "status": "SUCCESS",
+            "final_variable": "#1",
+            "observation": 'minted_variables: {"resolved_CNES": "#1"}',
+        },
+        {"tool_plan": plan},
+    )
+
+    assert anchor_only_result["value_delivered"] == "resolved_anchor"
+    assert anchor_only_result["minimum_bankable_achieved_state"] == "resolved_both_anchors"
+    assert anchor_only_result["material_progress"] is False
+    assert anchor_only_result["bankable_partial_progress"] is False
+    assert anchor_only_result["reason"] == "resolved_anchor_only_insufficient_for_plan"
+
+
+def test_stabilization_a_multi_anchor_progress_plan_accepts_resolved_both_anchors_floor(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    plan = _kg_plan(
+        preferred_tool_mode="progress_tool",
+        execution_style="partial_value_first",
+    )
+
+    result = controller._summarize_toolgen_live_progress(
+        {
+            "status": "MACRO EXHAUSTED",
+            "final_variable": None,
+            "observation": (
+                "MACRO EXHAUSTED: Resulting set is empty. "
+                'minted_variables: {"resolved_Goat": "#1", "resolved_cows": ["#2"]}'
+            ),
+        },
+        {"tool_plan": plan},
+    )
+
+    assert result["value_delivered"] == "resolved_both_anchors"
+    assert result["material_progress"] is True
+    assert result["partial_value_usable"] is True
+
+
+def test_stabilization_a_regression_below_best_achieved_state_is_demoted(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    regressed = controller._toolgen_apply_validation_policy(
+        validation={
+            "grade": 7,
+            "issues": [],
+            "fixes": [],
+            "summary": "regressed to weaker anchor-only shape",
+            "plan_diagnosis": "OK",
+            "repair_mode": "none",
+        },
+        execution_validation={
+            "status": "SUCCESS",
+            "final_variable": "#1",
+            "observation": 'Variable #1 contains resolved anchor. minted_variables: {"resolved_Goat": "#1"}',
+        },
+        live_progress_summary={
+            "execution_status": "SUCCESS",
+            "has_final_variable": True,
+            "has_context": True,
+            "material_progress": True,
+            "handoff_state": "partial_safe_continue",
+            "final_operation_safe": False,
+        },
+        round_context={
+            "round": 5,
+            "preferred_tool_mode": "progress_tool",
+            "best_achieved_state": "produced_actionable_handoff",
+        },
+        tool_plan=_kg_plan(preferred_tool_mode="progress_tool"),
+        tool_code=(
+            "def run(payload: dict) -> dict:\n"
+            "    entities = payload.get('entities') or []\n"
+            "    attribute_target_concept = payload.get('attribute_target_concept')\n"
+            "    for ent in entities:\n"
+            "        out = kg_utils.resolve_entity_to_vars(ent, None, {}, None)\n"
+            "        ids = kg_utils.extract_var_ids(out)\n"
+            "        if ids:\n"
+            "            return {'status': 'SUCCESS', 'final_variable': ids[0], 'observation': 'ok'}\n"
+        ),
+    )
+    assert regressed["grade"] <= 4
+    assert regressed["partial_value_usable"] is False
+    assert regressed["prefer_best_retry_anchor"] is True
+    assert any(
+        "regressed_below_best_achieved_state" in str(item)
+        for item in regressed["issues"]
+    )
+
+
+def test_stabilization_a_anchor_only_insufficiency_sets_next_round_constraint(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    result = controller._toolgen_apply_validation_policy(
+        validation={
+            "grade": 7,
+            "issues": [],
+            "fixes": [],
+            "summary": "anchor-only output is too broad",
+            "plan_diagnosis": "OK",
+            "repair_mode": "none",
+        },
+        execution_validation={
+            "status": "SUCCESS",
+            "final_variable": "#1",
+            "observation": 'minted_variables: {"resolved_CNES": "#1"}',
+        },
+        live_progress_summary={
+            "execution_status": "SUCCESS",
+            "has_final_variable": True,
+            "has_context": True,
+            "material_progress": False,
+            "partial_value_usable": False,
+            "handoff_state": "partial_fallback_not_final",
+            "final_operation_safe": False,
+            "value_delivered": "resolved_anchor",
+            "achieved_state": "resolved_anchor",
+            "reason": "resolved_anchor_only_insufficient_for_plan",
+        },
+        round_context={
+            "round": 2,
+            "preferred_tool_mode": "full_solve",
+        },
+        tool_plan=_kg_plan(
+            preferred_tool_mode="full_solve",
+            execution_style="relation_first",
+        ),
+        tool_code="def run(payload: dict) -> dict:\n    return {}\n",
+    )
+
+    assert result["repair_mode"] == "rewrite_code"
+    assert "minimum_acceptable_deliverable" in result
+    assert "resolved_both_anchors" in result["minimum_acceptable_deliverable"]
+    assert "PLAN-STAGE REPAIR TARGET" in str(result["primary_repair_instruction"])
+
+
+def test_stage_binding_retry_context_sets_required_next_state_for_attribute_intersector(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    plan = _kg_plan(
+        target_archetype="ATTRIBUTE_INTERSECTOR",
+        preferred_tool_mode="full_solve",
+        entities=["Goat", "cows", "semi-firm"],
+        entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+        attribute_target_concept="cheese.texture",
+        topological_execution_plan=[
+            "1. Resolve both anchors.",
+            "2. Walk anchor A to cheese candidates.",
+            "3. Walk anchor B to cheese candidates.",
+            "4. Intersect the cheese candidate sets.",
+            "5. Apply resolve_semantic_filter for texture.",
+        ],
+    )
+    round_context, _ = controller._toolgen_bind_best_partial_retry_context(
+        {"round": 2, "preferred_tool_mode": "full_solve"},
+        tool_plan=plan,
+        round_history=[
+            {
+                "round": 1,
+                "value_delivered": "resolved_both_anchors",
+                "tool_name": "generated_tool",
+                "bankable_partial_progress": True,
+            }
+        ],
+        best_candidate=None,
+        best_live_candidate=None,
+        best_partial_candidate=None,
+        best_partial_live_candidate=None,
+    )
+
+    assert round_context["required_next_achieved_state"] == "built_filter_ready_set"
+    assert round_context["required_handoff_achieved_state"] == "built_filter_ready_set"
+    assert "intersect the two anchor-derived target sets" in str(
+        round_context["stage_binding_instruction"]
+    ).lower()
+    assert "apply resolve_semantic_filter to the intersection" in str(
+        round_context["stage_binding_instruction"]
+    ).lower()
+    assert "if preserved anchor vars" in str(
+        round_context["stage_binding_instruction"]
+    ).lower()
+    assert "fallback recovery" in str(round_context["stage_binding_instruction"]).lower()
+    assert "do not return error solely because preserved anchors are absent" in str(
+        round_context["stage_binding_instruction"]
+    ).lower()
+
+
+def test_stage_binding_validation_demotes_anchor_reresolve_main_output_after_preserved_state(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    plan = _kg_plan(
+        target_archetype="ATTRIBUTE_INTERSECTOR",
+        preferred_tool_mode="progress_tool",
+        execution_style="partial_value_first",
+        entities=["Goat", "cows", "semi-firm"],
+        entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+        attribute_target_concept="cheese.texture",
+        topological_execution_plan=[
+            "1. Resolve both anchors.",
+            "2. Walk anchor A to cheese candidates.",
+            "3. Walk anchor B to cheese candidates.",
+            "4. Intersect the cheese candidate sets.",
+            "5. Apply resolve_semantic_filter for texture.",
+        ],
+    )
+
+    result = controller._toolgen_apply_validation_policy(
+        validation={
+            "grade": 7,
+            "issues": [],
+            "fixes": [],
+            "summary": "candidate stopped at re-resolved anchors",
+            "plan_diagnosis": "OK",
+            "repair_mode": "none",
+        },
+        execution_validation={
+            "status": "MACRO EXHAUSTED",
+            "final_variable": None,
+            "observation": (
+                'minted_variables: {"resolved_Goat": "#1", "resolved_cows": "#2"}'
+            ),
+        },
+        live_progress_summary={
+            "execution_status": "MACRO EXHAUSTED",
+            "has_final_variable": False,
+            "has_context": True,
+            "material_progress": True,
+            "partial_value_usable": True,
+            "bankable_partial_progress": True,
+            "handoff_state": "partial_safe_continue",
+            "final_operation_safe": False,
+            "value_delivered": "resolved_both_anchors",
+            "achieved_state": "resolved_both_anchors",
+        },
+        round_context={
+            "round": 5,
+            "preferred_tool_mode": "progress_tool",
+            "best_achieved_state": "resolved_both_anchors",
+        },
+        tool_plan=plan,
+        tool_code=(
+            "def run(payload: dict) -> dict:\n"
+            "    entities = payload.get('entities') or []\n"
+            "    resolved = []\n"
+            "    for ent in entities[:2]:\n"
+            "        out = kg_utils.resolve_entity_to_vars(ent, None, {}, None)\n"
+            "        ids = kg_utils.extract_var_ids(out)\n"
+            "        if ids:\n"
+            "            resolved.append(ids[0])\n"
+            "    return {'status': 'MACRO EXHAUSTED', 'final_variable': None, 'observation': str(resolved)}\n"
+        ),
+    )
+
+    assert result["grade"] <= 4
+    assert result["partial_value_usable"] is False
+    assert result["prefer_best_retry_anchor"] is True
+    assert "does_not_respect_preserved_anchor_vars" in result["semantic_code_smells"]
+    assert "re_resolve_anchors_as_main_output" in result["semantic_code_smells"]
+    assert any(
+        "does_not_respect_preserved_anchor_vars" in str(item)
+        for item in result["issues"]
+    )
+    assert any(
+        "re_resolve_anchors_as_main_output" in str(item)
+        for item in result["issues"]
+    )
+    assert "fallback recovery" in str(result["primary_repair_instruction"]).lower()
+
+
+def test_phase1_retry_state_activates_from_stage_binding_controls(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    state = controller._toolgen_phase1_retry_state(
+        json.dumps(
+            {
+                "phase": "validator",
+                "required_next_achieved_state": "built_filter_ready_set",
+                "required_handoff_achieved_state": "built_filter_ready_set",
+                "stage_binding_instruction": "advance directly to the filter-ready intersection",
+                "minimum_acceptable_deliverable": "return at least built_filter_ready_set",
+                "forbidden_fallback_shapes": ["raw_anchor_handoff"],
+                "force_structural_stage_rewrite": True,
+            }
+        )
+    )
+
+    assert state["active"] is True
+    assert state["omit_prior_code"] is True
+    assert state["override_preferred_tool_mode"] == "progress_tool"
+    assert state["required_next_achieved_state"] == "built_filter_ready_set"
+    assert state["force_structural_stage_rewrite"] is True
+
+
+def test_apply_round_strategy_context_rewrites_plan_to_stage_binding_sequence(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    payload = controller._toolgen_apply_round_strategy_context(
+        _kg_plan(
+            target_archetype="ATTRIBUTE_INTERSECTOR",
+            preferred_tool_mode="full_solve",
+            execution_style="walk_first",
+            entities=["Goat", "cows", "semi-firm"],
+            entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+            attribute_target_concept="cheese.texture",
+        ),
+        {
+            "round": 2,
+            "preferred_tool_mode": "progress_tool",
+            "required_next_achieved_state": "built_filter_ready_set",
+            "required_handoff_achieved_state": "built_filter_ready_set",
+            "stage_binding_instruction": "preserve anchors, walk both, intersect, filter, return filter-ready set",
+            "minimum_acceptable_deliverable": "return built_filter_ready_set",
+        },
+        phase1_retry_state={
+            "active": True,
+            "omit_prior_code": False,
+            "override_preferred_tool_mode": "progress_tool",
+            "minimum_acceptable_deliverable": "return built_filter_ready_set",
+            "primary_repair_dominates": True,
+            "required_next_achieved_state": "built_filter_ready_set",
+            "required_handoff_achieved_state": "built_filter_ready_set",
+            "stage_binding_instruction": "preserve anchors, walk both, intersect, filter, return filter-ready set",
+            "forbidden_fallback_shapes": [
+                "raw_anchor_handoff",
+                "raw_walk_set_handoff",
+            ],
+            "force_structural_stage_rewrite": False,
+        },
+    )
+    steps = payload["topological_execution_plan_steps"]
+
+    assert any("walk anchor a" in str(step).lower() for step in steps)
+    assert any("walk anchor b" in str(step).lower() for step in steps)
+    assert any("intersect the two anchor-derived target sets" in str(step).lower() for step in steps)
+    assert any("apply resolve_semantic_filter to the intersection" in str(step).lower() for step in steps)
+    assert any("built_filter_ready_set" in str(step) for step in steps)
+
+
+def test_blueprint_prompt_adds_compact_finish_chain_override_for_filter_ready_handoff(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    prompt = controller._toolgen_build_blueprint_prompt(
+        query="Question: find semi-firm cheese from goat and cows, Entities: ['Goat', 'cows', 'semi-firm']",
+        tool_type="macro",
+        reason="INPUT: ['Goat', 'cows', 'semi-firm']. GOAL: return the filter-ready overlap.",
+        upgrade_goal="INPUT: ['Goat', 'cows', 'semi-firm']. GOAL: finish the filter-ready chain.",
+        tool_plan=_kg_plan(
+            target_archetype="ATTRIBUTE_INTERSECTOR",
+            preferred_tool_mode="progress_tool",
+            entities=["Goat", "cows", "semi-firm"],
+            entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+            attribute_target_concept="cheese.texture",
+            required_next_achieved_state="built_filter_ready_set",
+            required_handoff_achieved_state="built_filter_ready_set",
+            topological_execution_plan=[
+                "1. Resolve both anchors.",
+                "2. Walk anchor A to cheese candidates.",
+                "3. Walk anchor B to cheese candidates.",
+                "4. Intersect the cheese candidate sets.",
+                "5. Apply resolve_semantic_filter for texture.",
+            ],
+        ),
+        env_name="knowledge_graph",
+        env_contract="Question: find semi-firm cheese from goat and cows, Entities: ['Goat', 'cows', 'semi-firm']",
+    )
+
+    assert "FILTER-READY FINISH-CHAIN OVERRIDE" in prompt
+    assert "Do not stop at resolved anchors, walked target sets, or raw intersection sets." in prompt
+    assert "Avoid alternate fallback branches" in prompt
+
+
+def test_validation_policy_repeated_same_stage_below_handoff_forces_structural_rewrite(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    result = controller._toolgen_apply_validation_policy(
+        validation={
+            "grade": 6,
+            "issues": [],
+            "fixes": [],
+            "summary": "repeated same-stage exhaustion",
+            "plan_diagnosis": "OK",
+            "repair_mode": "none",
+        },
+        execution_validation={
+            "status": "MACRO EXHAUSTED",
+            "final_variable": None,
+            "observation": 'minted_variables: {"resolved_Goat": "#1", "resolved_cows": "#2"}',
+        },
+        live_progress_summary={
+            "execution_status": "MACRO EXHAUSTED",
+            "has_final_variable": False,
+            "has_context": True,
+            "material_progress": True,
+            "handoff_state": "exhausted",
+            "final_operation_safe": False,
+            "value_delivered": "resolved_both_anchors",
+            "achieved_state": "resolved_both_anchors",
+            "reason": "honest_zero_no_handoff",
+        },
+        round_context={
+            "round": 3,
+            "preferred_tool_mode": "full_solve",
+            "best_achieved_state": "resolved_both_anchors",
+            "previous_achieved_state": "resolved_both_anchors",
+            "previous_failure_bucket": "partial_value_delivered",
+        },
+        tool_plan=_kg_plan(
+            target_archetype="ATTRIBUTE_INTERSECTOR",
+            preferred_tool_mode="full_solve",
+            entities=["Goat", "cows", "semi-firm"],
+            entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+            attribute_target_concept="cheese.texture",
+            topological_execution_plan=[
+                "1. Resolve both anchors.",
+                "2. Walk both anchors to cheese sets.",
+                "3. Intersect the cheese sets.",
+                "4. Apply resolve_semantic_filter for texture.",
+            ],
+        ),
+        tool_code="def run(payload: dict) -> dict:\n    return {}\n",
+    )
+
+    assert result["force_structural_stage_rewrite"] is True
+    assert result["prefer_best_retry_anchor"] is True
+    assert result["required_next_achieved_state"] == "built_filter_ready_set"
+    assert "intersect the two anchor-derived target sets" in str(
+        result["primary_repair_instruction"]
+    ).lower()
+
+
+def test_dynamic_plan_smells_flag_multi_anchor_filter_order_violation(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    smells = controller._toolgen_dynamic_plan_code_smells(
+        "\n".join(
+            [
+                "def run(payload: dict) -> dict:",
+                "    candidate_map = {}",
+                "    filtered = kg_utils.resolve_semantic_filter(walked_cheeses, 'cheese.texture', walked_cheeses)",
+                "    return {'status': 'SUCCESS', 'final_variable': '#1', 'observation': 'ok'}",
+            ]
+        ),
+        _kg_plan(
+            target_archetype="ATTRIBUTE_INTERSECTOR",
+            preferred_tool_mode="full_solve",
+            entities=["Goat", "cows", "semi-firm"],
+            entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+            attribute_target_concept="cheese.texture",
+            topological_execution_plan=[
+                "1. Resolve both anchors.",
+                "2. Walk to target sets.",
+                "3. Intersect the target sets.",
+                "4. Apply resolve_semantic_filter.",
+            ],
+        ),
+    )
+
+    assert "multi_anchor_filter_order_violation" in smells
+
+
+def test_stabilization_a_value_classification_recognizes_grounded_walk_intersect_and_filter_labels(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    plan = _kg_plan(
+        preferred_tool_mode="progress_tool",
+        execution_style="partial_value_first",
+        attribute_target_concept="cheese.texture",
+        topological_execution_plan=[
+            "1. Resolve both anchors.",
+            "2. Walk to cheese candidates.",
+            "3. Intersect the candidate sets.",
+            "4. Apply resolve_semantic_filter for texture.",
+        ],
+    )
+
+    walk_value = controller._toolgen_classify_value_delivered(
+        tool_plan=plan,
+        execution_validation={
+            "status": "SUCCESS",
+            "final_variable": "#3",
+            "observation": 'minted_variables: {"walk_Goat_to_cheese": "#3"}',
+        },
+        live_progress_summary={
+            "execution_status": "SUCCESS",
+            "has_final_variable": True,
+            "has_context": True,
+        },
+    )
+    intersect_value = controller._toolgen_classify_value_delivered(
+        tool_plan=plan,
+        execution_validation={
+            "status": "SUCCESS",
+            "final_variable": "#4",
+            "observation": 'minted_variables: {"intersect_Goat_cows": "#4"}',
+        },
+        live_progress_summary={
+            "execution_status": "SUCCESS",
+            "has_final_variable": True,
+            "has_context": True,
+        },
+    )
+    filter_value = controller._toolgen_classify_value_delivered(
+        tool_plan=plan,
+        execution_validation={
+            "status": "SUCCESS",
+            "final_variable": "#5",
+            "observation": 'minted_variables: {"filter_texture_semifirm": ["#5"]}',
+        },
+        live_progress_summary={
+            "execution_status": "SUCCESS",
+            "has_final_variable": True,
+            "has_context": True,
+        },
+    )
+
+    assert walk_value == "built_target_set"
+    assert intersect_value == "built_intersection_set"
+    assert filter_value == "built_filter_ready_set"
+
+
+def test_stabilization_a_single_anchor_plan_still_accepts_resolved_anchor_progress(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    plan = {
+        "preferred_tool_mode": "progress_tool",
+        "execution_style": "partial_value_first",
+        "target_concept": "scientist",
+        "entities": ["Einstein"],
+        "entity_target_concepts": ["scientist"],
+        "topological_execution_plan": [
+            "1. Resolve the anchor.",
+            "2. Return the grounded scientist variable.",
+        ],
+    }
+
+    result = controller._summarize_toolgen_live_progress(
+        {
+            "status": "SUCCESS",
+            "final_variable": "#1",
+            "observation": 'minted_variables: {"resolved_Einstein": "#1"}',
+        },
+        {"tool_plan": plan},
+    )
+
+    assert result["value_delivered"] == "resolved_anchor"
+    assert result["material_progress"] is True
+    assert result["usefulness_passed"] is True
+
+
+def test_stabilization_b_broad_multi_anchor_handoff_is_demoted_but_bankable(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    plan = _kg_plan(
+        preferred_tool_mode="progress_tool",
+        execution_style="partial_value_first",
+        entities=["Goat", "cows", "semi-firm"],
+        entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+        attribute_target_concept="cheese.texture",
+        topological_execution_plan=[
+            "1. Resolve both anchors.",
+            "2. Walk to cheese candidates.",
+            "3. Intersect the candidate sets.",
+            "4. Apply resolve_semantic_filter for texture.",
+        ],
+    )
+
+    result = controller._summarize_toolgen_live_progress(
+        {
+            "status": "SUCCESS",
+            "final_variable": "#0",
+            "observation": (
+                'minted_variables: {"resolved_Goat": "#0", "resolved_cows": ["#1"]}'
+            ),
+        },
+        {"tool_plan": plan},
+    )
+
+    assert result["value_delivered"] == "resolved_both_anchors"
+    assert result["bankable_partial_progress"] is True
+    assert result["usefulness_passed"] is False
+    assert result["reason"] == "plan_stage_handoff_too_broad"
+
+
+def test_stabilization_b_full_solve_attribute_filter_plan_rejects_broad_anchor_handoff(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    plan = _kg_plan(
+        preferred_tool_mode="full_solve",
+        execution_style="relation_first",
+        entities=["Goat", "cows", "semi-firm"],
+        entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+        attribute_target_concept="cheese.texture",
+        topological_execution_plan=[
+            "1. Resolve both anchors.",
+            "2. Walk to cheese candidates.",
+            "3. Intersect the candidate sets.",
+            "4. Apply resolve_semantic_filter for texture.",
+        ],
+    )
+
+    result = controller._summarize_toolgen_live_progress(
+        {
+            "status": "SUCCESS",
+            "final_variable": "#0",
+            "observation": (
+                'minted_variables: {"resolved_Goat": "#0", "resolved_cows": ["#1"]}'
+            ),
+        },
+        {"tool_plan": plan},
+    )
+
+    assert result["value_delivered"] == "resolved_both_anchors"
+    assert result["minimum_handoff_achieved_state"] == "built_filter_ready_set"
+    assert result["bankable_partial_progress"] is True
+    assert result["usefulness_passed"] is False
+    assert result["reason"] == "plan_stage_handoff_too_broad"
+
+
+def test_stabilization_b_filter_ready_handoff_is_accepted_for_attribute_filter_plan(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    plan = _kg_plan(
+        preferred_tool_mode="progress_tool",
+        execution_style="partial_value_first",
+        entities=["Goat", "cows", "semi-firm"],
+        entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+        attribute_target_concept="cheese.texture",
+        topological_execution_plan=[
+            "1. Resolve both anchors.",
+            "2. Walk to cheese candidates.",
+            "3. Intersect the candidate sets.",
+            "4. Apply resolve_semantic_filter for texture.",
+        ],
+    )
+
+    result = controller._summarize_toolgen_live_progress(
+        {
+            "status": "SUCCESS",
+            "final_variable": "#7",
+            "observation": 'minted_variables: {"filter_texture_semifirm": ["#7"]}',
+        },
+        {"tool_plan": plan},
+    )
+
+    assert result["value_delivered"] == "built_filter_ready_set"
+    assert result["usefulness_passed"] is True
+    assert result["minimum_handoff_achieved_state"] == "built_filter_ready_set"
+
+
+def test_stabilization_c_best_achieved_summary_skips_below_floor_anchor_states(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    history = [
+        {
+            "round": 1,
+            "value_delivered": "resolved_anchor",
+            "tool_name": "t1",
+            "bankable_partial_progress": False,
+        },
+        {
+            "round": 2,
+            "value_delivered": "built_target_set",
+            "tool_name": "t2",
+            "bankable_partial_progress": True,
+        },
+    ]
+
+    result = controller._toolgen_best_achieved_state_summary(history)
+    assert result["best_achieved_state"] == "built_target_set"
+    assert result["best_achieved_round"] == 2
 
 
 def test_stabilization_b_helper_signature_mismatch_is_a_blocking_smell(
@@ -3919,7 +4937,7 @@ def test_stabilization_b_helper_signature_mismatch_is_a_blocking_smell(
         "        vars_b = kg_utils.resolve_entity_to_vars('Astrium', None, actions_spec, domain_hints)\n"
         "        walk_b = kg_utils.walk_to_target(actions_spec, vars_b, target_concept, domain_hints)\n"
         "        # correct: 3 positional args\n"
-        "        result = kg_utils.cross_intersect(walk_a, walk_b, actions_spec)\n"
+        "        result = kg_utils.cross_intersect(actions_spec, walk_a, walk_b)\n"
         "        return {'status': 'SUCCESS', 'final_variable': None, 'observation': str(result)}\n"
         "    except Exception as e:\n"
         "        return {'status': 'ERROR', 'final_variable': None, 'observation': str(e)}\n"
@@ -3940,6 +4958,459 @@ def test_stabilization_b_helper_signature_mismatch_is_a_blocking_smell(
         "helper_signature_mismatch must be listed in blocking_kg_smells inside "
         "_toolgen_validate_candidate_tool to prevent live-run TypeError"
     )
+
+
+def test_stabilization_d_resolve_semantic_filter_context_misuse_is_preblocked(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    live_calls = {"count": 0}
+    controller._toolgen_execution_payload = {
+        "tool_plan": _kg_plan(
+            preferred_tool_mode="progress_tool",
+            execution_style="partial_value_first",
+            entities=["Goat", "cows", "semi-firm"],
+            entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+            attribute_target_concept="cheese.texture",
+            topological_execution_plan=[
+                "1. Resolve both anchors.",
+                "2. Walk to cheese candidates.",
+                "3. Intersect the candidate sets.",
+                "4. Apply resolve_semantic_filter for texture.",
+            ],
+        )
+    }
+    controller._toolgen_execution_check = lambda tool_code, exec_payload: live_calls.__setitem__(
+        "count", live_calls["count"] + 1
+    ) or {
+        "status": "SUCCESS",
+        "final_variable": "#9",
+        "observation": "unexpected live execution",
+    }
+    controller._toolgen_validator_call = lambda payload: {
+        "grade": 8,
+        "issues": [],
+        "fixes": [],
+        "summary": "candidate superficially looks usable",
+        "plan_diagnosis": "OK",
+        "repair_mode": "none",
+    }
+
+    tool_code = (
+        "def run(payload: dict) -> dict:\n"
+        "    variable_list = payload.get('variable_list') or []\n"
+        "    target_concept = payload.get('attribute_target_concept')\n"
+        "    base_var = '#1'\n"
+        "    filtered = kg_utils.resolve_semantic_filter(variable_list, target_concept, base_var)\n"
+        "    return {'status': 'SUCCESS', 'final_variable': '#9', 'observation': str(filtered)}\n"
+        "\n"
+        "def self_test() -> bool:\n"
+        "    return True\n"
+    )
+
+    validation = controller._toolgen_validate_candidate_tool(
+        {
+            "name": "bad_filter_context",
+            "description": "test tool",
+            "signature": "run(payload: dict) -> dict",
+        },
+        tool_code,
+        task_pack="test task pack",
+        run_live_execution_check=True,
+    )
+
+    assert validation is not None
+    assert live_calls["count"] == 0
+    assert "resolve_semantic_filter_context_misuse" in validation["semantic_code_smells"]
+    assert "stale_anchor_filter_context" in validation["semantic_code_smells"]
+    assert validation["usefulness_passed"] is False
+    assert validation["grade"] <= 4
+
+
+def test_stabilization_d_variable_list_is_optional_and_missing_it_is_preblocked(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    live_calls = {"count": 0}
+    controller._toolgen_execution_payload = {
+        "tool_plan": _kg_plan(
+            preferred_tool_mode="progress_tool",
+            execution_style="partial_value_first",
+        )
+    }
+    controller._toolgen_execution_check = lambda tool_code, exec_payload: live_calls.__setitem__(
+        "count", live_calls["count"] + 1
+    ) or {
+        "status": "SUCCESS",
+        "final_variable": "#9",
+        "observation": "unexpected live execution",
+    }
+    controller._toolgen_validator_call = lambda payload: {
+        "grade": 8,
+        "issues": [],
+        "fixes": [],
+        "summary": "candidate superficially looks usable",
+        "plan_diagnosis": "OK",
+        "repair_mode": "none",
+    }
+
+    tool_code = (
+        "def run(payload: dict) -> dict:\n"
+        "    variable_list = payload.get('variable_list')\n"
+        "    if not variable_list:\n"
+        "        return {'status': 'ERROR', 'final_variable': None, 'observation': 'missing variable_list'}\n"
+        "    return {'status': 'SUCCESS', 'final_variable': '#1', 'observation': 'ok'}\n"
+        "\n"
+        "def self_test() -> bool:\n"
+        "    return True\n"
+    )
+
+    validation = controller._toolgen_validate_candidate_tool(
+        {
+            "name": "bad_preserved_state_contract",
+            "description": "test tool",
+            "signature": "run(payload: dict) -> dict",
+        },
+        tool_code,
+        task_pack="test task pack",
+        run_live_execution_check=True,
+    )
+
+    assert validation is not None
+    assert live_calls["count"] == 0
+    assert "requires_variable_list_in_payload" in validation["semantic_code_smells"]
+    assert validation["usefulness_passed"] is False
+    assert validation["grade"] <= 4
+
+
+def test_stabilization_d_remaining_helper_context_misuse_is_preblocked(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    live_calls = {"count": 0}
+    controller._toolgen_execution_check = lambda tool_code, exec_payload: live_calls.__setitem__(
+        "count", live_calls["count"] + 1
+    ) or {
+        "status": "SUCCESS",
+        "final_variable": "#9",
+        "observation": "unexpected live execution",
+    }
+    controller._toolgen_validator_call = lambda payload: {
+        "grade": 8,
+        "issues": [],
+        "fixes": [],
+        "summary": "candidate superficially looks usable",
+        "plan_diagnosis": "OK",
+        "repair_mode": "none",
+    }
+
+    cases = [
+        (
+            "walk_to_target_context_misuse",
+            _kg_plan(
+                preferred_tool_mode="full_solve",
+                execution_style="relation_first",
+            ),
+            (
+                "def run(payload: dict) -> dict:\n"
+                "    actions_spec = payload.get('actions_spec') or {}\n"
+                "    domain_hints = payload.get('domain_hints') or {}\n"
+                "    vars_a = kg_utils.resolve_entity_to_vars('CNES', None, actions_spec, domain_hints)\n"
+                "    walked = kg_utils.walk_to_target(vars_a, actions_spec, 'spacecraft', domain_hints)\n"
+                "    return {'status': 'SUCCESS', 'final_variable': '#1', 'observation': str(walked)}\n"
+                "\n"
+                "def self_test() -> bool:\n"
+                "    return True\n"
+            ),
+        ),
+        (
+            "cross_intersect_context_misuse",
+            _kg_plan(
+                preferred_tool_mode="full_solve",
+                execution_style="relation_first",
+            ),
+            (
+                "def run(payload: dict) -> dict:\n"
+                "    actions_spec = payload.get('actions_spec') or {}\n"
+                "    walk_a = '#1'\n"
+                "    walk_b = '#2'\n"
+                "    overlap = kg_utils.cross_intersect(walk_a, walk_b, actions_spec)\n"
+                "    return {'status': 'SUCCESS', 'final_variable': '#3', 'observation': str(overlap)}\n"
+                "\n"
+                "def self_test() -> bool:\n"
+                "    return True\n"
+            ),
+        ),
+        (
+            "extract_attribute_value_context_misuse",
+            {
+                "target_archetype": "SUPERLATIVE_FINDER",
+                "preferred_tool_mode": "full_solve",
+                "execution_style": "attribute_mapping_first",
+                "entities": ["fighter"],
+                "target_concept": "aircraft",
+                "attribute_target_concept": "maximum_damage",
+                "topological_execution_plan": [
+                    "1. Resolve the anchor.",
+                    "2. Walk to aircraft candidates.",
+                    "3. Use extract_attribute_value on the helper output.",
+                    "4. Use argmax over the extracted values.",
+                ],
+            },
+            (
+                "def run(payload: dict) -> dict:\n"
+                "    attribute_target_concept = payload.get('attribute_target_concept')\n"
+                "    extracted = kg_utils.extract_attribute_value(attribute_target_concept)\n"
+                "    return {'status': 'SUCCESS', 'final_variable': '#4', 'observation': str(extracted)}\n"
+                "\n"
+                "def self_test() -> bool:\n"
+                "    return True\n"
+            ),
+        ),
+    ]
+
+    for smell, plan, tool_code in cases:
+        controller._toolgen_execution_payload = {"tool_plan": plan}
+        before = live_calls["count"]
+        validation = controller._toolgen_validate_candidate_tool(
+            {
+                "name": f"bad_{smell}",
+                "description": "test tool",
+                "signature": "run(payload: dict) -> dict",
+            },
+            tool_code,
+            task_pack="test task pack",
+            run_live_execution_check=True,
+        )
+
+        assert validation is not None
+        assert live_calls["count"] == before
+        assert smell in validation["semantic_code_smells"]
+        assert validation["usefulness_passed"] is False
+        assert validation["grade"] <= 4
+
+
+def test_stabilization_d_missing_attribute_filter_application_is_blocking(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    controller._toolgen_execution_payload = {
+        "tool_plan": _kg_plan(
+            preferred_tool_mode="progress_tool",
+            execution_style="partial_value_first",
+            entities=["Goat", "cows", "semi-firm"],
+            entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+            attribute_target_concept="cheese.texture",
+            topological_execution_plan=[
+                "1. Resolve both anchors.",
+                "2. Walk to cheese candidates.",
+                "3. Intersect the candidate sets.",
+                "4. Apply resolve_semantic_filter for texture.",
+            ],
+        )
+    }
+    controller._toolgen_execution_check = lambda tool_code, exec_payload: {
+        "status": "SUCCESS",
+        "final_variable": "#3",
+        "observation": 'minted_variables: {"intersect_goat_cows": "#3"}',
+    }
+    controller._toolgen_validator_call = lambda payload: {
+        "grade": 7,
+        "issues": [],
+        "fixes": [],
+        "summary": "candidate superficially looks usable",
+        "plan_diagnosis": "OK",
+        "repair_mode": "none",
+    }
+
+    tool_code = (
+        "def run(payload: dict) -> dict:\n"
+        "    actions_spec = payload.get('actions_spec') or {}\n"
+        "    domain_hints = payload.get('domain_hints') or {}\n"
+        "    vars_a = kg_utils.resolve_entity_to_vars('Goat', None, actions_spec, domain_hints)\n"
+        "    vars_b = kg_utils.resolve_entity_to_vars('cows', None, actions_spec, domain_hints)\n"
+        "    walk_a = kg_utils.walk_to_target(actions_spec, vars_a, 'cheese', domain_hints)\n"
+        "    walk_b = kg_utils.walk_to_target(actions_spec, vars_b, 'cheese', domain_hints)\n"
+        "    overlap = kg_utils.cross_intersect(actions_spec, walk_a, walk_b)\n"
+        "    return {'status': 'SUCCESS', 'final_variable': '#3', 'observation': str(overlap)}\n"
+        "\n"
+        "def self_test() -> bool:\n"
+        "    return True\n"
+    )
+
+    validation = controller._toolgen_validate_candidate_tool(
+        {
+            "name": "missing_filter",
+            "description": "test tool",
+            "signature": "run(payload: dict) -> dict",
+        },
+        tool_code,
+        task_pack="test task pack",
+        run_live_execution_check=True,
+    )
+
+    assert validation is not None
+    assert "missing_attribute_filter_application" in validation["semantic_code_smells"]
+    assert validation["usefulness_passed"] is False
+    assert validation["grade"] <= 4
+
+
+def test_validate_candidate_tool_blocks_exhausted_without_final_variable_admission(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    controller._toolgen_execution_payload = {
+        "tool_plan": _kg_plan(preferred_tool_mode="full_solve")
+    }
+    controller._toolgen_execution_check = lambda tool_code, exec_payload: {
+        "status": "MACRO EXHAUSTED",
+        "final_variable": None,
+        "observation": (
+            "MACRO EXHAUSTED: Resulting set is empty. "
+            'minted_variables: {"resolved_CNES": "#1", "resolved_Astrium": "#2"}'
+        ),
+    }
+    controller._toolgen_validator_call = lambda payload: {
+        "grade": 9,
+        "issues": [],
+        "fixes": [],
+        "summary": "looks superficially usable",
+        "plan_diagnosis": "OK",
+        "repair_mode": "none",
+    }
+
+    validation = controller._toolgen_validate_candidate_tool(
+        {
+            "name": "exhausted_without_final",
+            "description": "test tool",
+            "signature": "run(payload: dict) -> dict",
+        },
+        "def run(payload: dict) -> dict:\n    return {'status': 'MACRO EXHAUSTED', 'final_variable': None, 'observation': 'x'}\n",
+        task_pack="test task pack",
+        run_live_execution_check=True,
+    )
+
+    assert validation is not None
+    assert validation["admission_blocked"] is True
+    assert validation["usefulness_passed"] is False
+    assert validation["grade"] <= 4
+
+
+def test_stabilization_e_blanket_entity_resolve_loop_is_blocked_for_progress_retry(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    live_calls = {"count": 0}
+    controller._toolgen_execution_payload = {
+        "tool_plan": _kg_plan(
+            preferred_tool_mode="progress_tool",
+            execution_style="partial_value_first",
+            entities=["Goat", "cows", "semi-firm"],
+            entity_target_concepts=["dairy.animal", "dairy.animal", "cheese.texture"],
+            attribute_target_concept="cheese.texture",
+        )
+    }
+    controller._toolgen_execution_check = lambda tool_code, exec_payload: live_calls.__setitem__(
+        "count", live_calls["count"] + 1
+    ) or {
+        "status": "SUCCESS",
+        "final_variable": "#1",
+        "observation": 'Variable #1 contains resolved anchor. minted_variables: {"resolved_Goat": "#1"}',
+    }
+    controller._toolgen_validator_call = lambda payload: {
+        "grade": 7,
+        "issues": [],
+        "fixes": [],
+        "summary": "candidate superficially looks usable",
+        "plan_diagnosis": "OK",
+        "repair_mode": "none",
+    }
+
+    tool_code = (
+        '"""blanket resolver"""\n'
+        "def run(payload: dict) -> dict:\n"
+        "    entities = payload.get('entities') or []\n"
+        "    actions_spec = payload.get('actions_spec') or {}\n"
+        "    domain_hints = payload.get('domain_hints') or {}\n"
+        "    attribute_target_concept = payload.get('attribute_target_concept')\n"
+        "    for ent in entities:\n"
+        "        out = kg_utils.resolve_entity_to_vars(ent, None, actions_spec, domain_hints)\n"
+        "        ids = kg_utils.extract_var_ids(out)\n"
+        "        if ids:\n"
+        "            return {'status': 'SUCCESS', 'final_variable': ids[0], 'observation': 'resolved first anchor'}\n"
+        "    return {'status': 'MACRO EXHAUSTED', 'final_variable': None, 'observation': str(attribute_target_concept)}\n"
+        "\n"
+        "def self_test() -> bool:\n"
+        "    return True\n"
+    )
+    validation = controller._toolgen_validate_candidate_tool(
+        {
+            "name": "blanket_resolve_progress_tool",
+            "description": "test tool",
+            "signature": "run(payload: dict) -> dict",
+        },
+        tool_code,
+        task_pack="test task pack",
+        run_live_execution_check=True,
+    )
+
+    assert validation is not None
+    assert live_calls["count"] == 0
+    assert "blanket_entity_resolve_loop" in validation["semantic_code_smells"]
+    assert validation["usefulness_passed"] is False
+    assert validation["usefulness_reason"] == "blocking_semantic_code_smells"
+
+
+def test_stabilization_e_first_candidate_selection_by_index_is_preblocked(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    live_calls = {"count": 0}
+    controller._toolgen_execution_payload = {
+        "tool_plan": _kg_plan(
+            preferred_tool_mode="progress_tool",
+            execution_style="partial_value_first",
+        )
+    }
+    controller._toolgen_execution_check = lambda tool_code, exec_payload: live_calls.__setitem__(
+        "count", live_calls["count"] + 1
+    ) or {
+        "status": "SUCCESS",
+        "final_variable": "#1",
+        "observation": "unexpected live execution",
+    }
+    controller._toolgen_validator_call = lambda payload: {
+        "grade": 8,
+        "issues": [],
+        "fixes": [],
+        "summary": "candidate superficially looks usable",
+        "plan_diagnosis": "OK",
+        "repair_mode": "none",
+    }
+
+    tool_code = (
+        "def run(payload: dict) -> dict:\n"
+        "    candidate_ids = ['#1', '#2']\n"
+        "    return {'status': 'SUCCESS', 'final_variable': candidate_ids[0], 'observation': 'selected first candidate by index'}\n"
+        "\n"
+        "def self_test() -> bool:\n"
+        "    return True\n"
+    )
+    validation = controller._toolgen_validate_candidate_tool(
+        {
+            "name": "first_candidate_by_index",
+            "description": "test tool",
+            "signature": "run(payload: dict) -> dict",
+        },
+        tool_code,
+        task_pack="test task pack",
+        run_live_execution_check=True,
+    )
+
+    assert validation is not None
+    assert live_calls["count"] == 0
+    assert "first_candidate_selection_by_index" in validation["semantic_code_smells"]
+    assert validation["usefulness_passed"] is False
 
 
 def test_stabilization_c_pivot_required_omits_prior_code_from_full_rewrite_prompt(
@@ -4126,3 +5597,390 @@ def test_stabilization_d_data_sparse_overridden_when_code_quality_failure(
     assert not abort_on_override_round, (
         "toolgen_data_sparse_abort must NOT fire in the same round as the override"
     )
+
+
+# ---------------------------------------------------------------------------
+# Turn-0 ToolGen gating (spec A/B)
+# ---------------------------------------------------------------------------
+
+
+def test_best_achieved_state_summary_returns_none_for_empty_history(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_toolgen_best_achieved_state_summary returns 'none' when round_history is empty."""
+    controller = _DummyController(tmp_path)
+    result = controller._toolgen_best_achieved_state_summary([])
+    assert result["best_achieved_state"] == "none"
+    assert result["best_achieved_round"] is None
+
+
+def test_best_achieved_state_summary_picks_highest_ranked_state(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_toolgen_best_achieved_state_summary returns the highest-ranked value state seen."""
+    controller = _DummyController(tmp_path)
+    history = [
+        {"round": 1, "value_delivered": "resolved_anchor", "tool_name": "t1"},
+        {"round": 2, "value_delivered": "produced_actionable_handoff", "tool_name": "t2"},
+        {"round": 3, "value_delivered": "built_target_set", "tool_name": "t3"},
+    ]
+    result = controller._toolgen_best_achieved_state_summary(history)
+    assert result["best_achieved_state"] == "produced_actionable_handoff"
+    assert result["best_achieved_round"] == 2
+    assert result["best_achieved_tool_name"] == "t2"
+
+
+def test_best_achieved_state_summary_skips_none_value_entries(
+    tmp_path: pathlib.Path,
+) -> None:
+    """'none' value_delivered entries do not contribute to best-achieved state."""
+    controller = _DummyController(tmp_path)
+    history = [
+        {"round": 1, "value_delivered": "none", "tool_name": "t1"},
+        {"round": 2, "value_delivered": "resolved_both_anchors", "tool_name": "t2"},
+    ]
+    result = controller._toolgen_best_achieved_state_summary(history)
+    assert result["best_achieved_state"] == "resolved_both_anchors"
+    assert result["best_achieved_round"] == 2
+
+
+def test_best_partial_retry_context_preserves_best_candidate_anchor(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    best_partial = _candidate_obj(
+        name="best_partial",
+        value_delivered="built_intersection_set",
+        partial_value_usable=True,
+        semantic_trust_level="partial_unverified",
+        semantic_code_smells=[],
+        failure_bucket="partial_value_delivered",
+        grade=6,
+    )
+    context, anchor_candidate = controller._toolgen_bind_best_partial_retry_context(
+        {"round": 4, "pivot_required": False},
+        round_history=_make_round_history_with_partial_success(),
+        best_candidate=best_partial,
+        best_live_candidate=None,
+        best_partial_candidate=best_partial,
+        best_partial_live_candidate=None,
+    )
+    assert context["preserve_best_partial_candidate"] is True
+    assert context["best_achieved_state"] == "produced_actionable_handoff"
+    assert context["do_not_regress_below_best_achieved_state"] == "produced_actionable_handoff"
+    assert anchor_candidate is best_partial
+
+
+def test_best_achieved_final_state_is_used_as_retry_anchor(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    best_full = _candidate_obj(
+        name="best_full",
+        value_delivered="produced_final_variable",
+        partial_value_usable=True,
+        semantic_trust_level="verified",
+        semantic_code_smells=[],
+        failure_bucket="final_value_delivered",
+        grade=8,
+        usefulness_passed=True,
+    )
+    weaker_partial = _candidate_obj(
+        name="weaker_partial",
+        value_delivered="resolved_both_anchors",
+        partial_value_usable=True,
+        semantic_trust_level="partial_unverified",
+        semantic_code_smells=[],
+        failure_bucket="partial_value_delivered",
+        grade=6,
+    )
+
+    context, anchor_candidate = controller._toolgen_bind_best_partial_retry_context(
+        {"round": 4, "pivot_required": False},
+        round_history=[
+            {
+                "round": 1,
+                "value_delivered": "produced_final_variable",
+                "tool_name": "best_full",
+                "usefulness_passed": True,
+            }
+        ],
+        best_candidate=best_full,
+        best_live_candidate=None,
+        best_partial_candidate=weaker_partial,
+        best_partial_live_candidate=None,
+    )
+
+    assert context["preserve_best_partial_candidate"] is True
+    assert context["best_achieved_state"] == "produced_final_variable"
+    assert context["best_retry_anchor_achieved_state"] == "produced_final_variable"
+    assert anchor_candidate is best_full
+
+
+def test_feedback_note_with_authoritative_baseline_uses_best_candidate_validation(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    retry_anchor = _candidate_obj(
+        name="best_intersection",
+        value_delivered="built_intersection_set",
+        partial_value_usable=True,
+        semantic_trust_level="partial_unverified",
+        semantic_code_smells=[],
+        failure_bucket="partial_value_delivered",
+        grade=7,
+    )
+    retry_anchor["validation"].update(
+        {
+            "summary": "best prior candidate built the grounded intersection set",
+            "issues": ["repair local helper misuse without changing topology"],
+            "fixes": ["keep the grounded intersection handoff"],
+            "achieved_state": "built_intersection_set",
+        }
+    )
+
+    note = controller._toolgen_feedback_note_with_authoritative_baseline(
+        json.dumps(
+            {
+                "phase": "validator",
+                "validation": {"summary": "weak current candidate"},
+                "primary_repair_instruction": "repair the current round",
+            }
+        ),
+        failed_validation={
+            "prefer_best_retry_anchor": True,
+            "primary_repair_instruction": "repair the local regression",
+        },
+        retry_anchor_candidate=retry_anchor,
+    )
+    payload = json.loads(note)
+
+    assert payload["prefer_best_retry_anchor"] is True
+    assert payload["validation"]["summary"] == (
+        "best prior candidate built the grounded intersection set"
+    )
+    assert payload["authoritative_retry_baseline"]["achieved_state"] == (
+        "built_intersection_set"
+    )
+    assert "authoritative_retry_baseline" in payload["CRITICAL_INSTRUCTION"].lower()
+
+
+def test_normalize_tool_spec_persists_structured_registration_metadata(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    enriched = controller._toolgen_enrich_registration_payload(
+        {
+            "name": "kg_macro_generated_tool",
+            "description": "test tool",
+            "signature": "run(payload: dict) -> dict",
+            "code_lines": [
+                "def run(payload: dict) -> dict:",
+                "    return {'status': 'SUCCESS', 'final_variable': '#1', 'observation': 'ok'}",
+            ],
+        },
+        registration_exec_payload=_kg_plan(),
+    )
+    normalized = controller._normalize_tool_spec(enriched)
+    props = normalized["input_schema"]["properties"]
+
+    assert props["target_archetype"]["const"] == "COUNTING_INTERSECTOR"
+    assert props["output_form"]["const"] == "count_variable"
+    assert "archetype:COUNTING_INTERSECTOR" in normalized["capabilities"]
+    assert "output_form:count_variable" in normalized["capabilities"]
+
+
+def test_orchestrator_prefers_structured_archetype_and_output_form_metadata(
+    tmp_path: pathlib.Path,
+) -> None:
+    controller = _DummyController(tmp_path)
+    tool = types.SimpleNamespace(
+        name="kg_macro_generated_tool",
+        signature="run(payload: dict) -> dict",
+        docstring="generic facade",
+        description="generic grounded tool",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "target_archetype": {"const": "COUNTING_INTERSECTOR", "type": "string"},
+                "output_form": {"const": "count_variable", "type": "string"},
+            },
+        },
+        required_keys=[],
+        optional_keys=[],
+        property_types={},
+        capabilities=[
+            "archetype:COUNTING_INTERSECTOR",
+            "output_form:count_variable",
+            "target_concept:spacecraft",
+        ],
+        creation_time="1",
+        success_count=0,
+        failure_count=0,
+        reliability_score=1.0,
+        negative_marks=0,
+    )
+    controller._registry = types.SimpleNamespace(
+        retrieve_similar_tools=lambda query_text, top_k, environment: [tool]
+    )
+    controller._load_dynamic_registry = lambda: [tool]  # noqa: SLF001
+    controller._parse_tool_invoke_contract = lambda tool_name: None  # noqa: SLF001
+    controller._append_generated_tools_log = lambda payload: None  # noqa: SLF001
+
+    compact = controller._orchestrator_compact_existing_tools(
+        query_text="How many shared spacecraft are there?",
+        tool_plan=_kg_plan(),
+        query_entity_count=2,
+    )
+    compatible, _, request_form, tool_form = controller._is_tool_output_form_compatible(
+        tool,
+        archetype_label="UNKNOWN",
+        query_text="How many shared spacecraft are there?",
+        tool_plan=_kg_plan(),
+    )
+
+    assert compact
+    assert compact[0]["archetype"] == "COUNTING_INTERSECTOR"
+    assert compatible is True
+    assert request_form == "count_variable"
+    assert tool_form == "count_variable"
+
+
+# ---------------------------------------------------------------------------
+# Patch failure best-achieved anchor preservation (spec C/D/E)
+# ---------------------------------------------------------------------------
+
+
+def _make_round_history_with_partial_success() -> list[dict]:
+    """Build a round_history where round 3 achieved produced_actionable_handoff."""
+    return [
+        {"round": 1, "value_delivered": "none", "tool_name": "tool_v1"},
+        {"round": 2, "value_delivered": "resolved_anchor", "tool_name": "tool_v2"},
+        {"round": 3, "value_delivered": "produced_actionable_handoff", "tool_name": "tool_v3"},
+    ]
+
+
+def test_patch_plan_parse_failure_includes_best_achieved_anchor(
+    tmp_path: pathlib.Path,
+) -> None:
+    """After patch_plan_parse failure, feedback_note must include best-achieved anchor
+    fields when a prior round achieved meaningful partial value."""
+    controller = _DummyController(tmp_path)
+    round_history = _make_round_history_with_partial_success()
+    best = controller._toolgen_best_achieved_state_summary(round_history)
+
+    # Simulate what the patched code does for patch_plan_parse failure
+    _patch_parse_note: dict = {
+        "phase": "patch_plan_parse",
+        "error": "Patch plan was not valid JSON with a non-empty operations list.",
+        "raw": "",
+    }
+    if best.get("best_achieved_state", "none") != "none":
+        _best_round = best.get("best_achieved_round")
+        _best_state = best["best_achieved_state"]
+        _patch_parse_note["best_achieved_state"] = _best_state
+        _patch_parse_note["best_achieved_round"] = _best_round
+        _patch_parse_note["primary_repair_instruction"] = (
+            f"Round {_best_round} achieved '{_best_state}'. "
+            "Recovery must preserve or improve that partial-success shape. "
+            "Do not regress to broader rewrite or lower-value first-attempt behavior."
+        )
+    feedback_note = json.loads(json.dumps(_patch_parse_note, ensure_ascii=True, default=str))
+
+    assert feedback_note["best_achieved_state"] == "produced_actionable_handoff", (
+        "patch_plan_parse feedback_note must include best_achieved_state anchor"
+    )
+    assert feedback_note["best_achieved_round"] == 3, (
+        "patch_plan_parse feedback_note must record the round that achieved best state"
+    )
+    assert "primary_repair_instruction" in feedback_note, (
+        "patch_plan_parse feedback_note must include primary_repair_instruction anchor"
+    )
+    assert "produced_actionable_handoff" in feedback_note["primary_repair_instruction"]
+    assert "regress" in feedback_note["primary_repair_instruction"].lower()
+
+
+def test_patch_apply_failure_includes_best_achieved_anchor(
+    tmp_path: pathlib.Path,
+) -> None:
+    """After patch_apply failure, feedback_note must include best-achieved anchor
+    fields when a prior round achieved meaningful partial value."""
+    controller = _DummyController(tmp_path)
+    round_history = _make_round_history_with_partial_success()
+    best = controller._toolgen_best_achieved_state_summary(round_history)
+
+    # Simulate what the patched code does for patch_apply failure
+    _patch_apply_note: dict = {
+        "phase": "patch_apply",
+        "error": "hunk mismatch at line 42",
+        "plan": [],
+    }
+    if best.get("best_achieved_state", "none") != "none":
+        _best_round = best.get("best_achieved_round")
+        _best_state = best["best_achieved_state"]
+        _patch_apply_note["best_achieved_state"] = _best_state
+        _patch_apply_note["best_achieved_round"] = _best_round
+        _patch_apply_note["primary_repair_instruction"] = (
+            f"Round {_best_round} achieved '{_best_state}'. "
+            "Recovery must preserve or improve that partial-success shape. "
+            "Do not regress to broader rewrite or lower-value first-attempt behavior."
+        )
+    feedback_note = json.loads(json.dumps(_patch_apply_note, ensure_ascii=True, default=str))
+
+    assert feedback_note["best_achieved_state"] == "produced_actionable_handoff", (
+        "patch_apply feedback_note must include best_achieved_state anchor"
+    )
+    assert feedback_note["best_achieved_round"] == 3, (
+        "patch_apply feedback_note must record the round that achieved best state"
+    )
+    assert "primary_repair_instruction" in feedback_note, (
+        "patch_apply feedback_note must include primary_repair_instruction anchor"
+    )
+    assert "produced_actionable_handoff" in feedback_note["primary_repair_instruction"]
+    assert "regress" in feedback_note["primary_repair_instruction"].lower()
+
+
+def test_patch_failure_no_anchor_when_no_prior_partial_success(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When no prior round has achieved meaningful value, patch failure feedback_note
+    must NOT include best-achieved anchor fields (no false anchoring)."""
+    controller = _DummyController(tmp_path)
+    round_history = [
+        {"round": 1, "value_delivered": "none", "tool_name": "t1"},
+        {"round": 2, "value_delivered": "none", "tool_name": "t2"},
+    ]
+    best = controller._toolgen_best_achieved_state_summary(round_history)
+
+    _note: dict = {
+        "phase": "patch_apply",
+        "error": "hunk mismatch",
+        "plan": [],
+    }
+    if best.get("best_achieved_state", "none") != "none":
+        _note["best_achieved_state"] = best["best_achieved_state"]
+        _note["best_achieved_round"] = best.get("best_achieved_round")
+        _note["primary_repair_instruction"] = "anchor"
+
+    assert "best_achieved_state" not in _note, (
+        "When no partial success exists, patch failure note must not add false anchor"
+    )
+    assert "primary_repair_instruction" not in _note, (
+        "When no partial success exists, patch failure note must not add primary_repair_instruction"
+    )
+
+
+def test_patch_failure_anchor_not_added_when_best_is_none(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Confirm _toolgen_best_achieved_state_summary gates on 'none' correctly —
+    an all-'none' history must yield best_achieved_state='none' and no anchor injection."""
+    controller = _DummyController(tmp_path)
+    history = [
+        {"round": 1, "value_delivered": "none"},
+        {"round": 2, "value_delivered": "none"},
+        {"round": 3, "value_delivered": "none"},
+    ]
+    best = controller._toolgen_best_achieved_state_summary(history)
+    assert best["best_achieved_state"] == "none"
+    assert best["best_achieved_round"] is None

@@ -153,6 +153,106 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         self._set_dataset(dataset)
         self.variable_list: Optional[list[Variable]] = None
 
+    def resume_for_interact(self, session: Session) -> bool:
+        if session.task_name != self.task_name:
+            return False
+        if session.sample_status != SampleStatus.RUNNING:
+            return False
+        if session.finish_reason is not None or session.task_output is not None:
+            return False
+        if session.chat_history.get_value_length() < 4:
+            return False
+        if not self._session_uses_pal_bridge(session):
+            return False
+
+        self._resume_task_state_from_session(session)
+        return True
+
+    def _session_uses_pal_bridge(self, session: Session) -> bool:
+        for idx in range(session.chat_history.get_value_length()):
+            item = session.chat_history.get_item_deep_copy(idx)
+            if item.role != Role.AGENT:
+                continue
+            if 'execute_macro("pal_benchmark_bridge_macro"' in (item.content or ""):
+                return True
+        return False
+
+    def _resume_task_state_from_session(self, session: Session) -> None:
+        logger = logging.getLogger(__name__)
+        self.current_sample_index = None
+        self.current_round = 0
+        self.variable_list = None
+        self._Task__current_dataset_item = None
+
+        bootstrap_session = Session(
+            task_name=self.task_name,
+            sample_index=session.sample_index,
+        )
+        self.reset(bootstrap_session)
+        self.current_round = self._estimate_current_round_for_resume(session)
+        self._replay_completed_pal_bridge_actions(session)
+
+        logger.warning(
+            "KG resumed interact state for sample=%s round=%s vars=%s",
+            session.sample_index,
+            self.current_round,
+            len(self.variable_list or []),
+        )
+
+    def _estimate_current_round_for_resume(self, session: Session) -> int:
+        agent_turn_count = 0
+        for idx in range(session.chat_history.get_value_length()):
+            item = session.chat_history.get_item_deep_copy(idx)
+            if item.role == Role.AGENT:
+                agent_turn_count += 1
+        return max(0, agent_turn_count - 2)
+
+    def _replay_completed_pal_bridge_actions(self, session: Session) -> None:
+        current_dataset_item = self._get_current_dataset_item()
+        for idx in range(session.chat_history.get_value_length() - 1):
+            item = session.chat_history.get_item_deep_copy(idx)
+            if item.role != Role.AGENT:
+                continue
+            content = item.content or ""
+            if 'execute_macro("pal_benchmark_bridge_macro"' not in content:
+                continue
+            next_item = session.chat_history.get_item_deep_copy(idx + 1)
+            if next_item.role != Role.USER:
+                continue
+            if not (next_item.content or "").startswith(
+                "Macro result: pal_benchmark_bridge_macro -> SUCCESS."
+            ):
+                continue
+            argument_str = KnowledgeGraph._extract_argument_str_from_agent_response(
+                content
+            )
+            if argument_str is None:
+                raise AssertionError("pal_bridge_resume_missing_argument_str")
+            tool_name, payload = KnowledgeGraph._parse_execute_macro_args(argument_str)
+            if tool_name != "pal_benchmark_bridge_macro" or not isinstance(
+                payload, Mapping
+            ):
+                raise AssertionError("pal_bridge_resume_invalid_payload")
+            temp_session = Session(
+                task_name=session.task_name,
+                sample_index=session.sample_index,
+                sample_status=session.sample_status,
+            )
+            for replay_index in range(idx + 1):
+                temp_session.chat_history.inject(
+                    session.chat_history.get_item_deep_copy(replay_index)
+                )
+            previous_var_count = len(self.variable_list or [])
+            self._execute_macro(
+                session=temp_session,
+                tool_name=tool_name,
+                payload=payload,
+                current_dataset_item=current_dataset_item,
+                api_str=f"execute_macro({argument_str})",
+            )
+            if len(self.variable_list or []) <= previous_var_count:
+                raise AssertionError("pal_bridge_resume_replay_failed")
+
     @staticmethod
     def _load_data(
         *,
@@ -1545,9 +1645,18 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         else:
             agent_answer_list = None
         ground_truth_answer_set = current_dataset_item.answer_set
+        sorted_answers = sorted(ground_truth_answer_set)
         session.expected_answer = {
-            "answer_list": sorted(ground_truth_answer_set),
+            "answer_list": sorted_answers,
         }
+        try:
+            name_dict = self.knowledge_graph_api.sparql_executor.get_entity_names(sorted_answers)
+            if name_dict:
+                session.expected_answer["answer_name_list"] = [
+                    name_dict.get(ans, ans) for ans in sorted_answers
+                ]
+        except Exception:
+            pass
         # endregion
         # region Calculate metrics
         # region Calculate f1_score
