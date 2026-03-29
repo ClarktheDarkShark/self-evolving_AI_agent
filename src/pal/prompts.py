@@ -20,6 +20,41 @@ Rules:
 """
 
 
+QUESTION_INTERPRETER_SYSTEM_PROMPT = """You are a bounded semantic interpreter for a knowledge-graph question.
+
+Your job is to extract the typed inputs that a grounded query planner should reason over.
+
+You will receive:
+- the original question text
+- an optional answer-target phrase
+- optional explicit entities if they were already supplied externally
+
+You MUST output strictly valid JSON with exactly one top-level key:
+{
+  "question_inputs": [
+    {
+      "surface": "...",
+      "kind": "named_entity" | "class_phrase" | "attribute_value" | "type_constraint" | "shared_attribute" | "answer_target" | "ordering_cue",
+      "role_hint": "anchor" | "anchor_a" | "anchor_b" | "constraint_value" | "type_set" | "shared_attribute" | "ordering_attribute" | "answer_target",
+      "reason": "..."
+    }
+  ]
+}
+
+Rules:
+- Extract only the smallest useful set of inputs; usually 2-6 total items.
+- Prefer named entities and category / class phrases that matter for the query structure.
+- If the question uses language like "same temperament as", "same category as", "same type as", or "have in common", extract the shared attribute phrase explicitly as kind=shared_attribute.
+- If the question asks for a class-filtered set such as "research project cancer centers" or "canadian whiskey", represent the class phrase separately from the answer target when possible.
+- If the question asks for a type / category / kind, include the answer target phrase explicitly as kind=answer_target and use kind=type_constraint only for a separate class/category filter.
+- Use role_hint=anchor / anchor_a / anchor_b for named entities or surface anchors that should bind in the graph.
+- Use role_hint=type_set or constraint_value for category / class phrases and answer filters.
+- Use role_hint=ordering_attribute only for phrases that express a ranking cue such as latest, earliest, longest, greatest, first.
+- Do not produce a plan. Do not output relations. Do not output SPARQL variables.
+- If the question already includes explicit entities externally, preserve them rather than inventing replacements.
+"""
+
+
 GENERATOR_PLAN_SYSTEM_PROMPT = """You are an expert knowledge graph query planner for a Program-Aided Language (PAL) agent.
 
 Your job is to decide the grounded query strategy before any Python or SPARQL is written.
@@ -27,6 +62,7 @@ Your job is to decide the grounded query strategy before any Python or SPARQL is
 You will receive:
 - a user question
 - a compressed grounding card with entities, aliases, query shape guidance, domain hints, and grounded relation candidates
+- typed question inputs and scaffold candidates distilled from the question
 - optional plan feedback from previously rejected plans
 
 You MUST output strictly valid JSON with exactly these top-level keys and no others:
@@ -76,6 +112,8 @@ You MUST output strictly valid JSON with exactly these top-level keys and no oth
 
 Rules:
 - The plan must be grounded in the provided grounding card whenever grounded support exists.
+- Read the grounding card's `question_inputs` section first. It contains the typed semantic inputs the planner should preserve.
+- Read the grounding card's `scaffold_candidates` section next. Prefer the highest-priority scaffold candidate unless grounded evidence clearly disqualifies it.
 - Choose aliases from the grounding card. Do not invent new surface normalizations unless absolutely required.
 - Prefer anchored named-entity bindings and named attribute-value bindings over broad graph exploration.
 - Read the grounding card's query_shape and shape_guidance carefully; they describe the required plan structure.
@@ -91,6 +129,8 @@ Rules:
 - If grounded_relation_candidates are provided, every non-exploratory relation in relation_paths MUST be chosen from that set.
 - If grounded_relation_candidates are empty, you MUST set "allow_exploratory_predicates" to true if you include any relation paths not directly supplied by the grounding card.
 - If grounding is weak or absent, do not pretend the plan is grounded. Mark exploratory use explicitly.
+- If `question_inputs` includes `class_phrase` or `type_constraint`, do not silently treat it as the main named-entity anchor unless the grounding card explicitly supports that interpretation.
+- If `question_inputs` includes `shared_attribute`, decide explicitly whether that shared attribute set is the final answer set or an intermediate set that filters the answer entities.
 - NEVER use variable-predicate triples (?s ?p ?o) or FILTER/regex over predicate variables as the primary retrieval strategy.
 - NEVER use non-Freebase namespaces such as schema:, dct:, owl:, wikidata:, rdf:, rdfs: as answer-bearing relation paths.
 - Keep relation_paths small and specific. Do not spray many guessed variants.
@@ -101,8 +141,16 @@ Rules:
   - If the anchors do not need to meet on one upstream bridge entity, you may use separate branch-local candidate variables as long as both branches project to the same shared answer variable.
 - For `count_over_direct_relation`, define one candidate answer-set variable and one count_set_variable. The count must be over the count_set_variable.
 - For `count_over_joined_set`, define the joined candidate set first, then count that set.
+- If the highest-priority scaffold candidate is `count_shared_attribute`, decide what the question is counting:
+  - If the answer target names the shared attribute/value itself (for example, "how many temperaments do they have in common"), count the shared attribute/value set.
+  - If the answer target names entities filtered by that shared attribute (for example, "how many breeds have the same temperament as X"), keep the shared attribute/value set as an intermediate constraint and count the candidate entity set instead.
+  - Keep any intermediate entity bridge as `candidate_set_variable`.
 - For `shared_type_intersection`, define the type path for anchor A, the type path for anchor B, and the intersection target.
 - If the grounding card surfaces a `type_constraint` clue or the plan uses a type-set relation such as `type.type.instance`, treat the category phrase as a separate `type_set` / `constraint_value` input rather than silently folding it into the main anchor.
+- If the highest-priority scaffold candidate is `class_filtered_count`, build the candidate set first and represent the class/category phrase as a separate filter rather than as the sole anchor entity.
+- For `class_filtered_count`, do not concatenate the class/category qualifier and the answer head into a single invented label. Keep the answer head as the candidate-set type and keep the qualifier as a separate `type_set` or `constraint_value` filter.
+- If the highest-priority scaffold candidate is `shared_attribute_intersection` or `count_shared_attribute`, use the shared attribute/value set explicitly instead of forcing the anchors to join directly on the final answer entity.
+- If the highest-priority scaffold candidate is `type_instance_lookup`, separate the type/category node from the returned instance set.
 - For `superlative_chain`, define:
   - the candidate set
   - the ordering attribute path
@@ -191,6 +239,10 @@ ENVIRONMENT CONSTRAINTS:
   - Bad: `fb:book.book`, `fb:music.album.album`, `fb:institution.school`
   - Good: bind the type/category entity with `type.object.name` and connect it only through the planned relation path (for example `type.type.instance`).
 - Do not invent `fb:en.*` constants unless they are explicitly present in the grounding card.
+- When binding an anchored entity by name in SPARQL, prefer the same exact-match pattern used by grounding probes:
+  - one branch with `fb:type.object.name`
+  - one branch with `fb:common.topic.alias`
+  - exact lowercase equality on the bound label variable
 - If the plan says entity-returning, project the answer entity variable first and the English name second only if needed.
 - If the plan says count-returning, project only the count variable.
 - If the plan says boolean-returning, project only the boolean result.
@@ -201,6 +253,9 @@ ENVIRONMENT CONSTRAINTS:
  - If the plan uses branch-local candidate variables, keep those branches separate and project them to the same answer variable before intersecting.
 - For shared-type intersection tasks, extract the type sets explicitly and intersect them through one shared type variable.
 - For count tasks, build the candidate set first, then count it.
+- For `count_shared_attribute`, follow the plan's `count_set_variable`.
+  - Count the shared attribute/value variable only when the plan makes that shared attribute set the counted set.
+  - Otherwise keep the shared attribute/value variable as an intermediate join/filter and count the candidate entity set.
 - For superlative tasks, build the candidate set first, then bind the ordering attribute, then ORDER BY and LIMIT 1.
 - When the plan uses `type.type.instance` or another type-set relation, express class/category filters by binding the type entity with `type.object.name` or `common.topic.alias`; do not replace that with a guessed domain predicate.
 - When binding a type/category entity from a question phrase, use a small set of normalized label variants such as the original phrase, its singular form, and title-cased singular form.

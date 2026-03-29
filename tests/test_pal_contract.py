@@ -1,6 +1,7 @@
 import json
 import pathlib
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -8,8 +9,10 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import src.agents.instance.pal_agent_controller as pal_agent_controller_module
 from src.agents.exceptions import AgentUnknownException
 from src.agents.instance.pal_agent_controller import PALAgentController
+from src.pal.invoker import PALInvocationResult
 from src.pal.plausibility_validator import (
     AnchorProbeResult,
     PlausibilityVerdict,
@@ -27,6 +30,970 @@ def _make_controller() -> PALAgentController:
     controller = object.__new__(PALAgentController)
     controller._emit_generated_tools_event = lambda payload: None
     return controller
+
+
+def test_question_interpretation_extracts_dynamic_anchor_inputs() -> None:
+    controller = _make_controller()
+
+    interpretation = controller._build_question_interpretation(
+        question_text="the creators of wma's most recently released browser was called what?",
+        explicit_entities=[],
+        answer_target_phrase="creators",
+    )
+
+    surfaces = {
+        str(item.get("surface") or "")
+        for item in interpretation["question_inputs"]
+    }
+    scaffold_names = {
+        str(item.get("name") or "")
+        for item in interpretation["preferred_scaffolds"]
+    }
+
+    assert "wma" in {surface.lower() for surface in surfaces}
+    assert "most recently" in {surface.lower() for surface in surfaces}
+    assert "superlative_over_candidate_set" in scaffold_names
+    assert "pivoted_chain_lookup" in scaffold_names
+
+
+def test_question_interpretation_extracts_shared_attribute_and_constraints() -> None:
+    controller = _make_controller()
+
+    interpretation = controller._build_question_interpretation(
+        question_text="how many different breeds from republic of brazil have the same temperament as the manchester terrier?",
+        explicit_entities=[],
+        answer_target_phrase="different breeds",
+    )
+
+    role_by_surface = {
+        str(item.get("surface") or "").lower(): str(item.get("role_hint") or "")
+        for item in interpretation["question_inputs"]
+    }
+    kind_by_surface = {
+        str(item.get("surface") or "").lower(): str(item.get("kind") or "")
+        for item in interpretation["question_inputs"]
+    }
+    scaffold_names = {
+        str(item.get("name") or "")
+        for item in interpretation["preferred_scaffolds"]
+    }
+
+    assert kind_by_surface["temperament"] == "shared_attribute"
+    assert role_by_surface["republic of brazil"] == "constraint_value"
+    assert role_by_surface["manchester terrier"] == "anchor_b"
+    assert "count_shared_attribute" in scaffold_names
+
+
+def test_question_interpretation_preserves_count_shared_attribute_with_question_prefix() -> None:
+    controller = _make_controller()
+
+    interpretation = controller._build_question_interpretation(
+        question_text="Question: how many different breeds from republic of brazil have the same temperament as the manchester terrier?",
+        explicit_entities=["republic of brazil", "Manchester Terrier"],
+        answer_target_phrase="different breeds",
+    )
+
+    scaffold_names = {
+        str(item.get("name") or "")
+        for item in interpretation["preferred_scaffolds"]
+    }
+
+    assert "count_shared_attribute" in scaffold_names
+
+
+def test_question_interpretation_retypes_explicit_class_phrase_inside_answer_target() -> None:
+    controller = _make_controller()
+
+    interpretation = controller._build_question_interpretation(
+        question_text="Question: what is the number of research project cancer centers?",
+        explicit_entities=["research project"],
+        answer_target_phrase="research project cancer centers",
+    )
+
+    role_by_surface = {
+        str(item.get("surface") or "").lower(): str(item.get("role_hint") or "")
+        for item in interpretation["question_inputs"]
+    }
+    kind_by_surface = {
+        str(item.get("surface") or "").lower(): str(item.get("kind") or "")
+        for item in interpretation["question_inputs"]
+    }
+
+    assert kind_by_surface["research project"] == "class_phrase"
+    assert role_by_surface["research project"] == "type_set"
+
+
+def test_answer_target_relative_clause_is_not_split_as_class_phrase() -> None:
+    controller = _make_controller()
+
+    class_phrase, target_head = controller._split_answer_target_compound_phrase(
+        "infectious diseases that can be transmitted by aedes aegypti"
+    )
+
+    assert class_phrase == ""
+    assert target_head == "infectious diseases that can be transmitted by aedes aegypti"
+
+
+def test_infer_entity_clue_marks_from_location_as_origin_constraint() -> None:
+    controller = _make_controller()
+
+    clue = controller._infer_entity_clue(
+        "Question: how many different breeds from republic of brazil have the same temperament as the manchester terrier?",
+        "republic of brazil",
+    )
+
+    assert clue == "origin_constraint"
+
+
+def test_infer_entity_clue_marks_has_phrase_inside_shared_category_question_as_feature() -> None:
+    controller = _make_controller()
+
+    clue = controller._infer_entity_clue(
+        "Question: what martial art has the same category as mongolian wrestling and has strike?",
+        "Strike",
+    )
+
+    assert clue == "attribute_value.feature"
+
+
+def test_count_shared_attribute_plan_rewrite_counts_candidate_set_when_answer_target_is_entity() -> None:
+    controller = _make_controller()
+
+    plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_joined_set",
+        "anchored_entities": [
+            {"surface": "republic of brazil", "chosen_alias": "Brazil", "role": "anchor_a"},
+            {"surface": "Manchester Terrier", "chosen_alias": "Manchester Terrier", "role": "anchor_b"},
+        ],
+        "shared_answer_variable": "shared_answer",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "count",
+        "ordering_attribute": {"direction": "forward"},
+        "ordering_direction": "none",
+        "join_structure": {
+            "type": "intersection",
+            "anchor_constraints": [
+                {"anchor_role": "anchor_a", "constrains_variable": "shared_answer", "notes": "country constrains breeds"},
+                {"anchor_role": "anchor_b", "constrains_variable": "shared_answer", "notes": "breed temperament equality"},
+            ],
+        },
+        "relation_paths": [
+            {
+                "relation": "biology.breed_origin.breeds_originating_here",
+                "direction": "reverse",
+                "from": "country",
+                "to": "breed",
+                "from_role": "constraint_value",
+                "to_role": "shared_answer",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "biology.animal_breed.temperament",
+                "direction": "forward",
+                "from": "breed",
+                "to": "temperament",
+                "from_role": "shared_answer",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "biology.animal_breed.temperament",
+                "direction": "forward",
+                "from": "Manchester Terrier",
+                "to": "temperament",
+                "from_role": "anchor_b",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+            },
+        ],
+        "projection": ["count"],
+        "allow_exploratory_predicates": False,
+        "strategy": "count breeds with same temperament",
+        "plan_rationale": ["initial"],
+    }
+
+    rewritten = controller._apply_question_scaffold_plan_rewrites(
+        task_question="Question: how many different breeds from republic of brazil have the same temperament as the manchester terrier?, Entities: ['republic of brazil', 'Manchester Terrier']",
+        query_plan=plan,
+    )
+
+    assert rewritten["shared_answer_variable"] == "breed"
+    assert rewritten["count_set_variable"] == "breed"
+    assert rewritten["candidate_set_variable"] == "breed"
+    assert rewritten["join_structure"]["type"] == "count"
+    assert rewritten["join_structure"]["anchor_constraints"][0]["constrains_variable"] == "breed"
+    assert rewritten["join_structure"]["anchor_constraints"][1]["constrains_variable"] == "temperament"
+    assert rewritten["relation_paths"][0]["to_role"] == "candidate_set"
+    assert rewritten["relation_paths"][1]["from_role"] == "candidate_set"
+    assert rewritten["relation_paths"][1]["to_role"] == "constraint_value"
+    assert rewritten["relation_paths"][2]["to_role"] == "constraint_value"
+
+
+def test_count_shared_attribute_plan_rewrite_counts_shared_values_when_answer_target_matches_attribute() -> None:
+    controller = _make_controller()
+
+    plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_joined_set",
+        "anchored_entities": [
+            {"surface": "Aidi", "chosen_alias": "Aidi", "role": "anchor_a"},
+            {
+                "surface": "Australian Sheep Dog",
+                "chosen_alias": "Australian Sheep Dog",
+                "role": "anchor_b",
+            },
+        ],
+        "shared_answer_variable": "shared_answer",
+        "candidate_set_variable": "",
+        "count_set_variable": "count",
+        "ordering_attribute": {"direction": "forward"},
+        "ordering_direction": "none",
+        "join_structure": {
+            "type": "intersection",
+            "anchor_constraints": [
+                {"anchor_role": "anchor_a", "constrains_variable": "shared_answer", "notes": "aidi temperament"},
+                {
+                    "anchor_role": "anchor_b",
+                    "constrains_variable": "shared_answer",
+                    "notes": "australian sheep dog temperament",
+                },
+            ],
+        },
+        "relation_paths": [
+            {
+                "relation": "biology.animal_breed.temperament",
+                "direction": "forward",
+                "from": "Aidi",
+                "to": "temperament",
+                "from_role": "anchor_a",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "biology.animal_breed.temperament",
+                "direction": "forward",
+                "from": "Australian Sheep Dog",
+                "to": "temperament",
+                "from_role": "anchor_b",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+            },
+        ],
+        "projection": ["count"],
+        "allow_exploratory_predicates": False,
+        "strategy": "count common temperaments",
+        "plan_rationale": ["initial"],
+    }
+
+    rewritten = controller._apply_question_scaffold_plan_rewrites(
+        task_question="Question: for the aidi and australian sheep dog breeds, how many temperaments do they have in common?, Entities: ['Aidi', 'Australian Sheep Dog']",
+        query_plan=plan,
+    )
+
+    assert rewritten["shared_answer_variable"] == "temperament"
+    assert rewritten["count_set_variable"] == "temperament"
+    assert rewritten["join_structure"]["anchor_constraints"][0]["constrains_variable"] == "temperament"
+    assert rewritten["join_structure"]["anchor_constraints"][1]["constrains_variable"] == "temperament"
+    assert rewritten["relation_paths"][0]["to_role"] == "count_set"
+    assert rewritten["relation_paths"][1]["to_role"] == "count_set"
+
+
+def test_question_scaffold_rewrite_is_noop_for_non_shared_attribute_count() -> None:
+    controller = _make_controller()
+
+    plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_direct_relation",
+        "anchored_entities": [
+            {"surface": "Unsteadiness", "chosen_alias": "Unsteadiness", "role": "anchor"}
+        ],
+        "shared_answer_variable": "treatment",
+        "candidate_set_variable": "",
+        "count_set_variable": "treatment",
+        "ordering_attribute": {"direction": "forward"},
+        "ordering_direction": "none",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {"anchor_role": "anchor", "constrains_variable": "treatment", "notes": "count treatments"}
+            ],
+        },
+        "relation_paths": [
+            {
+                "relation": "medicine.symptom.side_effect_of",
+                "direction": "reverse",
+                "from": "symptom",
+                "to": "treatment",
+                "from_role": "anchor",
+                "to_role": "count_set",
+                "grounding_source": "curated",
+            }
+        ],
+        "projection": ["count"],
+        "allow_exploratory_predicates": False,
+        "strategy": "count direct relation",
+        "plan_rationale": ["initial"],
+    }
+
+    rewritten = controller._apply_question_scaffold_plan_rewrites(
+        task_question="Question: unsteadiness can be a side effect in how many medical treatments?, Entities: ['Unsteadiness']",
+        query_plan=plan,
+    )
+
+    assert rewritten == plan
+
+
+def test_generated_query_anchor_binding_rewrite_adds_name_or_alias_union() -> None:
+    controller = _make_controller()
+
+    query_text = """PREFIX fb: <http://rdf.freebase.com/ns/>
+SELECT * WHERE {
+  ?breedB fb:type.object.name "Australian Sheep Dog"@en .
+  ?breedB fb:biology.animal_breed.temperament ?t .
+}"""
+    generated_code = f'query = """{query_text}"""\nwrapper.setQuery(query)\n'
+
+    rewritten_code, rewritten_queries = controller._rewrite_generated_code_anchor_bindings(
+        generated_code=generated_code,
+        query_texts=[query_text],
+        query_plan={
+            "anchored_entities": [
+                {
+                    "surface": "australian sheep dog",
+                    "chosen_alias": "Australian Sheep Dog",
+                    "role": "anchor_b",
+                }
+            ]
+        },
+    )
+
+    assert rewritten_queries
+    assert "fb:common.topic.alias" in rewritten_queries[0]
+    assert 'FILTER(LCASE(STR(?breedB_label_1)) = "australian sheep dog")' in rewritten_queries[0]
+    assert rewritten_code != generated_code
+
+
+def test_generated_query_anchor_binding_rewrite_prefers_resolved_entity_id() -> None:
+    controller = _make_controller()
+
+    query_text = """PREFIX fb: <http://rdf.freebase.com/ns/>
+SELECT * WHERE {
+  ?language fb:type.object.name "Southern Min"@en .
+  ?dialect fb:language.language_dialect.language ?language .
+}"""
+    generated_code = f'query = """{query_text}"""\nwrapper.setQuery(query)\n'
+
+    rewritten_code, rewritten_queries = controller._rewrite_generated_code_anchor_bindings(
+        generated_code=generated_code,
+        query_texts=[query_text],
+        query_plan={
+            "anchored_entities": [
+                {
+                    "surface": "Southern Min",
+                    "chosen_alias": "Southern Min",
+                    "role": "anchor",
+                    "resolved_entity_id": "m.01c44b",
+                }
+            ]
+        },
+    )
+
+    assert rewritten_queries
+    assert "VALUES ?language { fb:m.01c44b }" in rewritten_queries[0]
+    assert '"Southern Min"@en' not in rewritten_queries[0]
+    assert rewritten_code != generated_code
+
+
+def test_generated_query_anchor_binding_rewrite_handles_filter_without_str() -> None:
+    controller = _make_controller()
+
+    query_text = """PREFIX fb: <http://rdf.freebase.com/ns/>
+SELECT * WHERE {
+  ?anchor fb:type.object.name ?anchor_name .
+  FILTER(LCASE(?anchor_name) = "southern min")
+  ?dialect fb:language.language_dialect.language ?anchor .
+}"""
+    generated_code = f'query = """{query_text}"""\nwrapper.setQuery(query)\n'
+
+    rewritten_code, rewritten_queries = controller._rewrite_generated_code_anchor_bindings(
+        generated_code=generated_code,
+        query_texts=[query_text],
+        query_plan={
+            "anchored_entities": [
+                {
+                    "surface": "Southern Min",
+                    "chosen_alias": "Southern Min",
+                    "role": "anchor",
+                }
+            ]
+        },
+    )
+
+    assert rewritten_queries
+    assert "fb:common.topic.alias" in rewritten_queries[0]
+    assert 'FILTER(LCASE(STR(?anchor_name)) = "southern min")' in rewritten_queries[0]
+    assert rewritten_code != generated_code
+
+
+def test_generated_query_anchor_binding_rewrite_collapses_alias_union_after_resolved_id() -> None:
+    controller = _make_controller()
+
+    query_text = """PREFIX fb: <http://rdf.freebase.com/ns/>
+SELECT * WHERE {
+  {
+    ?anchor fb:type.object.name ?anchor_name .
+    FILTER(LCASE(STR(?anchor_name)) = "southern min")
+  }
+  UNION
+  {
+    ?anchor fb:common.topic.alias ?anchor_alias .
+    FILTER(LCASE(STR(?anchor_alias)) = "southern min")
+  }
+  ?dialect fb:language.language_dialect.language ?anchor .
+}"""
+    generated_code = f'query = """{query_text}"""\nwrapper.setQuery(query)\n'
+
+    rewritten_code, rewritten_queries = controller._rewrite_generated_code_anchor_bindings(
+        generated_code=generated_code,
+        query_texts=[query_text],
+        query_plan={
+            "anchored_entities": [
+                {
+                    "surface": "Southern Min",
+                    "chosen_alias": "Southern Min",
+                    "role": "anchor",
+                    "resolved_entity_id": "m.01c44b",
+                }
+            ]
+        },
+    )
+
+    assert rewritten_queries
+    assert "VALUES ?anchor { fb:m.01c44b }" in rewritten_queries[0]
+    assert "fb:common.topic.alias" not in rewritten_queries[0]
+    assert "fb:type.object.name ?anchor_name" not in rewritten_queries[0]
+    assert rewritten_code != generated_code
+
+
+def test_generated_query_anchor_binding_rewrite_collapses_same_line_union_after_resolved_id() -> None:
+    controller = _make_controller()
+
+    query_text = """PREFIX fb: <http://rdf.freebase.com/ns/>
+SELECT * WHERE {
+  { VALUES ?anchor { fb:m.01c44b } } UNION { ?anchor fb:common.topic.alias ?anchor_alias . FILTER(LCASE(STR(?anchor_alias)) = "southern min") }
+  ?dialect fb:language.language_dialect.language ?anchor .
+}"""
+
+    rewritten = controller._collapse_resolved_anchor_union_binding_blocks(
+        query_text=query_text,
+        resolved_entity_id="m.01c44b",
+        anchor_literal="Southern Min",
+    )
+
+    assert "UNION" not in rewritten
+    assert "fb:common.topic.alias" not in rewritten
+    assert "VALUES ?anchor { fb:m.01c44b }" in rewritten
+
+
+def test_same_attempt_anchor_entity_retry_reexecutes_with_resolved_id() -> None:
+    controller = _make_controller()
+
+    query_text = """PREFIX fb: <http://rdf.freebase.com/ns/>
+SELECT (COUNT(DISTINCT ?candidate_set) AS ?count) WHERE {
+  ?anchor fb:type.object.name ?anchor_name .
+  FILTER(LCASE(?anchor_name) = "southern min")
+  ?candidate_set fb:language.language_dialect.language ?anchor .
+}"""
+    generated_code = f'query = """{query_text}"""\nwrapper.setQuery(query)\n'
+    original_result = PALInvocationResult(
+        success=True,
+        payload={
+            "results": {
+                "bindings": [
+                    {
+                        "count": {
+                            "type": "literal",
+                            "value": "0",
+                        }
+                    }
+                ]
+            }
+        },
+    )
+    retried_result = PALInvocationResult(
+        success=True,
+        payload={
+            "results": {
+                "bindings": [
+                    {
+                        "count": {
+                            "type": "literal",
+                            "value": "4",
+                        }
+                    }
+                ]
+            }
+        },
+    )
+
+    with patch.object(
+        pal_agent_controller_module,
+        "execute_pal_code_with_result",
+        return_value=retried_result,
+    ) as retry_exec:
+        rewritten_code, new_result, repaired_plan, used_retry = (
+            controller._retry_execution_with_resolved_anchor_ids(
+                generated_code=generated_code,
+                invocation_result=original_result,
+                query_plan={
+                    "answer_mode": "count",
+                    "anchored_entities": [
+                        {
+                            "surface": "Southern Min",
+                            "chosen_alias": "Southern Min",
+                            "role": "anchor",
+                        }
+                    ],
+                },
+                anchor_probe_results=[
+                    AnchorProbeResult(
+                        anchor_name="Southern Min",
+                        entity_count=1,
+                        path_count=8,
+                        relation_probed="language.language_dialect.language",
+                        anchor_position="object",
+                        resolved_entity_id="m.01c44b",
+                    )
+                ],
+            )
+        )
+
+    assert used_retry is True
+    assert retry_exec.called
+    assert "VALUES ?anchor { fb:m.01c44b }" in rewritten_code
+    assert new_result is retried_result
+    assert repaired_plan["anchored_entities"][0]["resolved_entity_id"] == "m.01c44b"
+
+
+def test_same_attempt_anchor_entity_retry_adopts_ambiguous_anchor_pin_even_without_count_gain() -> None:
+    controller = _make_controller()
+
+    query_text = """PREFIX fb: <http://rdf.freebase.com/ns/>
+SELECT (COUNT(DISTINCT ?candidate_set) AS ?count) WHERE {
+  ?anchor fb:type.object.name ?anchor_name .
+  FILTER(LCASE(STR(?anchor_name)) = "southern min")
+  ?candidate_set fb:language.language_dialect.language ?anchor .
+}"""
+    generated_code = f'query = """{query_text}"""\nwrapper.setQuery(query)\n'
+    original_result = PALInvocationResult(
+        success=True,
+        payload={
+            "results": {
+                "bindings": [
+                    {
+                        "count": {
+                            "type": "literal",
+                            "value": "4",
+                        }
+                    }
+                ]
+            }
+        },
+    )
+    retried_result = PALInvocationResult(
+        success=True,
+        payload={
+            "results": {
+                "bindings": [
+                    {
+                        "count": {
+                            "type": "literal",
+                            "value": "4",
+                        }
+                    }
+                ]
+            }
+        },
+    )
+
+    with patch.object(
+        pal_agent_controller_module,
+        "execute_pal_code_with_result",
+        return_value=retried_result,
+    ) as retry_exec:
+        rewritten_code, new_result, repaired_plan, used_retry = (
+            controller._retry_execution_with_resolved_anchor_ids(
+                generated_code=generated_code,
+                invocation_result=original_result,
+                query_plan={
+                    "answer_mode": "count",
+                    "anchored_entities": [
+                        {
+                            "surface": "Southern Min",
+                            "chosen_alias": "Southern Min",
+                            "role": "anchor",
+                        }
+                    ],
+                },
+                anchor_probe_results=[
+                    AnchorProbeResult(
+                        anchor_name="Southern Min",
+                        entity_count=2,
+                        path_count=4,
+                        relation_probed="language.language_dialect.language",
+                        anchor_position="object",
+                        resolved_entity_id="m.01c44b",
+                    )
+                ],
+            )
+        )
+
+    assert used_retry is True
+    assert retry_exec.called
+    assert "VALUES ?anchor { fb:m.01c44b }" in rewritten_code
+    assert new_result is retried_result
+    assert repaired_plan["anchored_entities"][0]["resolved_entity_id"] == "m.01c44b"
+
+
+def test_retry_same_plan_after_alias_repair_for_pure_anchor_not_found_count() -> None:
+    controller = _make_controller()
+
+    should_retry = controller._should_retry_same_plan_after_alias_repair(
+        verdict=PlausibilityVerdict(
+            verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+            reasons=[
+                "anchor_not_found:'republic of brazil'",
+                "probe_count:'republic of brazil'=0",
+                "count_set_anchor_not_found",
+            ],
+        ),
+        alias_repair_feedback=[
+            "anchor_alias_override:republic of brazil=>Brazil",
+        ],
+    )
+
+    assert should_retry is True
+
+
+def test_retry_same_plan_after_alias_repair_retries_path_empty_counts_when_anchor_changes() -> None:
+    controller = _make_controller()
+
+    should_retry = controller._should_retry_same_plan_after_alias_repair(
+        verdict=PlausibilityVerdict(
+            verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+            reasons=[
+                "anchor_path_empty:'Brazil':biology.animal_breed.country_of_origin",
+                "count_set_path_empty",
+            ],
+        ),
+        alias_repair_feedback=[
+            "anchor_alias_override:republic of brazil=>Brazil",
+        ],
+    )
+
+    assert should_retry is True
+
+
+def test_apply_probe_guided_anchor_entity_repairs_adds_resolved_entity_override() -> None:
+    controller = _make_controller()
+
+    repaired_query_plan, feedback = controller._apply_probe_guided_anchor_entity_repairs(
+        query_plan={
+            "anchored_entities": [
+                {
+                    "surface": "Southern Min",
+                    "chosen_alias": "Southern Min",
+                    "role": "anchor",
+                }
+            ]
+        },
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Southern Min",
+                entity_count=3,
+                path_count=8,
+                relation_probed="language.language_dialect.language",
+                anchor_position="object",
+                resolved_entity_id="m.01c44b",
+            )
+        ],
+    )
+
+    assert (
+        repaired_query_plan["anchored_entities"][0]["resolved_entity_id"] == "m.01c44b"
+    )
+    assert "anchor_entity_override:Southern Min=>m.01c44b" in feedback
+
+
+def test_question_interpretation_grounding_entities_use_named_entities_only() -> None:
+    controller = _make_controller()
+    interpretation = {
+        "question_inputs": [
+            {
+                "surface": "research project",
+                "kind": "class_phrase",
+                "role_hint": "type_set",
+                "reason": "class/category qualifier",
+            },
+            {
+                "surface": "Cancer Centers",
+                "kind": "answer_target",
+                "role_hint": "answer_target",
+                "reason": "answer head",
+            },
+            {
+                "surface": "RS-27A",
+                "kind": "named_entity",
+                "role_hint": "anchor",
+                "reason": "engine anchor",
+            },
+        ]
+    }
+
+    assert controller._extract_grounding_entities_from_question_interpretation(
+        interpretation
+    ) == ["RS-27A"]
+
+
+def test_question_interpretation_grounding_entities_skip_class_typed_duplicates() -> None:
+    controller = _make_controller()
+    interpretation = {
+        "question_inputs": [
+            {
+                "surface": "research project",
+                "kind": "named_entity",
+                "role_hint": "anchor",
+                "reason": "explicit entity payload",
+            },
+            {
+                "surface": "research project",
+                "kind": "class_phrase",
+                "role_hint": "type_set",
+                "reason": "class/category qualifier",
+            },
+            {
+                "surface": "cancer centers",
+                "kind": "answer_target",
+                "role_hint": "answer_target",
+                "reason": "answer head",
+            },
+        ]
+    }
+
+    assert controller._extract_grounding_entities_from_question_interpretation(
+        interpretation
+    ) == []
+
+
+def test_structured_question_inputs_suppress_raw_entity_fallback_for_grounding() -> None:
+    controller = _make_controller()
+    interpretation = controller._build_question_interpretation(
+        question_text="what is the number of research project cancer centers?",
+        explicit_entities=["research project"],
+        answer_target_phrase=controller._extract_answer_target_phrase(
+            "what is the number of research project cancer centers?"
+        ),
+    )
+
+    interpreted_grounding_entities = (
+        controller._extract_grounding_entities_from_question_interpretation(
+            interpretation
+        )
+    )
+    has_structured_non_entity_inputs = any(
+        str(item.get("kind") or "").strip()
+        in {"class_phrase", "type_constraint", "shared_attribute"}
+        for item in interpretation["question_inputs"]
+    )
+    grounding_entities = interpreted_grounding_entities or (
+        [] if has_structured_non_entity_inputs else ["research project"]
+    )
+
+    assert grounding_entities == []
+
+
+def test_extract_answer_target_phrase_handles_number_of_questions() -> None:
+    controller = _make_controller()
+
+    assert (
+        controller._extract_answer_target_phrase(
+            "what is the number of research project cancer centers?"
+        )
+        == "research project cancer centers"
+    )
+
+
+def test_extract_answer_target_phrase_handles_type_of_questions() -> None:
+    controller = _make_controller()
+
+    assert (
+        controller._extract_answer_target_phrase(
+            "what type of fuel ran the engine on rs-27a?"
+        )
+        == "fuel"
+    )
+
+
+def test_build_entity_alias_candidates_strips_common_geopolitical_prefixes() -> None:
+    controller = _make_controller()
+
+    aliases = controller._build_entity_alias_candidates("republic of brazil")
+
+    assert "Brazil" in aliases
+    assert aliases.index("Brazil") < aliases.index("brazil")
+
+
+def test_infer_query_shape_prefers_shared_type_intersection_with_shared_type_cues() -> None:
+    controller = _make_controller()
+
+    query_shape = controller._infer_query_shape(
+        question_text="what other types of collections are in the same category as patch collecting collection?",
+        entities=["Patch collecting collection"],
+        answer_target_phrase="other types of collections",
+        question_inputs=[
+            {
+                "surface": "category",
+                "kind": "shared_attribute",
+                "role_hint": "shared_attribute",
+            },
+            {
+                "surface": "Patch collecting collection",
+                "kind": "named_entity",
+                "role_hint": "anchor",
+            },
+        ],
+    )
+
+    assert query_shape == "shared_type_intersection"
+
+
+def test_validate_pal_execution_treats_anchor_probe_as_optional_for_type_set_only_count_plan() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {
+                    "surface": "research project",
+                    "chosen_alias": "research project",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "type.type.instance",
+                    "direction": "forward",
+                    "from_role": "type_set",
+                    "to_role": "count_set",
+                }
+            ],
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "type_node",
+                    }
+                ],
+            },
+            "candidate_set_variable": "candidate_set",
+            "count_set_variable": "count",
+            "allow_exploratory_predicates": False,
+        },
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/> "
+            "SELECT (COUNT(DISTINCT ?candidate_set) AS ?count) WHERE { "
+            "?type_node fb:type.object.name \"research project cancer center\" . "
+            "?type_node fb:type.type.instance ?candidate_set . }"
+        ),
+        result_dict={
+            "head": {"vars": ["count"]},
+            "results": {"bindings": [{"count": {"type": "literal", "value": "0"}}]},
+        },
+        entities=["research project"],
+        anchor_probe_results=[AnchorProbeResult(anchor_name="research project", entity_count=0)],
+    )
+
+    assert "anchor_not_found:'research project'" not in verdict.reasons
+
+
+def test_generic_type_relation_candidates_added_for_class_or_type_questions() -> None:
+    controller = _make_controller()
+
+    augmented = controller._augment_generic_type_relation_candidates(
+        relation_candidates=[],
+        answer_target_phrase="types of collections",
+        question_interpretation={
+            "question_inputs": [
+                {
+                    "surface": "types of collections",
+                    "kind": "answer_target",
+                    "role_hint": "answer_target",
+                    "reason": "answer target",
+                },
+                {
+                    "surface": "category",
+                    "kind": "shared_attribute",
+                    "role_hint": "shared_attribute",
+                    "reason": "shared category cue",
+                },
+            ]
+        },
+    )
+
+    relations = {str(item.get("relation") or "") for item in augmented}
+    relation_roles = {
+        (
+            str(item.get("relation") or ""),
+            str(item.get("from_role") or ""),
+            str(item.get("to_role") or ""),
+        )
+        for item in augmented
+    }
+    assert "type.object.type" in relations
+    assert "type.type.instance" in relations
+    assert ("type.object.type", "candidate_set", "type_set") in relation_roles
+    assert ("type.type.instance", "type_set", "candidate_set") in relation_roles
+
+
+def test_grounding_card_surfaces_question_inputs_and_scaffolds() -> None:
+    controller = _make_controller()
+
+    grounding_card = controller._build_pal_grounding_card(
+        "Question: what is the number of research project cancer centers?",
+        relation_grounding=[],
+        question_interpretation={
+            "question_inputs": [
+                {
+                    "surface": "research project",
+                    "kind": "class_phrase",
+                    "role_hint": "type_set",
+                    "reason": "class/category qualifier extracted from answer target",
+                },
+                {
+                    "surface": "cancer centers",
+                    "kind": "answer_target",
+                    "role_hint": "answer_target",
+                    "reason": "answer head noun phrase",
+                },
+            ],
+            "preferred_scaffolds": [
+                {
+                    "name": "class_filtered_count",
+                    "priority": 1,
+                    "reason": "count question with a derived class/category phrase",
+                }
+            ],
+        },
+    )
+
+    assert "- question_inputs:" in grounding_card
+    assert "class_filtered_count" in grounding_card
+    assert "research project" in grounding_card
 
 
 def test_plan_normalization_preserves_structured_fields() -> None:
@@ -88,6 +1055,30 @@ def test_plan_normalization_preserves_structured_fields() -> None:
     assert plan["relation_paths"][0]["from_role"] == "anchor"
     assert plan["relation_paths"][0]["to_role"] == "count_set"
     assert plan["relation_paths"][0]["grounding_source"] == "curated"
+
+
+def test_count_relation_normalization_preserves_inverse_answer_side_semantics() -> None:
+    controller = _make_controller()
+    normalized = controller._normalize_grounded_relation_candidates(
+        relation_candidates=[
+            {
+                "relation": "medicine.disease.transmitted_by",
+                "direction": "forward",
+                "from": "disease",
+                "to": "transmitter",
+                "support": "curated_medicine_disease_predicate",
+                "use_when": "find organisms or vectors that transmit a disease",
+            }
+        ],
+        query_shape="count_over_direct_relation",
+        answer_mode="count",
+        answer_target_phrase="infectious diseases",
+        entities=["Aedes aegypti"],
+    )
+
+    assert len(normalized) == 1
+    assert normalized[0]["from_role"] == "count_set"
+    assert normalized[0]["to_role"] == "anchor"
 
 
 def test_count_plan_normalization_coerces_lookup_shape_to_count_shape() -> None:
@@ -868,6 +1859,171 @@ def test_probe_guided_alias_repair_can_use_path_count_signal() -> None:
     assert "anchor_alias_override:Seventh sphere=>Seventh Sphere" in feedback
 
 
+def test_refresh_dynamic_grounding_after_anchor_alias_change_reprobes_new_alias() -> None:
+    controller = _make_controller()
+    controller._build_pal_grounding_card = (
+        lambda task_question, relation_grounding=None, alias_overrides=None: json.dumps(
+            {
+                "relations": [
+                    candidate.get("relation")
+                    for candidate in relation_grounding or []
+                ],
+                "aliases": alias_overrides or {},
+            },
+            sort_keys=True,
+        )
+    )
+    controller._probe_dynamic_relation_candidates_for_anchors = (
+        lambda anchored_entities, answer_target_phrase, domain_hints, question_text="", probe_timeout_s=5.0, max_anchors=2: [
+            {
+                "relation": "cvg.cvg_engine.successor",
+                "direction": "forward",
+                "from": str(anchored_entities[0].get("chosen_alias") or ""),
+                "to": "successor",
+                "from_role": "anchor",
+                "to_role": "answer",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_outgoing",
+            }
+        ]
+    )
+
+    grounding_card, merged_candidates, feedback = (
+        controller._refresh_dynamic_grounding_after_anchor_alias_change(
+            task_question="Question: the quake 3 engine was proceeded by which video game engine?, Entities: ['quake 3 engine']",
+            previous_alias_assignments={"quake 3 engine": "Quake 3 Engine"},
+            query_plan={
+                "answer_mode": "entity",
+                "query_shape": "single_anchor_lookup",
+                "anchored_entities": [
+                    {
+                        "surface": "quake 3 engine",
+                        "chosen_alias": "id Tech 3",
+                        "role": "anchor",
+                    }
+                ],
+            },
+            relation_grounding=[],
+        )
+    )
+
+    assert any(
+        candidate.get("relation") == "cvg.cvg_engine.successor"
+        and candidate.get("from") == "id Tech 3"
+        for candidate in merged_candidates
+    )
+    assert any(
+        "dynamic_grounding_refreshed_after_alias_change" in item
+        for item in feedback
+    )
+    assert "id Tech 3" in grounding_card
+
+
+def test_refresh_dynamic_grounding_after_anchor_alias_change_skips_when_curated_exists() -> None:
+    controller = _make_controller()
+    controller._build_pal_grounding_card = (
+        lambda task_question, relation_grounding=None, alias_overrides=None: json.dumps(
+            {"count": len(relation_grounding or []), "aliases": alias_overrides or {}},
+            sort_keys=True,
+        )
+    )
+    controller._probe_dynamic_relation_candidates_for_anchors = (
+        lambda **kwargs: pytest.fail(
+            "should not re-probe when curated grounding already exists"
+        )
+    )
+
+    grounding_card, merged_candidates, feedback = (
+        controller._refresh_dynamic_grounding_after_anchor_alias_change(
+            task_question="Question: what dug dosage form exist for drugs formulated from naloxone and has active ingredient enalaprilat?, Entities: ['Naloxone', 'Enalaprilat']",
+            previous_alias_assignments={"Naloxone": "Naloxone"},
+            query_plan={
+                "answer_mode": "entity",
+                "query_shape": "multi_anchor_intersection",
+                "anchored_entities": [
+                    {
+                        "surface": "Naloxone",
+                        "chosen_alias": "Naloxone hydrochloride",
+                        "role": "anchor_a",
+                    }
+                ],
+            },
+            relation_grounding=[
+                {
+                    "relation": "medicine.drug_formulation.formulation_of",
+                    "direction": "forward",
+                    "from": "formulation",
+                    "to": "drug_or_ingredient",
+                    "from_role": "shared_answer",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                }
+            ],
+        )
+    )
+
+    assert len(merged_candidates) == 1
+    assert feedback == []
+    assert "Naloxone hydrochloride" in grounding_card
+
+
+def test_single_anchor_dynamic_lookup_repair_plan_uses_best_live_dynamic_candidate() -> None:
+    controller = _make_controller()
+
+    repaired_plan = controller._build_single_anchor_dynamic_lookup_repair_plan(
+        query_plan={
+            "answer_mode": "entity",
+            "query_shape": "single_anchor_lookup",
+            "anchored_entities": [
+                {
+                    "surface": "quake 3 engine",
+                    "chosen_alias": "id Tech 3",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "succeeded_by",
+                    "direction": "forward",
+                    "from": "anchor",
+                    "to": "answer",
+                    "from_role": "anchor",
+                    "to_role": "answer",
+                    "grounding_source": "exploratory",
+                }
+            ],
+            "strategy": "stale exploratory lookup",
+            "plan_rationale": ["initial"],
+        },
+        relation_grounding=[
+            {
+                "relation": "cvg.computer_game_engine.predecessor_engine",
+                "direction": "forward",
+                "from": "id Tech 3",
+                "to": "predecessor",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "dynamic_probe",
+            },
+            {
+                "relation": "cvg.computer_game_engine.successor_engine",
+                "direction": "forward",
+                "from": "id Tech 3",
+                "to": "successor",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "dynamic_probe",
+            },
+        ],
+    )
+
+    assert repaired_plan is not None
+    assert repaired_plan["relation_paths"][0]["relation"] == "cvg.computer_game_engine.predecessor_engine"
+    assert repaired_plan["relation_paths"][0]["from"] == "anchor"
+    assert repaired_plan["relation_paths"][0]["to"] == "answer"
+    assert repaired_plan["relation_paths"][0]["to_role"] == "answer"
+
+
 def test_anchor_path_probe_supports_object_side_triples() -> None:
     controller = _make_controller()
     captured: dict[str, str] = {}
@@ -960,11 +2116,52 @@ def test_anchor_existence_probes_map_multi_anchor_constraint_paths() -> None:
         ("Naloxone", "medicine.drug_formulation.formulation_of", "object"),
         ("Enalaprilat", "medicine.drug_formulation.active_ingredients", "object"),
     ]
-    assert [result.relation_probed for result in results] == [
-        "medicine.drug_formulation.formulation_of",
-        "medicine.drug_formulation.active_ingredients",
-    ]
-    assert [result.anchor_position for result in results] == ["object", "object"]
+
+
+def test_anchor_existence_probes_capture_unique_resolved_entity_id_from_live_path() -> None:
+    controller = _make_controller()
+    controller._probe_entity_name_count = lambda alias, timeout_s=2.5: 3
+    controller._probe_anchor_path_count = (
+        lambda alias, relation, anchor_position="subject", timeout_s=2.5: 4
+    )
+    controller._probe_anchor_entity_ids = (
+        lambda *, anchor_name, relation=None, anchor_position="subject", timeout_s=2.5: ["m.01c44b"]
+        if anchor_name == "Southern Min"
+        and relation == "language.language_dialect.language"
+        and anchor_position == "object"
+        else []
+    )
+
+    results = controller._run_anchor_existence_probes(
+        query_plan={
+            "anchored_entities": [
+                {
+                    "surface": "Southern Min",
+                    "chosen_alias": "Southern Min",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "language.language_dialect.language",
+                    "direction": "reverse",
+                    "from": "dialect",
+                    "to": "Southern Min",
+                    "from_role": "candidate_set",
+                    "to_role": "anchor",
+                    "grounding_source": "curated",
+                }
+            ],
+        },
+        probe_paths=True,
+        timeout_s=1.0,
+    )
+
+    assert len(results) == 1
+    assert results[0].path_count == 4
+    assert results[0].resolved_entity_id == "m.01c44b"
+    assert results[0].relation_probed == "language.language_dialect.language"
+    assert results[0].anchor_position == "object"
 
 
 def test_dynamic_grounding_repair_augments_candidates_on_path_failure() -> None:
@@ -1813,6 +3010,98 @@ def test_plausibility_does_not_require_exact_count_set_variable_name_in_query() 
     assert verdict.verdict == VERDICT_ACCEPTED
 
 
+def test_plausibility_rejects_count_query_that_counts_wrong_variable() -> None:
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_joined_set",
+        "anchored_entities": [
+            {"surface": "Brazil", "chosen_alias": "Brazil", "role": "anchor_a"},
+            {
+                "surface": "Manchester Terrier",
+                "chosen_alias": "Manchester Terrier",
+                "role": "anchor_b",
+            },
+        ],
+        "shared_answer_variable": "temperament",
+        "candidate_set_variable": "breed",
+        "count_set_variable": "temperament",
+        "ordering_attribute": {"direction": "forward"},
+        "ordering_direction": "none",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {"anchor_role": "anchor_a", "constrains_variable": "breed", "notes": "country to breed"},
+                {
+                    "anchor_role": "anchor_b",
+                    "constrains_variable": "temperament",
+                    "notes": "anchor temperament",
+                },
+            ],
+        },
+        "relation_paths": [
+            {
+                "relation": "biology.breed_origin.breeds_originating_here",
+                "direction": "reverse",
+                "from": "country",
+                "to": "breed",
+                "from_role": "constraint_value",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "biology.animal_breed.temperament",
+                "direction": "forward",
+                "from": "breed",
+                "to": "temperament",
+                "from_role": "candidate_set",
+                "to_role": "count_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "biology.animal_breed.temperament",
+                "direction": "forward",
+                "from": "Manchester Terrier",
+                "to": "temperament",
+                "from_role": "anchor_b",
+                "to_role": "count_set",
+                "grounding_source": "curated",
+            },
+        ],
+        "projection": ["count"],
+        "allow_exploratory_predicates": False,
+        "strategy": "count shared temperament values",
+        "plan_rationale": [],
+    }
+    query_text = """
+    PREFIX fb: <http://rdf.freebase.com/ns/>
+    SELECT (COUNT(DISTINCT ?breed) AS ?count) WHERE {
+      ?country fb:type.object.name ?country_name .
+      FILTER(LCASE(STR(?country_name)) = "brazil") .
+      ?country fb:biology.breed_origin.breeds_originating_here ?breed .
+      ?anchor fb:type.object.name ?anchor_name .
+      FILTER(LCASE(STR(?anchor_name)) = "manchester terrier") .
+      ?breed fb:biology.animal_breed.temperament ?temperament .
+      ?anchor fb:biology.animal_breed.temperament ?temperament .
+    } LIMIT 50
+    """
+    result_dict = {
+        "head": {"vars": ["count"]},
+        "results": {"bindings": [{"count": {"type": "literal", "value": "1"}}]},
+    }
+
+    verdict = validate_pal_execution(
+        query_plan=query_plan,
+        query_text=query_text,
+        result_dict=result_dict,
+        entities=["Brazil", "Manchester Terrier"],
+        anchor_probe_results=None,
+    )
+
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "count_query_counts_wrong_variable:breed" in verdict.reasons
+
+
 def test_superlative_grounding_normalizes_ordering_roles() -> None:
     controller = _make_controller()
     candidates = controller._normalize_grounded_relation_candidates(
@@ -1906,6 +3195,34 @@ def solve(endpoint_url):
     assert len(query_texts) == 2
     assert "fictional_universe.fictional_universe.races" in query_texts[0]
     assert "fictional_universe.fictional_setting.setting_type" in query_texts[1]
+
+
+def test_validate_query_predicates_ignores_freebase_entity_ids() -> None:
+    controller = _make_controller()
+
+    errors = controller._validate_query_predicates_against_plan(
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/> "
+            "SELECT (COUNT(DISTINCT ?candidate_set) AS ?count) WHERE { "
+            "?candidate_set fb:language.language_dialect.language fb:m.01c44b . "
+            "} LIMIT 50"
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "relation_paths": [
+                {
+                    "relation": "language.language_dialect.language",
+                    "direction": "reverse",
+                    "from_role": "candidate_set",
+                    "to_role": "anchor",
+                }
+            ],
+            "ordering_attribute": {},
+            "allow_exploratory_predicates": False,
+        },
+    )
+
+    assert errors == []
 
 
 def test_query_candidate_accepts_count_fallback_queries_with_named_query_variables() -> None:
@@ -2104,6 +3421,108 @@ def test_plausibility_accepts_count_join_when_constraints_target_candidate_set()
     assert verdict.verdict == VERDICT_ACCEPTED
 
 
+def test_plausibility_accepts_count_join_when_constraints_target_shared_answer_alias() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_joined_set",
+            "shared_answer_variable": "shared_answer",
+            "candidate_set_variable": "candidate_set",
+            "count_set_variable": "count_set",
+            "anchored_entities": [
+                {"surface": "brazil", "chosen_alias": "brazil", "role": "anchor_a"},
+                {
+                    "surface": "Manchester Terrier",
+                    "chosen_alias": "Manchester Terrier",
+                    "role": "anchor_b",
+                },
+            ],
+            "join_structure": {
+                "type": "intersection",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor_a",
+                        "constrains_variable": "shared_answer",
+                        "notes": "country filter",
+                    },
+                    {
+                        "anchor_role": "anchor_b",
+                        "constrains_variable": "shared_answer",
+                        "notes": "temperament filter",
+                    },
+                ],
+            },
+            "relation_paths": [
+                {
+                    "relation": "biology.animal_breed.country_of_origin",
+                    "direction": "forward",
+                    "from": "breed",
+                    "to": "country",
+                    "from_role": "shared_answer",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "biology.animal_breed.temperament",
+                    "direction": "forward",
+                    "from": "breed",
+                    "to": "breed_temperament",
+                    "from_role": "shared_answer",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "biology.animal_breed.temperament",
+                    "direction": "forward",
+                    "from": "anchor_b",
+                    "to": "manchester_temperament",
+                    "from_role": "anchor_b",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count joined shared-answer set",
+        },
+        query_text=(
+            "SELECT (COUNT(DISTINCT ?breed) AS ?count) WHERE { "
+            '?country fb:type.object.name "brazil"@en . '
+            '?manchester fb:type.object.name "Manchester Terrier"@en . '
+            "?breed fb:biology.animal_breed.country_of_origin ?country . "
+            "?breed fb:biology.animal_breed.temperament ?breed_temperament . "
+            "?manchester fb:biology.animal_breed.temperament ?manchester_temperament . "
+            "FILTER(?breed_temperament = ?manchester_temperament) "
+            "} LIMIT 50"
+        ),
+        result_dict={
+            "results": {
+                "bindings": [
+                    {"count": {"type": "literal", "value": "0"}}
+                ]
+            }
+        },
+        entities=["brazil", "Manchester Terrier"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="brazil",
+                entity_count=5,
+                path_count=0,
+                relation_probed="biology.animal_breed.country_of_origin",
+                anchor_position="object",
+            ),
+            AnchorProbeResult(
+                anchor_name="Manchester Terrier",
+                entity_count=9,
+                path_count=54,
+                relation_probed="biology.animal_breed.temperament",
+                anchor_position="subject",
+            ),
+        ],
+    )
+
+    assert "join_structure_drifting_constraints:shared_answer" not in verdict.reasons
+
+
 def test_dynamic_probe_scoring_uses_question_text() -> None:
     controller = _make_controller()
 
@@ -2161,6 +3580,83 @@ def test_dynamic_probe_scoring_uses_anchor_clue_for_medicine_bridge() -> None:
     )
 
     assert marketed_score > moiety_score
+
+
+def test_dynamic_probe_scoring_prefers_origin_family_for_origin_constraint() -> None:
+    controller = _make_controller()
+
+    originating_here_score = controller._score_probe_predicate(
+        "biology.breed_origin.breeds_originating_here",
+        "different breeds",
+        ["biology", "animal"],
+        "Question: how many different breeds from republic of brazil have the same temperament as the manchester terrier?",
+        anchor_clue="origin_constraint",
+    )
+    country_of_origin_score = controller._score_probe_predicate(
+        "biology.animal_breed.country_of_origin",
+        "different breeds",
+        ["biology", "animal"],
+        "Question: how many different breeds from republic of brazil have the same temperament as the manchester terrier?",
+        anchor_clue="origin_constraint",
+    )
+
+    assert originating_here_score > country_of_origin_score
+
+
+def test_dynamic_probe_scoring_prefers_successor_family_for_preceded_by_question() -> None:
+    controller = _make_controller()
+
+    successor_score = controller._score_probe_predicate(
+        "cvg.cvg_engine.successor",
+        "video game engine",
+        ["software", "engine", "video game"],
+        "Question: the quake 3 engine was proceeded by which video game engine?",
+    )
+    unrelated_score = controller._score_probe_predicate(
+        "cvg.cvg_engine.games",
+        "video game engine",
+        ["software", "engine", "video game"],
+        "Question: the quake 3 engine was proceeded by which video game engine?",
+    )
+
+    assert successor_score > unrelated_score
+
+
+def test_dynamic_probe_scoring_penalizes_category_relations_for_feature_clues() -> None:
+    controller = _make_controller()
+
+    technique_score = controller._score_probe_predicate(
+        "martial_arts.martial_art.techniques",
+        "martial art",
+        ["martial_arts"],
+        "Question: what martial art has the same category as mongolian wrestling and has strike?",
+        anchor_clue="attribute_value.feature",
+    )
+    category_score = controller._score_probe_predicate(
+        "martial_arts.martial_art.category",
+        "martial art",
+        ["martial_arts"],
+        "Question: what martial art has the same category as mongolian wrestling and has strike?",
+        anchor_clue="attribute_value.feature",
+    )
+
+    assert technique_score > category_score
+
+
+def test_grounding_candidates_include_reverse_breed_origin_family() -> None:
+    controller = _make_controller()
+
+    candidates = controller._build_grounded_relation_candidates(
+        "Question: how many different breeds from republic of brazil have the same temperament as the manchester terrier?, Entities: ['republic of brazil', 'Manchester Terrier']"
+    )
+
+    assert any(
+        candidate.get("relation") == "biology.breed_origin.breeds_originating_here"
+        and candidate.get("direction") == "reverse"
+        and candidate.get("from") == "country"
+        and candidate.get("to") == "breed"
+        for candidate in candidates
+    )
 
 
 def test_dynamic_probe_candidate_uses_semantic_endpoint_labels() -> None:
@@ -2595,6 +4091,376 @@ def test_projected_intersection_repair_can_build_from_grounding_candidates() -> 
         item.get("relation") == "medicine.drug_ingredient.active_moiety_of_formulation"
         and item.get("to") == "candidate_set_anchor_b"
         for item in repaired_plan["relation_paths"]
+    )
+
+
+def test_projected_intersection_repair_prefers_forward_anchor_bridge_candidates() -> None:
+    controller = _make_controller()
+
+    repaired_plan = controller._build_projected_answer_intersection_repair_plan(
+        query_plan=controller._normalize_pal_query_plan(
+            {
+                "answer_type": "entity",
+                "answer_mode": "entity",
+                "query_shape": "multi_anchor_intersection",
+                "anchored_entities": [
+                    {
+                        "surface": "Candesartan cilexetil",
+                        "chosen_alias": "Candesartan cilexetil",
+                        "role": "anchor_a",
+                    },
+                    {
+                        "surface": "Formic acid",
+                        "chosen_alias": "Formic acid",
+                        "role": "anchor_b",
+                    },
+                ],
+                "normalized_aliases": [],
+                "shared_answer_variable": "formulation",
+                "candidate_set_variable": "candidate_set",
+                "count_set_variable": "",
+                "join_structure": {
+                    "type": "intersection",
+                    "anchor_constraints": [
+                        {"anchor_role": "anchor_a", "constrains_variable": "formulation", "notes": "a"},
+                        {"anchor_role": "anchor_b", "constrains_variable": "formulation", "notes": "b"},
+                    ],
+                },
+                "relation_paths": [
+                    {
+                        "relation": "medicine.drug_formulation.formulation_of",
+                        "direction": "reverse",
+                        "from": "formulation",
+                        "to": "drug_or_ingredient",
+                        "from_role": "candidate_set",
+                        "to_role": "constraint_value",
+                        "grounding_source": "curated",
+                        "reason": "failed initial bridge a",
+                    },
+                    {
+                        "relation": "medicine.drug_ingredient.active_ingredient_of_formulation",
+                        "direction": "forward",
+                        "from": "Formic acid",
+                        "to": "formulation",
+                        "from_role": "anchor_b",
+                        "to_role": "shared_answer",
+                        "grounding_source": "curated",
+                        "reason": "failed initial bridge b",
+                    },
+                    {
+                        "relation": "medicine.drug_formulation.dosage_form",
+                        "direction": "forward",
+                        "from": "formulation",
+                        "to": "dosage_form",
+                        "from_role": "shared_answer",
+                        "to_role": "answer",
+                        "grounding_source": "curated",
+                        "reason": "project dosage form",
+                    }
+                ],
+                "projection": ["dosage_form"],
+                "allow_exploratory_predicates": False,
+                "strategy": "project each branch to dosage_form",
+                "plan_rationale": ["start with formulation bridge"],
+            }
+        ),
+        relation_grounding=[
+            {
+                "relation": "medicine.drug.marketed_formulations",
+                "direction": "forward",
+                "from": "Candesartan cilexetil",
+                "to": "formulation",
+                "from_role": "anchor_a",
+                "to_role": "candidate_set",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_outgoing",
+            },
+            {
+                "relation": "medicine.drug_formulation.active_ingredients",
+                "direction": "reverse",
+                "from": "formulation",
+                "to": "Candesartan cilexetil",
+                "from_role": "candidate_set",
+                "to_role": "anchor_a",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+            },
+            {
+                "relation": "medicine.drug_ingredient.active_ingredient_of_formulation",
+                "direction": "forward",
+                "from": "Formic acid",
+                "to": "formulation",
+                "from_role": "anchor_b",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "support": "curated_anchor_bridge_synthesized",
+            },
+            {
+                "relation": "medicine.drug_formulation.dosage_form",
+                "direction": "forward",
+                "from": "formulation",
+                "to": "dosage_form",
+                "from_role": "shared_answer",
+                "to_role": "answer",
+                "grounding_source": "curated",
+            },
+        ],
+    )
+
+    assert repaired_plan is not None
+    assert any(
+        path.get("relation") == "medicine.drug.marketed_formulations"
+        and path.get("from_role") == "anchor_a"
+        and path.get("to") == "candidate_set_anchor_a"
+        for path in repaired_plan["relation_paths"]
+    )
+    assert not any(
+        path.get("relation") == "medicine.drug_formulation.active_ingredients"
+        and path.get("to_role") == "anchor_a"
+        for path in repaired_plan["relation_paths"]
+    )
+
+
+def test_projected_intersection_repair_prefers_live_probed_anchor_relation_family() -> None:
+    controller = _make_controller()
+
+    repaired_plan = controller._build_projected_answer_intersection_repair_plan(
+        query_plan=controller._normalize_pal_query_plan(
+            {
+                "answer_type": "entity",
+                "answer_mode": "entity",
+                "query_shape": "multi_anchor_intersection",
+                "anchored_entities": [
+                    {
+                        "surface": "Candesartan cilexetil",
+                        "chosen_alias": "Candesartan cilexetil",
+                        "role": "anchor_a",
+                    },
+                    {
+                        "surface": "Formic acid",
+                        "chosen_alias": "Formic acid",
+                        "role": "anchor_b",
+                    },
+                ],
+                "shared_answer_variable": "formulation",
+                "candidate_set_variable": "candidate_set",
+                "relation_paths": [
+                    {
+                        "relation": "medicine.drug_formulation.formulation_of",
+                        "direction": "reverse",
+                        "from": "formulation",
+                        "to": "anchor_a",
+                        "from_role": "candidate_set",
+                        "to_role": "anchor_a",
+                    },
+                    {
+                        "relation": "medicine.drug_ingredient.active_ingredient_of_formulation",
+                        "direction": "forward",
+                        "from": "anchor_b",
+                        "to": "formulation",
+                        "from_role": "anchor_b",
+                        "to_role": "shared_answer",
+                    },
+                    {
+                        "relation": "medicine.drug_formulation.dosage_form",
+                        "direction": "forward",
+                        "from": "formulation",
+                        "to": "dosage_form",
+                        "from_role": "shared_answer",
+                        "to_role": "answer",
+                    },
+                ],
+                "projection": ["dosage_form"],
+            }
+        ),
+        relation_grounding=[
+            {
+                "relation": "medicine.drug.marketed_formulations",
+                "direction": "forward",
+                "from": "Candesartan cilexetil",
+                "to": "formulation",
+                "from_role": "anchor_a",
+                "to_role": "candidate_set",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_outgoing",
+            },
+            {
+                "relation": "medicine.drug_formulation.active_ingredients",
+                "direction": "reverse",
+                "from": "formulation",
+                "to": "Candesartan cilexetil",
+                "from_role": "candidate_set",
+                "to_role": "anchor_a",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+            },
+            {
+                "relation": "medicine.drug_ingredient.active_ingredient_of_formulation",
+                "direction": "forward",
+                "from": "Formic acid",
+                "to": "formulation",
+                "from_role": "anchor_b",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "medicine.drug_formulation.active_ingredient_moieties",
+                "direction": "reverse",
+                "from": "formulation",
+                "to": "Formic acid",
+                "from_role": "candidate_set",
+                "to_role": "anchor_b",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+            },
+            {
+                "relation": "medicine.drug_formulation.dosage_form",
+                "direction": "forward",
+                "from": "formulation",
+                "to": "dosage_form",
+                "from_role": "shared_answer",
+                "to_role": "answer",
+                "grounding_source": "curated",
+            },
+        ],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Candesartan cilexetil",
+                entity_count=1,
+                path_count=4,
+                relation_probed="medicine.drug.marketed_formulations",
+                anchor_position="subject",
+            ),
+            AnchorProbeResult(
+                anchor_name="Formic acid",
+                entity_count=1,
+                path_count=17,
+                relation_probed="medicine.drug_ingredient.active_ingredient_of_formulation",
+                anchor_position="subject",
+            ),
+        ],
+    )
+
+    assert repaired_plan is not None
+    assert any(
+        path.get("relation") == "medicine.drug.marketed_formulations"
+        and path.get("to") == "candidate_set_anchor_a"
+        for path in repaired_plan["relation_paths"]
+    )
+    assert any(
+        path.get("relation") == "medicine.drug_ingredient.active_ingredient_of_formulation"
+        and path.get("to") == "candidate_set_anchor_b"
+        for path in repaired_plan["relation_paths"]
+    )
+    assert not any(
+        path.get("relation") == "medicine.drug_formulation.active_ingredients"
+        for path in repaired_plan["relation_paths"]
+    )
+
+
+def test_projected_intersection_repair_preserves_existing_anchor_family_without_probe_override() -> None:
+    controller = _make_controller()
+
+    repaired_plan = controller._build_projected_answer_intersection_repair_plan(
+        query_plan=controller._normalize_pal_query_plan(
+            {
+                "answer_type": "entity",
+                "answer_mode": "entity",
+                "query_shape": "multi_anchor_intersection",
+                "anchored_entities": [
+                    {
+                        "surface": "Candesartan cilexetil",
+                        "chosen_alias": "Candesartan cilexetil",
+                        "role": "anchor_a",
+                    },
+                    {
+                        "surface": "Formic acid",
+                        "chosen_alias": "Formic acid",
+                        "role": "anchor_b",
+                    },
+                ],
+                "shared_answer_variable": "formulation",
+                "candidate_set_variable": "candidate_set",
+                "relation_paths": [
+                    {
+                        "relation": "medicine.drug.marketed_formulations",
+                        "direction": "forward",
+                        "from": "anchor_a",
+                        "to": "formulation",
+                        "from_role": "anchor_a",
+                        "to_role": "shared_answer",
+                    },
+                    {
+                        "relation": "medicine.drug_ingredient.active_ingredient_of_formulation",
+                        "direction": "forward",
+                        "from": "anchor_b",
+                        "to": "formulation",
+                        "from_role": "anchor_b",
+                        "to_role": "shared_answer",
+                    },
+                    {
+                        "relation": "medicine.drug_formulation.dosage_form",
+                        "direction": "forward",
+                        "from": "formulation",
+                        "to": "dosage_form",
+                        "from_role": "shared_answer",
+                        "to_role": "answer",
+                    },
+                ],
+                "projection": ["dosage_form"],
+            }
+        ),
+        relation_grounding=[
+            {
+                "relation": "medicine.drug.marketed_formulations",
+                "direction": "forward",
+                "from": "Candesartan cilexetil",
+                "to": "formulation",
+                "from_role": "anchor_a",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "medicine.drug_ingredient.active_ingredient_of_formulation",
+                "direction": "forward",
+                "from": "Formic acid",
+                "to": "formulation",
+                "from_role": "anchor_b",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "medicine.drug_ingredient.active_moiety_of_formulation",
+                "direction": "forward",
+                "from": "Formic acid",
+                "to": "formulation",
+                "from_role": "anchor_b",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "medicine.drug_formulation.dosage_form",
+                "direction": "forward",
+                "from": "formulation",
+                "to": "dosage_form",
+                "from_role": "shared_answer",
+                "to_role": "answer",
+                "grounding_source": "curated",
+            },
+        ],
+        anchor_probe_results=None,
+    )
+
+    assert repaired_plan is not None
+    assert any(
+        path.get("relation") == "medicine.drug_ingredient.active_ingredient_of_formulation"
+        and path.get("to") == "candidate_set_anchor_b"
+        for path in repaired_plan["relation_paths"]
+    )
+    assert not any(
+        path.get("relation") == "medicine.drug_ingredient.active_moiety_of_formulation"
+        and path.get("to") == "candidate_set_anchor_b"
+        for path in repaired_plan["relation_paths"]
     )
 
 
@@ -3037,10 +4903,173 @@ def test_anchor_existence_probe_prefers_full_count_chain_when_available() -> Non
 
     assert len(probe_results) == 1
     assert probe_results[0].path_count == 45
-    assert probe_results[0].relation_probed == (
-        "fictional_universe.fictional_setting.universe"
-        " -> fictional_universe.fictional_universe.species"
+
+
+def test_pivot_preserving_count_repair_prefers_live_direct_dynamic_count_relation() -> None:
+    controller = _make_controller()
+    query_plan = controller._normalize_pal_query_plan(
+        {
+            "answer_type": "count",
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {
+                    "surface": "Aedes aegypti",
+                    "chosen_alias": "Aedes aegypti",
+                    "role": "anchor",
+                }
+            ],
+            "shared_answer_variable": "candidate_set",
+            "candidate_set_variable": "candidate_set",
+            "count_set_variable": "candidate_set",
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "candidate_set",
+                    }
+                ],
+            },
+            "relation_paths": [
+                {
+                    "relation": "biology.organism.diseases_transmitted",
+                    "direction": "forward",
+                    "from": "organism",
+                    "to": "disease",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                }
+            ],
+            "projection": ["count"],
+        }
     )
+
+    rewritten = controller._build_pivot_preserving_count_repair_plan(
+        query_plan=query_plan,
+        relation_grounding=[
+            {
+                "relation": "medicine.infectious_disease.vector",
+                "direction": "reverse",
+                "from": "disease",
+                "to": "Aedes aegypti",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+            },
+            {
+                "relation": "type.type.instance",
+                "direction": "reverse",
+                "from": "type",
+                "to": "Aedes aegypti",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+            },
+            {
+                "relation": "biology.organism.diseases_transmitted",
+                "direction": "forward",
+                "from": "pivot",
+                "to": "disease",
+                "from_role": "candidate_set",
+                "to_role": "count_set",
+                "grounding_source": "curated",
+            },
+        ],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Aedes aegypti",
+                entity_count=12,
+                path_count=0,
+                relation_probed="biology.organism.diseases_transmitted",
+                anchor_position="subject",
+            )
+        ],
+    )
+
+    assert rewritten is not None
+    assert [path["relation"] for path in rewritten["relation_paths"]] == [
+        "medicine.infectious_disease.vector"
+    ]
+    assert rewritten["count_set_variable"] == "disease"
+
+
+def test_direct_count_repair_prefers_curated_inverse_family_before_dynamic_fallback() -> None:
+    controller = _make_controller()
+    query_plan = controller._normalize_pal_query_plan(
+        {
+            "answer_type": "count",
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {
+                    "surface": "Aedes aegypti",
+                    "chosen_alias": "Aedes aegypti",
+                    "role": "anchor",
+                }
+            ],
+            "candidate_set_variable": "disease",
+            "count_set_variable": "disease",
+            "join_structure": {"type": "count", "anchor_constraints": []},
+            "relation_paths": [
+                {
+                    "relation": "biology.organism.diseases_transmitted",
+                    "direction": "forward",
+                    "from": "organism",
+                    "to": "disease",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                }
+            ],
+            "projection": ["count"],
+        }
+    )
+
+    rewritten = controller._build_direct_dynamic_count_repair_plan(
+        query_plan=query_plan,
+        relation_grounding=[
+            {
+                "relation": "medicine.infectious_disease.vector",
+                "direction": "reverse",
+                "from": "disease",
+                "to": "Aedes aegypti",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+            },
+            {
+                "relation": "medicine.disease.transmitted_by",
+                "direction": "forward",
+                "from": "disease",
+                "to": "transmitter",
+                "from_role": "count_set",
+                "to_role": "anchor",
+                "grounding_source": "curated",
+                "support": "curated_medicine_disease_predicate",
+            },
+        ],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Aedes aegypti",
+                entity_count=12,
+                path_count=0,
+                relation_probed="biology.organism.diseases_transmitted",
+                anchor_position="subject",
+            )
+        ],
+    )
+
+    assert rewritten is not None
+    assert [path["relation"] for path in rewritten["relation_paths"]] == [
+        "medicine.disease.transmitted_by"
+    ]
+    assert rewritten["relation_paths"][0]["from_role"] == "count_set"
+    assert rewritten["relation_paths"][0]["to_role"] == "anchor"
 
 
 def test_structural_repair_emits_anchor_clues_for_scaffold_switch() -> None:
@@ -3282,6 +5311,275 @@ def test_plausibility_repairs_zero_count_for_unplanned_dynamic_type_filter() -> 
 
     assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
     assert "count_query_unplanned_type_constraint" in verdict.reasons
+
+
+def test_plausibility_repairs_ambiguous_live_count_without_resolved_anchor_binding() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {"surface": "Southern Min", "chosen_alias": "Southern Min", "role": "anchor"}
+            ],
+            "candidate_set_variable": "dialect",
+            "count_set_variable": "dialect",
+            "relation_paths": [
+                {
+                    "relation": "language.language_dialect.language",
+                    "direction": "reverse",
+                    "from": "dialect",
+                    "to": "anchor",
+                    "from_role": "count_set",
+                    "to_role": "anchor",
+                    "grounding_source": "curated",
+                }
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count dialects for one language anchor",
+        },
+        query_text=(
+            "SELECT (COUNT(DISTINCT ?dialect) AS ?count) WHERE { "
+            '?language fb:type.object.name "Southern Min"@en . '
+            "?dialect fb:language.language_dialect.language ?language . "
+            "}"
+        ),
+        result_dict={
+            "results": {
+                "bindings": [
+                    {"count": {"type": "literal", "value": "0"}}
+                ]
+            }
+        },
+        entities=["Southern Min"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Southern Min",
+                entity_count=3,
+                path_count=8,
+                relation_probed="language.language_dialect.language",
+                anchor_position="object",
+                resolved_entity_id="m.01c44b",
+            )
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "repair:bind_anchor_to_resolved_entity_id_before_accepting_result" in verdict.reasons
+
+
+def test_plausibility_repairs_low_support_dynamic_count_even_after_resolved_id_pin() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {
+                    "surface": "Aedes aegypti",
+                    "chosen_alias": "Aedes aegypti",
+                    "role": "anchor",
+                }
+            ],
+            "candidate_set_variable": "disease",
+            "count_set_variable": "disease",
+            "relation_paths": [
+                {
+                    "relation": "medicine.infectious_disease.vector",
+                    "direction": "reverse",
+                    "from": "disease",
+                    "to": "anchor",
+                    "from_role": "count_set",
+                    "to_role": "anchor",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count disease entities via a dynamic probe relation after curated paths failed",
+        },
+        query_text=(
+            "SELECT (COUNT(DISTINCT ?disease) AS ?count) WHERE { "
+            "?disease fb:medicine.infectious_disease.vector fb:m.06y6_w . "
+            "}"
+        ),
+        result_dict={
+            "results": {
+                "bindings": [
+                    {"count": {"type": "literal", "value": "1"}}
+                ]
+            }
+        },
+        entities=["Aedes aegypti"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Aedes aegypti",
+                entity_count=12,
+                path_count=1,
+                relation_probed="medicine.infectious_disease.vector",
+                anchor_position="object",
+                resolved_entity_id="m.06y6_w",
+            )
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "count_query_dynamic_chain_too_weak" in verdict.reasons
+    assert (
+        "repair:verify_resolved_anchor_entity_and_relation_family_before_accepting_low_support_count"
+        in verdict.reasons
+    )
+
+
+def test_plausibility_repairs_generic_type_only_zero_count_with_optional_anchor_probe() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {
+                    "surface": "research project",
+                    "chosen_alias": "research project",
+                    "role": "type_set",
+                }
+            ],
+            "candidate_set_variable": "center",
+            "count_set_variable": "center",
+            "relation_paths": [
+                {
+                    "relation": "type.object.type",
+                    "direction": "forward",
+                    "from_role": "candidate_set",
+                    "to_role": "type_set",
+                    "grounding_source": "dynamic_probe",
+                },
+                {
+                    "relation": "type.type.instance",
+                    "direction": "reverse",
+                    "from_role": "type_set",
+                    "to_role": "candidate_set",
+                    "grounding_source": "dynamic_probe",
+                },
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count candidate set using only generic type relations",
+        },
+        query_text=(
+            "SELECT (COUNT(DISTINCT ?center) AS ?count) WHERE { "
+            "?center fb:type.object.type ?t . "
+            "?t fb:type.type.instance ?center . "
+            'FILTER(LCASE(STR(?label)) = "research project") '
+            "}"
+        ),
+        result_dict={
+            "results": {
+                "bindings": [
+                    {"count": {"type": "literal", "value": "0"}}
+                ]
+            }
+        },
+        entities=["research project"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="research project",
+                entity_count=0,
+            )
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "generic_type_only_zero_count_plan" in verdict.reasons
+
+
+def test_plausibility_repairs_zero_joined_count_with_live_anchor_paths() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_joined_set",
+            "anchored_entities": [
+                {"surface": "Canada", "chosen_alias": "Canada", "role": "anchor_a"},
+                {
+                    "surface": "Bull Terrier",
+                    "chosen_alias": "Bull Terrier",
+                    "role": "anchor_b",
+                },
+            ],
+            "shared_answer_variable": "breed",
+            "candidate_set_variable": "breed",
+            "count_set_variable": "breed",
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {"anchor_role": "anchor_a", "constrains_variable": "breed"},
+                    {"anchor_role": "anchor_b", "constrains_variable": "temperament"},
+                ],
+            },
+            "relation_paths": [
+                {
+                    "relation": "biology.breed_origin.breeds_originating_here",
+                    "direction": "reverse",
+                    "from": "country",
+                    "to": "breed",
+                    "from_role": "anchor_a",
+                    "to_role": "candidate_set",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "biology.animal_breed.temperament",
+                    "direction": "forward",
+                    "from": "Bull Terrier",
+                    "to": "temperament",
+                    "from_role": "anchor_b",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "biology.animal_breed.temperament",
+                    "direction": "reverse",
+                    "from": "temperament",
+                    "to": "breed",
+                    "from_role": "constraint_value",
+                    "to_role": "candidate_set",
+                    "grounding_source": "curated",
+                },
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count candidate breeds constrained by country and shared temperament",
+        },
+        query_text=(
+            "SELECT (COUNT(DISTINCT ?breed) AS ?count) WHERE { "
+            '?country fb:type.object.name "Canada"@en . '
+            '?bull fb:type.object.name "Bull Terrier"@en . '
+            "?bull fb:biology.animal_breed.temperament ?temp . "
+            "?country fb:biology.breed_origin.breeds_originating_here ?breed . "
+            "?breed fb:biology.animal_breed.temperament ?temp . "
+            "}"
+        ),
+        result_dict={
+            "results": {
+                "bindings": [
+                    {"count": {"type": "literal", "value": "0"}}
+                ]
+            }
+        },
+        entities=["Canada", "Bull Terrier"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Canada",
+                entity_count=10,
+                path_count=190,
+                relation_probed="biology.breed_origin.breeds_originating_here",
+                anchor_position="subject",
+            ),
+            AnchorProbeResult(
+                anchor_name="Bull Terrier",
+                entity_count=8,
+                path_count=40,
+                relation_probed="biology.animal_breed.temperament",
+                anchor_position="subject",
+            ),
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "count_query_zero_with_live_anchor_paths" in verdict.reasons
 
 
 def test_bad_count_set_feedback_adds_type_constraint_repair_hints() -> None:

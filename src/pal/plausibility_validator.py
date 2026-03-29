@@ -78,6 +78,9 @@ class AnchorProbeResult:
     anchor_position: str | None = None
     """Whether the anchor was probed on the subject or object side of the triple."""
 
+    resolved_entity_id: str | None = None
+    """A uniquely resolved Freebase entity id for this anchor, when probing found one."""
+
     @property
     def found(self) -> bool:
         """True if at least one entity with this name exists in the KG."""
@@ -274,20 +277,73 @@ def validate_pal_execution(
     # early regardless of what the combined query returned.               #
     # ------------------------------------------------------------------ #
     if anchor_probe_results:
-        not_found = [r for r in anchor_probe_results if r.entity_count == 0]
-        if not_found:
-            reasons = [f"anchor_not_found:{r.anchor_name!r}" for r in not_found]
-            reasons += [
-                f"probe_count:{r.anchor_name!r}={r.entity_count}" for r in not_found
+        ambiguous_surface_bound = [
+            result
+            for result in anchor_probe_results
+            if result.entity_count > 1
+            and (result.path_count or 0) > 0
+            and str(result.resolved_entity_id or "").strip()
+            and not _query_pins_resolved_anchor_entity(
+                query_text=qt,
+                resolved_entity_id=str(result.resolved_entity_id or "").strip(),
+            )
+        ]
+        if ambiguous_surface_bound:
+            reasons = [
+                (
+                    f"ambiguous_anchor_surface_binding:{result.anchor_name!r}:"
+                    f"{result.entity_count}"
+                )
+                for result in ambiguous_surface_bound
             ]
-            if answer_mode == "count":
-                reasons += ["count_set_anchor_not_found"]
+            reasons += [
+                "repair:bind_anchor_to_resolved_entity_id_before_accepting_result"
+            ]
+            if is_multi_anchor_strategy:
                 return PlausibilityVerdict(
-                    verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET, reasons=reasons
+                    verdict=VERDICT_REPAIRABLE_BAD_JOIN,
+                    reasons=reasons,
+                )
+            if answer_mode == "count":
+                return PlausibilityVerdict(
+                    verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                    reasons=reasons,
                 )
             return PlausibilityVerdict(
-                verdict=VERDICT_REPAIRABLE_ANCHOR_NOT_FOUND, reasons=reasons
+                verdict=VERDICT_REPAIRABLE_ANCHOR_PATH_EMPTY,
+                reasons=reasons,
             )
+
+        relation_path_roles = {
+            _normalize_contract_role(relation_path.get(endpoint_role))
+            for relation_path in relation_paths
+            if isinstance(relation_path, Mapping)
+            for endpoint_role in ("from_role", "to_role")
+        }
+        anchor_probe_optional = (
+            bool({"type_set", "shared_type"} & relation_path_roles)
+            and not bool({"anchor", "anchor_a", "anchor_b"} & relation_path_roles)
+        )
+        not_found = [r for r in anchor_probe_results if r.entity_count == 0]
+        if not_found:
+            if anchor_probe_optional:
+                soft_reasons += [
+                    f"anchor_probe_optional_not_found:{r.anchor_name!r}"
+                    for r in not_found
+                ]
+            else:
+                reasons = [f"anchor_not_found:{r.anchor_name!r}" for r in not_found]
+                reasons += [
+                    f"probe_count:{r.anchor_name!r}={r.entity_count}" for r in not_found
+                ]
+                if answer_mode == "count":
+                    reasons += ["count_set_anchor_not_found"]
+                    return PlausibilityVerdict(
+                        verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET, reasons=reasons
+                    )
+                return PlausibilityVerdict(
+                    verdict=VERDICT_REPAIRABLE_ANCHOR_NOT_FOUND, reasons=reasons
+                )
 
         probe_failed = [r for r in anchor_probe_results if r.entity_count == -1]
         path_empty = [
@@ -342,6 +398,45 @@ def validate_pal_execution(
             )
 
         if (
+            scalar_count == 0
+            and _plan_uses_only_generic_type_relations(relation_paths)
+            and any(
+                reason.startswith("anchor_probe_optional_not_found:")
+                for reason in soft_reasons
+            )
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=soft_reasons
+                + [
+                    "generic_type_only_zero_count_plan",
+                    "repair:strengthen_type_grounding_before_accepting_zero_count",
+                ],
+            )
+
+        live_anchor_paths = [
+            result
+            for result in (anchor_probe_results or [])
+            if result.entity_count > 0 and (result.path_count or 0) > 0
+        ]
+        if (
+            answer_mode == "count"
+            and scalar_count == 0
+            and query_shape == "count_over_joined_set"
+            and is_multi_anchor_strategy
+            and not plan_is_weak
+            and len(live_anchor_paths) >= 2
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=[
+                    "count_query_zero_with_live_anchor_paths",
+                    "count_scalar_returned:0",
+                    "repair:change_the_joined_relation_family_or_anchor_binding_before_accepting_zero_count",
+                ],
+            )
+
+        if (
             answer_mode == "count"
             and scalar_count == 0
             and _has_dynamic_type_filtered_zero_count(relation_paths)
@@ -392,6 +487,47 @@ def validate_pal_execution(
             reasons.append(
                 "repair:prefer_the_shortest_grounded_anchor_to_count_set_chain_before_adding_dynamic_type_filters"
             )
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=reasons,
+            )
+
+        ambiguous_low_support_dynamic_count = [
+            result
+            for result in (anchor_probe_results or [])
+            if result.entity_count > 1
+            and (result.path_count or 0) <= 1
+            and str(result.resolved_entity_id or "").strip()
+            and _query_pins_resolved_anchor_entity(
+                query_text=qt,
+                resolved_entity_id=str(result.resolved_entity_id or "").strip(),
+            )
+        ]
+        if (
+            answer_mode == "count"
+            and scalar_count is not None
+            and ambiguous_low_support_dynamic_count
+            and _has_dynamic_only_count_relation_paths(relation_paths)
+        ):
+            reasons = [
+                (
+                    f"ambiguous_anchor_surface_binding:{result.anchor_name!r}:"
+                    f"{result.entity_count}"
+                )
+                for result in ambiguous_low_support_dynamic_count
+            ]
+            reasons += [
+                (
+                    f"count_anchor_path_low_support:{result.anchor_name!r}:"
+                    f"{result.path_count or 0}:{result.relation_probed or ''}"
+                )
+                for result in ambiguous_low_support_dynamic_count
+            ]
+            reasons += [
+                f"count_scalar_returned:{scalar_count}",
+                "count_query_dynamic_chain_too_weak",
+                "repair:verify_resolved_anchor_entity_and_relation_family_before_accepting_low_support_count",
+            ]
             return PlausibilityVerdict(
                 verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
                 reasons=reasons,
@@ -531,6 +667,42 @@ def _query_mentions_variable(query_text: str, variable_name: str) -> bool:
     )
 
 
+def _extract_count_aggregate_variables(query_text: str) -> list[str]:
+    variables: list[str] = []
+    for match in re.finditer(
+        r"COUNT\s*\(\s*(?:DISTINCT\s+)?\?([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        query_text,
+        flags=re.IGNORECASE,
+    ):
+        variable = _normalize_contract_token(match.group(1))
+        if variable and variable not in variables:
+            variables.append(variable)
+    return variables
+
+
+def _count_set_token_is_structural(
+    count_set_variable: str,
+    relation_paths: Sequence[Any],
+) -> bool:
+    count_set_token = _normalize_contract_token(count_set_variable)
+    if not count_set_token:
+        return False
+    for relation_path in relation_paths:
+        if not isinstance(relation_path, Mapping):
+            continue
+        if count_set_token in {
+            _normalize_contract_token(relation_path.get("from")),
+            _normalize_contract_token(relation_path.get("to")),
+        }:
+            return True
+        if "count_set" in {
+            _normalize_contract_role(relation_path.get("from_role")),
+            _normalize_contract_role(relation_path.get("to_role")),
+        }:
+            return True
+    return False
+
+
 def _extract_anchor_roles(anchored_entities: Sequence[Any]) -> list[str]:
     roles: list[str] = []
     for anchored_entity in anchored_entities:
@@ -632,12 +804,16 @@ def _collect_multi_anchor_issues(
                     "join_structure_missing_anchor_roles:" + ",".join(missing_roles)
                 )
 
-    if query_shape == "count_over_joined_set":
-        primary_target = candidate_set_variable or shared_answer_variable or count_set_variable
-    else:
-        primary_target = shared_answer_variable or candidate_set_variable or count_set_variable
-    shared_target = _normalize_contract_token(primary_target)
-    allowed_constraint_targets = {shared_target} if shared_target else set()
+    primary_targets = {
+        _normalize_contract_token(shared_answer_variable),
+        _normalize_contract_token(candidate_set_variable),
+        _normalize_contract_token(count_set_variable),
+    }
+    primary_targets.discard("")
+    if query_shape == "count_over_joined_set" and "shared_answer" in primary_targets:
+        primary_targets.add(_normalize_contract_token(shared_answer_variable))
+    shared_target = next(iter(primary_targets), "")
+    allowed_constraint_targets = set(primary_targets)
     for relation_path in relation_paths:
         if not isinstance(relation_path, Mapping):
             continue
@@ -734,6 +910,18 @@ def _collect_count_structure_issues(
 
     if not re.search(r"\bCOUNT\s*\(", query_text, flags=re.IGNORECASE):
         issues.append("count_query_missing_COUNT_aggregate")
+    count_set_token = _normalize_contract_token(count_set_variable)
+    counted_variables = _extract_count_aggregate_variables(query_text)
+    if (
+        count_set_token
+        and counted_variables
+        and _count_set_token_is_structural(count_set_variable, relation_paths)
+        and _query_mentions_variable(query_text, count_set_variable)
+        and count_set_token not in counted_variables
+    ):
+        issues.append(
+            "count_query_counts_wrong_variable:" + ",".join(counted_variables[:2])
+        )
 
     if not relation_paths:
         issues.append("count_query_missing_relation_paths")
@@ -852,6 +1040,34 @@ def _extract_scalar_count_value(result_dict: Mapping[str, Any] | None) -> int | 
         return None
 
 
+def _query_pins_resolved_anchor_entity(
+    *,
+    query_text: str,
+    resolved_entity_id: str,
+) -> bool:
+    entity_id = str(resolved_entity_id or "").strip()
+    if not entity_id:
+        return False
+    return f"fb:{entity_id}" in str(query_text or "")
+
+
+def _plan_uses_only_generic_type_relations(
+    relation_paths: Sequence[Any],
+) -> bool:
+    generic_relations = {"type.object.type", "type.type.instance"}
+    seen_relation = False
+    for relation_path in relation_paths or ():
+        if not isinstance(relation_path, Mapping):
+            continue
+        relation = str(relation_path.get("relation") or "").strip()
+        if not relation:
+            continue
+        seen_relation = True
+        if relation not in generic_relations:
+            return False
+    return seen_relation
+
+
 def _has_weak_dynamic_count_chain(
     *,
     anchored_entities: Sequence[Any],
@@ -968,6 +1184,23 @@ def _count_query_has_unplanned_dynamic_type_filter(
         re.search(r"\bfb:type\.object\.type\b", query_text)
         or re.search(r"\bfb:type\.type\.instance\b", query_text)
     )
+
+
+def _has_dynamic_only_count_relation_paths(
+    relation_paths: Sequence[Any],
+) -> bool:
+    normalized_paths = [
+        relation_path
+        for relation_path in relation_paths
+        if isinstance(relation_path, Mapping)
+    ]
+    if not normalized_paths:
+        return False
+    grounding_sources = {
+        str(relation_path.get("grounding_source") or "").strip().lower()
+        for relation_path in normalized_paths
+    }
+    return bool(grounding_sources) and grounding_sources <= {"dynamic_probe", "exploratory"}
 
 
 # ---------------------------------------------------------------------------
