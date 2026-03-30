@@ -202,6 +202,24 @@ def materialize_benchmark_artifact(
     *,
     context: BenchmarkAdapterContext,
 ) -> BenchmarkMaterialization:
+    if artifact.artifact_type == "unresolved":
+        return BenchmarkMaterialization(
+            materialization_type="unresolved_failure",
+            needs_bridge=False,
+            bridge_action=None,
+            bridge_tool_name=None,
+            bridge_payload=None,
+            final_variable=None,
+            final_answer_text=None,
+            diagnostics={
+                "artifact_type": artifact.artifact_type,
+                "artifact_source": artifact.source,
+                "failure_kind": artifact.diagnostics.get("failure_kind"),
+            },
+            confidence=0.0,
+            determinism_level="none",
+        )
+
     bridge_payload = {
         "pal_artifact_type": artifact.artifact_type,
         "pal_artifact_value": artifact.value,
@@ -325,7 +343,6 @@ _TYPE_MAP = {
     "scalar_literal": "pal.scalar_literal",
     "text_literal": "pal.text_literal",
     "empty": "pal.empty",
-    "unresolved": "pal.unresolved",
 }
 
 
@@ -339,6 +356,12 @@ def run(payload: dict) -> dict:
             "final_variable": None,
             "observation": "PAL benchmark bridge received an invalid payload.",
         }
+    if artifact_type == "unresolved":
+        return {
+            "status": "ERROR",
+            "final_variable": None,
+            "observation": "PAL benchmark bridge refuses to materialize unresolved PAL execution artifacts.",
+        }
 
     program = json.dumps(
         {
@@ -349,7 +372,7 @@ def run(payload: dict) -> dict:
         sort_keys=True,
     )
     variable = Variable(
-        type=_TYPE_MAP.get(artifact_type, "pal.unresolved"),
+        type=_TYPE_MAP.get(artifact_type, "pal.empty"),
         program=program,
     )
     variable_list.append(variable)

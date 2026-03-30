@@ -247,7 +247,11 @@ def validate_pal_execution(
         fallback_entities=entities,
     )
     if is_multi_anchor_strategy and len(expected_anchor_literals) >= 2:
-        missing = _find_missing_anchor_literals(qt, expected_anchor_literals[:2])
+        missing = _find_missing_anchor_literals(
+            qt,
+            expected_anchor_literals[:2],
+            anchor_probe_results=anchor_probe_results,
+        )
         if missing:
             return PlausibilityVerdict(
                 verdict=VERDICT_REPAIRABLE_BAD_JOIN,
@@ -1277,6 +1281,7 @@ def build_repair_feedback(verdict: PlausibilityVerdict) -> list[str]:
             r.split(":", 1)[-1].strip("'\"")
             for r in verdict.reasons
             if "missing_anchor_literal:" in r
+            or "multi_anchor_missing_anchor_literal:" in r
         ]
         feedback += [
             "plausibility_feedback:multi_anchor_join_incomplete — at least one anchor entity is not bound in WHERE",
@@ -1368,21 +1373,49 @@ def _detect_unsupported_predicates(query_text: str) -> list[str]:
 def _find_missing_anchor_literals(
     query_text: str,
     entities: Sequence[str],
+    *,
+    anchor_probe_results: Sequence[AnchorProbeResult] | None = None,
 ) -> list[str]:
-    """Return anchor entity names absent from quoted string literals in the query."""
+    """Return anchor entities absent from either quoted literals or resolved mid pins."""
     qt = query_text or ""
     missing: list[str] = []
-    for entity in entities:
+    probe_results = list(anchor_probe_results or [])
+    for idx, entity in enumerate(entities):
         surface = str(entity or "").strip()
         if not surface:
             continue
-        found = bool(
-            re.search(
-                r'["\']' + re.escape(surface) + r'["\']',
-                qt,
-                flags=re.IGNORECASE,
-            )
+        resolved_entity_id = ""
+        if idx < len(probe_results):
+            resolved_entity_id = str(
+                getattr(probe_results[idx], "resolved_entity_id", "") or ""
+            ).strip()
+        found = _query_mentions_anchor_binding(
+            query_text=qt,
+            literal=surface,
+            resolved_entity_id=resolved_entity_id,
         )
         if not found:
             missing.append(surface)
     return missing
+
+
+def _looks_like_freebase_mid(value: str) -> bool:
+    return bool(re.fullmatch(r"[mg]\.[A-Za-z0-9_]+", str(value or "").strip()))
+
+
+def _query_mentions_anchor_binding(
+    *,
+    query_text: str,
+    literal: str,
+    resolved_entity_id: str = "",
+) -> bool:
+    qt = str(query_text or "")
+    surface = str(literal or "").strip()
+    resolved_id = str(resolved_entity_id or "").strip()
+    if surface and re.search(r'["\']' + re.escape(surface) + r'["\']', qt, flags=re.IGNORECASE):
+        return True
+    if resolved_id and f"fb:{resolved_id}" in qt:
+        return True
+    if _looks_like_freebase_mid(surface) and f"fb:{surface}" in qt:
+        return True
+    return False

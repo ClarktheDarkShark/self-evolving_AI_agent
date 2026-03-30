@@ -362,7 +362,7 @@ class KnowledgeGraphAPI:
         if kind == "entity_set":
             values = value if isinstance(value, Sequence) and not isinstance(value, str) else [value]
             return self._normalize_entity_list(values)
-        if kind in {"count_scalar", "scalar_literal", "text_literal", "unresolved"}:
+        if kind in {"count_scalar", "scalar_literal", "text_literal"}:
             if isinstance(value, Sequence) and not isinstance(value, str):
                 return [self._normalize_pal_scalar(item) for item in value]
             if value is None:

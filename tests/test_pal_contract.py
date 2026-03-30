@@ -24,6 +24,7 @@ from src.pal.plausibility_validator import (
     build_repair_feedback,
     validate_pal_execution,
 )
+from src.pal.kg_benchmark_adapter import BenchmarkMaterialization
 
 
 def _make_controller() -> PALAgentController:
@@ -996,6 +997,353 @@ def test_grounding_card_surfaces_question_inputs_and_scaffolds() -> None:
     assert "research project" in grounding_card
 
 
+def test_count_question_interpretation_keeps_answer_target_soft_for_single_anchor_counts() -> None:
+    controller = _make_controller()
+
+    question_text = "Question: how many songwriters work in the percussionist profession?"
+    answer_target = controller._extract_answer_target_phrase(question_text)
+    interpretation = controller._build_question_interpretation(
+        question_text=question_text,
+        explicit_entities=["Percussionist"],
+        answer_target_phrase=answer_target,
+    )
+
+    assert answer_target == "songwriters"
+    assert ("songwriters", "answer_target", "answer_target") in {
+        (
+            str(item.get("surface") or ""),
+            str(item.get("kind") or ""),
+            str(item.get("role_hint") or ""),
+        )
+        for item in interpretation["question_inputs"]
+    }
+    assert not any(
+        str(item.get("kind") or "") == "class_phrase"
+        for item in interpretation["question_inputs"]
+    )
+    assert interpretation["preferred_scaffolds"][0]["name"] == "direct_count"
+
+
+def test_count_question_interpretation_does_not_split_compound_answer_target() -> None:
+    controller = _make_controller()
+
+    question_text = (
+        "Question: what amount of comic book writers have a profession of "
+        "documentary filmmaker?"
+    )
+    answer_target = controller._extract_answer_target_phrase(question_text)
+    interpretation = controller._build_question_interpretation(
+        question_text=question_text,
+        explicit_entities=["Documentary Filmmaker"],
+        answer_target_phrase=answer_target,
+    )
+
+    surfaces = {
+        (
+            str(item.get("surface") or ""),
+            str(item.get("kind") or ""),
+            str(item.get("role_hint") or ""),
+        )
+        for item in interpretation["question_inputs"]
+    }
+
+    assert answer_target == "comic book writers"
+    assert ("comic book writers", "answer_target", "answer_target") in surfaces
+    assert ("book writers", "answer_target", "answer_target") not in surfaces
+    assert ("comic", "class_phrase", "type_set") not in surfaces
+
+
+def test_count_question_interpretation_keeps_simple_direct_count_without_class_promotion() -> None:
+    controller = _make_controller()
+
+    question_text = "Question: how many language dialects does southern min have?"
+    answer_target = controller._extract_answer_target_phrase(question_text)
+    interpretation = controller._build_question_interpretation(
+        question_text=question_text,
+        explicit_entities=["Southern Min"],
+        answer_target_phrase=answer_target,
+    )
+
+    assert answer_target == "language dialects"
+    assert not any(
+        str(item.get("kind") or "") == "class_phrase"
+        for item in interpretation["question_inputs"]
+    )
+    assert interpretation["preferred_scaffolds"][0]["name"] == "direct_count"
+
+
+def test_build_class_filtered_count_repair_plan_uses_answer_class_constraint() -> None:
+    controller = _make_controller()
+
+    rewritten = controller._build_class_filtered_count_repair_plan(
+        task_question=(
+            "Question: how many songwriters work in the percussionist profession?, "
+            "Entities: ['Percussionist']"
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "strategy": "Count the people reached from Percussionist.",
+            "anchored_entities": [
+                {
+                    "surface": "Percussionist",
+                    "chosen_alias": "Percussionist",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "people.profession.people_with_this_profession",
+                    "direction": "forward",
+                    "from": "Percussionist",
+                    "to": "person",
+                    "from_role": "anchor",
+                    "to_role": "candidate_set",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+            "shared_answer_variable": "candidate_set",
+            "candidate_set_variable": "candidate_set",
+            "count_set_variable": "candidate_set",
+            "ordering_attribute": {"direction": "forward"},
+            "ordering_direction": "none",
+        },
+        relation_grounding=[
+            {
+                "relation": "people.profession.people_with_this_profession",
+                "direction": "forward",
+                "from": "songwriter",
+                "to": "person",
+                "from_role": "type_set",
+                "to_role": "candidate_set",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+    )
+
+    assert rewritten is not None
+    assert rewritten["query_shape"] == "count_over_joined_set"
+    assert rewritten["count_set_variable"] == "shared_answer"
+    assert any(
+        str(item.get("role") or "") == "type_set"
+        and str(item.get("chosen_alias") or "") == "songwriter"
+        for item in rewritten["anchored_entities"]
+    )
+    assert any(
+        str(path.get("relation") or "") == "people.profession.people_with_this_profession"
+        and str(path.get("from_role") or "") == "type_set"
+        for path in rewritten["relation_paths"]
+    )
+
+
+def test_grounding_merges_dynamic_reverse_count_candidates_even_when_curated_exists() -> None:
+    controller = _make_controller()
+    interpretation = controller._build_question_interpretation(
+        question_text="Question: how many songwriters work in the percussionist profession?",
+        explicit_entities=["Percussionist"],
+        answer_target_phrase="songwriters",
+    )
+
+    with patch.object(
+        controller,
+        "_build_grounded_relation_candidates",
+        return_value=[
+            {
+                "relation": "people.person.profession",
+                "direction": "forward",
+                "from": "Percussionist",
+                "to": "person",
+                "from_role": "anchor",
+                "to_role": "answer",
+                "grounding_source": "curated",
+                "support": "curated_people_predicate",
+            }
+        ],
+    ), patch.object(
+        controller,
+        "_probe_dynamic_relation_candidates",
+        return_value=[
+            {
+                "relation": "people.profession.people_with_this_profession",
+                "direction": "forward",
+                "from": "Percussionist",
+                "to": "person",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_outgoing",
+            }
+        ],
+    ), patch.object(
+        controller,
+        "_probe_answer_class_dynamic_candidates",
+        return_value=[],
+    ):
+        grounding = controller._build_grounded_relation_candidates_with_dynamic_fallback(
+            task_question=(
+                "Question: how many songwriters work in the percussionist profession?, "
+                "Entities: ['Percussionist']"
+            ),
+            entities=["Percussionist"],
+            answer_target_phrase="songwriters",
+            domain_hints=["people"],
+            question_interpretation=interpretation,
+        )
+
+    assert grounding[0]["relation"] == "people.profession.people_with_this_profession"
+    assert any(
+        str(candidate.get("relation") or "") == "people.person.profession"
+        for candidate in grounding
+    )
+
+
+def test_apply_question_scaffold_rewrite_drops_answer_target_only_filter_for_direct_count() -> None:
+    controller = _make_controller()
+
+    rewritten = controller._apply_question_scaffold_plan_rewrites(
+        task_question=(
+            "Question: how many songwriters work in the percussionist profession?, "
+            "Entities: ['Percussionist']"
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "answer_type": "count",
+            "query_shape": "count_over_direct_relation",
+            "strategy": "Count people in the Percussionist profession and also require songwriter.",
+            "anchored_entities": [
+                {
+                    "surface": "Percussionist",
+                    "chosen_alias": "Percussionist",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "people.person.profession",
+                    "direction": "reverse",
+                    "from": "person",
+                    "to": "Percussionist",
+                    "from_role": "candidate_set",
+                    "to_role": "anchor",
+                    "grounding_source": "dynamic_probe",
+                },
+                {
+                    "relation": "people.person.profession",
+                    "direction": "forward",
+                    "from": "person",
+                    "to": "songwriter",
+                    "from_role": "candidate_set",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+            ],
+            "shared_answer_variable": "shared_answer",
+            "candidate_set_variable": "candidate_set",
+            "count_set_variable": "candidate_set",
+            "ordering_attribute": {"direction": "forward"},
+            "ordering_direction": "none",
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "candidate_set",
+                        "notes": "candidate persons must have Percussionist profession",
+                    }
+                ],
+            },
+            "projection": ["count"],
+            "plan_rationale": [],
+        },
+    )
+
+    assert rewritten["query_shape"] == "count_over_direct_relation"
+    assert len(rewritten["relation_paths"]) == 1
+    assert rewritten["relation_paths"][0]["relation"] == "people.person.profession"
+    assert rewritten["relation_paths"][0]["from_role"] == "count_set"
+    assert rewritten["relation_paths"][0]["to_role"] == "anchor"
+    assert rewritten["count_set_variable"] == "person"
+    assert "songwriter" not in rewritten["strategy"].lower()
+    assert all(
+        "songwriter" not in str(item).lower()
+        for item in rewritten["plan_rationale"]
+    )
+
+
+def test_apply_question_scaffold_rewrite_drops_generic_constraint_path_when_no_second_input() -> None:
+    controller = _make_controller()
+
+    rewritten = controller._apply_question_scaffold_plan_rewrites(
+        task_question=(
+            "Question: how many songwriters work in the percussionist profession?, "
+            "Entities: ['Percussionist']"
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "answer_type": "count",
+            "query_shape": "count_over_direct_relation",
+            "strategy": "Count people in Percussionist and filter by profession.",
+            "anchored_entities": [
+                {
+                    "surface": "Percussionist",
+                    "chosen_alias": "Percussionist",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "people.person.profession",
+                    "direction": "reverse",
+                    "from": "person",
+                    "to": "Percussionist",
+                    "from_role": "candidate_set",
+                    "to_role": "anchor",
+                    "grounding_source": "dynamic_probe",
+                },
+                {
+                    "relation": "people.person.profession",
+                    "direction": "forward",
+                    "from": "person",
+                    "to": "profession",
+                    "from_role": "candidate_set",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+            ],
+            "shared_answer_variable": "answer",
+            "candidate_set_variable": "candidate",
+            "count_set_variable": "candidate",
+            "ordering_attribute": {"direction": "forward"},
+            "ordering_direction": "none",
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "candidate",
+                        "notes": "Anchor constrains person candidates",
+                    }
+                ],
+            },
+            "projection": ["count"],
+            "plan_rationale": [],
+        },
+    )
+
+    assert len(rewritten["relation_paths"]) == 1
+    assert rewritten["relation_paths"][0]["relation"] == "people.person.profession"
+    assert rewritten["count_set_variable"] == "person"
+    assert "profession includes" not in rewritten["strategy"].lower()
+
+
+def test_infer_domain_hints_prefers_people_for_profession_questions() -> None:
+    controller = _make_controller()
+
+    assert controller._infer_domain_hints(
+        "how many songwriters work in the percussionist profession?"
+    ) == ["people", "profession"]
+
+
 def test_plan_normalization_preserves_structured_fields() -> None:
     controller = _make_controller()
     plan = controller._normalize_pal_query_plan(
@@ -1077,6 +1425,31 @@ def test_count_relation_normalization_preserves_inverse_answer_side_semantics() 
     )
 
     assert len(normalized) == 1
+    assert normalized[0]["from_role"] == "count_set"
+    assert normalized[0]["to_role"] == "anchor"
+
+
+def test_count_relation_normalization_preserves_reverse_spirit_type_count_semantics() -> None:
+    controller = _make_controller()
+    normalized = controller._normalize_grounded_relation_candidates(
+        relation_candidates=[
+            {
+                "relation": "distilled_spirits.distilled_spirit.spirit_type",
+                "direction": "reverse",
+                "from": "spirit",
+                "to": "bourbon whisky",
+                "support": "dynamic_probe_incoming",
+                "use_when": "find spirits whose spirit_type points to the anchor",
+            }
+        ],
+        query_shape="count_over_direct_relation",
+        answer_mode="count",
+        answer_target_phrase="distilled spirit",
+        entities=["bourbon whisky"],
+    )
+
+    assert len(normalized) == 1
+    assert normalized[0]["relation"] == "distilled_spirits.distilled_spirit.spirit_type"
     assert normalized[0]["from_role"] == "count_set"
     assert normalized[0]["to_role"] == "anchor"
 
@@ -1788,6 +2161,492 @@ def test_repair_loop_rejection_is_fail_closed() -> None:
         )
 
 
+def test_repair_loop_stagnation_cuts_off_repeated_state() -> None:
+    controller = _make_controller()
+    controller._generate_validated_pal_candidate = lambda **kwargs: ("def solve(endpoint_url):\n    return {}\n", {})
+    controller._extract_sparql_query_texts = lambda code: ["SELECT (COUNT(DISTINCT ?disease) AS ?count) WHERE { ?disease ?p ?o }"]
+    controller._run_anchor_existence_probes = lambda **kwargs: [
+        AnchorProbeResult(
+            anchor_name="Aedes aegypti",
+            entity_count=12,
+            path_count=1,
+            relation_probed="medicine.infectious_disease.vector",
+            anchor_position="object",
+            resolved_entity_id="m.06y6_w",
+        )
+    ]
+    controller._retry_execution_with_resolved_anchor_ids = (
+        lambda generated_code, invocation_result, query_plan, anchor_probe_results:
+        (generated_code, invocation_result, query_plan, False)
+    )
+    controller._apply_probe_guided_alias_repairs = (
+        lambda **kwargs: (kwargs["query_plan"], kwargs["grounding_card"], [])
+    )
+    controller._apply_probe_guided_anchor_entity_repairs = (
+        lambda **kwargs: (kwargs["query_plan"], [])
+    )
+    controller._augment_grounding_with_dynamic_probe_on_path_failure = (
+        lambda **kwargs: ("PAL grounding hints:", kwargs["relation_grounding"], [])
+    )
+    controller._augment_grounding_for_structural_repair = (
+        lambda **kwargs: ("PAL grounding hints:", kwargs["relation_grounding"], [])
+    )
+    controller._suppress_dead_grounded_relations = (
+        lambda **kwargs: ("PAL grounding hints:", kwargs["relation_grounding"], [])
+    )
+    controller._merge_feedback_items = lambda current, new: [*current, *new]
+    controller._should_retry_same_plan_after_alias_repair = lambda **kwargs: False
+    controller._build_projected_answer_intersection_repair_plan = lambda **kwargs: None
+    controller._build_single_anchor_dynamic_lookup_repair_plan = lambda **kwargs: None
+    controller._build_pivot_preserving_count_repair_plan = lambda **kwargs: None
+    controller._generate_pal_query_plan = lambda **kwargs: kwargs.get("relation_grounding") and {
+        "answer_mode": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "stagnation-test",
+        "anchored_entities": [
+            {"surface": "Aedes aegypti", "chosen_alias": "Aedes aegypti", "role": "anchor"}
+        ],
+        "relation_paths": [
+            {
+                "relation": "medicine.infectious_disease.vector",
+                "direction": "reverse",
+                "from_role": "count_set",
+                "to_role": "anchor",
+                "from": "disease",
+                "to": "anchor",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {"anchor_role": "anchor", "constrains_variable": "disease", "notes": "test"}
+            ],
+        },
+        "shared_answer_variable": "disease",
+        "candidate_set_variable": "disease",
+        "count_set_variable": "disease",
+        "ordering_attribute": {},
+        "ordering_direction": "none",
+    } or {}
+    controller._extract_anchor_alias_assignments = lambda plan: {}
+    controller._refresh_dynamic_grounding_after_anchor_alias_change = (
+        lambda **kwargs: (kwargs["task_question"], kwargs["relation_grounding"], [])
+    )
+
+    invocation_result = PALInvocationResult(
+        success=True,
+        payload={"head": {"vars": ["count"]}, "results": {"bindings": [{"count": {"type": "literal", "value": "1"}}]}},
+    )
+    repeated_verdict = PlausibilityVerdict(
+        verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+        reasons=["count_scalar_returned:1", "count_query_dynamic_chain_too_weak"],
+    )
+
+    query_plan = {
+        "answer_mode": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "stagnation-test",
+        "anchored_entities": [
+            {"surface": "Aedes aegypti", "chosen_alias": "Aedes aegypti", "role": "anchor"}
+        ],
+        "relation_paths": [
+            {
+                "relation": "medicine.infectious_disease.vector",
+                "direction": "reverse",
+                "from_role": "count_set",
+                "to_role": "anchor",
+                "from": "disease",
+                "to": "anchor",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {"anchor_role": "anchor", "constrains_variable": "disease", "notes": "test"}
+            ],
+        },
+        "shared_answer_variable": "disease",
+        "candidate_set_variable": "disease",
+        "count_set_variable": "disease",
+        "ordering_attribute": {},
+        "ordering_direction": "none",
+    }
+
+    with patch.object(
+        pal_agent_controller_module,
+        "execute_pal_code_with_result",
+        return_value=invocation_result,
+    ), patch.object(
+        pal_agent_controller_module,
+        "validate_pal_execution",
+        return_value=repeated_verdict,
+    ):
+        _code, _result, loop_log = controller._run_pal_repair_loop(
+            task_question="Question: what is the number of infectious diseases that are transmitted by the aedes aegypti?, Entities: ['Aedes aegypti']",
+            grounding_card="PAL grounding hints:",
+            query_plan=query_plan,
+            generated_tool_name="pal_sparql_query_tool_test",
+            question_entities=["Aedes aegypti"],
+            relation_grounding=[
+                {
+                    "relation": "medicine.infectious_disease.vector",
+                    "direction": "reverse",
+                    "from_role": "count_set",
+                    "to_role": "anchor",
+                    "from": "disease",
+                    "to": "anchor",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+        )
+
+    assert loop_log["total_attempts"] == 2
+    assert loop_log["last_verdict"] == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "repair_loop_stalled" in loop_log["last_reasons"]
+
+
+def test_repair_loop_same_attempt_anchor_retry_does_not_store_tuple_best_candidate() -> None:
+    controller = _make_controller()
+    controller._generate_validated_pal_candidate = lambda **kwargs: ("def solve(endpoint_url):\n    return {}\n", {})
+    controller._extract_sparql_query_texts = lambda code: ["SELECT (COUNT(DISTINCT ?disease) AS ?count) WHERE { ?disease ?p ?o }"]
+    controller._run_anchor_existence_probes = lambda **kwargs: [
+        AnchorProbeResult(
+            anchor_name="Aedes aegypti",
+            entity_count=12,
+            path_count=1,
+            relation_probed="medicine.infectious_disease.vector",
+            anchor_position="object",
+            resolved_entity_id="m.06y6_w",
+        )
+    ]
+    controller._retry_execution_with_resolved_anchor_ids = (
+        lambda generated_code, invocation_result, query_plan, anchor_probe_results:
+        (generated_code, invocation_result, query_plan, True)
+    )
+    controller._apply_probe_guided_alias_repairs = (
+        lambda **kwargs: (kwargs["query_plan"], kwargs["grounding_card"], [])
+    )
+    controller._apply_probe_guided_anchor_entity_repairs = (
+        lambda **kwargs: (kwargs["query_plan"], [])
+    )
+    controller._augment_grounding_with_dynamic_probe_on_path_failure = (
+        lambda **kwargs: ("PAL grounding hints:", kwargs["relation_grounding"], [])
+    )
+    controller._augment_grounding_for_structural_repair = (
+        lambda **kwargs: ("PAL grounding hints:", kwargs["relation_grounding"], [])
+    )
+    controller._suppress_dead_grounded_relations = (
+        lambda **kwargs: ("PAL grounding hints:", kwargs["relation_grounding"], [])
+    )
+    controller._merge_feedback_items = lambda current, new: [*current, *new]
+    controller._should_retry_same_plan_after_alias_repair = lambda **kwargs: False
+    controller._build_projected_answer_intersection_repair_plan = lambda **kwargs: None
+    controller._build_single_anchor_dynamic_lookup_repair_plan = lambda **kwargs: None
+    controller._build_pivot_preserving_count_repair_plan = lambda **kwargs: None
+    controller._generate_pal_query_plan = lambda **kwargs: kwargs.get("relation_grounding") and {
+        "answer_mode": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "same-attempt-anchor-retry-test",
+        "anchored_entities": [
+            {"surface": "Aedes aegypti", "chosen_alias": "Aedes aegypti", "role": "anchor"}
+        ],
+        "relation_paths": [
+            {
+                "relation": "medicine.infectious_disease.vector",
+                "direction": "reverse",
+                "from_role": "count_set",
+                "to_role": "anchor",
+                "from": "disease",
+                "to": "anchor",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {"anchor_role": "anchor", "constrains_variable": "disease", "notes": "test"}
+            ],
+        },
+        "shared_answer_variable": "disease",
+        "candidate_set_variable": "disease",
+        "count_set_variable": "disease",
+        "ordering_attribute": {},
+        "ordering_direction": "none",
+    } or {}
+    controller._extract_anchor_alias_assignments = lambda plan: {}
+    controller._refresh_dynamic_grounding_after_anchor_alias_change = (
+        lambda **kwargs: (kwargs["task_question"], kwargs["relation_grounding"], [])
+    )
+
+    invocation_result = PALInvocationResult(
+        success=True,
+        payload={"head": {"vars": ["count"]}, "results": {"bindings": [{"count": {"type": "literal", "value": "1"}}]}},
+    )
+    repeated_verdict = PlausibilityVerdict(
+        verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+        reasons=["count_scalar_returned:1", "count_query_dynamic_chain_too_weak"],
+    )
+
+    query_plan = {
+        "answer_mode": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "same-attempt-anchor-retry-test",
+        "anchored_entities": [
+            {"surface": "Aedes aegypti", "chosen_alias": "Aedes aegypti", "role": "anchor"}
+        ],
+        "relation_paths": [
+            {
+                "relation": "medicine.infectious_disease.vector",
+                "direction": "reverse",
+                "from_role": "count_set",
+                "to_role": "anchor",
+                "from": "disease",
+                "to": "anchor",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {"anchor_role": "anchor", "constrains_variable": "disease", "notes": "test"}
+            ],
+        },
+        "shared_answer_variable": "disease",
+        "candidate_set_variable": "disease",
+        "count_set_variable": "disease",
+        "ordering_attribute": {},
+        "ordering_direction": "none",
+    }
+
+    with patch.object(
+        pal_agent_controller_module,
+        "execute_pal_code_with_result",
+        return_value=invocation_result,
+    ), patch.object(
+        pal_agent_controller_module,
+        "validate_pal_execution",
+        return_value=repeated_verdict,
+    ):
+        _code, _result, loop_log = controller._run_pal_repair_loop(
+            task_question="Question: what is the number of infectious diseases that are transmitted by the aedes aegypti?, Entities: ['Aedes aegypti']",
+            grounding_card="PAL grounding hints:",
+            query_plan=query_plan,
+            generated_tool_name="pal_sparql_query_tool_test",
+            question_entities=["Aedes aegypti"],
+            relation_grounding=[
+                {
+                    "relation": "medicine.infectious_disease.vector",
+                    "direction": "reverse",
+                    "from_role": "count_set",
+                    "to_role": "anchor",
+                    "from": "disease",
+                    "to": "anchor",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+        )
+
+    assert loop_log["best_executing_candidate"]["score"] >= 0
+    assert loop_log["final_verdict"] in {"accepted_best_effort", "no_accepted_candidate"}
+
+
+def test_materialize_adapter_response_fails_closed_for_unresolved_artifact() -> None:
+    controller = _make_controller()
+
+    with pytest.raises(AgentUnknownException, match="pal_adapter_unresolved_artifact"):
+        controller._materialize_adapter_response(
+            task_question="Question: ...",
+            materialization=BenchmarkMaterialization(
+                materialization_type="unresolved_failure",
+                needs_bridge=False,
+                bridge_action=None,
+                bridge_tool_name=None,
+                bridge_payload=None,
+                final_variable=None,
+                final_answer_text=None,
+                diagnostics={"artifact_type": "unresolved", "artifact_source": "raw_execution_failure"},
+                confidence=0.0,
+                determinism_level="none",
+            ),
+        )
+
+
+def test_should_accept_best_executing_candidate_allows_salvageable_count_result() -> None:
+    controller = _make_controller()
+
+    assert controller._should_accept_best_executing_candidate(
+        candidate_metadata={
+            "verdict": VERDICT_REPAIRABLE_BAD_COUNT_SET,
+            "verdict_reasons": [
+                "ambiguous_anchor_surface_binding:'Aedes aegypti':12",
+                "count_anchor_path_low_support:'Aedes aegypti':1:medicine.infectious_disease.vector",
+                "count_scalar_returned:1",
+                "count_query_dynamic_chain_too_weak",
+            ],
+            "binding_count": 1,
+            "scalar_count": 1,
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "all_anchors_found": True,
+            "has_order_by_limit": False,
+            "score": 30,
+        }
+    )
+
+
+def test_should_accept_best_executing_candidate_allows_exhausted_zero_count_with_live_anchors() -> None:
+    controller = _make_controller()
+
+    assert controller._should_accept_best_executing_candidate(
+        candidate_metadata={
+            "verdict": VERDICT_REPAIRABLE_BAD_COUNT_SET,
+            "verdict_reasons": [
+                "anchor_path_empty:'Canada':biology.animal_breed.country_of_origin",
+                "count_set_path_empty",
+                "count_scalar_returned:0",
+            ],
+            "binding_count": 1,
+            "scalar_count": 0,
+            "answer_mode": "count",
+            "query_shape": "count_over_joined_set",
+            "all_anchors_found": True,
+            "has_order_by_limit": False,
+            "score": 23,
+        }
+    )
+
+
+def test_should_accept_best_executing_candidate_rejects_unverified_type_count() -> None:
+    controller = _make_controller()
+
+    assert not controller._should_accept_best_executing_candidate(
+        candidate_metadata={
+            "verdict": VERDICT_REPAIRABLE_BAD_COUNT_SET,
+            "verdict_reasons": [
+                "count_query_unverified_type_constraint",
+                "count_scalar_returned:0",
+            ],
+            "binding_count": 1,
+            "scalar_count": 0,
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "all_anchors_found": True,
+            "has_order_by_limit": False,
+            "score": 35,
+        }
+    )
+
+
+def test_should_accept_best_executing_candidate_rejects_exploratory_empty_superlative() -> None:
+    controller = _make_controller()
+
+    assert not controller._should_accept_best_executing_candidate(
+        candidate_metadata={
+            "verdict": VERDICT_REPAIRABLE_BAD_SUPERLATIVE,
+            "verdict_reasons": [
+                "ordering_attribute_path_exploratory",
+                "repair:add_grounded_candidate_set_ordering_attribute_and_ORDER_BY",
+            ],
+            "binding_count": 0,
+            "scalar_count": None,
+            "answer_mode": "entity",
+            "query_shape": "superlative_chain",
+            "all_anchors_found": True,
+            "has_order_by_limit": True,
+            "score": 40,
+        }
+    )
+
+
+def test_best_executing_candidate_scoring_prefers_grounded_positive_count_over_zero_with_unverified_type() -> None:
+    controller = _make_controller()
+
+    positive_metadata = controller._build_best_executing_candidate_metadata(
+        generated_code="def solve(endpoint_url):\n    return {}",
+        invocation_result=PALInvocationResult(
+            success=True,
+            payload={"head": {"vars": ["count"]}, "results": {"bindings": [{"count": {"type": "literal", "value": "1"}}]}},
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+        },
+        query_text="SELECT (COUNT(DISTINCT ?candidate_set) AS ?count) WHERE { VALUES ?anchor { fb:m.06y6_w } ?candidate_set fb:medicine.infectious_disease.vector ?anchor . }",
+        verdict=PlausibilityVerdict(
+            verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+            reasons=[
+                "ambiguous_anchor_surface_binding:'Aedes aegypti':12",
+                "count_anchor_path_low_support:'Aedes aegypti':1:medicine.infectious_disease.vector",
+                "count_scalar_returned:1",
+                "count_query_dynamic_chain_too_weak",
+            ],
+        ),
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Aedes aegypti",
+                entity_count=12,
+                path_count=1,
+                relation_probed="medicine.infectious_disease.vector",
+                anchor_position="object",
+                resolved_entity_id="m.06y6_w",
+            )
+        ],
+    )
+
+    zero_with_unverified_type = controller._build_best_executing_candidate_metadata(
+        generated_code="def solve(endpoint_url):\n    return {}",
+        invocation_result=PALInvocationResult(
+            success=True,
+            payload={"head": {"vars": ["count"]}, "results": {"bindings": [{"count": {"type": "literal", "value": "0"}}]}},
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+        },
+        query_text="SELECT (COUNT(DISTINCT ?disease) AS ?count) WHERE { VALUES ?anchor { fb:m.06y6_w } ?disease fb:medicine.infectious_disease.vector ?anchor . ?infectiousType fb:type.object.name ?itype_name . FILTER(LCASE(STR(?itype_name)) = \"infectious disease\") ?infectiousType fb:type.type.instance ?disease . }",
+        verdict=PlausibilityVerdict(
+            verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+            reasons=[
+                "count_query_dynamic_chain_too_weak",
+                "count_query_unverified_type_constraint",
+                "count_scalar_returned:0",
+            ],
+        ),
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Aedes aegypti",
+                entity_count=12,
+                path_count=1,
+                relation_probed="medicine.infectious_disease.vector",
+                anchor_position="object",
+                resolved_entity_id="m.06y6_w",
+            )
+        ],
+    )
+
+    assert int(positive_metadata["score"]) > int(zero_with_unverified_type["score"])
+    assert controller._should_accept_best_executing_candidate(
+        candidate_metadata=positive_metadata
+    )
+    assert not controller._should_accept_best_executing_candidate(
+        candidate_metadata=zero_with_unverified_type
+    )
+
+
+def test_ensure_repair_loop_accepted_allows_best_effort_final_verdict() -> None:
+    controller = _make_controller()
+
+    controller._ensure_repair_loop_accepted(
+        generated_tool_name="pal_sparql_query_tool_test",
+        repair_loop_log={
+            "final_verdict": "accepted_best_effort",
+            "accepted_attempt": "best_executing",
+        },
+    )
+
+
 def test_probe_guided_alias_repair_updates_plan_and_grounding_card() -> None:
     controller = _make_controller()
     probe_counts = {"cow": 0, "Cattle": 1}
@@ -2024,6 +2883,55 @@ def test_single_anchor_dynamic_lookup_repair_plan_uses_best_live_dynamic_candida
     assert repaired_plan["relation_paths"][0]["to_role"] == "answer"
 
 
+def test_single_anchor_dynamic_lookup_repair_plan_can_replace_dead_grounded_relation() -> None:
+    controller = _make_controller()
+
+    repaired_plan = controller._build_single_anchor_dynamic_lookup_repair_plan(
+        query_plan={
+            "answer_mode": "entity",
+            "query_shape": "single_anchor_lookup",
+            "anchored_entities": [
+                {
+                    "surface": "saxe-coburg-gotha",
+                    "chosen_alias": "saxe-coburg and gotha",
+                    "role": "anchor",
+                    "resolved_entity_id": "m.01f0_j",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "royalty.kingdom.monarchs",
+                    "direction": "forward",
+                    "from": "kingdom",
+                    "to": "monarch",
+                    "from_role": "anchor",
+                    "to_role": "answer",
+                    "grounding_source": "curated",
+                }
+            ],
+            "strategy": "grounded direct lookup",
+            "plan_rationale": ["initial"],
+        },
+        relation_grounding=[
+            {
+                "relation": "royalty.monarch.kingdom",
+                "direction": "forward",
+                "from": "monarch",
+                "to": "kingdom",
+                "from_role": "answer",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+    )
+
+    assert repaired_plan is not None
+    assert repaired_plan["relation_paths"][0]["relation"] == "royalty.monarch.kingdom"
+    assert repaired_plan["relation_paths"][0]["from"] == "answer"
+    assert repaired_plan["relation_paths"][0]["to"] == "anchor"
+    assert repaired_plan["relation_paths"][0]["to_role"] == "anchor"
+
+
 def test_anchor_path_probe_supports_object_side_triples() -> None:
     controller = _make_controller()
     captured: dict[str, str] = {}
@@ -2162,6 +3070,123 @@ def test_anchor_existence_probes_capture_unique_resolved_entity_id_from_live_pat
     assert results[0].resolved_entity_id == "m.01c44b"
     assert results[0].relation_probed == "language.language_dialect.language"
     assert results[0].anchor_position == "object"
+
+
+def test_anchor_existence_probes_use_surface_when_chosen_alias_is_mid() -> None:
+    controller = _make_controller()
+    probed_aliases: list[str] = []
+
+    def _fake_probe_entity_name_count(alias: str, timeout_s: float = 2.5) -> int:
+        probed_aliases.append(alias)
+        return 7
+
+    controller._probe_entity_name_count = _fake_probe_entity_name_count
+    controller._probe_anchor_path_count = (
+        lambda alias, relation, anchor_position="subject", timeout_s=2.5: 3
+    )
+    controller._probe_anchor_entity_ids = (
+        lambda *, anchor_name, relation=None, anchor_position="subject", timeout_s=2.5: []
+    )
+
+    results = controller._run_anchor_existence_probes(
+        query_plan={
+            "anchored_entities": [
+                {
+                    "surface": "Count Basie Orchestra",
+                    "chosen_alias": "m.01r4szq",
+                    "role": "anchor_a",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "music.artist.album",
+                    "direction": "forward",
+                    "from": "anchor_a",
+                    "to": "shared_answer",
+                    "from_role": "anchor_a",
+                    "to_role": "shared_answer",
+                    "grounding_source": "curated",
+                }
+            ],
+        },
+        probe_paths=True,
+        timeout_s=1.0,
+    )
+
+    assert probed_aliases == []
+    assert results[0].anchor_name == "Count Basie Orchestra"
+    assert results[0].entity_count == 1
+    assert results[0].resolved_entity_id == "m.01r4szq"
+
+
+def test_anchor_existence_probes_can_reuse_generic_constraint_path_for_multiple_anchors() -> None:
+    controller = _make_controller()
+    probed_relations: list[tuple[str, str]] = []
+
+    controller._probe_entity_name_count = lambda alias, timeout_s=2.5: 1
+
+    def _fake_probe_anchor_path_count(alias: str, relation: str, anchor_position="subject", timeout_s=2.5) -> int:
+        probed_relations.append((alias, relation))
+        return 2
+
+    controller._probe_anchor_path_count = _fake_probe_anchor_path_count
+    controller._probe_anchor_entity_ids = (
+        lambda *, anchor_name, relation=None, anchor_position="subject", timeout_s=2.5: []
+    )
+
+    results = controller._run_anchor_existence_probes(
+        query_plan={
+            "anchored_entities": [
+                {"surface": "Goat", "chosen_alias": "Goat", "role": "anchor_a"},
+                {"surface": "cows", "chosen_alias": "Cattle", "role": "anchor_b"},
+            ],
+            "join_structure": {
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor_a",
+                        "constrains_variable": "shared_answer",
+                        "notes": "cheese must list Goat as a milk source (source_of_milk = Goat)",
+                    },
+                    {
+                        "anchor_role": "anchor_b",
+                        "constrains_variable": "shared_answer",
+                        "notes": "cheese must list cows as a milk source (source_of_milk = cows)",
+                    },
+                ]
+            },
+            "relation_paths": [
+                {
+                    "relation": "food.cheese.source_of_milk",
+                    "direction": "forward",
+                    "from": "cheese",
+                    "to": "milk_source",
+                    "from_role": "shared_answer",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "food.cheese.texture",
+                    "direction": "forward",
+                    "from": "cheese",
+                    "to": "texture_value",
+                    "from_role": "shared_answer",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+            ],
+        },
+        probe_paths=True,
+        timeout_s=1.0,
+    )
+
+    assert probed_relations == [
+        ("Goat", "food.cheese.source_of_milk"),
+        ("Cattle", "food.cheese.source_of_milk"),
+    ]
+    assert [result.relation_probed for result in results] == [
+        "food.cheese.source_of_milk",
+        "food.cheese.source_of_milk",
+    ]
 
 
 def test_dynamic_grounding_repair_augments_candidates_on_path_failure() -> None:
@@ -3285,6 +4310,66 @@ def solve(endpoint_url):
     assert "count_plan_without_count_projection" not in errors
 
 
+def test_query_candidate_allows_binding_unions_scaled_by_bound_inputs() -> None:
+    controller = _make_controller()
+    query_text = """
+PREFIX fb: <http://rdf.freebase.com/ns/>
+SELECT ?cheese WHERE {
+  {
+    { ?milk_source_a fb:type.object.name ?name_a . FILTER(LCASE(STR(?name_a)) = "goat") }
+    UNION
+    { ?milk_source_a fb:common.topic.alias ?alias_a . FILTER(LCASE(STR(?alias_a)) = "goat") }
+  }
+  {
+    { ?milk_source_b fb:type.object.name ?name_b . FILTER(LCASE(STR(?name_b)) = "cows") }
+    UNION
+    { ?milk_source_b fb:common.topic.alias ?alias_b . FILTER(LCASE(STR(?alias_b)) = "cows") }
+  }
+  {
+    { ?texture_value fb:type.object.name ?tex_name . FILTER(LCASE(STR(?tex_name)) = "semi-firm") }
+    UNION
+    { ?texture_value fb:common.topic.alias ?tex_alias . FILTER(LCASE(STR(?tex_alias)) = "semi-firm") }
+  }
+  ?milk_source_a fb:food.cheese_milk_source.cheeses ?cheese .
+  ?milk_source_b fb:food.cheese_milk_source.cheeses ?cheese .
+  ?cheese fb:food.cheese.texture ?texture_value .
+}
+"""
+    errors = controller._validate_pal_query_candidate(
+        raw_output="",
+        generated_code="def solve(endpoint_url):\n    pass\n",
+        query_text=query_text,
+        query_plan={
+            "answer_mode": "entity",
+            "anchored_entities": [
+                {"surface": "Goat", "chosen_alias": "Goat", "role": "anchor_a"},
+                {"surface": "cows", "chosen_alias": "cows", "role": "anchor_b"},
+                {"surface": "semi-firm", "chosen_alias": "semi-firm", "role": "constraint_value"},
+            ],
+            "relation_paths": [
+                {
+                    "relation": "food.cheese_milk_source.cheeses",
+                    "direction": "reverse",
+                    "from_role": "constraint_value",
+                    "to_role": "shared_answer",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "food.cheese.texture",
+                    "direction": "forward",
+                    "from_role": "shared_answer",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+            ],
+            "ordering_attribute": {},
+            "allow_exploratory_predicates": False,
+        },
+    )
+
+    assert "excessive_union_branches:5" not in errors
+
+
 def test_plausibility_repairs_zero_count_with_unanchored_exploratory_constraint() -> None:
     verdict = validate_pal_execution(
         query_plan={
@@ -3521,6 +4606,96 @@ def test_plausibility_accepts_count_join_when_constraints_target_shared_answer_a
     )
 
     assert "join_structure_drifting_constraints:shared_answer" not in verdict.reasons
+
+
+def test_plausibility_accepts_multi_anchor_query_when_resolved_mids_are_pinned() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "entity",
+            "query_shape": "multi_anchor_intersection",
+            "shared_answer_variable": "shared_type",
+            "candidate_set_variable": "shared_type",
+            "count_set_variable": "",
+            "anchored_entities": [
+                {
+                    "surface": "the museum of modern art",
+                    "chosen_alias": "m.0hhjk",
+                    "role": "anchor_a",
+                },
+                {
+                    "surface": "Smithsonian Institution",
+                    "chosen_alias": "m.0hfyj",
+                    "role": "anchor_b",
+                },
+            ],
+            "join_structure": {
+                "type": "intersection",
+                "anchor_constraints": [
+                    {"anchor_role": "anchor_a", "constrains_variable": "shared_type"},
+                    {"anchor_role": "anchor_b", "constrains_variable": "shared_type"},
+                ],
+            },
+            "relation_paths": [
+                {
+                    "relation": "architecture.museum.type_of_museum",
+                    "direction": "forward",
+                    "from_role": "anchor_a",
+                    "to_role": "shared_answer",
+                    "grounding_source": "dynamic_probe",
+                },
+                {
+                    "relation": "architecture.museum.type_of_museum",
+                    "direction": "forward",
+                    "from_role": "anchor_b",
+                    "to_role": "shared_answer",
+                    "grounding_source": "dynamic_probe",
+                },
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "shared museum type intersection",
+        },
+        query_text=(
+            "SELECT ?shared_type WHERE { "
+            "VALUES ?anchor_a { fb:m.0hhjk } "
+            "VALUES ?anchor_b { fb:m.0hfyj } "
+            "?anchor_a fb:architecture.museum.type_of_museum ?shared_type . "
+            "?anchor_b fb:architecture.museum.type_of_museum ?shared_type . "
+            "}"
+        ),
+        result_dict={
+            "results": {
+                "bindings": [
+                    {
+                        "shared_type": {
+                            "type": "uri",
+                            "value": "http://rdf.freebase.com/ns/m.012abc",
+                        }
+                    }
+                ]
+            }
+        },
+        entities=["the museum of modern art", "Smithsonian Institution"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="the museum of modern art",
+                entity_count=1,
+                path_count=1,
+                relation_probed="architecture.museum.type_of_museum",
+                anchor_position="subject",
+                resolved_entity_id="m.0hhjk",
+            ),
+            AnchorProbeResult(
+                anchor_name="Smithsonian Institution",
+                entity_count=1,
+                path_count=1,
+                relation_probed="architecture.museum.type_of_museum",
+                anchor_position="subject",
+                resolved_entity_id="m.0hfyj",
+            ),
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_ACCEPTED
 
 
 def test_dynamic_probe_scoring_uses_question_text() -> None:
@@ -4997,7 +6172,7 @@ def test_pivot_preserving_count_repair_prefers_live_direct_dynamic_count_relatio
     assert rewritten["count_set_variable"] == "disease"
 
 
-def test_direct_count_repair_prefers_curated_inverse_family_before_dynamic_fallback() -> None:
+def test_direct_count_repair_prefers_live_dynamic_family_before_curated_inverse_fallback() -> None:
     controller = _make_controller()
     query_plan = controller._normalize_pal_query_plan(
         {
@@ -5066,7 +6241,7 @@ def test_direct_count_repair_prefers_curated_inverse_family_before_dynamic_fallb
 
     assert rewritten is not None
     assert [path["relation"] for path in rewritten["relation_paths"]] == [
-        "medicine.disease.transmitted_by"
+        "medicine.infectious_disease.vector"
     ]
     assert rewritten["relation_paths"][0]["from_role"] == "count_set"
     assert rewritten["relation_paths"][0]["to_role"] == "anchor"

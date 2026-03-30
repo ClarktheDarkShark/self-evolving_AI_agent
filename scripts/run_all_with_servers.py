@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +36,16 @@ FUSEKI_PLATFORM = os.getenv("LIFELONG_KG_DOCKER_PLATFORM", "linux/amd64")  # ARM
 FUSEKI_HOST_PORT = int(os.getenv("LIFELONG_FUSEKI_PORT", "3001"))
 FUSEKI_DATASET = os.getenv("LIFELONG_FUSEKI_DATASET", "kb")  # path /kb and databases/kb
 KG_DATA_DIR_ENV = "LIFELONG_KG_DATA_DIR"
+CLIENT_WALL_TIMEOUT_S = int(os.getenv("LIFELONG_CLIENT_TIMEOUT_S", "1800"))
+CLIENT_IDLE_TIMEOUT_S = int(os.getenv("LIFELONG_CLIENT_IDLE_TIMEOUT_S", "600"))
+CLIENT_WATCHDOG_POLL_S = float(os.getenv("LIFELONG_CLIENT_WATCHDOG_POLL_S", "5"))
+
+
+@dataclass(frozen=True)
+class ClientWatchdogResult:
+    exit_code: int
+    timed_out_reason: str | None = None
+    current_session: dict[str, object] | None = None
 
 
 def _append_log(log_path: Path | None, text: str) -> None:
@@ -251,6 +262,195 @@ def _pick_output_dir(before: list[Path], after: list[Path]) -> Path | None:
         after.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return after[0]
     return None
+
+
+def _latest_client_progress_mtime(output_dir: Path) -> float | None:
+    candidates = [
+        output_dir / "generated_tools.log",
+        output_dir / "current_session.json",
+        output_dir / "exception.txt",
+        output_dir / "task_outcomes.json",
+        output_dir / "runs.json",
+        output_dir / "metric.json",
+    ]
+    latest: float | None = None
+    for path in candidates:
+        try:
+            if path.exists():
+                mtime = path.stat().st_mtime
+                latest = mtime if latest is None else max(latest, mtime)
+        except Exception:
+            continue
+    return latest
+
+
+def _read_current_session(output_dir: Path) -> dict[str, object] | None:
+    current_session_path = output_dir / "current_session.json"
+    try:
+        if not current_session_path.exists():
+            return None
+        payload = json.loads(current_session_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _extract_current_sample_index(session_payload: dict[str, object] | None) -> str | None:
+    if not isinstance(session_payload, dict):
+        return None
+    sample_index = session_payload.get("sample_index")
+    if sample_index is None:
+        return None
+    sample_index_text = str(sample_index).strip()
+    return sample_index_text or None
+
+
+def _record_timed_out_current_session(output_dir: Path, reason: str) -> str | None:
+    current_session = _read_current_session(output_dir)
+    sample_index = _extract_current_sample_index(current_session)
+    if not sample_index or current_session is None:
+        return None
+
+    current_session["sample_status"] = "agent_unknown_error"
+    current_session["finish_reason"] = f"[run_all_with_servers] {reason}"
+    current_session["task_output"] = {"answer": None}
+    current_session["evaluation_record"] = {
+        "outcome": "incorrect",
+        "detail_dict": {
+            "f1_score": 0.0,
+            "executable_flag": False,
+        },
+    }
+    current_session.setdefault("tool_invoked", [])
+    current_session["tool_invoked_any"] = bool(current_session.get("tool_invoked_any"))
+
+    runs_path = output_dir / "runs.json"
+    runs_payload: list[dict[str, object]] = []
+    try:
+        if runs_path.exists():
+            raw_runs = json.loads(runs_path.read_text(encoding="utf-8"))
+            if isinstance(raw_runs, list):
+                runs_payload = [item for item in raw_runs if isinstance(item, dict)]
+    except Exception:
+        runs_payload = []
+
+    if any(str(item.get("sample_index") or "").strip() == sample_index for item in runs_payload):
+        try:
+            (output_dir / "current_session.json").write_text(
+                json.dumps(current_session, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        return sample_index
+
+    runs_payload.append(current_session)
+    runs_path.write_text(json.dumps(runs_payload, indent=2), encoding="utf-8")
+    (output_dir / "current_session.json").write_text(
+        json.dumps(current_session, indent=2),
+        encoding="utf-8",
+    )
+    return sample_index
+
+
+def _append_client_timeout_exception(output_dir: Path, reason: str) -> None:
+    exception_path = output_dir / "exception.txt"
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _append_log(exception_path, f"Time: {stamp}")
+    _append_log(exception_path, f"Exception: [run_all_with_servers] {reason}")
+    _append_log(exception_path, "NoneType: None")
+    _append_log(exception_path, "")
+
+
+def _terminate_process_group(proc: subprocess.Popen[str], *, grace_s: float = 10.0) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.time() + grace_s
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return
+        time.sleep(0.2)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+
+def _run_client_with_watchdog(
+    client_cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    output_dir: Path,
+    log_path: Path,
+    wall_timeout_s: int,
+    idle_timeout_s: int,
+    poll_s: float,
+) -> ClientWatchdogResult:
+    proc = subprocess.Popen(
+        client_cmd,
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    )
+    start_ts = time.time()
+    last_progress_mtime = _latest_client_progress_mtime(output_dir)
+    current_sample_index: str | None = None
+    current_sample_start_ts = start_ts
+    current_sample_progress_ts = start_ts
+    try:
+        while True:
+            exit_code = proc.poll()
+            if exit_code is not None:
+                return ClientWatchdogResult(exit_code=exit_code)
+
+            now = time.time()
+            current_session = _read_current_session(output_dir)
+            observed_sample_index = _extract_current_sample_index(current_session)
+            if observed_sample_index != current_sample_index:
+                current_sample_index = observed_sample_index
+                current_sample_start_ts = now
+                current_sample_progress_ts = now
+
+            latest_mtime = _latest_client_progress_mtime(output_dir)
+            if (
+                latest_mtime is not None
+                and (last_progress_mtime is None or latest_mtime > last_progress_mtime)
+            ):
+                last_progress_mtime = latest_mtime
+                current_sample_progress_ts = now
+
+            timed_out_reason = None
+            if wall_timeout_s > 0 and now - current_sample_start_ts > wall_timeout_s:
+                timed_out_reason = f"sample_wall_timeout:{wall_timeout_s}s"
+            elif idle_timeout_s > 0 and now - current_sample_progress_ts > idle_timeout_s:
+                timed_out_reason = f"sample_idle_timeout:{idle_timeout_s}s"
+
+            if timed_out_reason:
+                message = (
+                    f"[run_all_with_servers] Sample watchdog triggered for "
+                    f"{output_dir} sample={current_sample_index or 'unknown'}: "
+                    f"{timed_out_reason}"
+                )
+                print(message)
+                _append_log(log_path, message)
+                _append_client_timeout_exception(output_dir, timed_out_reason)
+                _terminate_process_group(proc)
+                return ClientWatchdogResult(
+                    exit_code=124,
+                    timed_out_reason=timed_out_reason,
+                    current_session=current_session,
+                )
+
+            time.sleep(max(poll_s, 0.5))
+    finally:
+        _terminate_process_group(proc, grace_s=1.0)
 
 
 def _merge_runs(output_dir: Path, combined_dir: Path) -> None:
@@ -618,98 +818,133 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
             env["LIFELONG_KG_ONTOLOGY_DIR"] = ontology_dir
         env["PAL_SPARQL_ENDPOINT_URL"] = SPARQL_ENDPOINT
 
-    print(f"[run_all_with_servers] Starting server: {config_path}")
-    _preflight_kill_ports([8000, 8001])
-
-    log_fp = log_path.open("w", encoding="utf-8")
-    server_proc = subprocess.Popen(
-        server_cmd,
-        cwd=repo_root,
-        env=env,
-        stdout=log_fp,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-
+    recovered_timed_out_samples: set[str] = set()
+    should_retry_client = True
+    final_result_code = 1
     try:
-        if not _wait_for_server("http://127.0.0.1:8000/api/ping"):
-            print("[run_all_with_servers] Task server did not become ready on 8000.")
-            print(f"[run_all_with_servers] Server log: {log_path}")
-            print(_tail_file(log_path))
-            return 1
+        while should_retry_client:
+            should_retry_client = False
+            fuseki_watchdog_stop = None
+            fuseki_watchdog_thread = None
+            print(f"[run_all_with_servers] Starting server: {config_path}")
+            _preflight_kill_ports([8000, 8001])
 
-        if not _wait_for_server("http://127.0.0.1:8001/api/ping"):
-            print("[run_all_with_servers] ChatHistoryItemFactory server did not become ready on 8001.")
-            print(f"[run_all_with_servers] Server log: {log_path}")
-            print(_tail_file(log_path))
-            return 1
-
-        if is_kg:
-            ok = _ensure_kg_endpoint_available(
-                repo_root,
-                fuseki_log_path,
-                context="pre_client",
-                runtime_state=fuseki_runtime_state,
+            log_fp = log_path.open("a", encoding="utf-8")
+            server_proc = subprocess.Popen(
+                server_cmd,
+                cwd=repo_root,
+                env=env,
+                stdout=log_fp,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
             )
-            if not ok:
-                print("[run_all_with_servers] KG endpoint unavailable after server startup.")
-                print(f"[run_all_with_servers] Fuseki log: {fuseki_log_path}")
-                print(_tail_file(fuseki_log_path))
-                return 1
-            fuseki_watchdog_stop = threading.Event()
-            fuseki_watchdog_thread = threading.Thread(
-                target=_fuseki_watchdog_loop,
-                args=(
-                    repo_root,
-                    fuseki_log_path,
-                    fuseki_runtime_state,
-                    fuseki_watchdog_stop,
-                ),
-                daemon=True,
-            )
-            fuseki_watchdog_thread.start()
 
-        print(f"[run_all_with_servers] Running client: {config_path}")
-        result = subprocess.run(client_cmd, cwd=repo_root, env=env, check=False)
-        if result.returncode != 0:
-            print(f"[run_all_with_servers] Client failed for {config_path} (exit={result.returncode})")
-            print(f"[run_all_with_servers] Server log: {log_path}")
-            print(_tail_file(log_path))
-            return result.returncode
+            try:
+                if not _wait_for_server("http://127.0.0.1:8000/api/ping"):
+                    print("[run_all_with_servers] Task server did not become ready on 8000.")
+                    print(f"[run_all_with_servers] Server log: {log_path}")
+                    print(_tail_file(log_path))
+                    return 1
 
+                if not _wait_for_server("http://127.0.0.1:8001/api/ping"):
+                    print("[run_all_with_servers] ChatHistoryItemFactory server did not become ready on 8001.")
+                    print(f"[run_all_with_servers] Server log: {log_path}")
+                    print(_tail_file(log_path))
+                    return 1
 
+                if is_kg:
+                    ok = _ensure_kg_endpoint_available(
+                        repo_root,
+                        fuseki_log_path,
+                        context="pre_client",
+                        runtime_state=fuseki_runtime_state,
+                    )
+                    if not ok:
+                        print("[run_all_with_servers] KG endpoint unavailable after server startup.")
+                        print(f"[run_all_with_servers] Fuseki log: {fuseki_log_path}")
+                        print(_tail_file(fuseki_log_path))
+                        return 1
+                    fuseki_watchdog_stop = threading.Event()
+                    fuseki_watchdog_thread = threading.Thread(
+                        target=_fuseki_watchdog_loop,
+                        args=(
+                            repo_root,
+                            fuseki_log_path,
+                            fuseki_runtime_state,
+                            fuseki_watchdog_stop,
+                        ),
+                        daemon=True,
+                    )
+                    fuseki_watchdog_thread.start()
+
+                print(f"[run_all_with_servers] Running client: {config_path}")
+                result = _run_client_with_watchdog(
+                    client_cmd,
+                    cwd=repo_root,
+                    env=env,
+                    output_dir=Path(env["LIFELONG_OUTPUT_DIR"]),
+                    log_path=log_path,
+                    wall_timeout_s=CLIENT_WALL_TIMEOUT_S,
+                    idle_timeout_s=CLIENT_IDLE_TIMEOUT_S,
+                    poll_s=CLIENT_WATCHDOG_POLL_S,
+                )
+                final_result_code = result.exit_code
+                if result.exit_code == 0:
+                    final_result_code = 0
+                    continue
+
+                if result.timed_out_reason:
+                    recovered_sample_index = _record_timed_out_current_session(
+                        Path(env["LIFELONG_OUTPUT_DIR"]),
+                        result.timed_out_reason,
+                    )
+                    if recovered_sample_index and recovered_sample_index not in recovered_timed_out_samples:
+                        recovered_timed_out_samples.add(recovered_sample_index)
+                        message = (
+                            "[run_all_with_servers] Recorded timed-out sample and will restart client: "
+                            f"sample={recovered_sample_index} reason={result.timed_out_reason}"
+                        )
+                        print(message)
+                        _append_log(log_path, message)
+                        should_retry_client = True
+                        continue
+
+                print(f"[run_all_with_servers] Client failed for {config_path} (exit={result.exit_code})")
+                print(f"[run_all_with_servers] Server log: {log_path}")
+                print(_tail_file(log_path))
+                return result.exit_code
+
+            finally:
+                if fuseki_watchdog_stop is not None:
+                    fuseki_watchdog_stop.set()
+                if fuseki_watchdog_thread is not None:
+                    fuseki_watchdog_thread.join(timeout=5)
+                if server_proc.poll() is None:
+                    try:
+                        os.killpg(server_proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    server_proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(server_proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                time.sleep(2)
+                try:
+                    log_fp.close()
+                except Exception:
+                    pass
     finally:
-        if fuseki_watchdog_stop is not None:
-            fuseki_watchdog_stop.set()
-        if fuseki_watchdog_thread is not None:
-            fuseki_watchdog_thread.join(timeout=5)
-        if server_proc.poll() is None:
-            try:
-                os.killpg(server_proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        try:
-            server_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(server_proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        time.sleep(2)
-        try:
-            log_fp.close()
-        except Exception:
-            pass
-
-        # Stop Fuseki only if THIS script started it.
         if is_kg and fuseki_runtime_state["managed_by_script"]:
             try:
                 _run(["docker", "rm", "-f", FUSEKI_CONTAINER], log_path=fuseki_log_path)
             except Exception:
                 pass
 
-    return 0
+    return final_result_code
 
 
 def main() -> int:

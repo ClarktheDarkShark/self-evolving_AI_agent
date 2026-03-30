@@ -3,12 +3,12 @@ from __future__ import annotations
 import builtins
 import inspect
 import json
+import multiprocessing
 import os
+import queue as queue_module
 import socket
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.error import URLError
 
 from .parser import ParsedPALProgram, parse_pal_code
 
@@ -66,41 +66,129 @@ def invoke_pal_program(
     timeout_s: float = 10.0,
     sparqlwrapper_module: Any | None = None,
 ) -> PALInvocationResult:
+    queue: multiprocessing.Queue[dict[str, Any]] = multiprocessing.get_context(
+        "spawn"
+    ).Queue(maxsize=1)
+    process = multiprocessing.get_context("spawn").Process(
+        target=_execute_program_in_subprocess,
+        kwargs={
+            "parsed_program": parsed_program,
+            "endpoint_url": endpoint_url,
+            "queue": queue,
+        },
+    )
+    process.start()
     try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                _execute_program,
-                parsed_program=parsed_program,
-                endpoint_url=endpoint_url,
-                sparqlwrapper_module=sparqlwrapper_module,
+        process.join(timeout=timeout_s)
+        if process.is_alive():
+            _terminate_process(process)
+            return PALInvocationResult(
+                success=False,
+                error=f"execution_timed_out:{timeout_s}",
+                failure_kind="endpoint_timeout",
+                diagnostics={
+                    "endpoint_url": endpoint_url,
+                    "timeout_s": timeout_s,
+                },
             )
-            payload, runtime_diagnostics = future.result(timeout=timeout_s)
-        return PALInvocationResult(
-            success=True,
-            payload=payload,
-            diagnostics=runtime_diagnostics,
-        )
-    except TimeoutError:
+
+        if process.exitcode not in (0, None):
+            return PALInvocationResult(
+                success=False,
+                error=f"execution_process_failed:{process.exitcode}",
+                failure_kind="execution_error",
+                diagnostics={
+                    "endpoint_url": endpoint_url,
+                    "exitcode": process.exitcode,
+                },
+            )
+
+        try:
+            message = queue.get(timeout=0.2)
+        except queue_module.Empty:
+            return PALInvocationResult(
+                success=False,
+                error="execution_result_missing",
+                failure_kind="execution_error",
+                diagnostics={
+                    "endpoint_url": endpoint_url,
+                    "exitcode": process.exitcode,
+                },
+            )
+
+        status = str(message.get("status") or "").strip().lower()
+        if status == "ok":
+            return PALInvocationResult(
+                success=True,
+                payload=message.get("payload"),
+                diagnostics=dict(message.get("diagnostics") or {}),
+            )
+        if status == "error":
+            return PALInvocationResult(
+                success=False,
+                error=str(message.get("error") or "pal_execution_failed"),
+                failure_kind=str(message.get("failure_kind") or "execution_error"),
+                diagnostics=dict(message.get("diagnostics") or {}),
+            )
         return PALInvocationResult(
             success=False,
-            error=f"execution_timed_out:{timeout_s}",
-            failure_kind="endpoint_timeout",
+            error="execution_result_invalid",
+            failure_kind="execution_error",
             diagnostics={
                 "endpoint_url": endpoint_url,
-                "timeout_s": timeout_s,
             },
+        )
+    finally:
+        try:
+            queue.close()
+        except Exception:
+            pass
+        try:
+            queue.join_thread()
+        except Exception:
+            pass
+
+
+def _execute_program_in_subprocess(
+    *,
+    parsed_program: ParsedPALProgram,
+    endpoint_url: str,
+    queue: multiprocessing.Queue,
+) -> None:
+    try:
+        payload, runtime_diagnostics = _execute_program(
+            parsed_program=parsed_program,
+            endpoint_url=endpoint_url,
+            sparqlwrapper_module=None,
+        )
+        queue.put(
+            {
+                "status": "ok",
+                "payload": payload,
+                "diagnostics": runtime_diagnostics,
+            }
         )
     except Exception as exc:
         failure_kind, diagnostics = _classify_invocation_exception(
             exc,
             endpoint_url=endpoint_url,
         )
-        return PALInvocationResult(
-            success=False,
-            error=str(exc),
-            failure_kind=failure_kind,
-            diagnostics=diagnostics,
+        queue.put(
+            {
+                "status": "error",
+                "error": str(exc),
+                "failure_kind": failure_kind,
+                "diagnostics": diagnostics,
+            }
         )
+
+
+def _terminate_process(process: multiprocessing.Process) -> None:
+    process.terminate()
+    process.join(timeout=1.0)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=1.0)
 
 
 def _execute_program(

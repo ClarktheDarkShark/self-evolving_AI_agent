@@ -62,6 +62,7 @@ class PALAgentController(Agent):
     _PAL_QUERY_CODE_MAX_ATTEMPTS = 3
     # Max repair iterations *after* the initial candidate (total attempts = 1 + this)
     _PAL_REPAIR_MAX_ATTEMPTS = 3
+    _PAL_REPAIR_STAGNATION_REPEAT_LIMIT = 2
     _SUPPORTED_QUERY_SHAPES = {
         "single_anchor_lookup",
         "single_anchor_chain_lookup",
@@ -575,6 +576,9 @@ class PALAgentController(Agent):
         task_question: str,
         materialization: BenchmarkMaterialization,
     ) -> str:
+        artifact_type = str(
+            (materialization.diagnostics or {}).get("artifact_type") or ""
+        ).strip()
         if materialization.needs_bridge:
             tool_name = self._ensure_bridge_tool(
                 materialization.bridge_tool_name or PAL_BENCHMARK_BRIDGE_TOOL_NAME
@@ -613,7 +617,9 @@ class PALAgentController(Agent):
             )
         if materialization.final_answer_text:
             return materialization.final_answer_text
-        return "Final Answer: "
+        if artifact_type == "unresolved":
+            raise AgentUnknownException("pal_adapter_unresolved_artifact")
+        raise AgentUnknownException("pal_adapter_empty_materialization")
 
     def _run_text_prompt(self, *, system_prompt: str, user_prompt: str) -> str:
         prompt_history = ChatHistory()
@@ -762,6 +768,40 @@ class PALAgentController(Agent):
             "sha1": self._sha1_text(safe_text),
             "preview": preview,
         }
+
+    def _build_repair_loop_stagnation_signature(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+        query_text: str,
+        verdict: PlausibilityVerdict,
+        anchor_probe_results: Sequence[AnchorProbeResult] | None,
+        invocation_result: Any,
+    ) -> str:
+        probe_signature = [
+            {
+                "anchor": result.anchor_name,
+                "resolved_entity_id": result.resolved_entity_id,
+                "entity_count": result.entity_count,
+                "path_count": result.path_count,
+                "relation_probed": result.relation_probed,
+                "anchor_position": result.anchor_position,
+            }
+            for result in (anchor_probe_results or [])
+        ]
+        signature_payload = {
+            "query_shape": query_plan.get("query_shape"),
+            "answer_mode": query_plan.get("answer_mode"),
+            "strategy": query_plan.get("strategy"),
+            "relation_paths": query_plan.get("relation_paths") or [],
+            "query_text_sha1": self._sha1_text(str(query_text or "")),
+            "execution_success": bool(getattr(invocation_result, "success", False)),
+            "failure_kind": getattr(invocation_result, "failure_kind", None),
+            "verdict": verdict.verdict,
+            "verdict_reasons": list(verdict.reasons),
+            "anchor_probes": probe_signature,
+        }
+        return self._sha1_text(json.dumps(signature_payload, sort_keys=True, default=str))
 
     def _get_result_binding_count(self, result_dict: Mapping[str, Any]) -> int:
         bindings = result_dict.get("results", {}).get("bindings", [])
@@ -1065,7 +1105,177 @@ class PALAgentController(Agent):
                 answer_target_phrase=answer_target_phrase,
                 question_interpretation=interpretation,
             )
+        rewritten_plan = self._rewrite_single_anchor_answer_target_count_plan(
+            task_question=task_question,
+            query_plan=rewritten_plan,
+            question_interpretation=interpretation,
+        )
         return rewritten_plan
+
+    def _rewrite_single_anchor_answer_target_count_plan(
+        self,
+        *,
+        task_question: str,
+        query_plan: Mapping[str, Any],
+        question_interpretation: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        if str(query_plan.get("answer_mode") or "").strip().lower() != "count":
+            return dict(query_plan)
+        if str(query_plan.get("query_shape") or "").strip().lower() != "count_over_direct_relation":
+            return dict(query_plan)
+
+        question_text, explicit_entities = self._split_task_question(task_question)
+        interpretation = question_interpretation or self._build_question_interpretation(
+            question_text=question_text,
+            explicit_entities=explicit_entities,
+            answer_target_phrase=self._extract_answer_target_phrase(question_text),
+        )
+        non_anchor_semantic_inputs = [
+            item
+            for item in (interpretation.get("question_inputs") or [])
+            if isinstance(item, Mapping)
+            and str(item.get("kind") or "").strip() not in {"named_entity", "answer_target"}
+        ]
+        if any(
+            str(item.get("kind") or "").strip() in {"class_phrase", "type_constraint", "shared_attribute"}
+            for item in (interpretation.get("question_inputs") or [])
+            if isinstance(item, Mapping)
+        ):
+            return dict(query_plan)
+
+        anchored_entities = [
+            dict(item)
+            for item in (query_plan.get("anchored_entities") or [])
+            if isinstance(item, Mapping)
+            and self._normalize_relation_role(item.get("role")) in {"anchor", "anchor_a", "anchor_b"}
+        ]
+        if len(anchored_entities) != 1:
+            return dict(query_plan)
+        anchor_role = self._normalize_relation_role(anchored_entities[0].get("role")) or "anchor"
+
+        relation_paths = [
+            dict(path)
+            for path in (query_plan.get("relation_paths") or [])
+            if isinstance(path, Mapping)
+        ]
+        if len(relation_paths) < 2:
+            return dict(query_plan)
+
+        answer_target_phrase = self._extract_answer_target_phrase(question_text)
+        answer_target_token = self._normalize_variable_token(
+            self._singularize_phrase(answer_target_phrase)
+        )
+        explicit_entity_tokens = {
+            self._normalize_variable_token(entity)
+            for entity in explicit_entities
+            if self._normalize_variable_token(entity)
+        }
+
+        anchor_paths: list[dict[str, Any]] = []
+        answer_target_filter_paths: list[dict[str, Any]] = []
+        other_non_anchor_paths: list[dict[str, Any]] = []
+
+        for path in relation_paths:
+            from_role = self._normalize_relation_role(path.get("from_role"))
+            to_role = self._normalize_relation_role(path.get("to_role"))
+            if self._path_touches_anchor_role(path, anchor_role=anchor_role):
+                if {from_role, to_role} & {"candidate_set", "count_set", "shared_answer"}:
+                    anchor_paths.append(path)
+                else:
+                    other_non_anchor_paths.append(path)
+                continue
+            if (
+                not non_anchor_semantic_inputs
+                and {from_role, to_role} & {"candidate_set", "count_set", "shared_answer"}
+                and "constraint_value" in {from_role, to_role}
+            ):
+                answer_target_filter_paths.append(path)
+                continue
+            constraint_raw = ""
+            if from_role == "constraint_value":
+                constraint_raw = str(path.get("from") or "").strip()
+            elif to_role == "constraint_value":
+                constraint_raw = str(path.get("to") or "").strip()
+            constraint_token = self._normalize_variable_token(
+                self._singularize_phrase(constraint_raw)
+            )
+            touches_candidate = {from_role, to_role} & {"candidate_set", "count_set", "shared_answer"}
+            if (
+                touches_candidate
+                and constraint_token
+                and constraint_token == answer_target_token
+                and constraint_token not in explicit_entity_tokens
+            ):
+                answer_target_filter_paths.append(path)
+            else:
+                other_non_anchor_paths.append(path)
+
+        if len(anchor_paths) != 1 or not answer_target_filter_paths or other_non_anchor_paths:
+            return dict(query_plan)
+
+        rewritten_anchor_path = copy.deepcopy(anchor_paths[0])
+        from_role = self._normalize_relation_role(rewritten_anchor_path.get("from_role"))
+        to_role = self._normalize_relation_role(rewritten_anchor_path.get("to_role"))
+        if from_role == anchor_role and to_role in {"candidate_set", "shared_answer", "count_set"}:
+            count_variable = (
+                self._normalize_variable_token(rewritten_anchor_path.get("to"))
+                or "count_set"
+            )
+            rewritten_anchor_path["to"] = count_variable
+            rewritten_anchor_path["to_role"] = "count_set"
+        elif to_role == anchor_role and from_role in {"candidate_set", "shared_answer", "count_set"}:
+            count_variable = (
+                self._normalize_variable_token(rewritten_anchor_path.get("from"))
+                or "count_set"
+            )
+            rewritten_anchor_path["from"] = count_variable
+            rewritten_anchor_path["from_role"] = "count_set"
+        else:
+            return dict(query_plan)
+
+        rewritten_plan = copy.deepcopy(dict(query_plan))
+        rewritten_plan["shared_answer_variable"] = count_variable
+        rewritten_plan["candidate_set_variable"] = count_variable
+        rewritten_plan["count_set_variable"] = count_variable
+        rewritten_plan["join_structure"] = {
+            "type": "count",
+            "anchor_constraints": [
+                {
+                    "anchor_role": anchor_role,
+                    "constrains_variable": count_variable,
+                    "notes": (
+                        f"{anchor_role} directly constrains the counted set; the answer "
+                        "target is a semantic description, not a second KG filter."
+                    ),
+                }
+            ],
+        }
+        rewritten_plan["relation_paths"] = [rewritten_anchor_path]
+        rewritten_plan["projection"] = ["count"]
+        rewritten_plan["normalized_aliases"] = [
+            {
+                **dict(item),
+                "reason": (
+                    "semantic answer target phrase used only for relation selection"
+                    if self._clean_question_input_surface(item.get("surface"))
+                    == self._clean_question_input_surface(answer_target_phrase)
+                    else str(item.get("reason") or "").strip()
+                ),
+            }
+            for item in (rewritten_plan.get("normalized_aliases") or [])
+            if isinstance(item, Mapping)
+        ]
+        rewritten_plan["plan_rationale"] = [
+            "Single-anchor count rewrite: use one grounded relation from the anchor to the counted set.",
+            "The answer target is a semantic description of the counted set, not a second KG filter.",
+            "Do not add extra candidate-to-constraint paths unless a separate question input explicitly requires them.",
+        ]
+        rewritten_plan["strategy"] = (
+            f"Count the distinct {count_variable} reached directly from the anchor "
+            f"via {str(rewritten_anchor_path.get('relation') or '').strip()}. "
+            "Treat the answer target only as a relation-selection hint."
+        ).strip()
+        return self._normalize_pal_query_plan(rewritten_plan)
 
     def _count_shared_attribute_targets_shared_values(
         self,
@@ -1619,7 +1829,10 @@ class PALAgentController(Agent):
     ) -> None:
         final_verdict = str(repair_loop_log.get("final_verdict") or "").strip()
         accepted_attempt = repair_loop_log.get("accepted_attempt")
-        if accepted_attempt is not None or final_verdict == "accepted":
+        if accepted_attempt is not None or final_verdict in {
+            "accepted",
+            "accepted_best_effort",
+        }:
             return
         last_verdict = str(
             repair_loop_log.get("last_verdict") or final_verdict or "no_accepted_candidate"
@@ -1638,6 +1851,151 @@ class PALAgentController(Agent):
             }
         )
         raise AgentUnknownException(f"pal_query_not_accepted:{last_verdict}")
+
+    def _build_best_executing_candidate_metadata(
+        self,
+        *,
+        generated_code: str,
+        invocation_result: Any,
+        query_plan: Mapping[str, Any],
+        query_text: str,
+        verdict: PlausibilityVerdict,
+        anchor_probe_results: Sequence[AnchorProbeResult] | None,
+    ) -> dict[str, Any]:
+        result_dict = invocation_result.payload if invocation_result.success else None
+        binding_count = (
+            self._get_result_binding_count(result_dict)
+            if isinstance(result_dict, Mapping)
+            else 0
+        )
+        scalar_count = (
+            self._extract_scalar_count_value(result_dict)
+            if isinstance(result_dict, Mapping)
+            else None
+        )
+        anchor_results = list(anchor_probe_results or [])
+        all_anchors_found = bool(anchor_results) and all(
+            bool(result.found) for result in anchor_results
+        )
+        resolved_anchor_count = sum(
+            1 for result in anchor_results if str(result.resolved_entity_id or "").strip()
+        )
+        query_text_upper = str(query_text or "").upper()
+
+        score = 0
+        if invocation_result.success and invocation_result.payload is not None:
+            score += 10
+        if binding_count > 0:
+            score += 20
+        if scalar_count is not None:
+            if scalar_count > 0:
+                score += 15
+            else:
+                score += 5
+        if all_anchors_found:
+            score += 15
+        score += resolved_anchor_count * 5
+        if "ORDER BY" in query_text_upper and "LIMIT 1" in query_text_upper:
+            score += 10
+
+        soft_bonus = {
+            "repairable_bad_count_set": 8,
+            "repairable_bad_join": 6,
+            "repairable_bad_superlative_structure": 4,
+        }
+        score += soft_bonus.get(str(verdict.verdict or "").strip(), 0)
+
+        for reason in verdict.reasons:
+            reason_text = str(reason or "").strip()
+            if reason_text.startswith("anchor_not_found"):
+                score -= 100
+            elif reason_text == "count_set_path_empty":
+                score -= 50
+            elif reason_text == "ordering_attribute_path_exploratory":
+                score -= 60
+            elif reason_text.startswith("ambiguous_anchor_surface_binding"):
+                score -= 5
+            elif reason_text.startswith("count_anchor_path_low_support"):
+                score -= 10
+            elif reason_text == "count_query_dynamic_chain_too_weak":
+                score -= 10
+            elif (
+                reason_text == "count_query_unverified_type_constraint"
+                or reason_text.startswith("count_query_unverified_type_constraint:")
+            ):
+                score -= 30
+            elif (
+                reason_text == "count_query_counts_wrong_variable"
+                or reason_text.startswith("count_query_counts_wrong_variable:")
+            ):
+                score -= 30
+
+        return {
+            "generated_code": generated_code,
+            "invocation_result": invocation_result,
+            "query_plan": copy.deepcopy(dict(query_plan)),
+            "query_text": query_text,
+            "verdict": str(verdict.verdict or "").strip(),
+            "verdict_reasons": list(verdict.reasons),
+            "binding_count": binding_count,
+            "scalar_count": scalar_count,
+            "answer_mode": str(query_plan.get("answer_mode") or "").strip().lower(),
+            "query_shape": str(query_plan.get("query_shape") or "").strip().lower(),
+            "all_anchors_found": all_anchors_found,
+            "resolved_anchor_count": resolved_anchor_count,
+            "has_order_by_limit": "ORDER BY" in query_text_upper and "LIMIT 1" in query_text_upper,
+            "score": score,
+        }
+
+    def _should_accept_best_executing_candidate(
+        self,
+        *,
+        candidate_metadata: Mapping[str, Any],
+    ) -> bool:
+        verdict = str(candidate_metadata.get("verdict") or "").strip()
+        if verdict not in {
+            "repairable_bad_count_set",
+            "repairable_bad_join",
+            "repairable_bad_superlative_structure",
+        }:
+            return False
+
+        binding_count = int(candidate_metadata.get("binding_count") or 0)
+        scalar_count = candidate_metadata.get("scalar_count")
+        answer_mode = str(candidate_metadata.get("answer_mode") or "").strip().lower()
+        query_shape = str(candidate_metadata.get("query_shape") or "").strip().lower()
+        reasons = [
+            str(reason or "").strip()
+            for reason in (candidate_metadata.get("verdict_reasons") or [])
+        ]
+
+        if any(reason.startswith("anchor_not_found") for reason in reasons):
+            return False
+        if "ordering_attribute_path_exploratory" in reasons:
+            return False
+        if not bool(candidate_metadata.get("all_anchors_found")):
+            return False
+        if binding_count <= 0 and scalar_count is None:
+            return False
+        if answer_mode == "count" and scalar_count is None:
+            return False
+        if any(
+            reason == "count_query_counts_wrong_variable"
+            or reason.startswith("count_query_counts_wrong_variable:")
+            or reason == "count_query_unverified_type_constraint"
+            or reason.startswith("count_query_unverified_type_constraint:")
+            for reason in reasons
+        ):
+            return False
+        if query_shape == "superlative_chain":
+            if binding_count <= 0 or not bool(candidate_metadata.get("has_order_by_limit")):
+                return False
+            return int(candidate_metadata.get("score") or 0) >= 25
+
+        if answer_mode == "count":
+            return int(candidate_metadata.get("score") or 0) >= 20
+
+        return int(candidate_metadata.get("score") or 0) >= 25
 
     def _normalize_ordering_attribute(self, raw_value: Any) -> dict[str, str]:
         if not isinstance(raw_value, Mapping):
@@ -3486,7 +3844,7 @@ class PALAgentController(Agent):
         """
         max_total: int = self._PAL_REPAIR_MAX_ATTEMPTS + 1  # initial + repairs
 
-        best_executing: tuple[str, Any] | None = None
+        best_executing: dict[str, Any] | None = None
         plausibility_feedback: list[str] = []
         cumulative_plan_feedback: list[str] = []
         last_code: str = ""
@@ -3498,6 +3856,7 @@ class PALAgentController(Agent):
             for candidate in (relation_grounding or [])
             if isinstance(candidate, Mapping)
         ]
+        seen_attempt_signatures: dict[str, int] = {}
         loop_log: dict[str, Any] = {
             "total_attempts": 0,
             "accepted_attempt": None,
@@ -3588,11 +3947,6 @@ class PALAgentController(Agent):
             invocation_result = execute_pal_code_with_result(generated_code)
             last_result = invocation_result
 
-            if invocation_result.success and invocation_result.payload is not None:
-                # Track the earliest successfully-executing candidate as fallback
-                if best_executing is None:
-                    best_executing = (generated_code, invocation_result)
-
             query_texts = self._extract_sparql_query_texts(generated_code)
             query_text = query_texts[0] if query_texts else ""
             result_dict: Any = (
@@ -3668,9 +4022,6 @@ class PALAgentController(Agent):
                 query_plan.update(copy.deepcopy(working_query_plan))
                 last_code = generated_code
                 last_result = invocation_result
-                if invocation_result.success and invocation_result.payload is not None:
-                    if best_executing is None:
-                        best_executing = (generated_code, invocation_result)
                 query_texts = self._extract_sparql_query_texts(generated_code)
                 query_text = query_texts[0] if query_texts else ""
                 result_dict = (
@@ -3756,13 +4107,36 @@ class PALAgentController(Agent):
             loop_log["last_verdict"] = verdict.verdict
             loop_log["last_reasons"] = list(verdict.reasons)
 
+            if invocation_result.success and invocation_result.payload is not None:
+                candidate_metadata = self._build_best_executing_candidate_metadata(
+                    generated_code=generated_code,
+                    invocation_result=invocation_result,
+                    query_plan=working_query_plan,
+                    query_text=query_text,
+                    verdict=verdict,
+                    anchor_probe_results=anchor_probe_results,
+                )
+                if (
+                    best_executing is None
+                    or int(candidate_metadata.get("score") or 0)
+                    > int(best_executing.get("score") or 0)
+                ):
+                    best_executing = candidate_metadata
+
+            stagnation_signature = self._build_repair_loop_stagnation_signature(
+                query_plan=working_query_plan,
+                query_text=query_text,
+                verdict=verdict,
+                anchor_probe_results=anchor_probe_results,
+                invocation_result=invocation_result,
+            )
+            signature_repeat_count = seen_attempt_signatures.get(stagnation_signature, 0) + 1
+            seen_attempt_signatures[stagnation_signature] = signature_repeat_count
+
             if verdict.is_accepted:
                 loop_log["accepted_attempt"] = attempt
                 loop_log["repair_used"] = is_repair
                 loop_log["final_verdict"] = verdict.verdict
-                # Promote to best_executing if this candidate executed
-                if invocation_result.success and invocation_result.payload is not None:
-                    best_executing = (generated_code, invocation_result)
                 self._emit_generated_tools_event(
                     {
                         "event": "pal_repair_loop_accepted",
@@ -3774,6 +4148,23 @@ class PALAgentController(Agent):
                     }
                 )
                 return generated_code, invocation_result, loop_log
+
+            if signature_repeat_count >= self._PAL_REPAIR_STAGNATION_REPEAT_LIMIT:
+                loop_log["final_verdict"] = verdict.verdict
+                loop_log["last_reasons"] = list(verdict.reasons) + [
+                    "repair_loop_stalled"
+                ]
+                self._emit_generated_tools_event(
+                    {
+                        "event": "pal_repair_loop_stalled",
+                        "mode": "pal",
+                        "tool_name": generated_tool_name,
+                        "attempt": attempt,
+                        "verdict": verdict.verdict,
+                        "signature_repeat_count": signature_repeat_count,
+                    }
+                )
+                break
 
             # ---- Prepare repair feedback for next round -----------------
             if attempt < max_total:
@@ -3895,6 +4286,13 @@ class PALAgentController(Agent):
                     )
                     rewrite_family = "single_anchor_dynamic_lookup"
                 if rewritten_query_plan is None:
+                    rewritten_query_plan = self._build_class_filtered_count_repair_plan(
+                        task_question=task_question,
+                        query_plan=working_query_plan,
+                        relation_grounding=working_relation_grounding,
+                    )
+                    rewrite_family = "class_filtered_count"
+                if rewritten_query_plan is None:
                     rewritten_query_plan = self._build_pivot_preserving_count_repair_plan(
                         query_plan=working_query_plan,
                         relation_grounding=working_relation_grounding,
@@ -3998,10 +4396,43 @@ class PALAgentController(Agent):
                 )
 
         # ---- All attempts exhausted without acceptance ------------------
-        loop_log["final_verdict"] = "no_accepted_candidate"
+        if not loop_log.get("final_verdict"):
+            loop_log["final_verdict"] = "no_accepted_candidate"
 
         if best_executing is not None:
-            best_code, best_inv = best_executing
+            loop_log["best_executing_candidate"] = {
+                "verdict": best_executing.get("verdict"),
+                "verdict_reasons": best_executing.get("verdict_reasons") or [],
+                "binding_count": best_executing.get("binding_count"),
+                "scalar_count": best_executing.get("scalar_count"),
+                "answer_mode": best_executing.get("answer_mode"),
+                "query_shape": best_executing.get("query_shape"),
+                "all_anchors_found": best_executing.get("all_anchors_found"),
+                "resolved_anchor_count": best_executing.get("resolved_anchor_count"),
+                "score": best_executing.get("score"),
+            }
+            if self._should_accept_best_executing_candidate(
+                candidate_metadata=best_executing
+            ):
+                loop_log["accepted_attempt"] = "best_executing"
+                loop_log["final_verdict"] = "accepted_best_effort"
+                self._emit_generated_tools_event(
+                    {
+                        "event": "pal_repair_loop_salvaged",
+                        "mode": "pal",
+                        "tool_name": generated_tool_name,
+                        "salvage_source": "best_executing_candidate",
+                        "original_verdict": best_executing.get("verdict"),
+                        "score": best_executing.get("score"),
+                        "binding_count": best_executing.get("binding_count"),
+                        "scalar_count": best_executing.get("scalar_count"),
+                    }
+                )
+                return (
+                    str(best_executing.get("generated_code") or ""),
+                    best_executing.get("invocation_result"),
+                    loop_log,
+                )
             self._emit_generated_tools_event(
                 {
                     "event": "pal_repair_loop_fallback",
@@ -4010,9 +4441,15 @@ class PALAgentController(Agent):
                     "reason": "no_accepted_candidate_using_best_executing",
                     "total_attempts": loop_log["total_attempts"],
                     "repair_used": loop_log["repair_used"],
+                    "score": best_executing.get("score"),
+                    "best_verdict": best_executing.get("verdict"),
                 }
             )
-            return best_code, best_inv, loop_log
+            return (
+                str(best_executing.get("generated_code") or ""),
+                best_executing.get("invocation_result"),
+                loop_log,
+            )
 
         # Nothing executed successfully — return last result to trigger the
         # caller's existing execution-failure path.
@@ -5555,6 +5992,187 @@ class PALAgentController(Agent):
         rewritten_plan["plan_rationale"] = plan_rationale
         return self._normalize_pal_query_plan(rewritten_plan)
 
+    def _select_class_filtered_count_candidate(
+        self,
+        *,
+        relation_grounding: Sequence[Mapping[str, str]],
+    ) -> Optional[dict[str, Any]]:
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for candidate in relation_grounding:
+            if not isinstance(candidate, Mapping):
+                continue
+            from_role = self._normalize_relation_role(candidate.get("from_role"))
+            to_role = self._normalize_relation_role(candidate.get("to_role"))
+            if {from_role, to_role}.isdisjoint({"type_set", "shared_type"}):
+                continue
+            if {from_role, to_role}.isdisjoint({"candidate_set", "shared_answer", "count_set"}):
+                continue
+            score = 0
+            grounding_source = str(candidate.get("grounding_source") or "").strip().lower()
+            relation = str(candidate.get("relation") or "").strip()
+            if grounding_source == "dynamic_probe":
+                score += 10
+            elif grounding_source == "curated":
+                score += 6
+            else:
+                score += 3
+            if relation == "people.profession.people_with_this_profession":
+                score += 6
+            elif relation == "type.type.instance":
+                score += 4
+            elif relation == "type.object.type":
+                score += 2
+            if from_role in {"type_set", "shared_type"}:
+                score += 2
+            if to_role in {"candidate_set", "shared_answer", "count_set"}:
+                score += 2
+            scored.append((score, dict(candidate)))
+        if not scored:
+            return None
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                str(item[1].get("relation") or ""),
+            )
+        )
+        return scored[0][1]
+
+    def _build_class_filtered_count_repair_plan(
+        self,
+        *,
+        task_question: str,
+        query_plan: Mapping[str, Any],
+        relation_grounding: Sequence[Mapping[str, str]] = (),
+    ) -> Optional[dict[str, Any]]:
+        if str(query_plan.get("answer_mode") or "").strip().lower() != "count":
+            return None
+        if str(query_plan.get("query_shape") or "").strip().lower() not in {
+            "count_over_direct_relation",
+            "count_over_joined_set",
+        }:
+            return None
+
+        question_text, explicit_entities = self._split_task_question(task_question)
+        answer_target_phrase = self._extract_answer_target_phrase(question_text)
+        if not self._should_treat_answer_target_as_count_class(
+            question_text=question_text,
+            answer_target_phrase=answer_target_phrase,
+        ):
+            return None
+
+        anchored_entities = [
+            dict(item)
+            for item in (query_plan.get("anchored_entities") or [])
+            if isinstance(item, Mapping)
+            and self._normalize_relation_role(item.get("role")) in {"anchor", "anchor_a", "anchor_b"}
+        ]
+        if len(anchored_entities) != 1:
+            return None
+
+        relation_paths = [
+            dict(path)
+            for path in (query_plan.get("relation_paths") or [])
+            if isinstance(path, Mapping)
+        ]
+        anchor_role = self._normalize_relation_role(anchored_entities[0].get("role")) or "anchor"
+        anchor_path = next(
+            (
+                path
+                for path in relation_paths
+                if self._path_touches_anchor_role(path, anchor_role=anchor_role)
+                and {
+                    self._normalize_relation_role(path.get("from_role")),
+                    self._normalize_relation_role(path.get("to_role")),
+                }
+                & {"candidate_set", "shared_answer", "count_set"}
+            ),
+            None,
+        )
+        if anchor_path is None:
+            return None
+
+        class_candidate = self._select_class_filtered_count_candidate(
+            relation_grounding=relation_grounding,
+        )
+        if class_candidate is None:
+            return None
+
+        shared_variable = "shared_answer"
+        rewritten_anchor_path = copy.deepcopy(anchor_path)
+        if self._normalize_relation_role(rewritten_anchor_path.get("from_role")) in {"candidate_set", "shared_answer", "count_set"}:
+            rewritten_anchor_path["from"] = shared_variable
+            rewritten_anchor_path["from_role"] = "candidate_set"
+        if self._normalize_relation_role(rewritten_anchor_path.get("to_role")) in {"candidate_set", "shared_answer", "count_set"}:
+            rewritten_anchor_path["to"] = shared_variable
+            rewritten_anchor_path["to_role"] = "candidate_set"
+
+        rewritten_class_path = copy.deepcopy(class_candidate)
+        if self._normalize_relation_role(rewritten_class_path.get("from_role")) in {"candidate_set", "shared_answer", "count_set"}:
+            rewritten_class_path["from"] = shared_variable
+            rewritten_class_path["from_role"] = "candidate_set"
+        if self._normalize_relation_role(rewritten_class_path.get("to_role")) in {"candidate_set", "shared_answer", "count_set"}:
+            rewritten_class_path["to"] = shared_variable
+            rewritten_class_path["to_role"] = "candidate_set"
+
+        class_surface = self._singularize_phrase(answer_target_phrase) or answer_target_phrase
+        strategy = str(query_plan.get("strategy") or "").strip()
+        plan_rationale = [
+            str(item).strip()
+            for item in (query_plan.get("plan_rationale") or [])
+            if str(item).strip()
+        ]
+        plan_rationale.append(
+            "Treat the answer target as an explicit answer-class filter and intersect it with the anchor-derived candidate set before counting."
+        )
+
+        rewritten_plan = copy.deepcopy(dict(query_plan))
+        rewritten_plan["query_shape"] = "count_over_joined_set"
+        rewritten_plan["shared_answer_variable"] = shared_variable
+        rewritten_plan["candidate_set_variable"] = shared_variable
+        rewritten_plan["count_set_variable"] = shared_variable
+        rewritten_plan["anchored_entities"] = [
+            {
+                "surface": str(
+                    anchored_entities[0].get("surface")
+                    or anchored_entities[0].get("chosen_alias")
+                    or ""
+                ).strip(),
+                "chosen_alias": str(
+                    anchored_entities[0].get("chosen_alias")
+                    or anchored_entities[0].get("surface")
+                    or ""
+                ).strip(),
+                "role": anchor_role,
+            },
+            {
+                "surface": answer_target_phrase,
+                "chosen_alias": class_surface,
+                "role": "type_set",
+            },
+        ]
+        rewritten_plan["join_structure"] = {
+            "type": "intersection",
+            "anchor_constraints": [
+                {
+                    "anchor_role": anchor_role,
+                    "constrains_variable": shared_variable,
+                    "notes": "The primary anchor constrains the shared counted entity set.",
+                },
+                {
+                    "anchor_role": "type_set",
+                    "constrains_variable": shared_variable,
+                    "notes": "The answer target phrase is treated as an explicit answer-class filter on the same counted set.",
+                },
+            ],
+        }
+        rewritten_plan["relation_paths"] = [rewritten_anchor_path, rewritten_class_path]
+        rewritten_plan["projection"] = ["count"]
+        rewritten_plan["strategy"] = (
+            f"{strategy} Repair by separating the answer class phrase from the anchor and counting the intersection."
+        ).strip()
+        rewritten_plan["plan_rationale"] = plan_rationale
+        return self._normalize_pal_query_plan(rewritten_plan)
+
     def _build_single_anchor_dynamic_lookup_repair_plan(
         self,
         *,
@@ -5582,9 +6200,27 @@ class PALAgentController(Agent):
             for path in (query_plan.get("relation_paths") or [])
             if isinstance(path, Mapping)
         ]
-        if not existing_paths or not all(
-            str(path.get("grounding_source") or "").strip().lower() == "exploratory"
+        if not existing_paths:
+            return None
+        live_relation_names = {
+            str(candidate.get("relation") or "").strip()
+            for candidate in relation_grounding
+            if isinstance(candidate, Mapping) and str(candidate.get("relation") or "").strip()
+        }
+        existing_relations = {
+            str(path.get("relation") or "").strip()
             for path in existing_paths
+            if str(path.get("relation") or "").strip()
+        }
+        stale_grounded_paths = bool(existing_relations) and existing_relations.isdisjoint(
+            live_relation_names
+        )
+        if not (
+            all(
+                str(path.get("grounding_source") or "").strip().lower() == "exploratory"
+                for path in existing_paths
+            )
+            or stale_grounded_paths
         ):
             return None
 
@@ -5716,6 +6352,7 @@ class PALAgentController(Agent):
             grounding_source = str(candidate.get("grounding_source") or "").strip().lower()
             if grounding_source not in {"curated", "dynamic_probe"}:
                 continue
+            support = str(candidate.get("support") or "").strip().lower()
             from_role = self._normalize_relation_role(candidate.get("from_role"))
             to_role = self._normalize_relation_role(candidate.get("to_role"))
             if from_role == anchor_role and to_role in {"candidate_set", "count_set"}:
@@ -5726,8 +6363,10 @@ class PALAgentController(Agent):
                 score = 8
             else:
                 continue
-            if grounding_source == "curated":
-                score += 4
+            if grounding_source == "dynamic_probe":
+                score += 8
+            elif grounding_source == "curated":
+                score += 2
             if dead_target_token and endpoint_token != dead_target_token:
                 if dead_target_token not in relation:
                     continue
@@ -5735,8 +6374,12 @@ class PALAgentController(Agent):
                 score -= 6
             if endpoint_token in generic_tokens:
                 score -= 4
-            if "dynamic_probe_outgoing" in str(candidate.get("support") or ""):
+            if "dynamic_probe_incoming" in support:
+                score += 6
+            if "dynamic_probe_outgoing" in support:
                 score += 2
+            if "curated_anchor_role_reinterpretation" in support:
+                score -= 3
             if "disease" in relation or endpoint_token == "disease":
                 score += 2
             candidates.append((score, dict(candidate)))
@@ -6335,7 +6978,15 @@ class PALAgentController(Agent):
             default=0,
         )
         relation_count = len(query_plan.get("relation_paths", []))
-        if union_count > 2 and union_count > max(1, relation_count):
+        anchor_binding_count = len(
+            [
+                anchored_entity
+                for anchored_entity in (query_plan.get("anchored_entities") or [])
+                if isinstance(anchored_entity, Mapping)
+                and str(anchored_entity.get("surface") or anchored_entity.get("chosen_alias") or "").strip()
+            ]
+        )
+        if union_count > 2 and union_count > max(1, relation_count + anchor_binding_count):
             errors.append(f"excessive_union_branches:{union_count}")
         for candidate_query in normalized_query_texts:
             errors.extend(
@@ -6466,6 +7117,7 @@ class PALAgentController(Agent):
         answer_target_phrase: str,
     ) -> dict[str, Any]:
         lower_text = str(question_text or "").lower()
+        is_count_question = self._is_count_question_text(question_text)
         inputs: list[dict[str, str]] = []
         seen: set[tuple[str, str, str]] = set()
         answer_target_clean = str(answer_target_phrase or "").strip()
@@ -6675,23 +7327,24 @@ class PALAgentController(Agent):
                     reason="two-anchor conjunction before governing verb",
                 )
 
-        class_phrase, target_head = self._split_answer_target_compound_phrase(
-            answer_target_clean
-        )
-        if target_head and target_head.lower() != answer_target_clean.lower():
-            _add_input(
-                target_head,
-                kind="answer_target",
-                role_hint="answer_target",
-                reason="head noun phrase extracted from answer target",
+        if not is_count_question:
+            class_phrase, target_head = self._split_answer_target_compound_phrase(
+                answer_target_clean
             )
-        if class_phrase:
-            _add_input(
-                class_phrase,
-                kind="class_phrase",
-                role_hint="type_set",
-                reason="class/category qualifier extracted from answer target",
-            )
+            if target_head and target_head.lower() != answer_target_clean.lower():
+                _add_input(
+                    target_head,
+                    kind="answer_target",
+                    role_hint="answer_target",
+                    reason="head noun phrase extracted from answer target",
+                )
+            if class_phrase:
+                _add_input(
+                    class_phrase,
+                    kind="class_phrase",
+                    role_hint="type_set",
+                    reason="class/category qualifier extracted from answer target",
+                )
 
         preferred_scaffolds = self._build_preferred_scaffold_candidates(
             question_text=question_text,
@@ -7139,7 +7792,12 @@ class PALAgentController(Agent):
         answer_target_phrase: str,
         question_inputs: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> str:
-        lower_text = str(question_text or "").lower()
+        lower_text = re.sub(
+            r"^\s*question:\s*",
+            "",
+            str(question_text or "").lower(),
+            flags=re.IGNORECASE,
+        )
         answer_target_lower = str(answer_target_phrase or "").lower()
         normalized_question_inputs = [
             item
@@ -7167,6 +7825,7 @@ class PALAgentController(Agent):
         is_count = (
             lower_text.startswith("how many")
             or "number of" in lower_text
+            or "amount of" in lower_text
             or lower_text.startswith("how much")
         )
         if any(
@@ -7263,18 +7922,37 @@ class PALAgentController(Agent):
             for item in ((question_interpretation or {}).get("question_inputs") or [])
             if isinstance(item, Mapping)
         ]
+        question_text = self._split_task_question(task_question)[0]
         query_shape = self._infer_query_shape(
-            question_text=self._split_task_question(task_question)[0],
+            question_text=question_text,
             entities=entities,
             answer_target_phrase=answer_target_phrase,
             question_inputs=interpreted_inputs,
         )
-        answer_mode = (
-            "count"
-            if task_question.lower().strip().startswith(("how many", "how much"))
-            or "number of" in task_question.lower()
-            else "entity"
+        answer_mode = "count" if self._is_count_question_text(question_text) else "entity"
+        type_dynamic = self._probe_answer_class_dynamic_candidates(
+            task_question=task_question,
+            entities=entities,
+            answer_target_phrase=answer_target_phrase,
+            domain_hints=domain_hints,
+            interpreted_inputs=interpreted_inputs,
+            query_shape=query_shape,
+            answer_mode=answer_mode,
         )
+        direct_count_dynamic: list[dict[str, str]] = []
+        if query_shape == "count_over_direct_relation" and len(entities) == 1:
+            direct_count_dynamic = self._normalize_grounded_relation_candidates(
+                relation_candidates=self._probe_dynamic_relation_candidates(
+                    entities=entities,
+                    answer_target_phrase=answer_target_phrase,
+                    domain_hints=domain_hints,
+                    question_text=question_text,
+                ),
+                query_shape=query_shape,
+                answer_mode=answer_mode,
+                answer_target_phrase=answer_target_phrase,
+                entities=entities,
+            )
         curated = self._normalize_grounded_relation_candidates(
             relation_candidates=self._augment_generic_type_relation_candidates(
                 relation_candidates=self._build_grounded_relation_candidates(task_question),
@@ -7286,6 +7964,18 @@ class PALAgentController(Agent):
             answer_target_phrase=answer_target_phrase,
             entities=entities,
         )
+        if direct_count_dynamic:
+            curated = self._merge_relation_grounding_candidates(
+                curated,
+                direct_count_dynamic,
+                prefer_extra=True,
+            )
+        if type_dynamic:
+            curated = self._merge_relation_grounding_candidates(
+                curated,
+                type_dynamic,
+                prefer_extra=True,
+            )
         if curated:
             self._emit_generated_tools_event(
                 {
@@ -7304,7 +7994,9 @@ class PALAgentController(Agent):
                 "question_preview": (answer_target_phrase or "")[:80],
             }
         )
-        if len(entities) > 1 and query_shape in {
+        if direct_count_dynamic and query_shape == "count_over_direct_relation" and len(entities) == 1:
+            dynamic = direct_count_dynamic
+        elif len(entities) > 1 and query_shape in {
             "multi_anchor_intersection",
             "count_over_joined_set",
             "shared_type_intersection",
@@ -7320,14 +8012,14 @@ class PALAgentController(Agent):
                 anchored_entities=normalized_anchored_entities,
                 answer_target_phrase=answer_target_phrase,
                 domain_hints=domain_hints,
-                question_text=self._split_task_question(task_question)[0],
+                question_text=question_text,
             )
         else:
             dynamic = self._probe_dynamic_relation_candidates(
                 entities=entities,
                 answer_target_phrase=answer_target_phrase,
                 domain_hints=domain_hints,
-                question_text=self._split_task_question(task_question)[0],
+                question_text=question_text,
             )
         dynamic = self._normalize_grounded_relation_candidates(
             relation_candidates=dynamic,
@@ -7354,7 +8046,80 @@ class PALAgentController(Agent):
                     "reason": "probe_returned_no_usable_predicates",
                 }
             )
+        if type_dynamic:
+            dynamic = self._merge_relation_grounding_candidates(
+                dynamic,
+                type_dynamic,
+                prefer_extra=True,
+            )
         return dynamic
+
+    def _probe_answer_class_dynamic_candidates(
+        self,
+        *,
+        task_question: str,
+        entities: Sequence[str],
+        answer_target_phrase: str,
+        domain_hints: Sequence[str],
+        interpreted_inputs: Sequence[Mapping[str, Any]],
+        query_shape: str,
+        answer_mode: str,
+    ) -> list[dict[str, str]]:
+        if (
+            answer_mode != "count"
+            or len(entities) > 1
+            or not any(
+                self._normalize_question_input_role(item.get("role_hint")) == "type_set"
+                for item in interpreted_inputs
+            )
+        ):
+            return []
+        type_surfaces: list[str] = []
+        for item in interpreted_inputs:
+            if not isinstance(item, Mapping):
+                continue
+            if self._normalize_question_input_role(item.get("role_hint")) != "type_set":
+                continue
+            surface = self._clean_question_input_surface(item.get("surface"))
+            if not surface:
+                continue
+            normalized_surface = self._singularize_phrase(surface)
+            if normalized_surface and normalized_surface not in type_surfaces:
+                type_surfaces.append(normalized_surface)
+        if not type_surfaces:
+            return []
+        type_dynamic = self._probe_dynamic_relation_candidates_for_anchors(
+            anchored_entities=[
+                {
+                    "surface": surface,
+                    "chosen_alias": surface,
+                    "role": "type_set",
+                }
+                for surface in type_surfaces[:1]
+            ],
+            answer_target_phrase=answer_target_phrase,
+            domain_hints=domain_hints,
+            question_text=self._split_task_question(task_question)[0],
+            max_anchors=1,
+        )
+        type_dynamic = self._normalize_grounded_relation_candidates(
+            relation_candidates=type_dynamic,
+            query_shape=query_shape,
+            answer_mode=answer_mode,
+            answer_target_phrase=answer_target_phrase,
+            entities=list(entities) + type_surfaces[:1],
+        )
+        if type_dynamic:
+            self._emit_generated_tools_event(
+                {
+                    "event": "pal_grounding_answer_class_dynamic_hit",
+                    "mode": "pal",
+                    "type_surface": type_surfaces[0],
+                    "dynamic_count": len(type_dynamic),
+                    "relations": [c.get("relation") for c in type_dynamic],
+                }
+            )
+        return type_dynamic
 
     # ------------------------------------------------------------------
     # Anchor existence probes (used by the repair loop)
@@ -7456,6 +8221,7 @@ class PALAgentController(Agent):
         self,
         *,
         anchored_entity: Mapping[str, Any],
+        query_plan: Mapping[str, Any],
         relation_paths: Sequence[Mapping[str, Any]],
         used_path_indexes: set[int],
     ) -> tuple[str | None, str | None]:
@@ -7494,10 +8260,20 @@ class PALAgentController(Agent):
         if anchor_role not in {"anchor", "anchor_a", "anchor_b"}:
             return None, None
 
+        note_text = ""
+        for constraint in ((query_plan.get("join_structure") or {}).get("anchor_constraints") or []):
+            if not isinstance(constraint, Mapping):
+                continue
+            if self._normalize_relation_role(constraint.get("anchor_role")) != anchor_role:
+                continue
+            note_text = str(constraint.get("notes") or "").strip().lower()
+            if note_text:
+                break
+
         constraint_bridge_paths: list[tuple[int, Mapping[str, Any], str]] = []
         for path_index, relation_path in enumerate(relation_paths):
             relation = str(relation_path.get("relation") or "").strip()
-            if not relation or path_index in used_path_indexes:
+            if not relation or (not note_text and path_index in used_path_indexes):
                 continue
             from_role = self._normalize_relation_role(
                 relation_path.get("from_role") or relation_path.get("from")
@@ -7518,10 +8294,21 @@ class PALAgentController(Agent):
             return None, None
 
         preferred_index = 0
-        if anchor_role == "anchor_b":
-            preferred_index = 1
-        elif anchor_role == "anchor_a":
-            preferred_index = 0
+        if note_text:
+            scored_paths: list[tuple[int, int]] = []
+            for ranked_index, (_, relation_path, _) in enumerate(constraint_bridge_paths):
+                relation = str(relation_path.get("relation") or "").strip().lower()
+                relation_leaf = relation.split(".")[-1] if relation else ""
+                from_token = self._normalize_variable_token(relation_path.get("from"))
+                to_token = self._normalize_variable_token(relation_path.get("to"))
+                score = 0
+                for cue in (relation_leaf, from_token, to_token):
+                    if cue and cue in note_text:
+                        score += 1
+                scored_paths.append((score, ranked_index))
+            scored_paths.sort(reverse=True)
+            if scored_paths and scored_paths[0][0] > 0:
+                preferred_index = scored_paths[0][1]
 
         if preferred_index >= len(constraint_bridge_paths):
             preferred_index = 0
@@ -7529,7 +8316,8 @@ class PALAgentController(Agent):
         path_index, relation_path, anchor_position = constraint_bridge_paths[
             preferred_index
         ]
-        used_path_indexes.add(path_index)
+        if not note_text:
+            used_path_indexes.add(path_index)
         relation = str(relation_path.get("relation") or "").strip()
         if not relation:
             return None, None
@@ -7870,42 +8658,62 @@ class PALAgentController(Agent):
 
         # Limit to first 2 anchors to keep probe cost bounded.
         probe_anchors = anchored_entities[:2]
-        aliases: list[str] = [
-            str(a.get("chosen_alias") or a.get("surface") or "").strip()
-            for a in probe_anchors
-        ]
+        aliases: list[str] = []
+        probe_labels: list[str] = []
+        preset_resolved_ids: list[str | None] = []
+        for anchored_entity in probe_anchors:
+            chosen_alias = str(
+                anchored_entity.get("chosen_alias") or anchored_entity.get("surface") or ""
+            ).strip()
+            surface = str(anchored_entity.get("surface") or "").strip()
+            alias_is_mid = bool(re.fullmatch(r"[mg]\.[A-Za-z0-9_]+", chosen_alias))
+            aliases.append(chosen_alias)
+            probe_labels.append(surface if alias_is_mid and surface else chosen_alias)
+            preset_resolved_ids.append(chosen_alias if alias_is_mid else None)
         roles: list[str] = [
             self._normalize_relation_role(a.get("role")) for a in probe_anchors
         ]
 
         # Run entity-existence probes in parallel.
         entity_counts: list[int] = []
-        with ThreadPoolExecutor(max_workers=len(aliases)) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, len(aliases))) as executor:
             futures = [
-                executor.submit(self._probe_entity_name_count, alias, timeout_s=timeout_s)
-                for alias in aliases
-                if alias
+                executor.submit(self._probe_entity_name_count, probe_label, timeout_s=timeout_s)
+                for probe_label, preset_resolved_id in zip(probe_labels, preset_resolved_ids)
+                if probe_label and not preset_resolved_id
             ]
+            future_results: list[int] = []
             for future in futures:
                 try:
-                    entity_counts.append(future.result(timeout=timeout_s + 1.0))
+                    future_results.append(future.result(timeout=timeout_s + 1.0))
                 except Exception:
-                    entity_counts.append(-1)
+                    future_results.append(-1)
+        future_idx = 0
+        for probe_label, preset_resolved_id in zip(probe_labels, preset_resolved_ids):
+            if preset_resolved_id:
+                entity_counts.append(1)
+            elif probe_label:
+                entity_counts.append(future_results[future_idx])
+                future_idx += 1
+            else:
+                entity_counts.append(-1)
 
         results: list[AnchorProbeResult] = []
         used_path_indexes: set[int] = set()
-        for anchored_entity, alias, role, entity_count in zip(
+        for anchored_entity, alias, probe_label, preset_resolved_id, role, entity_count in zip(
             probe_anchors,
             aliases,
+            probe_labels,
+            preset_resolved_ids,
             roles,
             entity_counts,
         ):
-            if not alias:
+            if not (alias or probe_label):
                 continue
             relation = None
             anchor_position = None
             path_count: int | None = None
-            resolved_entity_id: str | None = None
+            resolved_entity_id: str | None = preset_resolved_id
 
             if probe_paths and entity_count > 0:
                 chain_probe = self._resolve_anchor_count_chain_probe(
@@ -7916,13 +8724,13 @@ class PALAgentController(Agent):
                 if chain_probe is not None:
                     relation, anchor_position, chain_paths = chain_probe
                     path_count = self._probe_anchor_relation_chain_count(
-                        anchor_name=alias,
+                        anchor_name=probe_label or alias,
                         relation_paths=chain_paths,
                         timeout_s=timeout_s,
                     )
                     if path_count and path_count > 0:
                         resolved_ids = self._probe_anchor_relation_chain_entity_ids(
-                            anchor_name=alias,
+                            anchor_name=probe_label or alias,
                             relation_paths=chain_paths,
                             timeout_s=timeout_s,
                         )
@@ -7931,19 +8739,20 @@ class PALAgentController(Agent):
                 else:
                     relation, anchor_position = self._resolve_anchor_probe_target(
                         anchored_entity=anchored_entity,
+                        query_plan=query_plan,
                         relation_paths=relation_paths,
                         used_path_indexes=used_path_indexes,
                     )
                     if relation:
                         path_count = self._probe_anchor_path_count(
-                            alias,
+                            probe_label or alias,
                             relation,
                             anchor_position=anchor_position or "subject",
                             timeout_s=timeout_s,
                         )
                         if path_count and path_count > 0:
                             resolved_ids = self._probe_anchor_entity_ids(
-                                anchor_name=alias,
+                                anchor_name=probe_label or alias,
                                 relation=relation,
                                 anchor_position=anchor_position or "subject",
                                 timeout_s=timeout_s,
@@ -7952,7 +8761,7 @@ class PALAgentController(Agent):
                                 resolved_entity_id = resolved_ids[0]
             if resolved_entity_id is None and entity_count == 1:
                 resolved_ids = self._probe_anchor_entity_ids(
-                    anchor_name=alias,
+                    anchor_name=probe_label or alias,
                     timeout_s=timeout_s,
                 )
                 if len(resolved_ids) == 1:
@@ -7960,7 +8769,7 @@ class PALAgentController(Agent):
 
             results.append(
                 AnchorProbeResult(
-                    anchor_name=alias,
+                    anchor_name=probe_label or alias,
                     entity_count=entity_count,
                     path_count=path_count,
                     relation_probed=relation if probe_paths else None,
@@ -8426,6 +9235,7 @@ class PALAgentController(Agent):
                 score += 12
             if word and len(word) > 2 and word == source_label:
                 score += 8
+        question_lower = str(question_text or "").lower()
         clue_keywords: dict[str, tuple[str, ...]] = {
             "active_ingredient": (
                 "active_ingredient_of_formulation",
@@ -8465,6 +9275,13 @@ class PALAgentController(Agent):
                 score += 30
             if any(token in relation_tail for token in ("origin", "originating_here")):
                 score += 45
+        if "profession" in question_lower:
+            if "people_with_this_profession" in name_lower:
+                score += 90
+            if relation_tail == "profession":
+                score += 35
+            if "instrument" in name_lower:
+                score -= 30
         if anchor_clue == "formulation_input" and target_label == "formulation":
             score += 45
         if anchor_clue == "active_ingredient" and target_label == "formulation":
@@ -8490,7 +9307,6 @@ class PALAgentController(Agent):
             and target_label == "universe"
         ):
             score += 35
-        question_lower = str(question_text or "").lower()
         if any(
             phrase in question_lower
             for phrase in (
@@ -8587,6 +9403,13 @@ class PALAgentController(Agent):
             compact_token = re.sub(r"[^A-Za-z0-9]", "", raw_entity)
             if compact_token.isalpha() and compact_token.islower() and len(compact_token) <= 5:
                 candidate_pool.append(compact_token.upper())
+            hyphen_parts = [part.strip() for part in raw_entity.split("-") if part.strip()]
+            if len(hyphen_parts) >= 2:
+                candidate_pool.append(" ".join(hyphen_parts))
+                if len(hyphen_parts) == 2:
+                    candidate_pool.append(" and ".join(hyphen_parts))
+                else:
+                    candidate_pool.append("-".join(hyphen_parts[:-1]) + " and " + hyphen_parts[-1])
             irregular_aliases = {
                 "cows": ["Cattle"],
             }
@@ -8672,11 +9495,17 @@ class PALAgentController(Agent):
         normalized_text = re.sub(r"^\s*Question:\s*", "", str(question_text or ""), flags=re.IGNORECASE)
         lower_text = normalized_text.lower()
         number_of_match = re.search(
-            r"^(?:what|which)\s+(?:is\s+)?the\s+number\s+of\s+(.+?)(?:\?|$)",
+            r"^(?:what|which)\s+(?:is\s+)?the\s+number\s+of\s+(.+?)(?:\s+(?:that|which|who|work|works|worked|have|has|had|can|could|are|is|was|were)\b|\?|$)",
             lower_text,
         )
         if number_of_match is not None:
             return number_of_match.group(1).strip()
+        amount_of_match = re.search(
+            r"^(?:what|which)\s+(?:is\s+)?(?:the\s+)?amount\s+of\s+(.+?)(?:\s+(?:that|which|who|work|works|worked|have|has|had|can|could|are|is|was|were)\b|\?|$)",
+            lower_text,
+        )
+        if amount_of_match is not None:
+            return amount_of_match.group(1).strip()
         type_of_match = re.search(
             r"^(?:what|which)\s+(?:other\s+)?(?:type|types|kind|kinds|category|categories)\s+of\s+(.+?)(?:\s+(?:is|are|was|were|did|does|do|has|have|ran|run|used|uses|use|with|from|for|in|on|that|who|which)\b|\?|$)",
             lower_text,
@@ -8699,7 +9528,7 @@ class PALAgentController(Agent):
             if keyword in lower_text:
                 return keyword
         how_many_match = re.search(
-            r"\bhow many\s+(.+?)(?:\s+(?:is|are|was|were|did|does|do|has|have|made|make|exist|exists|for|from|in|of|with|that)\b|[?]|$)",
+            r"\bhow many\s+(.+?)(?:\s+(?:is|are|was|were|did|does|do|has|have|made|make|exist|exists|work|works|worked|serve|serves|served|apply|applies|applied|for|from|in|of|with|that|which|who)\b|[?]|$)",
             lower_text,
         )
         if how_many_match is not None:
@@ -8712,8 +9541,64 @@ class PALAgentController(Agent):
             return ""
         return target_match.group(1).strip()
 
+    def _is_count_question_text(self, question_text: str) -> bool:
+        lower_text = re.sub(
+            r"^\s*question:\s*",
+            "",
+            str(question_text or "").lower(),
+            flags=re.IGNORECASE,
+        )
+        return (
+            lower_text.startswith("how many")
+            or re.search(r"\bhow many\b", lower_text) is not None
+            or re.search(r"\bhow much\b", lower_text) is not None
+            or "number of" in lower_text
+            or "total number of" in lower_text
+            or "amount of" in lower_text
+        )
+
+    def _should_treat_answer_target_as_count_class(
+        self,
+        *,
+        question_text: str,
+        answer_target_phrase: str,
+    ) -> bool:
+        if not self._is_count_question_text(question_text):
+            return False
+        target = str(answer_target_phrase or "").strip().lower()
+        if not target or target in {"amount", "number", "total number"}:
+            return False
+        lower_text = re.sub(
+            r"^\s*question:\s*",
+            "",
+            str(question_text or "").lower(),
+            flags=re.IGNORECASE,
+        )
+        trailing_text = lower_text
+        target_pos = trailing_text.find(target)
+        if target_pos >= 0:
+            trailing_text = trailing_text[target_pos + len(target):]
+        class_cues = (
+            " that ",
+            " which ",
+            " who ",
+            " work ",
+            " works ",
+            " worked ",
+            " have ",
+            " has ",
+            " had ",
+            " associated with ",
+            " profession ",
+            " transmitted by ",
+            " applies to ",
+        )
+        return any(cue in trailing_text for cue in class_cues)
+
     def _infer_domain_hints(self, question_text: str) -> list[str]:
         lower_text = str(question_text or "").lower()
+        if "profession" in lower_text:
+            return ["people", "profession"]
         if "cheese" in lower_text:
             return ["food", "dairy", "cheese"]
         if "dosage form" in lower_text or "drug" in lower_text:

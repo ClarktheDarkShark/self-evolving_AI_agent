@@ -213,7 +213,12 @@ class SparqlHealth:
     error: Optional[str] = None
 
 
-def sparql_health(endpoint_url: str, timeout_s: float = 5.0) -> SparqlHealth:
+def sparql_health(
+    endpoint_url: str,
+    timeout_s: float = 5.0,
+    *,
+    log_success_preview: bool = False,
+) -> SparqlHealth:
     query = "ASK { ?s ?p ?o }"
     data = urllib.parse.urlencode({"query": query}).encode("utf-8")
     try:
@@ -228,12 +233,13 @@ def sparql_health(endpoint_url: str, timeout_s: float = 5.0) -> SparqlHealth:
         )
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             payload = resp.read().decode("utf-8")
-            _log_json_preview(
-                source=endpoint_url,
-                status_code=str(resp.status),
-                content_type=str(resp.headers.get("Content-Type", "")),
-                body=payload,
-            )
+            if log_success_preview:
+                _log_json_preview(
+                    source=endpoint_url,
+                    status_code=str(resp.status),
+                    content_type=str(resp.headers.get("Content-Type", "")),
+                    body=payload,
+                )
             content_type = str(resp.headers.get("Content-Type", ""))
             if "json" not in content_type.lower():
                 raise RuntimeError(
