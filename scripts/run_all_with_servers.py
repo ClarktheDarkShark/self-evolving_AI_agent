@@ -1592,10 +1592,15 @@ def _run_one_with_sample_boundary_family_evolution(
                 output_dir_override=aggregate_output_dir,
                 extra_env=extra_env,
             )
-            if code != 0:
-                return code
-
             session_record = _load_session_for_sample(aggregate_output_dir, str(sample_index))
+            if code != 0 and not isinstance(session_record, dict):
+                return code
+            if code != 0:
+                print(
+                    "[run_all_with_servers] Continuing after per-sample task failure: "
+                    f"sample={sample_index} config={config_name} exit={code}"
+                )
+
             if not isinstance(session_record, dict):
                 continue
             sample_status = str(session_record.get("sample_status") or "").strip()

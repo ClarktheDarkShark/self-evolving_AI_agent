@@ -587,7 +587,7 @@ def validate_pal_execution(
             for result in (anchor_probe_results or [])
             if result.entity_count > 0 and (result.path_count or 0) > 0
         ]
-        if (
+        exact_zero_joined_count_ok = (
             answer_mode == "count"
             and scalar_count == 0
             and _can_accept_exact_grounded_zero_joined_count(
@@ -595,12 +595,28 @@ def validate_pal_execution(
                 query_text=qt,
                 anchor_probe_results=live_anchor_paths,
             )
-        ):
+        )
+        if exact_zero_joined_count_ok:
             return PlausibilityVerdict(
                 verdict=VERDICT_ACCEPTED,
                 reasons=[
                     "count_scalar_returned:0",
                     "accepted_exact_grounded_zero_joined_count",
+                ],
+            )
+        if (
+            answer_mode == "count"
+            and scalar_count == 0
+            and query_shape == "count_over_joined_set"
+            and live_anchor_paths
+            and _joined_count_zero_structure_is_weak(query_plan=query_plan)
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=[
+                    "count_query_zero_without_grounded_join_constraints",
+                    "count_scalar_returned:0",
+                    "repair:ground_the_join_constraint_or_fall_back_from_joined_count",
                 ],
             )
         if (
@@ -2133,17 +2149,46 @@ def _can_accept_exact_grounded_zero_joined_count(
     query_shape = str(query_plan.get("query_shape") or "").strip().lower()
     if query_shape != "count_over_joined_set":
         return False
+    anchored_entities = [
+        anchored_entity
+        for anchored_entity in (query_plan.get("anchored_entities") or [])
+        if isinstance(anchored_entity, Mapping)
+    ]
+    anchor_roles = {
+        _normalize_contract_role(anchored_entity.get("role"))
+        for anchored_entity in anchored_entities
+    } & {"anchor", "anchor_a", "anchor_b"}
+    if len(anchor_roles) < 2:
+        return False
+    direct_anchor_count_roles: set[str] = set()
+    for relation_path in relation_paths:
+        path_roles = {
+            _normalize_contract_role(relation_path.get("from_role")),
+            _normalize_contract_role(relation_path.get("to_role")),
+        }
+        if path_roles & {"candidate_set", "count_set"}:
+            direct_anchor_count_roles.update(path_roles & anchor_roles)
+    if direct_anchor_count_roles != anchor_roles:
+        return False
     grounded_sources = {
         str(relation_path.get("grounding_source") or "").strip().lower()
         for relation_path in relation_paths
     }
     if not grounded_sources:
         return False
-    if grounded_sources - {"curated", "dynamic_probe"}:
+    if grounded_sources != {"curated"}:
         return False
     if _plan_uses_only_generic_type_relations(relation_paths):
         return False
     if _has_type_constraint_relation(relation_paths):
+        return False
+    constraint_paths = [
+        relation_path
+        for relation_path in relation_paths
+        if _normalize_contract_role(relation_path.get("from_role")) == "constraint_value"
+        or _normalize_contract_role(relation_path.get("to_role")) == "constraint_value"
+    ]
+    if not constraint_paths:
         return False
     answer_target_phrase = str(query_plan.get("answer_target_phrase") or "").strip()
     if (
@@ -2170,6 +2215,41 @@ def _can_accept_exact_grounded_zero_joined_count(
         ):
             return False
     return True
+
+
+def _joined_count_zero_structure_is_weak(
+    *,
+    query_plan: Mapping[str, Any],
+) -> bool:
+    relation_paths = [
+        relation_path
+        for relation_path in (query_plan.get("relation_paths") or [])
+        if isinstance(relation_path, Mapping)
+    ]
+    anchored_entities = [
+        anchored_entity
+        for anchored_entity in (query_plan.get("anchored_entities") or [])
+        if isinstance(anchored_entity, Mapping)
+    ]
+    anchor_roles = {
+        _normalize_contract_role(anchored_entity.get("role"))
+        for anchored_entity in anchored_entities
+    }
+    constraint_paths = [
+        relation_path
+        for relation_path in relation_paths
+        if _normalize_contract_role(relation_path.get("from_role")) == "constraint_value"
+        or _normalize_contract_role(relation_path.get("to_role")) == "constraint_value"
+    ]
+    grounded_sources = {
+        str(relation_path.get("grounding_source") or "").strip().lower()
+        for relation_path in relation_paths
+    }
+    if len(anchor_roles & {"anchor", "anchor_a", "anchor_b"}) < 2:
+        return True
+    if not constraint_paths:
+        return True
+    return bool(grounded_sources - {"curated"})
 
 
 # ---------------------------------------------------------------------------

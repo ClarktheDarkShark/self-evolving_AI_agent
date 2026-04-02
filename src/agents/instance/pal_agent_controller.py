@@ -2524,7 +2524,10 @@ class PALAgentController(Agent):
     ) -> dict[str, Any]:
         if str(query_plan.get("answer_mode") or "").strip().lower() != "count":
             return dict(query_plan)
-        if str(query_plan.get("query_shape") or "").strip().lower() != "count_over_direct_relation":
+        if str(query_plan.get("query_shape") or "").strip().lower() not in {
+            "count_over_direct_relation",
+            "count_over_joined_set",
+        }:
             return dict(query_plan)
 
         question_text, explicit_entities = self._split_task_question(task_question)
@@ -2533,18 +2536,28 @@ class PALAgentController(Agent):
             explicit_entities=explicit_entities,
             answer_target_phrase=self._extract_answer_target_phrase(question_text),
         )
+        anchor_question_inputs = [
+            item
+            for item in (interpretation.get("question_inputs") or [])
+            if isinstance(item, Mapping)
+            and self._normalize_question_input_role(item.get("role_hint")) in {
+                "anchor",
+                "anchor_a",
+                "anchor_b",
+            }
+        ]
         non_anchor_semantic_inputs = [
             item
             for item in (interpretation.get("question_inputs") or [])
             if isinstance(item, Mapping)
             and str(item.get("kind") or "").strip() not in {"named_entity", "answer_target"}
         ]
-        if any(
-            str(item.get("kind") or "").strip() in {"class_phrase", "type_constraint", "shared_attribute"}
-            for item in (interpretation.get("question_inputs") or [])
-            if isinstance(item, Mapping)
-        ):
-            return dict(query_plan)
+        anchor_is_attribute_or_class_value = any(
+            self._normalize_question_input_kind(item.get("kind"))
+            in {"attribute_value", "class_phrase", "type_constraint"}
+            or str(item.get("reason") or "").strip().startswith("explicit_entity:attribute_value.")
+            for item in anchor_question_inputs
+        )
 
         anchored_entities = [
             dict(item)
@@ -2553,6 +2566,8 @@ class PALAgentController(Agent):
             and self._normalize_relation_role(item.get("role")) in {"anchor", "anchor_a", "anchor_b"}
         ]
         if len(anchored_entities) != 1:
+            return dict(query_plan)
+        if not anchor_is_attribute_or_class_value:
             return dict(query_plan)
         anchor_role = self._normalize_relation_role(anchored_entities[0].get("role")) or "anchor"
 
@@ -2573,6 +2588,29 @@ class PALAgentController(Agent):
             for entity in explicit_entities
             if self._normalize_variable_token(entity)
         }
+        counted_variable_tokens = {
+            self._normalize_variable_token(query_plan.get(field_name))
+            for field_name in (
+                "shared_answer_variable",
+                "candidate_set_variable",
+                "count_set_variable",
+            )
+            if self._normalize_variable_token(query_plan.get(field_name))
+        }
+
+        def _path_touches_counted_set(path: Mapping[str, Any]) -> bool:
+            roles = {
+                self._normalize_relation_role(path.get("from_role")),
+                self._normalize_relation_role(path.get("to_role")),
+            }
+            tokens = {
+                self._normalize_variable_token(path.get("from")),
+                self._normalize_variable_token(path.get("to")),
+            }
+            return bool(
+                roles & {"candidate_set", "count_set", "shared_answer", "answer"}
+                or tokens & counted_variable_tokens
+            )
 
         anchor_paths: list[dict[str, Any]] = []
         answer_target_filter_paths: list[dict[str, Any]] = []
@@ -2581,19 +2619,15 @@ class PALAgentController(Agent):
         for path in relation_paths:
             from_role = self._normalize_relation_role(path.get("from_role"))
             to_role = self._normalize_relation_role(path.get("to_role"))
-            if self._path_touches_anchor_role(path, anchor_role=anchor_role):
-                if {from_role, to_role} & {"candidate_set", "count_set", "shared_answer"}:
-                    anchor_paths.append(path)
-                else:
-                    other_non_anchor_paths.append(path)
-                continue
+            touches_counted_set = _path_touches_counted_set(path)
             if (
                 not non_anchor_semantic_inputs
-                and {from_role, to_role} & {"candidate_set", "count_set", "shared_answer"}
+                and touches_counted_set
                 and "constraint_value" in {from_role, to_role}
             ):
                 answer_target_filter_paths.append(path)
                 continue
+            relation_name = str(path.get("relation") or "").strip()
             constraint_raw = ""
             if from_role == "constraint_value":
                 constraint_raw = str(path.get("from") or "").strip()
@@ -2602,14 +2636,43 @@ class PALAgentController(Agent):
             constraint_token = self._normalize_variable_token(
                 self._singularize_phrase(constraint_raw)
             )
-            touches_candidate = {from_role, to_role} & {"candidate_set", "count_set", "shared_answer"}
+            type_filter_token = ""
+            if relation_name.startswith("type_filter:"):
+                type_filter_token = self._normalize_variable_token(
+                    self._singularize_phrase(relation_name.split(":", 1)[1].replace("_", " "))
+                )
+            filter_tokens = {
+                self._normalize_variable_token(
+                    self._singularize_phrase(str(path.get(endpoint_name) or "").strip())
+                )
+                for endpoint_name in ("from", "to")
+            }
+            filter_tokens.discard("")
             if (
-                touches_candidate
-                and constraint_token
-                and constraint_token == answer_target_token
-                and constraint_token not in explicit_entity_tokens
+                not non_anchor_semantic_inputs
+                and touches_counted_set
+                and (
+                    (
+                        constraint_token
+                        and constraint_token == answer_target_token
+                        and constraint_token not in explicit_entity_tokens
+                    )
+                    or (
+                        type_filter_token
+                        and type_filter_token == answer_target_token
+                        and type_filter_token not in explicit_entity_tokens
+                    )
+                    or any(
+                        filter_token
+                        and filter_token == answer_target_token
+                        and filter_token not in explicit_entity_tokens
+                        for filter_token in filter_tokens
+                    )
+                )
             ):
                 answer_target_filter_paths.append(path)
+            elif self._path_touches_anchor_role(path, anchor_role=anchor_role) and touches_counted_set:
+                anchor_paths.append(path)
             else:
                 other_non_anchor_paths.append(path)
 
@@ -2619,14 +2682,22 @@ class PALAgentController(Agent):
         rewritten_anchor_path = copy.deepcopy(anchor_paths[0])
         from_role = self._normalize_relation_role(rewritten_anchor_path.get("from_role"))
         to_role = self._normalize_relation_role(rewritten_anchor_path.get("to_role"))
-        if from_role == anchor_role and to_role in {"candidate_set", "shared_answer", "count_set"}:
+        from_token = self._normalize_variable_token(rewritten_anchor_path.get("from"))
+        to_token = self._normalize_variable_token(rewritten_anchor_path.get("to"))
+        if from_role == anchor_role and (
+            to_role in {"candidate_set", "shared_answer", "count_set"}
+            or to_token in counted_variable_tokens
+        ):
             count_variable = (
                 self._normalize_variable_token(rewritten_anchor_path.get("to"))
                 or "count_set"
             )
             rewritten_anchor_path["to"] = count_variable
             rewritten_anchor_path["to_role"] = "count_set"
-        elif to_role == anchor_role and from_role in {"candidate_set", "shared_answer", "count_set"}:
+        elif to_role == anchor_role and (
+            from_role in {"candidate_set", "shared_answer", "count_set"}
+            or from_token in counted_variable_tokens
+        ):
             count_variable = (
                 self._normalize_variable_token(rewritten_anchor_path.get("from"))
                 or "count_set"
@@ -2637,6 +2708,7 @@ class PALAgentController(Agent):
             return dict(query_plan)
 
         rewritten_plan = copy.deepcopy(dict(query_plan))
+        rewritten_plan["query_shape"] = "count_over_direct_relation"
         rewritten_plan["shared_answer_variable"] = count_variable
         rewritten_plan["candidate_set_variable"] = count_variable
         rewritten_plan["count_set_variable"] = count_variable
@@ -2768,6 +2840,37 @@ class PALAgentController(Agent):
                 for item in ((query_plan.get("join_structure") or {}).get("anchor_constraints") or [])
                 if isinstance(item, Mapping)
             ]
+        original_anchor_roles = {
+            self._normalize_relation_role(item.get("role"))
+            for item in (query_plan.get("anchored_entities") or [])
+            if isinstance(item, Mapping)
+            and self._normalize_relation_role(item.get("role")) in {"anchor", "anchor_a", "anchor_b"}
+        }
+        if len(original_anchor_roles) > 1:
+            rewritten_path_anchor_roles = {
+                self._normalize_relation_role(path.get(endpoint_role))
+                for path in rewritten_paths
+                for endpoint_role in ("from_role", "to_role")
+                if self._normalize_relation_role(path.get(endpoint_role)) in original_anchor_roles
+            }
+            if not original_anchor_roles.issubset(rewritten_path_anchor_roles):
+                return dict(query_plan)
+            original_constraint_roles = {
+                self._normalize_relation_role(item.get("anchor_role"))
+                for item in ((query_plan.get("join_structure") or {}).get("anchor_constraints") or [])
+                if isinstance(item, Mapping)
+                and self._normalize_relation_role(item.get("anchor_role")) in original_anchor_roles
+            }
+            rewritten_constraint_roles = {
+                self._normalize_relation_role(item.get("anchor_role"))
+                for item in rewritten_constraints
+                if isinstance(item, Mapping)
+                and self._normalize_relation_role(item.get("anchor_role")) in original_anchor_roles
+            }
+            if original_constraint_roles and not original_constraint_roles.issubset(
+                rewritten_constraint_roles
+            ):
+                return dict(query_plan)
 
         rewritten_plan = copy.deepcopy(dict(query_plan))
         rewritten_plan["relation_paths"] = rewritten_paths
@@ -8175,7 +8278,6 @@ class PALAgentController(Agent):
             "shared_type",
             "anchor_value",
         }
-
         has_non_anchor_downstream_path = False
         has_candidate_constraint_filter = False
         observed_variable_roles: set[str] = set()

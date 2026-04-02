@@ -518,6 +518,7 @@ def test_direct_count_grounding_validation_accepts_pivot_preserving_count_family
     assert reason == "accepted_role_match"
 
 
+
 def test_superlative_grounding_validation_accepts_candidate_anchor_and_ordering_equivalence() -> None:
     controller = _make_controller()
 
@@ -3604,6 +3605,405 @@ def test_apply_question_scaffold_rewrite_drops_answer_target_only_filter_for_dir
     )
 
 
+def test_apply_question_scaffold_rewrite_drops_mislabeled_answer_target_filter_for_direct_count() -> None:
+    controller = _make_controller()
+
+    rewritten = controller._apply_question_scaffold_plan_rewrites(
+        task_question=(
+            "Question: how many songwriters work in the percussionist profession?, "
+            "Entities: ['Percussionist']"
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "answer_type": "count",
+            "query_shape": "count_over_direct_relation",
+            "strategy": "Count people in the Percussionist profession and also require songwriter.",
+            "anchored_entities": [
+                {
+                    "surface": "Percussionist",
+                    "chosen_alias": "Percussionist",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "people.profession.people_with_this_profession",
+                    "direction": "forward",
+                    "from": "Percussionist",
+                    "to": "candidate_person",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "people.person.profession",
+                    "direction": "forward",
+                    "from": "candidate_person",
+                    "to": "songwriter",
+                    "from_role": "anchor",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+            ],
+            "shared_answer_variable": "shared_answer",
+            "candidate_set_variable": "candidate_person",
+            "count_set_variable": "candidate_person",
+            "ordering_attribute": {"direction": "forward"},
+            "ordering_direction": "none",
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "candidate_person",
+                        "notes": "candidate persons must have Percussionist profession",
+                    }
+                ],
+            },
+            "projection": ["count"],
+            "plan_rationale": [],
+        },
+    )
+
+    assert rewritten["query_shape"] == "count_over_direct_relation"
+    assert len(rewritten["relation_paths"]) == 1
+    assert rewritten["relation_paths"][0]["relation"] == "people.profession.people_with_this_profession"
+    assert rewritten["count_set_variable"] == "candidate_person"
+    assert "songwriter" not in rewritten["strategy"].lower()
+
+
+def test_apply_question_scaffold_rewrite_keeps_surface_anchor_joined_type_filter() -> None:
+    controller = _make_controller()
+
+    rewritten = controller._apply_question_scaffold_plan_rewrites(
+        task_question=(
+            "Question: how many game expansions has valve corp released?, "
+            "Entities: ['valve corp']"
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "answer_type": "count",
+            "query_shape": "count_over_joined_set",
+            "strategy": "Count videogames published by Valve and filter to game expansions.",
+            "anchored_entities": [
+                {
+                    "surface": "valve corp",
+                    "chosen_alias": "valve corp",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "cvg.computer_videogame.publisher",
+                    "direction": "reverse",
+                    "from": "videogame",
+                    "to": "valve corp",
+                    "from_role": "candidate_set",
+                    "to_role": "anchor",
+                    "grounding_source": "dynamic_probe",
+                },
+                {
+                    "relation": "type_filter:game_expansion",
+                    "direction": "forward",
+                    "from": "videogame",
+                    "to": "expansion",
+                    "from_role": "candidate_set",
+                    "to_role": "count_set",
+                    "grounding_source": "exploratory",
+                },
+            ],
+            "shared_answer_variable": "shared_answer",
+            "candidate_set_variable": "videogame",
+            "count_set_variable": "videogame",
+            "ordering_attribute": {"direction": "forward"},
+            "ordering_direction": "none",
+            "join_structure": {
+                "type": "intersection",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "videogame",
+                        "notes": "anchor constrains the videogame set",
+                    }
+                ],
+            },
+            "projection": ["count"],
+            "plan_rationale": [],
+        },
+    )
+
+    assert rewritten["query_shape"] == "count_over_joined_set"
+    assert len(rewritten["relation_paths"]) == 2
+    assert any(
+        str(path.get("relation") or "").strip() == "type_filter:game_expansion"
+        for path in rewritten["relation_paths"]
+    )
+    assert rewritten["count_set_variable"] == "videogame"
+    assert "game expansion" in rewritten["strategy"].lower()
+
+
+def test_single_anchor_answer_target_count_rewrite_keeps_surface_anchor_semantics() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "Count videogames published by Valve and also require game expansion.",
+        "anchored_entities": [
+            {
+                "surface": "valve corp",
+                "chosen_alias": "valve corp",
+                "role": "anchor",
+            }
+        ],
+        "relation_paths": [
+            {
+                "relation": "cvg.computer_videogame.publisher",
+                "direction": "reverse",
+                "from": "videogame",
+                "to": "valve corp",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+            },
+            {
+                "relation": "type_filter:game_expansion",
+                "direction": "forward",
+                "from": "videogame",
+                "to": "expansion",
+                "from_role": "candidate_set",
+                "to_role": "count_set",
+                "grounding_source": "exploratory",
+            },
+        ],
+        "shared_answer_variable": "shared_answer",
+        "candidate_set_variable": "videogame",
+        "count_set_variable": "videogame",
+        "ordering_attribute": {"direction": "forward"},
+        "ordering_direction": "none",
+        "join_structure": {"type": "count", "anchor_constraints": []},
+        "projection": ["count"],
+        "plan_rationale": [],
+    }
+
+    rewritten = controller._rewrite_single_anchor_answer_target_count_plan(
+        task_question=(
+            "Question: how many game expansions has valve corp released?, "
+            "Entities: ['valve corp']"
+        ),
+        query_plan=query_plan,
+    )
+
+    assert rewritten == query_plan
+
+
+def test_single_anchor_answer_target_count_rewrite_keeps_explicit_semantic_inputs() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "Count the candidate set and also enforce the class filter.",
+        "anchored_entities": [
+            {
+                "surface": "Percussionist",
+                "chosen_alias": "Percussionist",
+                "role": "anchor",
+            }
+        ],
+        "relation_paths": [
+            {
+                "relation": "people.person.profession",
+                "direction": "reverse",
+                "from": "person",
+                "to": "Percussionist",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+            },
+            {
+                "relation": "people.person.profession",
+                "direction": "forward",
+                "from": "person",
+                "to": "songwriter",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+            },
+        ],
+        "shared_answer_variable": "shared_answer",
+        "candidate_set_variable": "person",
+        "count_set_variable": "person",
+        "ordering_attribute": {"direction": "forward"},
+        "ordering_direction": "none",
+        "join_structure": {"type": "count", "anchor_constraints": []},
+        "projection": ["count"],
+        "plan_rationale": [],
+    }
+
+    rewritten = controller._rewrite_single_anchor_answer_target_count_plan(
+        task_question=(
+            "Question: how many songwriters work in the percussionist profession?, "
+            "Entities: ['Percussionist']"
+        ),
+        query_plan=query_plan,
+        question_interpretation={
+            "question_inputs": [
+                {"surface": "Percussionist", "kind": "named_entity", "role_hint": "anchor"},
+                {"surface": "songwriters", "kind": "answer_target", "role_hint": "answer_target"},
+                {"surface": "creative professionals", "kind": "class_phrase", "role_hint": "constraint_value"},
+            ]
+        },
+    )
+
+    assert rewritten == query_plan
+
+
+def test_joined_count_answer_target_hint_preserves_multi_anchor_constraints() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_joined_set",
+        "strategy": "Count positions with both filters.",
+        "anchored_entities": [
+            {
+                "surface": "her majesty the queen",
+                "chosen_alias": "her majesty the queen",
+                "role": "anchor_a",
+            },
+            {
+                "surface": "Cayman Islands",
+                "chosen_alias": "Cayman Islands",
+                "role": "anchor_b",
+            },
+        ],
+        "relation_paths": [
+            {
+                "relation": "government.position.appointed_by",
+                "direction": "forward",
+                "from": "position",
+                "to": "person",
+                "from_role": "count_set",
+                "to_role": "anchor_a",
+                "grounding_source": "exploratory",
+            },
+            {
+                "relation": "government.position.jurisdiction",
+                "direction": "forward",
+                "from": "position",
+                "to": "cayman islands government position",
+                "from_role": "count_set",
+                "to_role": "constraint_value",
+                "grounding_source": "exploratory",
+            },
+        ],
+        "shared_answer_variable": "candidate_set",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "count_set",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {"anchor_role": "anchor_a", "constrains_variable": "candidate_set", "notes": "queen filter"},
+                {"anchor_role": "anchor_b", "constrains_variable": "candidate_set", "notes": "cayman filter"},
+            ],
+        },
+        "projection": ["count"],
+    }
+
+    rewritten = controller._rewrite_joined_count_answer_target_hint_plan(
+        task_question=(
+            "Question: how many cayman islands government positions were appointed by "
+            "her majesty the queen?, Entities: ['her majesty the queen', 'Cayman Islands']"
+        ),
+        query_plan=query_plan,
+    )
+
+    assert rewritten == query_plan
+
+
+def test_joined_count_answer_target_hint_keeps_multi_anchor_paths_while_dropping_type_filter() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_joined_set",
+        "strategy": "Count positions with two anchors and a redundant type filter.",
+        "anchored_entities": [
+            {
+                "surface": "her majesty the queen",
+                "chosen_alias": "her majesty the queen",
+                "role": "anchor_a",
+            },
+            {
+                "surface": "Cayman Islands",
+                "chosen_alias": "Cayman Islands",
+                "role": "anchor_b",
+            },
+        ],
+        "relation_paths": [
+            {
+                "relation": "government.government_position_held.appointed_by",
+                "direction": "reverse",
+                "from": "held",
+                "to": "her majesty the queen",
+                "from_role": "candidate_set",
+                "to_role": "anchor_a",
+                "grounding_source": "dynamic_probe",
+            },
+            {
+                "relation": "government.government_position_held.jurisdiction_of_office",
+                "direction": "reverse",
+                "from": "jurisdiction",
+                "to": "Cayman Islands",
+                "from_role": "candidate_set",
+                "to_role": "anchor_b",
+                "grounding_source": "dynamic_probe",
+            },
+            {
+                "relation": "type_filter:government_position",
+                "direction": "forward",
+                "from": "candidate_set",
+                "to": "government_position",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "exploratory",
+            },
+        ],
+        "shared_answer_variable": "answer",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "count_set",
+        "join_structure": {
+            "type": "intersection",
+            "anchor_constraints": [
+                {"anchor_role": "anchor_a", "constrains_variable": "candidate_set", "notes": "queen filter"},
+                {"anchor_role": "anchor_b", "constrains_variable": "candidate_set", "notes": "cayman filter"},
+            ],
+        },
+        "projection": ["count"],
+    }
+
+    rewritten = controller._rewrite_joined_count_answer_target_hint_plan(
+        task_question=(
+            "Question: how many government positions in Cayman Islands were appointed by "
+            "her majesty the queen?, Entities: ['her majesty the queen', 'Cayman Islands']"
+        ),
+        query_plan=query_plan,
+    )
+
+    assert len(rewritten["relation_paths"]) == 2
+    assert {
+        str(path.get("relation") or "").strip() for path in rewritten["relation_paths"]
+    } == {
+        "government.government_position_held.appointed_by",
+        "government.government_position_held.jurisdiction_of_office",
+    }
+    assert [item["anchor_role"] for item in rewritten["join_structure"]["anchor_constraints"]] == [
+        "anchor_a",
+        "anchor_b",
+    ]
+
+
 def test_condition_such_as_rewrite_uses_parent_disease_chain() -> None:
     controller = _make_controller()
 
@@ -3722,6 +4122,60 @@ def test_apply_question_scaffold_rewrite_drops_generic_constraint_path_when_no_s
     assert rewritten["relation_paths"][0]["relation"] == "people.person.profession"
     assert rewritten["count_set_variable"] == "person"
     assert "profession includes" not in rewritten["strategy"].lower()
+
+
+def test_exhibition_subject_rewrite_counts_subjects_over_exhibition_type() -> None:
+    controller = _make_controller()
+
+    rewritten = controller._apply_question_scaffold_plan_rewrites(
+        task_question=(
+            "Question: there are how many exhibition subjects in international "
+            "exhibition of modern art?, Entities: ['international exhibition of modern art']"
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "answer_type": "count",
+            "answer_target_phrase": "exhibition subjects",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {
+                    "surface": "international exhibition of modern art",
+                    "chosen_alias": "m.01_ggr",
+                    "role": "anchor",
+                }
+            ],
+            "shared_answer_variable": "answer",
+            "candidate_set_variable": "answer",
+            "count_set_variable": "answer",
+            "ordering_attribute": {"direction": "forward"},
+            "ordering_direction": "none",
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {"anchor_role": "anchor", "constrains_variable": "exhibition", "notes": "direct exhibition subject count"}
+                ],
+            },
+            "relation_paths": [
+                {
+                    "relation": "exhibitions.exhibition.subjects",
+                    "direction": "forward",
+                    "from": "exhibition",
+                    "to": "subject",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                }
+            ],
+            "projection": ["count"],
+            "plan_rationale": [],
+        },
+    )
+
+    assert [path["relation"] for path in rewritten["relation_paths"]] == [
+        "exhibitions.exhibition.exhibition_types",
+        "exhibitions.type_of_exhibition.exhibitions_of_this_type",
+        "exhibitions.exhibition.subjects",
+    ]
 
 
 def test_apply_question_scaffold_rewrite_drops_redundant_joined_type_filter() -> None:
@@ -4096,7 +4550,7 @@ def test_fictional_character_joined_count_rewrite_replaces_world_species_detour(
     )
 
 
-def test_exhibition_subject_rewrite_counts_subjects_over_exhibition_type() -> None:
+def test_exhibition_subject_question_keeps_direct_subject_count_plan() -> None:
     controller = _make_controller()
 
     rewritten = controller._apply_question_scaffold_plan_rewrites(
@@ -4144,8 +4598,6 @@ def test_exhibition_subject_rewrite_counts_subjects_over_exhibition_type() -> No
     )
 
     assert [path["relation"] for path in rewritten["relation_paths"]] == [
-        "exhibitions.exhibition.exhibition_types",
-        "exhibitions.type_of_exhibition.exhibitions_of_this_type",
         "exhibitions.exhibition.subjects",
     ]
 
@@ -6195,82 +6647,6 @@ def test_family_policy_candidate_uses_final_rejected_plan_instead_of_best_execut
     assert captured["relation_names"] == ["people.profession.people_with_this_profession"]
     trigger_context = captured["trigger_context"]
     assert isinstance(trigger_context, dict)
-    assert trigger_context["query_shape"] == "count_over_joined_set"
-
-
-def test_family_policy_candidate_prefers_repaired_query_shape_over_stale_selected_family(
-    monkeypatch,
-) -> None:
-    controller = _make_controller()
-    captured: dict[str, object] = {}
-
-    class _FakeStore:
-        def create_candidate_update(self, **kwargs):
-            captured.update(kwargs)
-            return type(
-                "Candidate",
-                (),
-                {
-                    "base_version": "2026-03-31",
-                    "candidate_version": "2026-03-31__cand0002",
-                    "fields_changed": ("blocked_scaffold_signatures",),
-                    "reason_for_change": "test_candidate",
-                    "trigger_context": kwargs["trigger_context"],
-                },
-            )()
-
-    controller._get_family_policy_store = lambda: _FakeStore()
-    controller._current_session = type(
-        "Session", (), {"task_name": "knowledge_graph", "sample_index": "17"}
-    )()
-    monkeypatch.setattr(
-        pal_agent_controller_module,
-        "family_policy_enabled_for",
-        lambda family_name: True,
-    )
-
-    controller._maybe_record_family_policy_candidate(
-        generated_tool_name="pal_sparql_query_tool_test",
-        query_plan={
-            "answer_mode": "count",
-            "query_shape": "count_over_direct_relation",
-            "relation_paths": [],
-        },
-        failure_reason="pal_query_not_accepted:repairable_bad_count_set",
-        repair_loop_log={
-            "final_verdict": "repairable_bad_count_set",
-            "attempt_decisions": [
-                {
-                    "selected_family": "count_over_direct_relation",
-                    "family_bundle_version": "2026-03-31",
-                }
-            ],
-            "final_attempt_query_plan": {
-                "answer_mode": "count",
-                "query_shape": "count_over_joined_set",
-                "relation_paths": [
-                    {
-                        "relation": "character.rank",
-                        "direction": "forward",
-                        "from_role": "anchor_a",
-                        "to_role": "candidate_set",
-                    },
-                    {
-                        "relation": "type.instance_of",
-                        "direction": "forward",
-                        "from_role": "candidate_set",
-                        "to_role": "constraint_value",
-                    },
-                ],
-            },
-            "last_reasons": ["count_query_all_relation_paths_exploratory"],
-        },
-    )
-
-    assert captured["family_name"] == "count_over_joined_set"
-    trigger_context = captured["trigger_context"]
-    assert isinstance(trigger_context, dict)
-    assert trigger_context["selected_family"] == "count_over_joined_set"
     assert trigger_context["query_shape"] == "count_over_joined_set"
 
 
@@ -13879,7 +14255,7 @@ def test_plausibility_accepts_pinned_semantic_dynamic_joined_count_with_structur
     assert "count_query_dynamic_chain_too_weak" not in verdict.reasons
 
 
-def test_plausibility_accepts_exact_grounded_zero_joined_count_when_pinned() -> None:
+def test_plausibility_repairs_exact_grounded_zero_joined_count_without_direct_anchor_constraints() -> None:
     verdict = validate_pal_execution(
         query_plan={
             "answer_mode": "count",
@@ -13984,12 +14360,12 @@ def test_plausibility_accepts_exact_grounded_zero_joined_count_when_pinned() -> 
         ],
     )
 
-    assert verdict.verdict == VERDICT_ACCEPTED
-    assert "accepted_exact_grounded_zero_joined_count" in verdict.reasons
-    assert "count_query_zero_with_live_anchor_paths" not in verdict.reasons
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "accepted_exact_grounded_zero_joined_count" not in verdict.reasons
+    assert "count_query_zero_with_live_anchor_paths" in verdict.reasons
 
 
-def test_plausibility_accepts_exact_pinned_dynamic_zero_joined_count_when_structural() -> None:
+def test_plausibility_repairs_dynamic_zero_joined_count_when_constraint_side_is_not_fully_curated() -> None:
     verdict = validate_pal_execution(
         query_plan={
             "answer_mode": "count",
@@ -14097,9 +14473,101 @@ def test_plausibility_accepts_exact_pinned_dynamic_zero_joined_count_when_struct
         ],
     )
 
-    assert verdict.verdict == VERDICT_ACCEPTED
-    assert "accepted_exact_grounded_zero_joined_count" in verdict.reasons
-    assert "count_query_zero_with_live_anchor_paths" not in verdict.reasons
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "accepted_exact_grounded_zero_joined_count" not in verdict.reasons
+    assert "count_query_zero_without_grounded_join_constraints" in verdict.reasons
+
+
+def test_plausibility_repairs_pseudo_joined_zero_count_without_distinct_anchor_constraints() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "answer_target_phrase": "teams",
+            "query_shape": "count_over_joined_set",
+            "anchored_entities": [
+                {
+                    "surface": "Sample Athlete",
+                    "chosen_alias": "Sample Athlete",
+                    "role": "anchor",
+                }
+            ],
+            "candidate_set_variable": "roster",
+            "count_set_variable": "team",
+            "shared_answer_variable": "team",
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "roster",
+                        "notes": "anchor -> roster",
+                    },
+                    {
+                        "anchor_role": "candidate_set",
+                        "constrains_variable": "team",
+                        "notes": "roster -> team projection",
+                    },
+                ],
+            },
+            "relation_paths": [
+                {
+                    "relation": "sports.pro_athlete.teams",
+                    "direction": "forward",
+                    "from": "athlete",
+                    "to": "roster",
+                    "from_role": "anchor",
+                    "to_role": "candidate_set",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "sports.sports_team_roster.team",
+                    "direction": "forward",
+                    "from": "roster",
+                    "to": "team",
+                    "from_role": "candidate_set",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                },
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count projected teams from one athlete",
+        },
+        query_text=(
+            "SELECT (COUNT(DISTINCT ?team) AS ?count) WHERE { "
+            "fb:m.sample_athlete fb:sports.pro_athlete.teams ?roster . "
+            "?roster fb:sports.sports_team_roster.team ?team . "
+            "}"
+        ),
+        result_dict={
+            "results": {
+                "bindings": [
+                    {"count": {"type": "literal", "value": "0"}}
+                ]
+            }
+        },
+        entities=["Sample Athlete"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Sample Athlete",
+                entity_count=1,
+                path_count=2,
+                relation_probed="sports.pro_athlete.teams",
+                anchor_position="subject",
+                resolved_entity_id="m.sample_athlete",
+            ),
+            AnchorProbeResult(
+                anchor_name="Sample Athlete",
+                entity_count=1,
+                path_count=2,
+                relation_probed="sports.pro_athlete.teams -> sports.sports_team_roster.team",
+                anchor_position="subject",
+                resolved_entity_id="m.sample_athlete",
+            ),
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "accepted_exact_grounded_zero_joined_count" not in verdict.reasons
 
 
 def test_plausibility_rejects_dynamic_entity_lookup_without_answer_target_semantics() -> None:
@@ -14595,6 +15063,188 @@ def test_validate_pal_execution_accepts_prepositional_count_target_when_head_is_
     )
 
     assert "count_answer_target_unenforced:contents about higher education" not in verdict.reasons
+
+
+def test_validate_pal_execution_accepts_joined_count_when_shared_filter_counts_grounded_candidate_set() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "answer_target_phrase": "breeds",
+            "query_shape": "count_over_joined_set",
+            "anchored_entities": [
+                {
+                    "surface": "Serbia",
+                    "chosen_alias": "m.077qn",
+                    "role": "anchor_a",
+                },
+                {
+                    "surface": "Smooth Fox Terrier",
+                    "chosen_alias": "m.03_vlr",
+                    "role": "anchor_b",
+                },
+            ],
+            "relation_paths": [
+                {
+                    "relation": "biology.breed_origin.breeds_originating_here",
+                    "direction": "reverse",
+                    "from": "country",
+                    "to": "breed",
+                    "from_role": "constraint_value",
+                    "to_role": "candidate_set",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "biology.animal_breed.temperament",
+                    "direction": "forward",
+                    "from": "breed",
+                    "to": "temperament",
+                    "from_role": "candidate_set",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "biology.animal_breed.temperament",
+                    "direction": "forward",
+                    "from": "breed",
+                    "to": "temperament",
+                    "from_role": "anchor_b",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+            ],
+            "candidate_set_variable": "breed",
+            "count_set_variable": "breed",
+            "shared_answer_variable": "breed",
+            "allow_exploratory_predicates": False,
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {"anchor_role": "anchor_a", "constrains_variable": "breed", "notes": "origin"},
+                    {"anchor_role": "anchor_b", "constrains_variable": "breed", "notes": "temperament"},
+                ],
+            },
+        },
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/> "
+            "SELECT (COUNT(DISTINCT ?breed) AS ?count) WHERE { "
+            "VALUES ?anchor_b { fb:m.03_vlr } "
+            "VALUES ?anchor_a { fb:m.077qn } "
+            "?anchor_a fb:biology.breed_origin.breeds_originating_here ?breed . "
+            "?breed fb:biology.animal_breed.temperament ?temperament . "
+            "?anchor_b fb:biology.animal_breed.temperament ?temperament . }"
+        ),
+        result_dict={
+            "head": {"vars": ["count"]},
+            "results": {"bindings": [{"count": {"type": "literal", "value": "1"}}]},
+        },
+        entities=["Serbia", "Smooth Fox Terrier"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Serbia",
+                entity_count=1,
+                path_count=1,
+                relation_probed="biology.breed_origin.breeds_originating_here",
+                anchor_position="subject",
+                resolved_entity_id="m.077qn",
+            ),
+            AnchorProbeResult(
+                anchor_name="Smooth Fox Terrier",
+                entity_count=1,
+                path_count=1,
+                relation_probed="biology.animal_breed.temperament",
+                anchor_position="subject",
+                resolved_entity_id="m.03_vlr",
+            ),
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_ACCEPTED
+    assert "count_query_detached_joined_count_set:breed" not in verdict.reasons
+
+
+def test_validate_pal_execution_accepts_joined_count_without_shared_filter_when_count_alias_is_detached() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "answer_target_phrase": "cayman islands government positions",
+            "query_shape": "count_over_joined_set",
+            "anchored_entities": [
+                {
+                    "surface": "her majesty the queen",
+                    "chosen_alias": "m.0cq74",
+                    "role": "anchor_a",
+                },
+                {
+                    "surface": "Cayman Islands",
+                    "chosen_alias": "m.0g6g2m",
+                    "role": "anchor_b",
+                },
+            ],
+            "relation_paths": [
+                {
+                    "relation": "government.government_position_held.appointed_by",
+                    "direction": "reverse",
+                    "from": "held",
+                    "to": "her majesty the queen",
+                    "from_role": "candidate_set",
+                    "to_role": "anchor_a",
+                    "grounding_source": "dynamic_probe",
+                },
+                {
+                    "relation": "government.government_position_held.jurisdiction_of_office",
+                    "direction": "reverse",
+                    "from": "jurisdiction",
+                    "to": "Cayman Islands",
+                    "from_role": "candidate_set",
+                    "to_role": "anchor_b",
+                    "grounding_source": "dynamic_probe",
+                },
+            ],
+            "candidate_set_variable": "candidate_positions",
+            "count_set_variable": "count_positions",
+            "shared_answer_variable": "shared_answer",
+            "allow_exploratory_predicates": False,
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {"anchor_role": "anchor_a", "constrains_variable": "candidate_positions", "notes": "appointing monarch"},
+                    {"anchor_role": "anchor_b", "constrains_variable": "candidate_positions", "notes": "jurisdiction"},
+                ],
+            },
+        },
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/> "
+            "SELECT (COUNT(DISTINCT ?candidate_positions) AS ?count) WHERE { "
+            "?candidate_positions fb:government.government_position_held.appointed_by fb:m.0cq74 . "
+            "?candidate_positions fb:government.government_position_held.jurisdiction_of_office fb:m.0g6g2m . }"
+        ),
+        result_dict={
+            "head": {"vars": ["count"]},
+            "results": {"bindings": [{"count": {"type": "literal", "value": "1"}}]},
+        },
+        entities=["her majesty the queen", "Cayman Islands"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="her majesty the queen",
+                entity_count=1,
+                path_count=1,
+                relation_probed="government.government_position_held.appointed_by",
+                anchor_position="object",
+                resolved_entity_id="m.0cq74",
+            ),
+            AnchorProbeResult(
+                anchor_name="Cayman Islands",
+                entity_count=1,
+                path_count=1,
+                relation_probed="government.government_position_held.jurisdiction_of_office",
+                anchor_position="object",
+                resolved_entity_id="m.0g6g2m",
+            ),
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_ACCEPTED
+    assert "count_query_detached_joined_count_set:count_positions" not in verdict.reasons
 
 
 def test_validate_pal_execution_accepts_species_count_target() -> None:

@@ -211,17 +211,17 @@ body{font-family:'Segoe UI',system-ui,sans-serif;display:flex;height:100vh;overf
   <div id="sb-head">
     <div id="sb-title">Sessions <span id="cnt"></span></div>
     <div id="sb-stats"></div>
-    <input id="sb-search" type="search" placeholder="\u2315  Search questions\u2026">
+    <input id="sb-search" type="search" placeholder="⌕  Search questions…">
     <div id="sb-filters">
       <button class="flt active" data-f="all">All</button>
-      <button class="flt" data-f="correct">\u2705 Correct</button>
-      <button class="flt" data-f="incorrect">\u274c Incorrect</button>
-      <button class="flt" data-f="pal">\U0001f309 PAL</button>
+      <button class="flt" data-f="correct">✅ Correct</button>
+      <button class="flt" data-f="incorrect">❌ Incorrect</button>
+      <button class="flt" data-f="pal">🌉 PAL</button>
     </div>
   </div>
   <div id="sl"></div>
 </div>
-<div id="main"><div id="empty">\u2190 Select a session</div></div>
+<div id="main"><div id="empty">← Select a session</div></div>
 <script>
 const logData=/*LOG_DATA_PLACEHOLDER*/;
 const STATE_KEY='traceViewerState:'+location.pathname;
@@ -234,7 +234,7 @@ function readState(){try{return JSON.parse(localStorage.getItem(STATE_KEY)||'{}'
 function writeState(p){try{const c=readState();localStorage.setItem(STATE_KEY,JSON.stringify({...c,...p}));}catch{}}
 function findIdx(si){const t=String(si??'').trim();return logData.findIndex(s=>String(s.sample_index??'').trim()===t);}
 function readHashSI(){const p='#sample=';if(!location.hash.startsWith(p))return'';try{return decodeURIComponent(location.hash.slice(p.length));}catch{return location.hash.slice(p.length);}}
-function setHash(si){const t='#sample='+encodeURIComponent(String(si??''));if(location.hash!==t)history.replaceState(null,'',t);}
+function setHash(si){const t='#sample='+encodeURIComponent(String(si??''));try{if(location.hash!==t)history.replaceState(null,'',t);}catch{location.hash=t;}}
 function persistScroll(){writeState({sTop:document.getElementById('sidebar')?.scrollTop||0,mTop:document.getElementById('main')?.scrollTop||0});}
 function restoreScroll(){const st=readState();const sb=document.getElementById('sidebar');const m=document.getElementById('main');if(sb&&st.sTop!=null)sb.scrollTop=st.sTop;if(m&&st.mTop!=null)m.scrollTop=st.mTop;}
 
@@ -548,7 +548,7 @@ function show(idx,options={}){
     `<div class="sec"><div class="sec-title">💬 Conversation (${turns.length} turns)</div>${turnsHtml}</div>`;
   writeState({si:String(s.sample_index??''),selectedSampleIndex:String(s.sample_index??'')});
   setHash(s.sample_index);
-  if(options.restoreScroll){requestAnimationFrame(restoreScroll);}
+  if(options.restoreScroll){setTimeout(restoreScroll,80);}
   else{document.getElementById('main').scrollTop=0;persistScroll();}
 }
 
@@ -572,7 +572,7 @@ buildSidebar();
 function initialIdx(){
   const hi=findIdx(readHashSI());if(hi>=0)return hi;
   const st=readState();
-  const si=findIdx(st.si)||findIdx(st.selectedSampleIndex);
+  const si=findIdx(st.si)>=0?findIdx(st.si):findIdx(st.selectedSampleIndex);
   return si>=0?si:0;
 }
 if(logData.length>0)show(initialIdx(),{restoreScroll:true});
