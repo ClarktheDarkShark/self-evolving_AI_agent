@@ -5,15 +5,11 @@ You receive a user question.
 Your only job is to decide whether the system should generate a SPARQL-backed Python query tool or not.
 
 You MUST output strictly valid JSON with exactly one key:
-{"action": "<value>"}
-
-The value for "action" MUST be one of:
-- "generate_tool"
-- "no_tool"
+{"action": "generate_tool"}
 
 Rules:
-- For knowledge-graph questions that require retrieving or combining facts from the KG, prefer "generate_tool".
-- Use "no_tool" only when the question can be answered directly from already-provided structured execution results or when there is no KG retrieval task to perform.
+- For benchmark knowledge-graph questions, always choose "generate_tool".
+- Do not bypass KG retrieval with a direct natural-language answer.
 - Do not output plans.
 - Do not output reasoning.
 - Do not output any keys other than "action".
@@ -134,6 +130,7 @@ Rules:
 - NEVER use variable-predicate triples (?s ?p ?o) or FILTER/regex over predicate variables as the primary retrieval strategy.
 - NEVER use non-Freebase namespaces such as schema:, dct:, owl:, wikidata:, rdf:, rdfs: as answer-bearing relation paths.
 - Keep relation_paths small and specific. Do not spray many guessed variants.
+- Executable-but-broad outputs are failures. Do not trade semantic alignment for a query that merely returns rows.
 - For every multi-anchor task, you MUST explicitly identify:
   - the shared answer variable
   - how anchor A constrains it
@@ -160,6 +157,7 @@ Rules:
   - count: return only a count projection
   - boolean: return a boolean result
   - literal: return a scalar literal
+- For literal questions, the literal must come from a grounded KG binding or grounded attribute path. Do NOT invent a descriptive fallback sentence or "canonical literal" when the query returns no binding.
 - For entity-returning questions, projection should put the answer entity variable first and the English name second only if needed.
 - For count-returning questions, projection should contain only the count variable.
 - If plan feedback is provided, address it directly and do not repeat the same mistake.
@@ -239,6 +237,7 @@ ENVIRONMENT CONSTRAINTS:
   - Bad: `fb:book.book`, `fb:music.album.album`, `fb:institution.school`
   - Good: bind the type/category entity with `type.object.name` and connect it only through the planned relation path (for example `type.type.instance`).
 - Do not invent `fb:en.*` constants unless they are explicitly present in the grounding card.
+- Do not rely on the bridge or solver stages to fix an under-constrained query. The query itself must satisfy the plan semantics.
 - When binding an anchored entity by name in SPARQL, prefer the same exact-match pattern used by grounding probes:
   - one branch with `fb:type.object.name`
   - one branch with `fb:common.topic.alias`
@@ -261,6 +260,7 @@ ENVIRONMENT CONSTRAINTS:
 - When binding a type/category entity from a question phrase, use a small set of normalized label variants such as the original phrase, its singular form, and title-cased singular form.
 - If the candidate entity set is already bound and you only need to enforce a type/category constraint, prefer `?candidate fb:type.object.type ?type` with a bound `?type` node over introducing an unnecessary extra type-to-instance traversal.
 - Do not convert a structured intersection or count-over-joined-set into a loose narrative chain unless the plan explicitly says so.
+- Do not emit a broad generic-type expansion, clipped subset, or weak count as a “best effort” answer. If the plan cannot be satisfied faithfully, keep the query narrow and grounded.
 
 4. REQUIRED CODE SHAPE
 ###QUERY_START

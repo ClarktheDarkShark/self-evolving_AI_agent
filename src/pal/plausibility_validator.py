@@ -29,6 +29,7 @@ repairable_bad_superlative_structure  – superlative strategy without ORDER BY
 repairable_bad_count_set              – count plan with failed anchor probe or weak path
 repairable_bad_projection             – projection / answer-mode mismatch detected
 rejected_unsupported_predicate        – non-Freebase ontology used in WHERE
+rejected_dangerous_overreach          – executable result is structurally broad or clipped
 rejected_unbounded_exploration        – (reserved)
 """
 from __future__ import annotations
@@ -52,6 +53,7 @@ VERDICT_REPAIRABLE_BAD_SUPERLATIVE = "repairable_bad_superlative_structure"
 VERDICT_REPAIRABLE_BAD_COUNT_SET = "repairable_bad_count_set"
 VERDICT_REPAIRABLE_BAD_PROJECTION = "repairable_bad_projection"
 VERDICT_REJECTED_UNSUPPORTED_PREDICATE = "rejected_unsupported_predicate"
+VERDICT_REJECTED_DANGEROUS_OVERREACH = "rejected_dangerous_overreach"
 VERDICT_REJECTED_UNBOUNDED = "rejected_unbounded_exploration"
 
 
@@ -123,6 +125,8 @@ def validate_pal_execution(
     result_dict: Mapping[str, Any] | None,
     entities: Sequence[str],
     anchor_probe_results: Sequence[AnchorProbeResult] | None = None,
+    execution_success: bool = True,
+    execution_failure_kind: str | None = None,
 ) -> PlausibilityVerdict:
     """
     Heuristic plausibility check for a PAL candidate after execution on the
@@ -168,6 +172,7 @@ def validate_pal_execution(
         else {}
     )
     ordering_direction = str(query_plan.get("ordering_direction") or "").strip().lower()
+    answer_target_phrase = str(query_plan.get("answer_target_phrase") or "").strip()
     qt: str = str(query_text or "")
 
     soft_reasons: list[str] = []
@@ -328,26 +333,58 @@ def validate_pal_execution(
             bool({"type_set", "shared_type"} & relation_path_roles)
             and not bool({"anchor", "anchor_a", "anchor_b"} & relation_path_roles)
         )
-        not_found = [r for r in anchor_probe_results if r.entity_count == 0]
-        if not_found:
-            if anchor_probe_optional:
-                soft_reasons += [
-                    f"anchor_probe_optional_not_found:{r.anchor_name!r}"
-                    for r in not_found
-                ]
-            else:
-                reasons = [f"anchor_not_found:{r.anchor_name!r}" for r in not_found]
-                reasons += [
-                    f"probe_count:{r.anchor_name!r}={r.entity_count}" for r in not_found
-                ]
-                if answer_mode == "count":
-                    reasons += ["count_set_anchor_not_found"]
-                    return PlausibilityVerdict(
-                        verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET, reasons=reasons
-                    )
-                return PlausibilityVerdict(
-                    verdict=VERDICT_REPAIRABLE_ANCHOR_NOT_FOUND, reasons=reasons
+        probed_entities = [
+            entity
+            for entity in anchored_entities
+            if isinstance(entity, Mapping)
+        ][: len(anchor_probe_results)]
+        required_not_found: list[AnchorProbeResult] = []
+        optional_not_found: list[AnchorProbeResult] = []
+        for index, probe_result in enumerate(anchor_probe_results):
+            if probe_result.entity_count != 0:
+                continue
+            anchored_role = ""
+            anchored_entity: Mapping[str, Any] | None = None
+            if index < len(probed_entities):
+                anchored_entity = probed_entities[index]
+                anchored_role = _normalize_contract_role(
+                    anchored_entity.get("role")
                 )
+            constraint_value_optional = (
+                anchored_role == "constraint_value"
+                and _constraint_value_probe_is_optional(
+                    anchored_entity=anchored_entity,
+                    answer_target_phrase=answer_target_phrase,
+                    explicit_entities=entities,
+                )
+            )
+            if anchor_probe_optional or anchored_role in {
+                "type_set",
+                "shared_type",
+                "anchor_value",
+            } or constraint_value_optional:
+                optional_not_found.append(probe_result)
+            else:
+                required_not_found.append(probe_result)
+        if optional_not_found:
+            soft_reasons += [
+                f"anchor_probe_optional_not_found:{r.anchor_name!r}"
+                for r in optional_not_found
+            ]
+        if required_not_found:
+            reasons = [f"anchor_not_found:{r.anchor_name!r}" for r in required_not_found]
+            reasons += [
+                f"probe_count:{r.anchor_name!r}={r.entity_count}"
+                for r in required_not_found
+            ]
+            if answer_mode == "count":
+                reasons += ["count_set_anchor_not_found"]
+                return PlausibilityVerdict(
+                    verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET, reasons=reasons
+                )
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_ANCHOR_NOT_FOUND, reasons=reasons
+            )
 
         probe_failed = [r for r in anchor_probe_results if r.entity_count == -1]
         path_empty = [
@@ -373,16 +410,84 @@ def validate_pal_execution(
                 f"anchor_probe_failed:{r.anchor_name!r}" for r in probe_failed
             ]
 
+    if not execution_success:
+        execution_failure = str(execution_failure_kind or "execution_failed").strip()
+        failure_reasons = [f"execution_failed:{execution_failure}"]
+        if answer_mode == "count":
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=failure_reasons
+                + count_structure_issues
+                + [
+                    "repair:fix_the_query_execution_failure_before_accepting_the_count_result"
+                ],
+            )
+        if is_multi_anchor_strategy:
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_JOIN,
+                reasons=failure_reasons
+                + [
+                    "repair:fix_the_query_execution_failure_before_accepting_the_join_result"
+                ],
+            )
+        if is_superlative_strategy:
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_SUPERLATIVE,
+                reasons=failure_reasons
+                + [
+                    "repair:fix_the_query_execution_failure_before_accepting_the_superlative_result"
+                ],
+            )
+        return PlausibilityVerdict(
+            verdict=VERDICT_REPAIRABLE_WEAK_GROUNDING,
+            reasons=failure_reasons
+            + [
+                "repair:fix_the_query_execution_failure_before_accepting_the_result"
+            ],
+        )
+
     # ------------------------------------------------------------------ #
     # Execution-result signals (only run when we have a result)           #
     # ------------------------------------------------------------------ #
     if result_dict is not None:
+        head_vars: list[Any] = (
+            result_dict.get("head", {}).get("vars", [])  # type: ignore[union-attr]
+            if isinstance(result_dict, Mapping)
+            else []
+        )
         bindings: list[Any] = (
             result_dict.get("results", {}).get("bindings", [])  # type: ignore[union-attr]
             if isinstance(result_dict, Mapping)
             else []
         )
         binding_count: int = len(bindings) if isinstance(bindings, list) else 0
+        selected_head_var = (
+            str(head_vars[0]).strip()
+            if isinstance(head_vars, list) and head_vars and str(head_vars[0]).strip()
+            else ""
+        )
+        if binding_count > 0 and selected_head_var:
+            binding_var_names = sorted(
+                {
+                    str(var_name or "").strip()
+                    for binding in bindings
+                    if isinstance(binding, Mapping)
+                    for var_name in binding.keys()
+                    if str(var_name or "").strip()
+                }
+            )
+            if selected_head_var not in binding_var_names:
+                return PlausibilityVerdict(
+                    verdict=VERDICT_REPAIRABLE_BAD_PROJECTION,
+                    reasons=[
+                        f"selected_head_var_missing_from_bindings:{selected_head_var}",
+                        (
+                            "available_binding_vars:"
+                            + (",".join(binding_var_names) if binding_var_names else "none")
+                        ),
+                        "repair:align_the_selected_projection_variable_with_the_returned_bindings",
+                    ],
+                )
         has_boolean: bool = (
             "boolean" in result_dict if isinstance(result_dict, Mapping) else False
         )
@@ -402,7 +507,52 @@ def validate_pal_execution(
             )
 
         if (
-            scalar_count == 0
+            scalar_count is not None
+            and _count_answer_target_requires_explicit_semantics(answer_target_phrase)
+            and not _count_plan_semantically_enforces_answer_target(
+                query_plan=query_plan,
+                answer_target_phrase=answer_target_phrase,
+                query_text=qt,
+            )
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REJECTED_DANGEROUS_OVERREACH,
+                reasons=[
+                    f"count_answer_target_unenforced:{answer_target_phrase}",
+                    f"count_scalar_returned:{scalar_count}",
+                    "dangerous_overreach:weak_count_semantics",
+                    "repair:preserve_answer_target_class_or_category_semantics_in_the_counted_set",
+                ],
+            )
+
+        if (
+            answer_mode == "entity"
+            and binding_count > 0
+            and _count_answer_target_requires_explicit_semantics(answer_target_phrase)
+            and _has_dynamic_only_count_relation_paths(relation_paths)
+            and not (
+                binding_count > 5
+                and _plan_uses_only_generic_type_relations(relation_paths)
+                and _result_looks_like_generic_type_dump(bindings)
+            )
+            and not _count_plan_semantically_enforces_answer_target(
+                query_plan=query_plan,
+                answer_target_phrase=answer_target_phrase,
+                query_text=qt,
+            )
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REJECTED_DANGEROUS_OVERREACH,
+                reasons=[
+                    f"entity_answer_target_unenforced:{answer_target_phrase}",
+                    f"entity_binding_count:{binding_count}",
+                    "dangerous_overreach:weak_entity_semantics",
+                    "repair:preserve_answer_target_class_or_category_semantics_in_the_projected_answer_set",
+                ],
+            )
+
+        if (
+            scalar_count is not None
             and _plan_uses_only_generic_type_relations(relation_paths)
             and any(
                 reason.startswith("anchor_probe_optional_not_found:")
@@ -410,11 +560,25 @@ def validate_pal_execution(
             )
         ):
             return PlausibilityVerdict(
-                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                verdict=(
+                    VERDICT_REPAIRABLE_BAD_COUNT_SET
+                    if scalar_count == 0
+                    else VERDICT_REJECTED_DANGEROUS_OVERREACH
+                ),
                 reasons=soft_reasons
                 + [
-                    "generic_type_only_zero_count_plan",
-                    "repair:strengthen_type_grounding_before_accepting_zero_count",
+                    (
+                        "generic_type_only_zero_count_plan"
+                        if scalar_count == 0
+                        else "generic_type_only_ungrounded_positive_count"
+                    ),
+                    f"count_scalar_returned:{scalar_count}",
+                    (
+                        "dangerous_overreach:broad_type_expansion"
+                        if scalar_count != 0
+                        else "repair:strengthen_type_grounding_before_accepting_count_result"
+                    ),
+                    "repair:strengthen_type_grounding_before_accepting_count_result",
                 ],
             )
 
@@ -423,6 +587,22 @@ def validate_pal_execution(
             for result in (anchor_probe_results or [])
             if result.entity_count > 0 and (result.path_count or 0) > 0
         ]
+        if (
+            answer_mode == "count"
+            and scalar_count == 0
+            and _can_accept_exact_grounded_zero_joined_count(
+                query_plan=query_plan,
+                query_text=qt,
+                anchor_probe_results=live_anchor_paths,
+            )
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_ACCEPTED,
+                reasons=[
+                    "count_scalar_returned:0",
+                    "accepted_exact_grounded_zero_joined_count",
+                ],
+            )
         if (
             answer_mode == "count"
             and scalar_count == 0
@@ -437,6 +617,39 @@ def validate_pal_execution(
                     "count_query_zero_with_live_anchor_paths",
                     "count_scalar_returned:0",
                     "repair:change_the_joined_relation_family_or_anchor_binding_before_accepting_zero_count",
+                ],
+            )
+
+        if (
+            answer_mode == "count"
+            and scalar_count == 0
+            and _normalize_contract_token(count_set_variable) in {"type_set", "shared_type"}
+            and live_anchor_paths
+            and _has_type_constraint_relation(relation_paths)
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=[
+                    "count_query_zero_after_type_projection_with_live_anchor_paths",
+                    "count_scalar_returned:0",
+                    "repair:verify_the_type_projection_or_type_constraint_before_accepting_zero_count",
+                ],
+            )
+
+        if (
+            answer_mode == "count"
+            and scalar_count == 0
+            and live_anchor_paths
+            and _has_type_constraint_relation(relation_paths)
+            and _count_query_has_explicit_type_name_filter(qt)
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=[
+                    "count_query_zero_after_type_projection_with_live_anchor_paths",
+                    "count_query_unverified_type_constraint",
+                    "count_scalar_returned:0",
+                    "repair:verify_the_type_projection_or_type_constraint_before_accepting_zero_count",
                 ],
             )
 
@@ -513,6 +726,19 @@ def validate_pal_execution(
             and ambiguous_low_support_dynamic_count
             and _has_dynamic_only_count_relation_paths(relation_paths)
         ):
+            if _can_accept_pinned_semantic_dynamic_count(
+                query_plan=query_plan,
+                query_text=qt,
+                scalar_count=scalar_count,
+                ambiguous_low_support_dynamic_count=ambiguous_low_support_dynamic_count,
+            ):
+                return PlausibilityVerdict(
+                    verdict=VERDICT_ACCEPTED,
+                    reasons=[
+                        f"count_scalar_returned:{scalar_count}",
+                        "accepted_pinned_semantic_dynamic_count",
+                    ],
+                )
             reasons = [
                 (
                     f"ambiguous_anchor_surface_binding:{result.anchor_name!r}:"
@@ -578,6 +804,32 @@ def validate_pal_execution(
                 ],
             )
 
+        if is_empty and answer_mode in {"entity", "literal"} and not plan_is_weak:
+            live_anchor_paths = [
+                result
+                for result in (anchor_probe_results or [])
+                if result.entity_count > 0 and (result.path_count or 0) > 0
+            ]
+            if live_anchor_paths:
+                return PlausibilityVerdict(
+                    verdict=VERDICT_REPAIRABLE_ANCHOR_PATH_EMPTY,
+                    reasons=[
+                        "grounded_single_anchor_empty_result",
+                        "anchor_paths_live_but_projection_empty",
+                        "query_shape:" + (query_shape or strategy[:80]),
+                        "repair:preserve_the_anchor_and_try_a_different_grounded_projection_or_relation_family",
+                    ],
+                )
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_WEAK_GROUNDING,
+                reasons=[
+                    "grounded_single_anchor_empty_result",
+                    "execution_result_empty",
+                    "query_shape:" + (query_shape or strategy[:80]),
+                    "repair:try_alternative_grounded_relation_or_projection_before_accepting_no_answer",
+                ],
+            )
+
         # -------------------------------------------------------------- #
         # Signal 6 — Empty result with a weak / exploratory plan          #
         #                                                                  #
@@ -610,6 +862,70 @@ def validate_pal_execution(
                         else "plan_weak:no_anchored_entities_or_relation_paths"
                     ),
                     "repair:try_alternative_anchor_alias_or_grounded_relation",
+                ],
+            )
+
+        if (
+            query_shape == "shared_type_intersection"
+            and binding_count > 5
+            and _plan_uses_only_generic_type_relations(relation_paths)
+            and _result_looks_like_generic_type_dump(bindings)
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REJECTED_DANGEROUS_OVERREACH,
+                reasons=[
+                    "shared_type_result_overbroad_generic_type_dump",
+                    f"shared_type_binding_count:{binding_count}",
+                    "dangerous_overreach:ontology_dump",
+                    "repair:prefer_domain_specific_shared_type_relation_or_add_type_filtering_before_accepting_generic_intersection",
+                ],
+            )
+        if (
+            answer_mode == "entity"
+            and binding_count > 5
+            and _plan_uses_only_generic_type_relations(relation_paths)
+            and _result_looks_like_generic_type_dump(bindings)
+            and _count_answer_target_requires_explicit_semantics(answer_target_phrase)
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REJECTED_DANGEROUS_OVERREACH,
+                reasons=[
+                    f"generic_type_result_overbroad_for_answer_target:{answer_target_phrase}",
+                    f"entity_binding_count:{binding_count}",
+                    "dangerous_overreach:broad_type_expansion",
+                    "repair:prefer_domain_specific_relation_or_explicit_answer_target_filter_before_accepting_generic_type_output",
+                ],
+            )
+
+        if (
+            answer_mode == "entity"
+            and binding_count > 1
+            and _answer_target_implies_singleton_entity(answer_target_phrase)
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_WEAK_GROUNDING,
+                reasons=[
+                    f"entity_result_multi_binding_for_singleton_target:{answer_target_phrase}",
+                    f"entity_binding_count:{binding_count}",
+                    "repair:add_filter_or_ordering_to_select_one_entity_before_materialization",
+                ],
+            )
+
+        query_limit = _extract_query_limit(qt)
+        if (
+            answer_mode == "entity"
+            and query_limit is not None
+            and query_limit > 1
+            and binding_count >= query_limit
+            and not is_superlative_strategy
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REJECTED_DANGEROUS_OVERREACH,
+                reasons=[
+                    f"entity_result_hits_limit_ceiling:{query_limit}",
+                    f"entity_binding_count:{binding_count}",
+                    "dangerous_overreach:clipped_subset",
+                    "repair:remove_or_raise_result_limit_before_accepting_entity_set",
                 ],
             )
 
@@ -671,6 +987,28 @@ def _query_mentions_variable(query_text: str, variable_name: str) -> bool:
     )
 
 
+def _query_binds_variable_outside_count_aggregate(
+    query_text: str,
+    variable_name: str,
+) -> bool:
+    normalized_variable = _normalize_contract_token(variable_name)
+    if not normalized_variable:
+        return False
+    query_without_counts = re.sub(
+        r"COUNT\s*\(\s*(?:DISTINCT\s+)?\?[A-Za-z_][A-Za-z0-9_]*\s*\)",
+        "COUNT_AGG",
+        query_text,
+        flags=re.IGNORECASE,
+    )
+    return bool(
+        re.search(
+            rf"\?{re.escape(normalized_variable)}\b",
+            query_without_counts,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _extract_count_aggregate_variables(query_text: str) -> list[str]:
     variables: list[str] = []
     for match in re.finditer(
@@ -682,6 +1020,46 @@ def _extract_count_aggregate_variables(query_text: str) -> list[str]:
         if variable and variable not in variables:
             variables.append(variable)
     return variables
+
+
+def _result_looks_like_generic_type_dump(bindings: Sequence[Any]) -> bool:
+    normalized_values: list[str] = []
+    for binding in bindings:
+        if not isinstance(binding, Mapping):
+            continue
+        for cell in binding.values():
+            if not isinstance(cell, Mapping):
+                continue
+            if str(cell.get("type") or "").strip().lower() != "uri":
+                continue
+            value = str(cell.get("value") or "").strip()
+            if not value:
+                continue
+            if value.startswith("http://rdf.freebase.com/ns/"):
+                value = value.split("/ns/", 1)[1]
+            normalized_values.append(value)
+    if len(normalized_values) < 5:
+        return False
+    generic_prefixes = (
+        "common.",
+        "base.",
+        "type.",
+        "freebase.",
+    )
+    generic_count = sum(
+        1 for value in normalized_values if value.startswith(generic_prefixes)
+    )
+    return generic_count >= max(3, len(normalized_values) // 2)
+
+
+def _extract_query_limit(query_text: str) -> int | None:
+    match = re.search(r"\bLIMIT\s+(\d+)\b", query_text or "", flags=re.IGNORECASE)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
 
 
 def _count_set_token_is_structural(
@@ -737,7 +1115,6 @@ def _is_multi_anchor_plan(
 ) -> bool:
     if query_shape in {
         "multi_anchor_intersection",
-        "count_over_joined_set",
         "shared_type_intersection",
     }:
         return True
@@ -873,8 +1250,8 @@ def _collect_expected_anchor_literals(
     *,
     query_plan: Mapping[str, Any],
     fallback_entities: Sequence[str],
-) -> list[str]:
-    planned_literals: list[str] = []
+) -> list[tuple[str, str]]:
+    planned_literals: list[tuple[str, str]] = []
     for anchored_entity in query_plan.get("anchored_entities") or []:
         if not isinstance(anchored_entity, Mapping):
             continue
@@ -886,11 +1263,18 @@ def _collect_expected_anchor_literals(
             or anchored_entity.get("surface")
             or ""
         ).strip()
+        resolved_entity_id = str(
+            anchored_entity.get("resolved_entity_id") or ""
+        ).strip()
         if literal:
-            planned_literals.append(literal)
+            planned_literals.append((literal, resolved_entity_id))
     if planned_literals:
         return planned_literals
-    return [str(entity or "").strip() for entity in fallback_entities if str(entity or "").strip()]
+    return [
+        (str(entity or "").strip(), "")
+        for entity in fallback_entities
+        if str(entity or "").strip()
+    ]
 
 
 def _collect_count_structure_issues(
@@ -926,6 +1310,16 @@ def _collect_count_structure_issues(
         issues.append(
             "count_query_counts_wrong_variable:" + ",".join(counted_variables[:2])
         )
+    if (
+        count_set_token
+        and counted_variables
+        and count_set_token in counted_variables
+        and not _query_binds_variable_outside_count_aggregate(
+            query_text,
+            count_set_variable,
+        )
+    ):
+        issues.append("count_query_unbound_count_variable:" + count_set_token)
 
     if not relation_paths:
         issues.append("count_query_missing_relation_paths")
@@ -993,6 +1387,7 @@ def _collect_superlative_structure_issues(
         return []
 
     issues: list[str] = []
+    uses_scalar_aggregate = _query_uses_superlative_scalar_aggregate(query_text)
     if not candidate_set_variable:
         issues.append("superlative_missing_candidate_set_variable")
 
@@ -1013,14 +1408,107 @@ def _collect_superlative_structure_issues(
         )
         if matched_path is None:
             issues.append("ordering_attribute_path_missing")
-        elif str(matched_path.get("grounding_source") or "").strip().lower() == "exploratory":
+        elif (
+            str(matched_path.get("grounding_source") or "").strip().lower() == "exploratory"
+            and not _allow_semantically_specific_exploratory_superlative_ordering(
+                query_text=query_text,
+                relation_paths=relation_paths,
+                ordering_relation=relation,
+                allow_scalar_aggregate=uses_scalar_aggregate,
+            )
+        ):
             issues.append("ordering_attribute_path_exploratory")
 
     if ordering_direction not in {"max", "min"}:
         issues.append("ordering_direction_missing")
-    if not re.search(r"\bORDER\s+BY\b", query_text, flags=re.IGNORECASE):
+    if not uses_scalar_aggregate and not re.search(r"\bORDER\s+BY\b", query_text, flags=re.IGNORECASE):
         issues.append("superlative_strategy_missing_ORDER_BY")
     return issues
+
+
+def _query_uses_superlative_scalar_aggregate(query_text: str) -> bool:
+    return bool(
+        re.search(
+            r"SELECT\s*\(\s*(?:MIN|MAX)\s*\(",
+            str(query_text or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _allow_semantically_specific_exploratory_superlative_ordering(
+    *,
+    query_text: str,
+    relation_paths: Sequence[Any],
+    ordering_relation: str,
+    allow_scalar_aggregate: bool = False,
+) -> bool:
+    relation = str(ordering_relation or "").strip().lower()
+    if not relation:
+        return False
+    uses_order_by = re.search(r"\bORDER\s+BY\b", query_text, flags=re.IGNORECASE) is not None
+    uses_limit_one = re.search(r"\bLIMIT\s+1\b", query_text, flags=re.IGNORECASE) is not None
+    uses_scalar_aggregate = (
+        allow_scalar_aggregate
+        and _query_uses_superlative_scalar_aggregate(query_text)
+    )
+    if not uses_scalar_aggregate and not uses_order_by:
+        return False
+    if not uses_scalar_aggregate and not uses_limit_one:
+        return False
+
+    has_grounded_candidate_path = any(
+        isinstance(relation_path, Mapping)
+        and str(relation_path.get("grounding_source") or "").strip().lower() != "exploratory"
+        and {
+            _normalize_contract_role(relation_path.get("from_role")),
+            _normalize_contract_role(relation_path.get("to_role")),
+        }
+        & {"candidate_set", "shared_answer", "answer"}
+        for relation_path in relation_paths
+    )
+    if not has_grounded_candidate_path:
+        return False
+
+    generic_tokens = {"name", "id", "identifier", "type", "instance", "object", "topic"}
+    semantic_tokens = {
+        "date",
+        "time",
+        "year",
+        "month",
+        "day",
+        "position",
+        "index",
+        "sequence",
+        "rank",
+        "distance",
+        "length",
+        "duration",
+        "runtime",
+        "height",
+        "weight",
+        "size",
+        "area",
+        "volume",
+        "age",
+        "population",
+        "capacity",
+        "speed",
+        "preparation",
+        "prep",
+        "temperature",
+        "elevation",
+        "score",
+        "rating",
+    }
+    tokens = {
+        token
+        for token in re.split(r"[\s_/.\-]+", relation)
+        if token.strip()
+    }
+    if not tokens or tokens <= generic_tokens:
+        return False
+    return bool(tokens & semantic_tokens)
 
 
 def _extract_scalar_count_value(result_dict: Mapping[str, Any] | None) -> int | None:
@@ -1044,6 +1532,360 @@ def _extract_scalar_count_value(result_dict: Mapping[str, Any] | None) -> int | 
         return None
 
 
+def _singularize_token(token: str) -> str:
+    value = str(token or "").strip().lower()
+    irregular_forms = {
+        "species": "species",
+        "series": "series",
+    }
+    if value in irregular_forms:
+        return irregular_forms[value]
+    if len(value) > 3 and value.endswith("ies"):
+        return value[:-3] + "y"
+    if len(value) > 2 and value.endswith("ses"):
+        return value[:-2]
+    if len(value) > 1 and value.endswith("s") and not value.endswith("ss"):
+        return value[:-1]
+    return value
+
+
+def _constraint_value_probe_is_optional(
+    *,
+    anchored_entity: Mapping[str, Any] | None,
+    answer_target_phrase: str,
+    explicit_entities: Sequence[str],
+) -> bool:
+    if anchored_entity is None:
+        return False
+    surface_value = str(
+        anchored_entity.get("surface")
+        or anchored_entity.get("chosen_alias")
+        or ""
+    ).strip()
+    normalized_surface = {
+        _singularize_token(token)
+        for token in re.split(r"[\s_/.\-]+", surface_value.lower())
+        if token.strip()
+    }
+    explicit_entity_tokens = {
+        _singularize_token(token)
+        for entity in (explicit_entities or ())
+        for token in re.split(r"[\s_/.\-]+", str(entity or "").lower())
+        if token.strip()
+    }
+    if normalized_surface and normalized_surface & explicit_entity_tokens:
+        return False
+    answer_target_tokens = {
+        _singularize_token(token)
+        for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
+        if token.strip()
+    }
+    surface_tokens = normalized_surface
+    if not answer_target_tokens:
+        return bool(surface_tokens)
+    if not surface_tokens:
+        return False
+    return surface_tokens == answer_target_tokens
+
+
+def _count_answer_target_requires_explicit_semantics(answer_target_phrase: str) -> bool:
+    tokens = [
+        _singularize_token(token)
+        for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
+        if token.strip()
+    ]
+    if not tokens:
+        return False
+    generic_tokens = {
+        "amount",
+        "number",
+        "total",
+        "item",
+        "entity",
+        "thing",
+        "result",
+        "answer",
+        "one",
+    }
+    informative = [token for token in tokens if token not in generic_tokens]
+    if not informative:
+        return False
+    return len(informative) > 1 or informative[0] not in {
+        "release",
+        "track",
+        "recording",
+        "album",
+        "song",
+        "artist",
+    }
+
+
+def _extract_answer_target_head_token(answer_target_phrase: str) -> str:
+    phrase = str(answer_target_phrase or "").lower()
+    phrase = re.split(
+        r"\b(?:that|which|who|whose|such as|including|featuring)\b",
+        phrase,
+        maxsplit=1,
+    )[0]
+    leading_segment = re.split(
+        r"\b(?:about|of|with|in|for|from|on|at|by|among|between|under|over|as)\b",
+        phrase,
+        maxsplit=1,
+    )[0]
+    phrase = leading_segment or phrase
+    tokens = [
+        _singularize_token(token)
+        for token in re.split(r"[\s_/.\-]+", phrase)
+        if token.strip()
+    ]
+    if not tokens:
+        return ""
+    modifier_tokens = {
+        "different",
+        "distinct",
+        "key",
+        "same",
+        "other",
+        "minimum",
+        "maximum",
+        "total",
+    }
+    informative = [token for token in tokens if token not in modifier_tokens]
+    if informative:
+        return informative[-1]
+    return tokens[-1]
+
+
+def _answer_target_is_type_like(answer_target_phrase: str) -> bool:
+    tokens = [
+        _singularize_token(token)
+        for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
+        if token.strip()
+    ]
+    informative = [token for token in tokens if token not in {"amount", "number", "total"}]
+    if len(informative) < 2:
+        return False
+    return any(token in {"type", "category", "class", "kind"} for token in informative)
+
+
+def _extract_type_like_answer_target_qualifier_tokens(
+    answer_target_phrase: str,
+) -> list[str]:
+    tokens = [
+        _singularize_token(token)
+        for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
+        if token.strip()
+    ]
+    informative = [
+        token
+        for token in tokens
+        if token not in {"amount", "number", "total", "different", "distinct", "same", "other"}
+    ]
+    if len(informative) < 2:
+        return []
+    if informative[-1] not in {"type", "category", "class", "kind"}:
+        return []
+    return [token for token in informative[:-1] if token]
+
+
+def _count_plan_counts_type_like_target(
+    *,
+    query_plan: Mapping[str, Any],
+    query_text: str,
+) -> bool:
+    relation_paths = [
+        relation_path
+        for relation_path in (query_plan.get("relation_paths") or [])
+        if isinstance(relation_path, Mapping)
+    ]
+    counted_variables = _extract_count_aggregate_variables(query_text)
+    count_set_token = _normalize_contract_token(query_plan.get("count_set_variable"))
+    candidate_set_token = _normalize_contract_token(query_plan.get("candidate_set_variable"))
+    counted_role_tokens = {
+        token
+        for token in [
+            *counted_variables,
+            count_set_token,
+            candidate_set_token,
+        ]
+        if token in {"candidate_set", "count_set", "shared_answer", "answer", "type_set", "shared_type"}
+    }
+    semantic_count_tokens = {"type", "type_set", "shared_type", "category", "class", "kind"}
+    if semantic_count_tokens & set(counted_variables):
+        return True
+    if count_set_token in semantic_count_tokens:
+        return True
+
+    for relation_path in relation_paths:
+        relation = str(relation_path.get("relation") or "").strip().lower()
+        if not relation:
+            continue
+        from_role = _normalize_contract_role(relation_path.get("from_role"))
+        to_role = _normalize_contract_role(relation_path.get("to_role"))
+        if to_role in counted_role_tokens and re.search(
+            r"(?:^|[._])(type|category|class|kind)(?:$|[._])",
+            relation,
+        ):
+            return True
+        if (
+            from_role in counted_role_tokens
+            and to_role in {"anchor", "anchor_a", "anchor_b"}
+            and re.search(r"(?:^|[._])(type|category|class|kind)(?:$|[._])", relation)
+        ):
+            return True
+        if {from_role, to_role} & {"type_set", "shared_type"} and counted_role_tokens & {
+            "type_set",
+            "shared_type",
+        }:
+            return True
+    return False
+
+
+def _count_plan_relation_semantically_implies_type_like_target(
+    *,
+    query_plan: Mapping[str, Any],
+    answer_target_phrase: str,
+    query_text: str,
+) -> bool:
+    qualifier_tokens = _extract_type_like_answer_target_qualifier_tokens(
+        answer_target_phrase
+    )
+    if not qualifier_tokens:
+        return False
+
+    relation_paths = [
+        relation_path
+        for relation_path in (query_plan.get("relation_paths") or [])
+        if isinstance(relation_path, Mapping)
+    ]
+    counted_variables = _extract_count_aggregate_variables(query_text)
+    count_set_token = _normalize_contract_token(query_plan.get("count_set_variable"))
+    candidate_set_token = _normalize_contract_token(query_plan.get("candidate_set_variable"))
+    counted_role_tokens = {
+        token
+        for token in [*counted_variables, count_set_token, candidate_set_token]
+        if token
+    }
+    if not counted_role_tokens:
+        counted_role_tokens = {"candidate_set", "count_set", "shared_answer", "answer"}
+
+    for relation_path in relation_paths:
+        from_role = _normalize_contract_role(relation_path.get("from_role"))
+        to_role = _normalize_contract_role(relation_path.get("to_role"))
+        from_token = _normalize_contract_token(relation_path.get("from"))
+        to_token = _normalize_contract_token(relation_path.get("to"))
+        touches_counted_set = bool(
+            {from_role, to_role} & {"candidate_set", "count_set", "shared_answer", "answer"}
+            or {from_token, to_token} & counted_role_tokens
+        )
+        if not touches_counted_set:
+            continue
+        haystack = " ".join(
+            str(relation_path.get(field) or "").lower()
+            for field in ("relation", "from", "to", "from_role", "to_role", "support", "use_when")
+        )
+        if any(token and token in haystack for token in qualifier_tokens):
+            return True
+    return False
+
+
+def _count_plan_semantically_enforces_answer_target(
+    *,
+    query_plan: Mapping[str, Any],
+    answer_target_phrase: str,
+    query_text: str = "",
+) -> bool:
+    relation_paths = list(query_plan.get("relation_paths") or [])
+    anchored_entities = list(query_plan.get("anchored_entities") or [])
+    query_shape = str(query_plan.get("query_shape") or "").strip().lower()
+    strategy = str(query_plan.get("strategy") or "").strip().lower()
+    head_token = _extract_answer_target_head_token(answer_target_phrase)
+    if not head_token:
+        return True
+    if _answer_target_is_type_like(answer_target_phrase):
+        return _count_plan_counts_type_like_target(
+            query_plan=query_plan,
+            query_text=query_text,
+        ) or _count_plan_relation_semantically_implies_type_like_target(
+            query_plan=query_plan,
+            answer_target_phrase=answer_target_phrase,
+            query_text=query_text,
+        )
+    if (
+        query_shape == "count_over_direct_relation"
+        and "relation-selection hint" in strategy
+        and any(
+            isinstance(relation_path, Mapping)
+            and str(relation_path.get("direction") or "").strip().lower() == "forward"
+            and _normalize_contract_role(relation_path.get("from_role"))
+            in {"anchor", "anchor_a", "anchor_b"}
+            and _normalize_contract_role(relation_path.get("to_role"))
+            in {"count_set", "candidate_set", "shared_answer", "answer"}
+            for relation_path in relation_paths
+        )
+    ):
+        return True
+
+    for anchored_entity in anchored_entities:
+        if not isinstance(anchored_entity, Mapping):
+            continue
+        role = _normalize_contract_role(anchored_entity.get("role"))
+        if role in {"type_set", "shared_type"}:
+            return True
+
+    for relation_path in relation_paths:
+        if not isinstance(relation_path, Mapping):
+            continue
+        from_role = _normalize_contract_role(relation_path.get("from_role"))
+        to_role = _normalize_contract_role(relation_path.get("to_role"))
+        if {"type_set", "shared_type"} & {from_role, to_role}:
+            return True
+        haystack = " ".join(
+            [
+                str(relation_path.get("relation") or "").lower(),
+                str(relation_path.get("from") or "").lower(),
+                str(relation_path.get("to") or "").lower(),
+            ]
+        )
+        if head_token and head_token in haystack:
+            return True
+    return False
+
+
+def _answer_target_implies_singleton_entity(answer_target_phrase: str) -> bool:
+    tokens = [
+        _singularize_token(token)
+        for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
+        if token.strip()
+    ]
+    if not tokens:
+        return False
+    singleton_markers = {
+        "last",
+        "first",
+        "latest",
+        "earliest",
+        "oldest",
+        "youngest",
+        "highest",
+        "lowest",
+        "longest",
+        "shortest",
+        "largest",
+        "smallest",
+        "biggest",
+        "farthest",
+        "furthest",
+        "nearest",
+        "closest",
+        "most",
+        "least",
+        "best",
+        "worst",
+        "final",
+        "top",
+    }
+    return any(token in singleton_markers for token in tokens)
 def _query_pins_resolved_anchor_entity(
     *,
     query_text: str,
@@ -1190,6 +2032,16 @@ def _count_query_has_unplanned_dynamic_type_filter(
     )
 
 
+def _count_query_has_explicit_type_name_filter(query_text: str) -> bool:
+    return bool(
+        re.search(r"\bfb:type\.object\.type\b", query_text)
+        and (
+            re.search(r"\bfb:type\.object\.name\b", query_text)
+            or re.search(r"\bfb:common\.topic\.alias\b", query_text)
+        )
+    )
+
+
 def _has_dynamic_only_count_relation_paths(
     relation_paths: Sequence[Any],
 ) -> bool:
@@ -1205,6 +2057,119 @@ def _has_dynamic_only_count_relation_paths(
         for relation_path in normalized_paths
     }
     return bool(grounding_sources) and grounding_sources <= {"dynamic_probe", "exploratory"}
+
+
+def _can_accept_pinned_semantic_dynamic_count(
+    *,
+    query_plan: Mapping[str, Any],
+    query_text: str,
+    scalar_count: int | None,
+    ambiguous_low_support_dynamic_count: Sequence[AnchorProbeResult],
+) -> bool:
+    if scalar_count is None or scalar_count <= 0:
+        return False
+    relation_paths = [
+        relation_path
+        for relation_path in (query_plan.get("relation_paths") or [])
+        if isinstance(relation_path, Mapping)
+    ]
+    if len(relation_paths) < 2:
+        return False
+    if any(
+        str(relation_path.get("grounding_source") or "").strip().lower() == "exploratory"
+        for relation_path in relation_paths
+    ):
+        return False
+    answer_target_phrase = str(query_plan.get("answer_target_phrase") or "").strip()
+    if (
+        _count_answer_target_requires_explicit_semantics(answer_target_phrase)
+        and not _count_plan_semantically_enforces_answer_target(
+            query_plan=query_plan,
+            answer_target_phrase=answer_target_phrase,
+            query_text=query_text,
+        )
+    ):
+        return False
+    if _plan_uses_only_generic_type_relations(relation_paths):
+        return False
+    if _has_type_constraint_relation(relation_paths):
+        return False
+    count_set_variable = str(query_plan.get("count_set_variable") or "").strip()
+    query_shape = str(query_plan.get("query_shape") or "").strip().lower()
+    candidate_roles = {
+        _normalize_contract_role(relation_path.get("from_role"))
+        for relation_path in relation_paths
+    } | {
+        _normalize_contract_role(relation_path.get("to_role"))
+        for relation_path in relation_paths
+    }
+    has_structural_terminal_count_set = (
+        query_shape == "count_over_joined_set"
+        and "candidate_set" in candidate_roles
+        and "count_set" in candidate_roles
+        and _count_set_token_is_structural(count_set_variable, relation_paths)
+    )
+    if not (
+        ({"candidate_set", "count_set"} & candidate_roles and "answer" in candidate_roles)
+        or has_structural_terminal_count_set
+    ):
+        return False
+    return bool(ambiguous_low_support_dynamic_count)
+
+
+def _can_accept_exact_grounded_zero_joined_count(
+    *,
+    query_plan: Mapping[str, Any],
+    query_text: str,
+    anchor_probe_results: Sequence[AnchorProbeResult],
+) -> bool:
+    relation_paths = [
+        relation_path
+        for relation_path in (query_plan.get("relation_paths") or [])
+        if isinstance(relation_path, Mapping)
+    ]
+    if len(relation_paths) < 2:
+        return False
+    query_shape = str(query_plan.get("query_shape") or "").strip().lower()
+    if query_shape != "count_over_joined_set":
+        return False
+    grounded_sources = {
+        str(relation_path.get("grounding_source") or "").strip().lower()
+        for relation_path in relation_paths
+    }
+    if not grounded_sources:
+        return False
+    if grounded_sources - {"curated", "dynamic_probe"}:
+        return False
+    if _plan_uses_only_generic_type_relations(relation_paths):
+        return False
+    if _has_type_constraint_relation(relation_paths):
+        return False
+    answer_target_phrase = str(query_plan.get("answer_target_phrase") or "").strip()
+    if (
+        _count_answer_target_requires_explicit_semantics(answer_target_phrase)
+        and not _count_plan_semantically_enforces_answer_target(
+            query_plan=query_plan,
+            answer_target_phrase=answer_target_phrase,
+            query_text=query_text,
+        )
+    ):
+        return False
+    count_set_variable = str(query_plan.get("count_set_variable") or "").strip()
+    if not _count_set_token_is_structural(count_set_variable, relation_paths):
+        return False
+    if len(anchor_probe_results) < 2:
+        return False
+    for probe_result in anchor_probe_results:
+        resolved_entity_id = str(probe_result.resolved_entity_id or "").strip()
+        if not resolved_entity_id:
+            return False
+        if not _query_pins_resolved_anchor_entity(
+            query_text=query_text,
+            resolved_entity_id=resolved_entity_id,
+        ):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +2302,17 @@ def build_repair_feedback(verdict: PlausibilityVerdict) -> list[str]:
             "repair_hint:use_only_fb_predicates — every predicate in the WHERE clause MUST use the fb: prefix (http://rdf.freebase.com/ns/). Do not use schema:, owl:, rdfs: (except rdfs:label), wikidata:, or dbpedia: predicates",
         ]
 
+    elif verdict.verdict == VERDICT_REJECTED_DANGEROUS_OVERREACH:
+        feedback += [
+            "plausibility_feedback:dangerous_overreach — the result is executable but structurally broader, clipped, or less semantically constrained than the question requires",
+            "repair_hint:do_not_materialize_broad_or_clipped_outputs — keep the family constraints intact and tighten the counted or projected set before accepting a result",
+        ]
+        feedback += [
+            f"plausibility_feedback:{reason}"
+            for reason in verdict.reasons
+            if str(reason or "").strip()
+        ]
+
     elif verdict.verdict == VERDICT_REJECTED_UNBOUNDED:
         feedback += [
             "plausibility_feedback:unbounded_exploration — query performs unguarded graph traversal without anchor constraints",
@@ -1372,7 +2348,7 @@ def _detect_unsupported_predicates(query_text: str) -> list[str]:
 
 def _find_missing_anchor_literals(
     query_text: str,
-    entities: Sequence[str],
+    entities: Sequence[Any],
     *,
     anchor_probe_results: Sequence[AnchorProbeResult] | None = None,
 ) -> list[str]:
@@ -1381,14 +2357,20 @@ def _find_missing_anchor_literals(
     missing: list[str] = []
     probe_results = list(anchor_probe_results or [])
     for idx, entity in enumerate(entities):
-        surface = str(entity or "").strip()
+        if isinstance(entity, (tuple, list)) and entity:
+            surface = str(entity[0] or "").strip()
+            resolved_entity_id = str(entity[1] or "").strip() if len(entity) > 1 else ""
+        else:
+            surface = str(entity or "").strip()
+            resolved_entity_id = ""
         if not surface:
             continue
-        resolved_entity_id = ""
         if idx < len(probe_results):
-            resolved_entity_id = str(
+            probed_resolved_id = str(
                 getattr(probe_results[idx], "resolved_entity_id", "") or ""
             ).strip()
+            if probed_resolved_id:
+                resolved_entity_id = probed_resolved_id
         found = _query_mentions_anchor_binding(
             query_text=qt,
             literal=surface,

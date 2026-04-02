@@ -43,6 +43,8 @@ from src.callbacks import (
 ENABLE_POST_TASK_REFLECTION = False
 ENABLE_PAL_AGENT = os.environ.get("ENABLE_PAL_AGENT") == "1"
 PAL_AGENT_NAME = "pal_agent_controller"
+PAL_AGENT_MAX_COMPLETION_TOKENS_ENV = "PAL_AGENT_MAX_COMPLETION_TOKENS"
+PAL_AGENT_REASONING_EFFORT_ENV = "PAL_AGENT_REASONING_EFFORT"
 PAL_AGENT_COMPONENT_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "configs",
@@ -58,62 +60,522 @@ _HTML_TRACE_TEMPLATE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Trace Viewer</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',Consolas,monospace;display:flex;height:100vh;overflow:hidden;background:#1a1a2e;color:#e0e0e0}
-#sidebar{width:260px;overflow-y:auto;background:#16213e;border-right:1px solid #0f3460;flex-shrink:0}
-#sidebar h2{padding:12px 16px;font-size:13px;color:#a0a0b0;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid #0f3460;position:sticky;top:0;background:#16213e;z-index:1}
-.si{padding:10px 14px;cursor:pointer;border-bottom:1px solid #0f3460;transition:background .15s}
-.si:hover{background:#0f3460}.si.active{background:#0f3460;border-left:3px solid #e94560}
-.si .idx{font-size:11px;color:#808090}.si .oc{font-size:12px;font-weight:bold;margin-top:2px}
-.oc-correct{color:#4caf50}.oc-incorrect{color:#e94560}.oc-unset{color:#9e9e9e}
-#main{flex:1;overflow-y:auto;padding:20px}
-.hdr{display:flex;gap:12px;align-items:center;margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid #0f3460;flex-wrap:wrap}
-.badge{padding:3px 9px;border-radius:4px;font-size:12px;font-weight:bold}
-.bc{background:#1b5e20;color:#a5d6a7}.bi{background:#b71c1c;color:#ffcdd2}.bu{background:#37474f;color:#b0bec5}
-.meta{font-size:12px;color:#808090}
-.sec{margin-bottom:18px}.stitle{font-size:11px;color:#808090;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
-.turn{margin-bottom:10px}.turn-user{display:flex}.turn-agent{display:flex;flex-direction:row-reverse}
-.bubble{max-width:88%;padding:9px 13px;border-radius:8px;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
-.turn-user .bubble{background:#0f3460;color:#d0d8f0;border-bottom-left-radius:2px}
-.turn-agent .bubble{background:#1a3a1a;color:#c8e6c9;border-bottom-right-radius:2px}
-.tlabel{font-size:10px;color:#606070;margin:2px 4px;align-self:flex-end}
-.abox{background:#0f2a3a;border:1px solid #1565c0;border-radius:6px;padding:10px;font-family:monospace;font-size:12px;margin-top:4px;white-space:pre-wrap;word-break:break-word}
-.ebox{background:#1a2a0a;border:1px solid #2e7d32;border-radius:6px;padding:10px;font-family:monospace;font-size:12px;margin-top:4px;white-space:pre-wrap;word-break:break-word}
-#empty{display:flex;align-items:center;justify-content:center;height:100%;color:#505060;font-size:18px}
-</style></head><body>
-<div id="sidebar"><h2>Sessions (<span id="cnt">0</span>)</h2><div id="sl"></div></div>
+body{font-family:'Segoe UI',system-ui,sans-serif;display:flex;height:100vh;overflow:hidden;background:#12121f;color:#dde1f0}
+
+/* ── Sidebar ── */
+#sidebar{width:288px;overflow:hidden;background:#161626;border-right:1px solid #252540;flex-shrink:0;display:flex;flex-direction:column}
+#sb-head{padding:12px 14px 10px;background:#161626;border-bottom:1px solid #252540;flex-shrink:0}
+#sb-title{font-size:11px;color:#6870a0;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:8px}
+#sb-stats{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+.stat-pill{padding:2px 9px;border-radius:12px;font-size:11px;font-weight:600}
+.sp-c{background:#162a1a;color:#6fcf7c;border:1px solid #2a5c35}
+.sp-i{background:#2a1616;color:#f07070;border:1px solid #5c2a2a}
+.sp-u{background:#1e1e35;color:#8890a8;border:1px solid #252540}
+#sb-search{width:100%;padding:6px 10px;background:#1a1a2e;border:1px solid #252540;border-radius:6px;color:#dde1f0;font-size:12px;outline:none;margin-bottom:8px}
+#sb-search:focus{border-color:#4d6aff}
+#sb-search::placeholder{color:#44445a}
+#sb-filters{display:flex;gap:4px;flex-wrap:wrap}
+.flt{padding:3px 9px;border-radius:12px;font-size:11px;cursor:pointer;border:1px solid #252540;background:transparent;color:#6870a0;transition:all .12s}
+.flt.active,.flt:hover{background:#1e2240;color:#dde1f0;border-color:#4d6aff}
+#sl{overflow-y:auto;flex:1}
+.si{padding:10px 14px;cursor:pointer;border-bottom:1px solid #1a1a2e;transition:background .12s}
+.si:hover{background:#1a1a2e}
+.si.active{background:#1a2240;border-left:3px solid #4d6aff}
+.si-row1{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.si-idx{font-size:11px;color:#6870a0}
+.si-badges{display:flex;gap:4px;align-items:center}
+.si-oc{font-size:11px;font-weight:700}
+.oc-correct{color:#6fcf7c}.oc-incorrect{color:#f07070}.oc-unset{color:#8890a8}
+.si-pal{font-size:9px;background:#0d1e30;color:#5ba8ff;border:1px solid #1d4060;border-radius:3px;padding:1px 5px;letter-spacing:.5px}
+.si-q{font-size:11px;color:#6878a0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ── Main panel ── */
+#main{flex:1;overflow-y:auto;padding:22px 28px}
+#empty{display:flex;align-items:center;justify-content:center;height:100%;color:#2a2a4a;font-size:18px}
+
+/* ── Answer summary card ── */
+.ans-card{border-radius:10px;padding:16px 20px;margin-bottom:20px;border:1px solid}
+.ans-card.oc-correct{background:linear-gradient(135deg,#0a1810,#0d1622);border-color:#2a5c35}
+.ans-card.oc-incorrect{background:linear-gradient(135deg,#1a0a0a,#150c18);border-color:#5c2a2a}
+.ans-card.oc-unset{background:#161626;border-color:#252540}
+.ac-top{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.ac-outcome{font-size:17px;font-weight:700;letter-spacing:.3px}
+.ac-outcome.oc-correct{color:#6fcf7c}
+.ac-outcome.oc-incorrect{color:#f07070}
+.ac-outcome.oc-unset{color:#8890a8}
+.ac-f1{font-size:11px;color:#8890a8;background:#1a1a2e;padding:3px 8px;border-radius:4px}
+.ac-si{font-size:11px;color:#6870a0;margin-left:auto}
+.ac-q{font-size:14px;color:#dde1f0;line-height:1.55;margin-bottom:12px;font-weight:500}
+.ac-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.ac-box{background:#1a1a2e;border-radius:8px;padding:10px 14px}
+.ac-box-agent{border-left:3px solid #4d6aff}
+.ac-box-expected{border-left:3px solid #6fcf7c}
+.ac-box-label{font-size:9px;text-transform:uppercase;letter-spacing:1.2px;color:#44547a;margin-bottom:5px}
+.ac-box-val{font-size:13px;font-weight:600;color:#dde1f0;line-height:1.4}
+.ac-box-mid{font-size:10px;color:#44547a;margin-top:3px;font-family:monospace}
+
+/* ── Pipeline stage timeline ── */
+.stage-wrap{display:flex;align-items:flex-start;gap:0;margin-bottom:20px;overflow-x:auto;padding:4px 0 8px}
+.stage{display:flex;flex-direction:column;align-items:center;min-width:80px;max-width:96px}
+.stage-conn{height:2px;flex:1;min-width:10px;max-width:28px;margin-top:15px;flex-shrink:0}
+.stage-conn.s-done{background:linear-gradient(90deg,#4d6aff,#4d6aff)}
+.stage-conn.s-pending{background:#252540}
+.stage-dot{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;border:2px solid;margin-bottom:5px}
+.stage-dot.s-done{background:#0a1428;border-color:#4d6aff}
+.stage-dot.s-warn{background:#1e1408;border-color:#f0a030}
+.stage-dot.s-fail{background:#1e0808;border-color:#f07070}
+.stage-dot.s-neutral{background:#1a1a2e;border-color:#252540}
+.stage-lbl{font-size:10px;color:#8890a8;text-align:center;line-height:1.3}
+.stage-det{font-size:9px;color:#5ba8ff;text-align:center;margin-top:2px;line-height:1.3}
+.stage-det.s-warn{color:#f0a030}
+
+/* ── PAL execution summary ── */
+.pal-card{background:#0a1828;border:1px solid #1d3050;border-radius:8px;padding:14px 16px;margin-bottom:20px}
+.pal-card-title{font-size:10px;color:#5ba8ff;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:12px;display:flex;align-items:center;gap:6px}
+.pal-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.pal-stat{background:#0a1220;border-radius:6px;padding:9px 11px;border:1px solid #152030}
+.pal-stat-k{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:#3a5070;margin-bottom:4px}
+.pal-stat-v{font-size:13px;font-weight:600;color:#c8d8f0}
+.pal-stat-v.pv-good{color:#6fcf7c}
+.pal-stat-v.pv-empty{color:#f0a030}
+.pal-stat-v.pv-mono{font-family:monospace;font-size:12px}
+
+/* ── Conversation ── */
+.sec{margin-bottom:22px}
+.sec-title{font-size:10px;color:#44547a;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:10px}
+.turn{margin-bottom:8px;display:flex;gap:8px;align-items:flex-start}
+.turn-user{flex-direction:row}
+.turn-agent{flex-direction:row-reverse}
+.t-icon{width:26px;height:26px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:12px;margin-top:1px}
+.turn-user .t-icon{background:#1a2240;color:#5ba8ff}
+.turn-agent .t-icon{background:#142014;color:#6fcf7c}
+.t-body{max-width:88%;display:flex;flex-direction:column;gap:3px}
+.turn-agent .t-body{align-items:flex-end}
+.t-role{font-size:9px;color:#3a3a5a}
+.bubble{padding:8px 12px;border-radius:8px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;color:#c0c8e8}
+.turn-user .bubble{background:#181830;border:1px solid #252540}
+.turn-agent .bubble{background:#121c12;border:1px solid #1e2e1e;color:#b0d8b0}
+
+/* Prompt collapse */
+.prompt-hdr{background:#181830;border:1px solid #252540;border-radius:6px;padding:7px 12px;font-size:11px;color:#44547a;cursor:pointer;display:flex;align-items:center;gap:6px;user-select:none;width:100%}
+.prompt-hdr:hover{color:#8890a8}
+.prompt-body{display:none;margin-top:3px;background:#181830;border:1px solid #252540;border-radius:6px;padding:10px 12px;font-size:11px;color:#6878a0;white-space:pre-wrap;word-break:break-word;max-height:180px;overflow-y:auto;line-height:1.5}
+.prompt-body.open{display:block}
+
+/* Question block */
+.q-block{background:#181830;border:1px solid #252540;border-radius:8px;padding:10px 14px;border-left:3px solid #4d6aff}
+.q-lbl{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:#4d6aff;margin-bottom:4px}
+.q-text{font-size:13px;color:#dde1f0;line-height:1.5;font-weight:500}
+.q-ents{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}
+.ent-chip{background:#1a2a3a;border:1px solid #2a3a5a;border-radius:12px;padding:2px 8px;font-size:10px;color:#5ba8ff}
+
+/* Action chips */
+.act-chip{display:inline-flex;align-items:center;gap:5px;background:#0e1828;border:1px solid #1d2e40;border-radius:6px;padding:5px 10px;font-family:monospace;font-size:11px;color:#a8c4e0;max-width:100%}
+.act-fn{color:#7ab4ff;font-weight:600}
+.act-arg{color:#f0c060}
+.act-rel{color:#88d888;font-size:10px;word-break:break-all}
+.act-op{color:#c88af0}
+
+/* Bridge block */
+.bridge-block{background:#081828;border:1px solid #1d4060;border-radius:8px;padding:10px 14px;border-left:3px solid #5ba8ff}
+.bridge-top{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.bridge-title{font-size:12px;font-weight:600;color:#5ba8ff}
+.atype-chip{background:#0e2035;border:1px solid #1d4060;border-radius:4px;padding:1px 7px;font-size:10px;color:#7ab4ff}
+.bridge-rows{display:flex;flex-direction:column;gap:4px}
+.bridge-row{display:flex;gap:8px;font-size:11px;align-items:flex-start}
+.bk{color:#3a5070;min-width:56px;flex-shrink:0}
+.bv{color:#c0d0e8;font-family:monospace;word-break:break-all}
+
+/* Final answer block */
+.final-block{background:#0a1c0a;border:1px solid #2a5c35;border-radius:8px;padding:9px 14px;border-left:3px solid #6fcf7c;display:flex;align-items:center;gap:10px}
+.final-icon{font-size:15px}
+.final-text{font-size:13px;font-weight:600;color:#6fcf7c}
+
+/* Observation block */
+.obs-block{background:#161620;border:1px solid #222230;border-radius:6px;padding:8px 12px;width:100%}
+.obs-act{font-size:10px;color:#44547a;margin-bottom:4px;font-family:monospace}
+.obs-body{font-size:11px;color:#7880a0;white-space:pre-wrap;word-break:break-word;max-height:90px;overflow:hidden;line-height:1.4}
+.obs-more{font-size:10px;color:#4d6aff;cursor:pointer;margin-top:3px;display:inline-block}
+.obs-body.expanded{max-height:none}
+
+/* Macro result */
+.macro-res{padding:6px 12px;border-radius:6px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+.macro-ok{background:#0a1c0a;color:#6fcf7c;border:1px solid #2a5c35}
+.macro-fail{background:#1c0a0a;color:#f07070;border:1px solid #5c2a2a}
+
+/* Ack chip */
+.ack{background:#1a1a2e;color:#44547a;padding:4px 10px;border-radius:4px;font-size:11px;display:inline-block}
+</style></head>
+<body>
+<div id="sidebar">
+  <div id="sb-head">
+    <div id="sb-title">Sessions <span id="cnt"></span></div>
+    <div id="sb-stats"></div>
+    <input id="sb-search" type="search" placeholder="\u2315  Search questions\u2026">
+    <div id="sb-filters">
+      <button class="flt active" data-f="all">All</button>
+      <button class="flt" data-f="correct">\u2705 Correct</button>
+      <button class="flt" data-f="incorrect">\u274c Incorrect</button>
+      <button class="flt" data-f="pal">\U0001f309 PAL</button>
+    </div>
+  </div>
+  <div id="sl"></div>
+</div>
 <div id="main"><div id="empty">\u2190 Select a session</div></div>
 <script>
 const logData=/*LOG_DATA_PLACEHOLDER*/;
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+const STATE_KEY='traceViewerState:'+location.pathname;
+const KG_PROMPT_PFX="You are an intelligent agent tasked with answering questions by querying a knowledge base.";
+
+// ── Utilities ──────────────────────────────────────────────────────────────
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function ocClass(o){return o==='correct'?'correct':o==='incorrect'?'incorrect':'unset';}
-function badge(o){const c=ocClass(o);return`<span class="badge b${c[0]}">${esc(o||'unset')}</span>`;}
-(function buildSidebar(){
-  document.getElementById('cnt').textContent=logData.length;
-  document.getElementById('sl').innerHTML=logData.map((s,i)=>{
+function readState(){try{return JSON.parse(localStorage.getItem(STATE_KEY)||'{}')||{};}catch{return{};}}
+function writeState(p){try{const c=readState();localStorage.setItem(STATE_KEY,JSON.stringify({...c,...p}));}catch{}}
+function findIdx(si){const t=String(si??'').trim();return logData.findIndex(s=>String(s.sample_index??'').trim()===t);}
+function readHashSI(){const p='#sample=';if(!location.hash.startsWith(p))return'';try{return decodeURIComponent(location.hash.slice(p.length));}catch{return location.hash.slice(p.length);}}
+function setHash(si){const t='#sample='+encodeURIComponent(String(si??''));if(location.hash!==t)history.replaceState(null,'',t);}
+function persistScroll(){writeState({sTop:document.getElementById('sidebar')?.scrollTop||0,mTop:document.getElementById('main')?.scrollTop||0});}
+function restoreScroll(){const st=readState();const sb=document.getElementById('sidebar');const m=document.getElementById('main');if(sb&&st.sTop!=null)sb.scrollTop=st.sTop;if(m&&st.mTop!=null)m.scrollTop=st.mTop;}
+
+// ── Data helpers ───────────────────────────────────────────────────────────
+function hasBridge(s){return(s.chat_history?.value||[]).some(t=>(t.content||'').includes('pal_benchmark_bridge_macro'));}
+function extractQuestion(turns){
+  for(const t of turns){
+    if(t.role!=='user')continue;
+    const m=(t.content||'').match(/Question:\\s*(.*?)(?=,\\s*Entities:|$)/s);
+    if(m)return m[1].trim();
+  }
+  return null;
+}
+function parseBridgePayload(turns){
+  for(const t of turns){
+    const c=t.content||'';
+    if(!c.includes('pal_benchmark_bridge_macro'))continue;
+    const m=c.match(/execute_macro\\([^,]+,\\s*(\\{[\\s\\S]*\\})\\)/);
+    if(m){try{return JSON.parse(m[1]);}catch{}}
+    break;
+  }
+  return null;
+}
+
+// ── 1. Pipeline stage timeline ─────────────────────────────────────────────
+function buildStages(s){
+  const turns=s.chat_history?.value||[];
+  const outcome=s.evaluation_record?.outcome||'unset';
+  const pal=hasBridge(s);
+  const ansIcon=outcome==='correct'?'\\u2705':outcome==='incorrect'?'\\u274c':'\\u2014';
+  const ansStatus=outcome==='correct'?'s-done':outcome==='incorrect'?'s-fail':'s-neutral';
+  const ansStage={label:'Answer',icon:ansIcon,status:ansStatus};
+  if(pal){
+    const p=parseBridgePayload(turns);
+    const diag=p?.pal_artifact_diagnostics||{};
+    const bcount=diag.binding_count??null;
+    const atype=p?.pal_artifact_type||'';
+    const execOk=bcount==null||bcount>0;
+    return[
+      {label:'Task Received',icon:'📥',status:'s-done'},
+      {label:'Query Planning',icon:'🧠',status:'s-done'},
+      {label:'Code & Validate',icon:'\\u2699\\ufe0f',status:'s-done'},
+      {label:'SPARQL Execution',icon:'🔍',status:execOk?'s-done':'s-warn',detail:bcount!=null?bcount+' result'+(bcount===1?'':'s'):''},
+      {label:'Bridge',icon:'🌉',status:'s-done',detail:atype},
+      ansStage,
+    ];
+  }else{
+    const acts=turns.filter(t=>t.role==='agent'&&/^Action:\\s/.test((t.content||'').trim()));
+    return[
+      {label:'Task Received',icon:'📥',status:'s-done'},
+      {label:'Tool Calls',icon:'🔧',status:acts.length?'s-done':'s-warn',detail:acts.length+' action'+(acts.length===1?'':'s')},
+      ansStage,
+    ];
+  }
+}
+function renderStageTimeline(stages){
+  const parts=[];
+  stages.forEach((st,i)=>{
+    parts.push(`<div class="stage">
+      <div class="stage-dot ${esc(st.status)}">${st.icon}</div>
+      <div class="stage-lbl">${esc(st.label)}</div>
+      ${st.detail?`<div class="stage-det ${st.status==='s-warn'?'s-warn':''}">${esc(st.detail)}</div>`:''}
+    </div>`);
+    if(i<stages.length-1){
+      const conn=stages.slice(0,i+1).every(x=>x.status!=='s-neutral')?'s-done':'s-pending';
+      parts.push(`<div class="stage-conn ${conn}"></div>`);
+    }
+  });
+  return`<div class="stage-wrap">${parts.join('')}</div>`;
+}
+
+// ── 3. Answer summary card ─────────────────────────────────────────────────
+function renderAnswerCard(s){
+  const turns=s.chat_history?.value||[];
+  const outcome=s.evaluation_record?.outcome||'unset';
+  const oc=ocClass(outcome);
+  const f1=s.evaluation_record?.detail_dict?.f1_score;
+  const f1s=f1!=null?Number(f1).toFixed(3):'N/A';
+  const question=extractQuestion(turns)||'(no question found)';
+  const agentRaw=s.task_output?.answer!=null?String(s.task_output.answer):'\\u2014';
+  const expList=s.expected_answer?.answer_list||[];
+  const expNames=s.expected_answer?.answer_name_list||[];
+  // Resolve agent answer to human-readable name if possible
+  let agentDisplay=agentRaw;
+  if(agentRaw!=='\\u2014'){
+    const parts=agentRaw.split('<SEP>');
+    agentDisplay=parts.map(mid=>{const i=expList.indexOf(mid);return(i>=0&&expNames[i])?expNames[i]:mid;}).join(', ');
+  }
+  const expDisplay=expNames.length?expNames.join(', '):expList.join(', ')||'\\u2014';
+  const expMids=expList.join(', ');
+  const ocLabel=outcome==='correct'?'\\u2705  CORRECT':outcome==='incorrect'?'\\u274c  INCORRECT':'\\u2014  UNSET';
+  return`<div class="ans-card oc-${esc(oc)}">
+    <div class="ac-top">
+      <span class="ac-outcome oc-${esc(oc)}">${ocLabel}</span>
+      <span class="ac-f1">F1: ${esc(f1s)}</span>
+      <span class="ac-si">Sample #${esc(s.sample_index)}</span>
+    </div>
+    <div class="ac-q">${esc(question)}</div>
+    <div class="ac-row">
+      <div class="ac-box ac-box-agent">
+        <div class="ac-box-label">Agent Answer</div>
+        <div class="ac-box-val">${esc(agentDisplay)}</div>
+        ${agentDisplay!==agentRaw&&agentRaw!=='\\u2014'?`<div class="ac-box-mid">${esc(agentRaw)}</div>`:''}
+      </div>
+      <div class="ac-box ac-box-expected">
+        <div class="ac-box-label">Expected Answer</div>
+        <div class="ac-box-val">${esc(expDisplay)}</div>
+        ${expMids&&expMids!==expDisplay?`<div class="ac-box-mid">${esc(expMids)}</div>`:''}
+      </div>
+    </div>
+  </div>`;
+}
+
+// ── 4. PAL execution summary (repair loop details) ─────────────────────────
+function renderPalDetails(s){
+  const turns=s.chat_history?.value||[];
+  const p=parseBridgePayload(turns);
+  if(!p)return'';
+  const atype=p.pal_artifact_type||'\\u2014';
+  const aval=p.pal_artifact_value;
+  const avalStr=Array.isArray(aval)?aval.join(', '):String(aval??'\\u2014');
+  const diag=p.pal_artifact_diagnostics||{};
+  const bcount=diag.binding_count;
+  const bcountStr=bcount!=null?String(bcount):'\\u2014';
+  const bcountClass=bcount==null?'':bcount>0?'pv-good':'pv-empty';
+  const selvar=diag.selected_var||'\\u2014';
+  const normcount=diag.normalized_value_count;
+  const normStr=normcount!=null?String(normcount):'\\u2014';
+  return`<div class="pal-card">
+    <div class="pal-card-title">🌉 PAL Execution Details</div>
+    <div class="pal-grid">
+      <div class="pal-stat"><div class="pal-stat-k">Artifact Type</div><div class="pal-stat-v">${esc(atype)}</div></div>
+      <div class="pal-stat"><div class="pal-stat-k">SPARQL Bindings</div><div class="pal-stat-v ${bcountClass}">${esc(bcountStr)}</div></div>
+      <div class="pal-stat"><div class="pal-stat-k">Answer Variable</div><div class="pal-stat-v pv-mono">${esc(selvar)}</div></div>
+      <div class="pal-stat"><div class="pal-stat-k">Normalized Count</div><div class="pal-stat-v">${esc(normStr)}</div></div>
+      <div class="pal-stat" style="grid-column:span 2"><div class="pal-stat-k">Raw Value</div><div class="pal-stat-v pv-mono" style="font-size:11px">${esc(avalStr)}</div></div>
+    </div>
+  </div>`;
+}
+
+// ── 2. Smart turn rendering ────────────────────────────────────────────────
+let _obsId=0;
+function renderTurnContent(t,ti){
+  const c=String(t.content??'');
+  const role=t.role;
+
+  // System prompt: collapse by default
+  if(ti===0&&c.startsWith(KG_PROMPT_PFX)){
+    const id='p'+ti+'_'+(++_obsId);
+    return`<div class="prompt-hdr" onclick="document.getElementById('${id}').classList.toggle('open')">
+      📋 Task Instructions &nbsp;\\u25be (click to expand)
+    </div><div class="prompt-body" id="${id}">${esc(c)}</div>`;
+  }
+
+  // Agent acknowledgment
+  if(role==='agent'&&c.trim()==='OK.') return`<span class="ack">\\u2713 Agent ready</span>`;
+
+  // Question turn
+  if(role==='user'){
+    const qm=c.match(/^Question:\\s*(.*?)(?=,\\s*Entities:|$)/s);
+    if(qm){
+      const em=c.match(/Entities:\\s*\\[([^\\]]*)\\]/);
+      const ents=em?em[1].split(',').map(e=>e.trim().replace(/['"]/g,'')).filter(Boolean):[];
+      return`<div class="q-block">
+        <div class="q-lbl">\\u2753 Question</div>
+        <div class="q-text">${esc(qm[1].trim())}</div>
+        ${ents.length?`<div class="q-ents">${ents.map(e=>`<span class="ent-chip">${esc(e)}</span>`).join('')}</div>`:''}
+      </div>`;
+    }
+  }
+
+  // PAL bridge macro call
+  if(c.includes('pal_benchmark_bridge_macro')){
+    const pm=c.match(/execute_macro\\([^,]+,\\s*(\\{[\\s\\S]*\\})\\)/);
+    let atype='',aval='',src='';
+    if(pm){try{const p=JSON.parse(pm[1]);atype=p.pal_artifact_type||'';aval=JSON.stringify(p.pal_artifact_value);src=p.pal_artifact_source||'';}catch{}}
+    return`<div class="bridge-block">
+      <div class="bridge-top">
+        <span style="font-size:16px">🌉</span>
+        <span class="bridge-title">PAL Benchmark Bridge</span>
+        ${atype?`<span class="atype-chip">${esc(atype)}</span>`:''}
+      </div>
+      <div class="bridge-rows">
+        <div class="bridge-row"><span class="bk">Value</span><span class="bv">${esc(aval)}</span></div>
+        ${src?`<div class="bridge-row"><span class="bk">Source</span><span class="bv">${esc(src)}</span></div>`:''}
+      </div>
+    </div>`;
+  }
+
+  // Final Answer
+  const fam=c.match(/Final\\s+Answer:\\s*#(\\d+)/i);
+  if(fam) return`<div class="final-block"><span class="final-icon">\\u2705</span><span class="final-text">Final Answer: Variable #${esc(fam[1])}</span></div>`;
+
+  // Macro result observation
+  if(role==='user'&&c.includes('Macro result:')){
+    const sm=c.match(/Macro result:\\s*(\\S+)\\s*->\\s*(\\w+)/);
+    const vm=c.match(/Final variable:\\s*(#\\d+)/);
+    if(sm){
+      const ok=sm[2]==='SUCCESS';
+      return`<div class="macro-res ${ok?'macro-ok':'macro-fail'}">${ok?'\\u2713':'\\u2717'} ${esc(sm[1])} \\u2192 ${esc(sm[2])}${vm?` &nbsp;\\u00b7&nbsp; stored as <strong>${esc(vm[1])}</strong>`:''}</div>`;
+    }
+  }
+
+  // Action: get_relations
+  const relm=c.match(/^Action:\\s*get_relations\\((.+)\\)\\s*$/);
+  if(relm) return`<div class="act-chip">🔍 <span class="act-fn">get_relations</span>(<span class="act-arg">${esc(relm[1])}</span>)</div>`;
+
+  // Action: get_neighbors
+  const nbm=c.match(/^Action:\\s*get_neighbors\\((.+?),\\s*(.+)\\)\\s*$/);
+  if(nbm) return`<div class="act-chip">\\u2192 <span class="act-fn">get_neighbors</span>(<span class="act-arg">${esc(nbm[1])}</span>, <span class="act-rel">${esc(nbm[2])}</span>)</div>`;
+
+  // Action: intersection / count / argmax / argmin
+  const opm=c.match(/^Action:\\s*(intersection|count|argmax|argmin)\\((.*)\\)\\s*$/i);
+  if(opm){
+    const icons={intersection:'\\u2229',count:'#',argmax:'\\u2191 max',argmin:'\\u2193 min'};
+    const ic=icons[opm[1].toLowerCase()]||'';
+    return`<div class="act-chip"><span class="act-op">${ic}</span> <span class="act-fn">${esc(opm[1])}</span>(<span class="act-arg">${esc(opm[2])}</span>)</div>`;
+  }
+
+  // Observation / tool result (user turn matching [...] pattern)
+  if(role==='user'){
+    const om=c.match(/^\\[([^\\]]+)\\]\\s*([\\s\\S]*)/);
+    if(om){
+      const body=om[2].trim();
+      const id='obs'+(++_obsId);
+      const isLong=body.length>220;
+      return`<div class="obs-block">
+        <div class="obs-act">${esc(om[1])}</div>
+        <div class="obs-body" id="${id}">${esc(isLong?body.slice(0,220):body)}</div>
+        ${isLong?`<span class="obs-more" onclick="var e=document.getElementById('${id}');e.classList.toggle('expanded');this.textContent=e.classList.contains('expanded')?'show less':'show more'">show more</span>`:''}
+      </div>`;
+    }
+  }
+
+  // Default fallback
+  return`<div class="bubble">${esc(c)}</div>`;
+}
+
+// ── 5. Sidebar: build + filter + search ───────────────────────────────────
+let _filter='all';
+let _search='';
+
+function matchFilter(s){
+  if(_filter==='correct') return(s.evaluation_record?.outcome||'')==='correct';
+  if(_filter==='incorrect') return(s.evaluation_record?.outcome||'')==='incorrect';
+  if(_filter==='pal') return hasBridge(s);
+  return true;
+}
+function matchSearch(s){
+  if(!_search)return true;
+  const q=_search.toLowerCase();
+  const turns=s.chat_history?.value||[];
+  const question=extractQuestion(turns)||'';
+  return question.toLowerCase().includes(q)||String(s.sample_index||'').includes(q);
+}
+
+function buildSidebar(){
+  const correct=logData.filter(s=>(s.evaluation_record?.outcome||'')==='correct').length;
+  const incorrect=logData.filter(s=>(s.evaluation_record?.outcome||'')==='incorrect').length;
+  const unset=logData.length-correct-incorrect;
+  document.getElementById('cnt').textContent='('+logData.length+')';
+  document.getElementById('sb-stats').innerHTML=
+    `<span class="stat-pill sp-c">\\u2705 ${correct}</span>`+
+    `<span class="stat-pill sp-i">\\u274c ${incorrect}</span>`+
+    (unset?`<span class="stat-pill sp-u">\\u2014 ${unset}</span>`:'');
+  renderSidebarList();
+}
+
+function renderSidebarList(){
+  const visible=logData.map((s,i)=>({s,i})).filter(({s})=>matchFilter(s)&&matchSearch(s));
+  document.getElementById('sl').innerHTML=visible.map(({s,i})=>{
     const o=s.evaluation_record?.outcome||'unset';
-    return`<div class="si" onclick="show(${i})" id="i${i}"><div class="idx">Sample #${esc(s.sample_index)}</div><div class="oc oc-${ocClass(o)}">${esc(o.toUpperCase())}</div></div>`;
-  }).join('');
-})();
-function show(idx){
+    const pal=hasBridge(s);
+    const turns=s.chat_history?.value||[];
+    const q=extractQuestion(turns)||'';
+    const qShort=q.length>48?q.slice(0,45)+'\\u2026':q;
+    return`<div class="si" onclick="show(${i})" id="i${i}">
+      <div class="si-row1">
+        <span class="si-idx">Sample #${esc(s.sample_index)}</span>
+        <span class="si-badges">
+          ${pal?'<span class="si-pal">PAL</span>':''}
+          <span class="si-oc oc-${ocClass(o)}">${o.toUpperCase()}</span>
+        </span>
+      </div>
+      <div class="si-q">${esc(qShort||'(no question)')}</div>
+    </div>`;
+  }).join('')||'<div style="padding:16px;color:#2a2a4a;font-size:12px">No matching sessions</div>';
+}
+
+// ── Main show ──────────────────────────────────────────────────────────────
+function show(idx,options={}){
+  _obsId=0;
   document.querySelectorAll('.si').forEach(e=>e.classList.remove('active'));
   const el=document.getElementById('i'+idx);if(el)el.classList.add('active');
   const s=logData[idx];
-  const o=s.evaluation_record?.outcome||'unset';
   const turns=s.chat_history?.value||[];
-  const tools=(s.tool_invoked||[]).filter(Boolean).join(', ')||'(none)';
-  const f1=s.evaluation_record?.detail_dict?.f1_score;
-  const f1s=f1!=null?Number(f1).toFixed(3):'N/A';
-  const turnsHtml=turns.map(t=>{
-    const r=t.role==='agent'?'agent':'user';
-    return`<div class="turn turn-${r}"><div class="bubble">${esc(t.content)}</div><div class="tlabel">${esc(t.role)}</div></div>`;
-  }).join('')||'<div style="color:#505060">No turns.</div>';
-  document.getElementById('main').innerHTML=`
-    <div class="hdr">${badge(o)}<span class="meta">Sample ${esc(s.sample_index)}</span><span class="meta">F1: ${esc(f1s)}</span><span class="meta">Status: ${esc(s.sample_status||'')}</span><span class="meta">Tool: <em>${esc(tools)}</em></span></div>
-    <div class="sec"><div class="stitle">Conversation (${turns.length} turns)</div>${turnsHtml}</div>
-    <div class="sec"><div class="stitle">Agent Answer</div><div class="abox">${esc(JSON.stringify(s.task_output,null,2))}</div></div>
-    <div class="sec"><div class="stitle">Expected Answer</div><div class="ebox">${esc(JSON.stringify(s.expected_answer,null,2))}</div></div>`;
+  const pal=hasBridge(s);
+  const stages=buildStages(s);
+  const turnsHtml=turns.map((t,ti)=>{
+    const role=t.role==='agent'?'agent':'user';
+    const icon=role==='agent'?'🤖':'👥';
+    return`<div class="turn turn-${role}">
+      <div class="t-icon">${icon}</div>
+      <div class="t-body">${renderTurnContent(t,ti)}<div class="t-role">${esc(t.role)}</div></div>
+    </div>`;
+  }).join('')||'<div style="color:#2a2a4a;font-size:12px">No turns recorded.</div>';
+  document.getElementById('main').innerHTML=
+    renderAnswerCard(s)+
+    renderStageTimeline(stages)+
+    (pal?renderPalDetails(s):'')+
+    `<div class="sec"><div class="sec-title">💬 Conversation (${turns.length} turns)</div>${turnsHtml}</div>`;
+  writeState({si:String(s.sample_index??''),selectedSampleIndex:String(s.sample_index??'')});
+  setHash(s.sample_index);
+  if(options.restoreScroll){requestAnimationFrame(restoreScroll);}
+  else{document.getElementById('main').scrollTop=0;persistScroll();}
 }
-if(logData.length>0)show(0);
+
+// ── Bootstrap ──────────────────────────────────────────────────────────────
+document.getElementById('sidebar').addEventListener('scroll',persistScroll,{passive:true});
+document.getElementById('main').addEventListener('scroll',persistScroll,{passive:true});
+window.addEventListener('beforeunload',persistScroll);
+document.querySelectorAll('.flt').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    _filter=btn.dataset.f;
+    document.querySelectorAll('.flt').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    renderSidebarList();
+  });
+});
+document.getElementById('sb-search').addEventListener('input',e=>{
+  _search=e.target.value.trim();
+  renderSidebarList();
+});
+buildSidebar();
+function initialIdx(){
+  const hi=findIdx(readHashSI());if(hi>=0)return hi;
+  const st=readState();
+  const si=findIdx(st.si)||findIdx(st.selectedSampleIndex);
+  return si>=0?si:0;
+}
+if(logData.length>0)show(initialIdx(),{restoreScroll:true});
 </script></body></html>"""
 
 
@@ -444,10 +906,24 @@ def _maybe_enable_pal_agent(raw_config: Mapping[str, Any]) -> dict[str, Any]:
     if language_model_name is None:
         raise ValueError("ENABLE_PAL_AGENT=1 requires an assignment language model.")
 
+    inference_config_override: dict[str, Any] = {}
+    raw_max_completion_tokens = os.environ.get(
+        PAL_AGENT_MAX_COMPLETION_TOKENS_ENV, ""
+    ).strip()
+    if raw_max_completion_tokens:
+        inference_config_override["max_completion_tokens"] = int(
+            raw_max_completion_tokens
+        )
+    raw_reasoning_effort = os.environ.get(
+        PAL_AGENT_REASONING_EFFORT_ENV, ""
+    ).strip()
+    if raw_reasoning_effort:
+        inference_config_override["reasoning_effort"] = raw_reasoning_effort
     updated_raw_config["assignment_config"]["agent"] = {
         "name": PAL_AGENT_NAME,
         "custom_parameters": {
             "language_model": language_model_name,
+            "inference_config_dict": inference_config_override,
         },
     }
     return updated_raw_config

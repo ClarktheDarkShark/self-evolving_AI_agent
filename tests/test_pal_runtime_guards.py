@@ -2,6 +2,9 @@ import json
 import pathlib
 import sys
 import time
+from urllib.error import URLError
+
+import pytest
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -12,13 +15,16 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 import run_all_with_servers as runner_script
+from scripts.evaluate_kg_family_regression import evaluate_family_regression
 from src.pal.kg_benchmark_adapter import (
     BenchmarkAdapterContext,
     PalExecutionArtifact,
+    assert_bridge_tool_code_narrow,
     build_pal_benchmark_bridge_tool_code,
     materialize_benchmark_artifact,
 )
 from src.pal.invoker import execute_pal_code_with_result
+from src.pal.invoker import _classify_invocation_exception
 
 
 def test_unresolved_artifact_is_not_bridge_materialized() -> None:
@@ -48,7 +54,9 @@ def test_unresolved_artifact_is_not_bridge_materialized() -> None:
 
 def test_bridge_tool_refuses_unresolved_artifact() -> None:
     namespace: dict[str, object] = {}
-    exec(build_pal_benchmark_bridge_tool_code(), namespace)
+    bridge_code = build_pal_benchmark_bridge_tool_code()
+    assert_bridge_tool_code_narrow(bridge_code)
+    exec(bridge_code, namespace)
 
     result = namespace["run"](
         {
@@ -60,6 +68,15 @@ def test_bridge_tool_refuses_unresolved_artifact() -> None:
 
     assert result["status"] == "ERROR"
     assert result["final_variable"] is None
+
+
+def test_bridge_tool_contract_rejects_retrieval_logic() -> None:
+    with pytest.raises(ValueError, match="bridge_tool_contract_violation"):
+        assert_bridge_tool_code_narrow(
+            "from SPARQLWrapper import SPARQLWrapper\n"
+            "def run(payload):\n"
+            "    return {'status': 'SUCCESS'}\n"
+        )
 
 
 def test_record_timed_out_current_session_appends_incorrect_session(tmp_path: pathlib.Path) -> None:
@@ -110,3 +127,57 @@ def solve(endpoint_url):
     assert result.failure_kind == "endpoint_timeout"
     assert str(result.error).startswith("execution_timed_out:")
     assert elapsed < 2.5
+
+
+def test_transport_exception_classifier_handles_urlerror() -> None:
+    failure_kind, diagnostics = _classify_invocation_exception(
+        URLError("temporary failure in name resolution"),
+        endpoint_url="http://127.0.0.1:3001/kb/sparql",
+    )
+
+    assert failure_kind == "transport_error"
+    assert diagnostics["endpoint_url"] == "http://127.0.0.1:3001/kb/sparql"
+
+
+def test_family_regression_evaluator_separates_tuning_and_held_out(tmp_path: pathlib.Path) -> None:
+    runs_path = tmp_path / "runs.json"
+    runs_path.write_text(
+        json.dumps(
+            [
+                {
+                    "sample_index": "11",
+                    "sample_status": "completed",
+                    "evaluation_record": {"outcome": "correct"},
+                },
+                {
+                    "sample_index": "15",
+                    "sample_status": "agent_unknown_error",
+                    "evaluation_record": {"outcome": "incorrect"},
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "families": {
+                    "count_over_direct_relation": {
+                        "tuning": ["11"],
+                        "held_out": ["15"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = evaluate_family_regression(
+        runs_path=runs_path,
+        manifest_path=manifest_path,
+    )
+
+    family_summary = summary["families"]["count_over_direct_relation"]
+    assert family_summary["tuning"]["correct_count"] == 1
+    assert family_summary["held_out"]["matched_count"] == 1

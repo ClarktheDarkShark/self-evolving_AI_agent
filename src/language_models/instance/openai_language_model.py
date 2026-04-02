@@ -63,6 +63,33 @@ TOOL_REQUEST_KEYS = {
     "function_call",
 }
 
+
+def _collect_retryable_exception_types() -> tuple[type[Exception], ...]:
+    retryable: list[type[Exception]] = []
+    for exc_name in (
+        "BadRequestError",
+        "APITimeoutError",
+        "APIConnectionError",
+        "RateLimitError",
+        "InternalServerError",
+    ):
+        exc_type = getattr(openai, exc_name, None)
+        if isinstance(exc_type, type) and issubclass(exc_type, Exception):
+            retryable.append(exc_type)
+    retryable.extend(
+        [
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+        ]
+    )
+    return tuple(retryable)
+
+
+OPENAI_RETRYABLE_EXCEPTIONS = _collect_retryable_exception_types()
+
 def _dbg_preview(x, n=220):
     s = "" if x is None else str(x)
     s = s.replace("\n", "\\n")
@@ -74,8 +101,8 @@ class OpenaiLanguageModel(LanguageModel):
     Thin chat wrapper that does NOT rewrite or parse model content.
     """
 
-    # Always-long default timeout (seconds). 30 minutes.
-    DEFAULT_TIMEOUT_S: float = 2400.0
+    # Default timeout (seconds) for a single model request.
+    DEFAULT_TIMEOUT_S: float = 240.0
 
     def __init__(
         self,
@@ -565,7 +592,7 @@ class OpenaiLanguageModel(LanguageModel):
 
     @RetryHandler.handle(
         max_retries=3,
-        retry_on=(openai.BadRequestError,),
+        retry_on=OPENAI_RETRYABLE_EXCEPTIONS,
         waiting_strategy=ExponentialBackoffStrategy(interval=(None, 60), multiplier=2),
     )
     def _get_completion_content(

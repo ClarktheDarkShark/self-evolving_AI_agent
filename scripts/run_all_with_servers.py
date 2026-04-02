@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -17,7 +18,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 import kg_sparql_server
+import yaml
+from src.pal.family_policy_evolution import build_family_policy_store
+from src.pal.reusable_tool_families import get_baseline_reusable_family_policy_bundles
 
 CONFIG_PATHS = [
     # "configs/assignments/experiments/llama_31_8b_instruct/instance/os_interaction/instance/standard.yaml",
@@ -25,6 +36,7 @@ CONFIG_PATHS = [
     # "configs/assignments/experiments/llama_31_8b_instruct/instance/db_bench/instance/standard.yaml",
     
 ]
+CONFIG_PATHS_ENV = "LIFELONG_CONFIG_PATHS"
 
 SPARQL_ENDPOINT = "http://127.0.0.1:3001/kb/sparql"
 
@@ -39,6 +51,25 @@ KG_DATA_DIR_ENV = "LIFELONG_KG_DATA_DIR"
 CLIENT_WALL_TIMEOUT_S = int(os.getenv("LIFELONG_CLIENT_TIMEOUT_S", "1800"))
 CLIENT_IDLE_TIMEOUT_S = int(os.getenv("LIFELONG_CLIENT_IDLE_TIMEOUT_S", "600"))
 CLIENT_WATCHDOG_POLL_S = float(os.getenv("LIFELONG_CLIENT_WATCHDOG_POLL_S", "5"))
+ENABLE_PAL_AGENT = os.getenv("ENABLE_PAL_AGENT") == "1"
+ENABLE_STANDARD_FAMILY_EVOLUTION = (
+    os.getenv("PAL_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
+)
+FAMILY_EVOLUTION_ENV = "PAL_ENABLE_FAMILY_POLICY_EVOLUTION"
+FAMILY_PROMOTION_ENV = "PAL_ENABLE_FAMILY_POLICY_PROMOTION"
+FAMILY_ENABLED_FAMILIES_ENV = "PAL_FAMILY_POLICY_EVOLUTION_FAMILIES"
+FAMILY_STORE_PATH_ENV = "PAL_FAMILY_POLICY_STORE_PATH"
+INLINE_FAMILY_EVOLUTION_FAMILIES_ENV = "PAL_INLINE_FAMILY_EVOLUTION_FAMILIES"
+INLINE_FAMILY_EVOLUTION_BUDGET_S = int(
+    os.getenv("PAL_STANDARD_FAMILY_EVOLUTION_BUDGET_S", "360")
+)
+INLINE_TRUSTED_SUCCESS_BANK_SIZE = 1
+DEFAULT_FAMILY_REGRESSION_MANIFEST = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "evaluation"
+    / "knowledge_graph_family_regression.json"
+)
 
 
 @dataclass(frozen=True)
@@ -46,6 +77,560 @@ class ClientWatchdogResult:
     exit_code: int
     timed_out_reason: str | None = None
     current_session: dict[str, object] | None = None
+
+
+def _family_evolution_enabled_for(family_name: str) -> bool:
+    configured = {
+        str(item or "").strip()
+        for item in os.getenv(FAMILY_ENABLED_FAMILIES_ENV, "").split(",")
+        if str(item or "").strip()
+    }
+    if not configured:
+        return True
+    return str(family_name or "").strip() in configured
+
+
+def _inline_family_evolution_allowed_for(family_name: str) -> bool:
+    configured = {
+        str(item or "").strip()
+        for item in os.getenv(INLINE_FAMILY_EVOLUTION_FAMILIES_ENV, "").split(",")
+        if str(item or "").strip()
+    }
+    if not configured:
+        return True
+    return str(family_name or "").strip() in configured
+
+
+def _load_sample_order_from_config(config_path: Path) -> list[str] | None:
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    sample_order = ((payload.get("assignment_config") or {}).get("sample_order"))
+    if not isinstance(sample_order, list):
+        return None
+    cleaned = [str(item or "").strip() for item in sample_order if str(item or "").strip()]
+    return cleaned or None
+
+
+def _write_single_sample_config(
+    *,
+    source_config_path: Path,
+    sample_index: str,
+    stem: str,
+) -> Path:
+    payload = yaml.safe_load(source_config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid_config:{source_config_path}")
+    assignment_config = payload.setdefault("assignment_config", {})
+    assignment_config["sample_order"] = [str(sample_index)]
+    temp_config_path = source_config_path.parent / f"{stem}.yaml"
+    temp_config_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+    return temp_config_path
+
+
+def _delete_file_if_exists(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _load_session_for_sample(output_dir: Path, sample_index: str) -> dict[str, object] | None:
+    runs_path = output_dir / "runs.json"
+    try:
+        if not runs_path.exists():
+            return None
+        payload = json.loads(runs_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, list):
+        return None
+    for item in reversed(payload):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("sample_index") or "").strip() == str(sample_index or "").strip():
+            return item
+    return None
+
+
+def _latest_selected_family_for_sample(output_dir: Path, sample_index: str) -> str | None:
+    generated_tools_path = output_dir / "generated_tools.log"
+    if not generated_tools_path.exists():
+        return None
+    selected_family: str | None = None
+    fallback_family: str | None = None
+    for line in generated_tools_path.read_text(encoding="utf-8").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if str(payload.get("sample_index") or "").strip() != str(sample_index or "").strip():
+            continue
+        cleaned_family = str(payload.get("selected_family") or "").strip()
+        if not cleaned_family:
+            continue
+        if payload.get("event") == "pal_attempt_decision_finalized":
+            selected_family = cleaned_family
+        elif payload.get("event") == "pal_attempt_decision" and not selected_family:
+            fallback_family = cleaned_family
+    return selected_family or fallback_family
+
+
+def _cleanup_family_evolution_artifacts(repo_root: Path, label: str) -> None:
+    config_dir = (
+        repo_root
+        / "configs"
+        / "assignments"
+        / "experiments"
+        / "llama_31_8b_instruct"
+        / "instance"
+        / "knowledge_graph"
+        / "instance"
+    )
+    for path in config_dir.glob(f"pal_batch_{label}*.yaml"):
+        _delete_file_if_exists(path)
+    outputs_root = repo_root / "outputs"
+    for run_root in outputs_root.glob("run_all_*"):
+        if not run_root.is_dir():
+            continue
+        kg_dir = run_root / "knowledge_graph"
+        if not kg_dir.is_dir():
+            continue
+        matched = False
+        for child in kg_dir.iterdir():
+            if child.is_dir() and child.name.startswith(f"pal_batch_{label}"):
+                shutil.rmtree(child, ignore_errors=True)
+                matched = True
+        if matched:
+            try:
+                next(kg_dir.iterdir())
+            except StopIteration:
+                shutil.rmtree(run_root, ignore_errors=True)
+
+
+def _append_generated_tool_event(log_path: Path | None, payload: dict[str, object]) -> None:
+    if not log_path:
+        return
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def _load_family_policy_store_summary(store_path: Path, family_name: str) -> dict[str, object]:
+    family_path = store_path / f"{family_name}.json"
+    if not family_path.exists():
+        return {
+            "family_name": family_name,
+            "active_version": "",
+            "pending_candidates": 0,
+            "candidate_versions": [],
+        }
+    try:
+        payload = json.loads(family_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "family_name": family_name,
+            "active_version": "",
+            "pending_candidates": 0,
+            "candidate_versions": [],
+        }
+    versions = payload.get("versions") or {}
+    if not isinstance(versions, dict):
+        versions = {}
+    candidate_versions = [
+        str(version_name)
+        for version_name, version_payload in versions.items()
+        if isinstance(version_payload, dict)
+        and str(version_payload.get("status") or "").strip() == "candidate"
+    ]
+    return {
+        "family_name": family_name,
+        "active_version": str(payload.get("active_version") or "").strip(),
+        "pending_candidates": len(candidate_versions),
+        "candidate_versions": candidate_versions,
+    }
+
+
+def _load_family_policy_store_payload(store_path: Path, family_name: str) -> dict[str, object]:
+    family_path = store_path / f"{family_name}.json"
+    if not family_path.exists():
+        return {}
+    try:
+        payload = json.loads(family_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_family_regression_manifest(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    families = payload.get("families") or {}
+    return families if isinstance(families, dict) else {}
+
+
+def _latest_attempt_decision_for_sample(output_dir: Path, sample_index: str) -> dict[str, object]:
+    generated_tools_path = output_dir / "generated_tools.log"
+    if not generated_tools_path.exists():
+        return {}
+    latest: dict[str, object] = {}
+    for line in generated_tools_path.read_text(encoding="utf-8").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if str(payload.get("sample_index") or "").strip() != str(sample_index or "").strip():
+            continue
+        if payload.get("event") == "pal_attempt_decision_finalized":
+            latest = payload
+    return latest
+
+
+def _build_inline_trigger_baseline_summary(
+    *,
+    output_dir: Path,
+    sample_index: str,
+    session_record: dict[str, object],
+) -> dict[str, object]:
+    evaluation_record = session_record.get("evaluation_record")
+    evaluation_outcome = ""
+    if isinstance(evaluation_record, dict):
+        evaluation_outcome = str(evaluation_record.get("outcome") or "").strip()
+    decision_payload = _latest_attempt_decision_for_sample(output_dir, sample_index)
+    dangerous_overreach_count = int(bool(decision_payload.get("dangerous_overreach")))
+    return {
+        "sample_index": str(sample_index or "").strip(),
+        "sample_status": str(session_record.get("sample_status") or "").strip(),
+        "evaluation_outcome": evaluation_outcome,
+        "dangerous_overreach_count": dangerous_overreach_count,
+        "run_dir": str(output_dir),
+    }
+
+
+def _write_trigger_baseline_summary(
+    *,
+    output_dir: Path,
+    sample_index: str,
+    session_record: dict[str, object],
+) -> Path:
+    summary = _build_inline_trigger_baseline_summary(
+        output_dir=output_dir,
+        sample_index=sample_index,
+        session_record=session_record,
+    )
+    path = output_dir / f"family_policy_trigger_baseline_{sample_index}.json"
+    path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def _build_trusted_success_bank_context(
+    *,
+    family_name: str,
+    active_version: str,
+) -> dict[str, object]:
+    # Keep the boundary runner's harvested successes compatible with the inline
+    # promotion harness gate. Otherwise the harness treats a warm family as cold.
+    from scripts.run_kg_family_policy_evolution import _build_success_bank_context
+
+    return _build_success_bank_context(
+        family_name=family_name,
+        active_version=active_version,
+    )
+
+
+def _record_trusted_family_success(
+    *,
+    output_dir: Path,
+    store_path: Path,
+    family_name: str,
+    sample_index: str,
+    active_version: str,
+    progress_log_path: Path | None = None,
+) -> list[str]:
+    decision_payload = _latest_attempt_decision_for_sample(output_dir, sample_index)
+    if str(decision_payload.get("selected_family") or "").strip() != str(family_name or "").strip():
+        return []
+    if str(decision_payload.get("family_bundle_version") or "").strip() != str(active_version or "").strip():
+        return []
+    trust_contract = decision_payload.get("trust_contract") or {}
+    materialization_allowed = bool(
+        (trust_contract.get("materialization_allowed") if isinstance(trust_contract, dict) else False)
+        or decision_payload.get("materialization_allowed")
+    )
+    dangerous_overreach = bool(
+        (trust_contract.get("dangerous_overreach") if isinstance(trust_contract, dict) else False)
+        or decision_payload.get("dangerous_overreach")
+    )
+    if not materialization_allowed or dangerous_overreach:
+        return []
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=store_path,
+    )
+    metadata = store.get_trusted_success_bank_metadata(family_name)
+    existing_ids: list[str] = []
+    if str(metadata.get("source_version") or "").strip() == str(active_version or "").strip():
+        existing_ids = store.get_trusted_success_bank(family_name)
+    updated_ids = [
+        sample_id
+        for sample_id in [*existing_ids, str(sample_index or "").strip()]
+        if sample_id
+    ]
+    deduped: list[str] = []
+    for sample_id in updated_ids:
+        if sample_id not in deduped:
+            deduped.append(sample_id)
+    deduped = deduped[-INLINE_TRUSTED_SUCCESS_BANK_SIZE:]
+    store.set_trusted_success_bank(
+        family_name,
+        sample_ids=deduped,
+        source_version=active_version,
+        evaluation_results={
+            "source": "inline_standard_run_success_harvest",
+            "sample_index": str(sample_index or "").strip(),
+        },
+        evaluation_context=_build_trusted_success_bank_context(
+            family_name=family_name,
+            active_version=active_version,
+        ),
+    )
+    _append_generated_tool_event(
+        progress_log_path,
+        {
+            "event": "pal_family_policy_trusted_success_recorded",
+            "family_name": family_name,
+            "sample_index": str(sample_index or "").strip(),
+            "active_version": active_version,
+            "trusted_success_bank": deduped,
+            "trusted_success_bank_ready": len(deduped) >= INLINE_TRUSTED_SUCCESS_BANK_SIZE,
+        },
+    )
+    return deduped
+
+
+def _oldest_pending_candidate_for_family(
+    *,
+    store_path: Path,
+    family_name: str,
+) -> dict[str, object] | None:
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=store_path,
+    )
+    pending = store.get_pending_candidates(family_name)
+    if not pending:
+        return None
+    return dict(pending[0])
+
+
+def _run_between_sample_family_evolution(
+    *,
+    repo_root: Path,
+    family_name: str,
+    sample_index: str,
+    store_path: Path,
+    label: str,
+    progress_log_path: Path | None = None,
+    trigger_baseline_summary_path: Path | None = None,
+    inline_budget_s: int = INLINE_FAMILY_EVOLUTION_BUDGET_S,
+    parent_output_dir: Path | None = None,
+    trigger_source: str = "sample_failure_or_wrong_completion",
+    boundary_sample_index: str | None = None,
+) -> int:
+    command = [
+        sys.executable,
+        "scripts/run_kg_family_policy_evolution.py",
+        "--family",
+        family_name,
+        "--samples",
+        str(sample_index),
+        "--label",
+        label,
+        "--store-path",
+        str(store_path),
+        "--promote",
+    ]
+    if trigger_baseline_summary_path is not None:
+        command.extend(
+            [
+                "--trigger-baseline-summary-path",
+                str(trigger_baseline_summary_path),
+            ]
+        )
+    if parent_output_dir is not None:
+        command.extend(
+            [
+                "--parent-output-dir",
+                str(parent_output_dir),
+            ]
+        )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
+    env["ENABLE_PAL_AGENT"] = "1"
+    env[FAMILY_EVOLUTION_ENV] = "1"
+    env[FAMILY_PROMOTION_ENV] = "1"
+    env[FAMILY_STORE_PATH_ENV] = str(store_path)
+    env[FAMILY_ENABLED_FAMILIES_ENV] = family_name
+    env["PAL_ENABLE_STANDARD_FAMILY_EVOLUTION"] = "0"
+    before_summary = _load_family_policy_store_summary(store_path, family_name)
+    start_ts = time.monotonic()
+    print(
+        "[run_all_with_servers] Family evolution start "
+        f"family={family_name} sample={sample_index} "
+        f"trigger_source={trigger_source} "
+        f"boundary_sample={boundary_sample_index or sample_index} "
+        f"active_version={before_summary.get('active_version') or 'n/a'} "
+        f"pending_candidates={before_summary.get('pending_candidates')}"
+    )
+    _append_generated_tool_event(
+        progress_log_path,
+        {
+            "event": "pal_family_policy_evaluation_started",
+            "family_name": family_name,
+            "sample_index": str(sample_index),
+            "label": label,
+            "store_path": str(store_path),
+            "inline_budget_s": int(inline_budget_s),
+            "trigger_baseline_reused": bool(trigger_baseline_summary_path),
+            "trigger_source": str(trigger_source or "").strip(),
+            "boundary_sample_index": str(boundary_sample_index or sample_index),
+            "parent_output_dir": str(parent_output_dir) if parent_output_dir is not None else "",
+            **before_summary,
+        },
+    )
+    fd, temp_log_name = tempfile.mkstemp(
+        prefix=f"family_policy_evolution_{family_name}_{sample_index}_",
+        suffix=".log",
+    )
+    os.close(fd)
+    temp_log_path = Path(temp_log_name)
+    return_code = -1
+    try:
+        with temp_log_path.open("w", encoding="utf-8") as log_fp:
+            proc = subprocess.Popen(
+                command,
+                cwd=repo_root,
+                env=env,
+                text=True,
+                stdout=log_fp,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            last_heartbeat_s = 0.0
+            while True:
+                return_code = proc.poll()
+                if return_code is not None:
+                    break
+                time.sleep(5)
+                elapsed_s = time.monotonic() - start_ts
+                if inline_budget_s > 0 and elapsed_s > float(inline_budget_s):
+                    print(
+                        "[run_all_with_servers] Family evolution budget exceeded "
+                        f"family={family_name} sample={sample_index} "
+                        f"budget_s={int(inline_budget_s)} elapsed_s={int(elapsed_s)}"
+                    )
+                    _append_generated_tool_event(
+                        progress_log_path,
+                        {
+                            "event": "pal_family_policy_evaluation_budget_exceeded",
+                            "family_name": family_name,
+                            "sample_index": str(sample_index),
+                            "label": label,
+                            "budget_s": int(inline_budget_s),
+                            "elapsed_s": int(elapsed_s),
+                        },
+                    )
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.time() + 5.0
+                    while time.time() < deadline and proc.poll() is None:
+                        time.sleep(0.2)
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    return_code = 124
+                    break
+                if elapsed_s - last_heartbeat_s < 15.0:
+                    continue
+                last_heartbeat_s = elapsed_s
+                print(
+                    "[run_all_with_servers] Family evolution running "
+                    f"family={family_name} sample={sample_index} "
+                    f"trigger_source={trigger_source} elapsed_s={int(elapsed_s)}"
+                )
+                _append_generated_tool_event(
+                    progress_log_path,
+                    {
+                        "event": "pal_family_policy_evaluation_heartbeat",
+                        "family_name": family_name,
+                        "sample_index": str(sample_index),
+                        "label": label,
+                        "elapsed_s": int(elapsed_s),
+                        "trigger_source": str(trigger_source or "").strip(),
+                        "boundary_sample_index": str(boundary_sample_index or sample_index),
+                    },
+                )
+    finally:
+        log_text = ""
+        try:
+            log_text = temp_log_path.read_text(encoding="utf-8")
+        except Exception:
+            log_text = ""
+        try:
+            temp_log_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    after_summary = _load_family_policy_store_summary(store_path, family_name)
+    elapsed_s = int(time.monotonic() - start_ts)
+    print(
+        "[run_all_with_servers] Family evolution end "
+        f"family={family_name} sample={sample_index} exit={return_code} "
+        f"trigger_source={trigger_source} "
+        f"boundary_sample={boundary_sample_index or sample_index} "
+        f"active_version={after_summary.get('active_version') or 'n/a'} "
+        f"pending_candidates={after_summary.get('pending_candidates')} "
+        f"elapsed_s={elapsed_s}"
+    )
+    _append_generated_tool_event(
+        progress_log_path,
+        {
+            "event": "pal_family_policy_evaluation_finished",
+            "family_name": family_name,
+            "sample_index": str(sample_index),
+            "label": label,
+            "exit_code": return_code,
+            "elapsed_s": elapsed_s,
+            "before": before_summary,
+            "after": after_summary,
+            "trigger_source": str(trigger_source or "").strip(),
+            "boundary_sample_index": str(boundary_sample_index or sample_index),
+            "parent_output_dir": str(parent_output_dir) if parent_output_dir is not None else "",
+        },
+    )
+    if return_code != 0:
+        print(
+            f"[run_all_with_servers] Family evolution harness failed for family={family_name} "
+            f"sample={sample_index} exit={return_code}"
+        )
+        if log_text:
+            print(log_text[-2000:])
+    _cleanup_family_evolution_artifacts(repo_root, label)
+    return int(return_code)
 
 
 def _append_log(log_path: Path | None, text: str) -> None:
@@ -762,7 +1347,13 @@ def _fuseki_watchdog_loop(
             _append_log(fuseki_log_path, message)
 
 
-def _run_one(config_path: str, combined_dir: Path) -> int:
+def _run_one(
+    config_path: str,
+    combined_dir: Path,
+    *,
+    output_dir_override: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> int:
     is_kg = "knowledge_graph" in config_path
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -808,8 +1399,12 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
     env = os.environ.copy()
     env_py_path = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env_py_path}" if env_py_path else str(repo_root)
-    env["LIFELONG_OUTPUT_DIR"] = str(combined_dir / task_name / config_name)
+    env["LIFELONG_OUTPUT_DIR"] = str(
+        output_dir_override or (combined_dir / task_name / config_name)
+    )
     env["LIFELONG_OUTPUT_TAG"] = ""
+    for key, value in (extra_env or {}).items():
+        env[key] = value
     if is_kg:
         ontology_dir = str(repo_root / "data" / "knowledge_graph" / "ontology")
         if not env.get("KG_ONTOLOGY_DIR"):
@@ -947,13 +1542,254 @@ def _run_one(config_path: str, combined_dir: Path) -> int:
     return final_result_code
 
 
+def _run_one_with_sample_boundary_family_evolution(
+    config_path: str,
+    combined_dir: Path,
+) -> int:
+    repo_root = Path(__file__).resolve().parents[1]
+    full_path = repo_root / config_path
+    sample_order = _load_sample_order_from_config(full_path)
+    if not sample_order:
+        return _run_one(config_path, combined_dir)
+
+    task_name = _extract_task_name(config_path)
+    config_name = Path(config_path).stem
+    aggregate_output_dir = combined_dir / task_name / config_name
+    aggregate_output_dir.mkdir(parents=True, exist_ok=True)
+    configured_store_path = str(os.getenv(FAMILY_STORE_PATH_ENV) or "").strip()
+    if configured_store_path:
+        store_path = Path(configured_store_path)
+        if not store_path.is_absolute():
+            store_path = repo_root / store_path
+    else:
+        store_path = aggregate_output_dir / "family_policy_store"
+
+    extra_env = {
+        FAMILY_EVOLUTION_ENV: "1",
+        FAMILY_PROMOTION_ENV: "0",
+        FAMILY_STORE_PATH_ENV: str(store_path),
+    }
+    configured_families = str(os.getenv(FAMILY_ENABLED_FAMILIES_ENV) or "").strip()
+    if configured_families:
+        extra_env[FAMILY_ENABLED_FAMILIES_ENV] = configured_families
+
+    temp_config_paths: dict[str, Path] = {}
+    for sample_index in sample_order:
+        temp_stem = f"{config_name}__sample_{sample_index}"
+        temp_config_paths[str(sample_index)] = _write_single_sample_config(
+            source_config_path=full_path,
+            sample_index=str(sample_index),
+            stem=temp_stem,
+        )
+
+    try:
+        for sample_index in sample_order:
+            temp_config_path = temp_config_paths[str(sample_index)]
+            _delete_file_if_exists(aggregate_output_dir / "config.yaml")
+            code = _run_one(
+                temp_config_path.relative_to(repo_root).as_posix(),
+                combined_dir,
+                output_dir_override=aggregate_output_dir,
+                extra_env=extra_env,
+            )
+            if code != 0:
+                return code
+
+            session_record = _load_session_for_sample(aggregate_output_dir, str(sample_index))
+            if not isinstance(session_record, dict):
+                continue
+            sample_status = str(session_record.get("sample_status") or "").strip()
+            evaluation_record = session_record.get("evaluation_record")
+            evaluation_outcome = ""
+            if isinstance(evaluation_record, dict):
+                evaluation_outcome = str(evaluation_record.get("outcome") or "").strip()
+            selected_family = _latest_selected_family_for_sample(
+                aggregate_output_dir,
+                str(sample_index),
+            )
+            if not selected_family or not _family_evolution_enabled_for(selected_family):
+                continue
+            active_summary = _load_family_policy_store_summary(store_path, selected_family)
+            active_version = str(active_summary.get("active_version") or "").strip()
+            if (
+                sample_status == "completed"
+                and evaluation_outcome == "correct"
+            ):
+                _record_trusted_family_success(
+                    output_dir=aggregate_output_dir,
+                    store_path=store_path,
+                    family_name=selected_family,
+                    sample_index=str(sample_index),
+                    active_version=active_version,
+                    progress_log_path=aggregate_output_dir / "generated_tools.log",
+                )
+            current_sample_is_correct = (
+                sample_status == "completed" and evaluation_outcome == "correct"
+            )
+            pending_candidate = _oldest_pending_candidate_for_family(
+                store_path=store_path,
+                family_name=selected_family,
+            )
+            if current_sample_is_correct and pending_candidate is None:
+                continue
+            evaluation_target_sample = str(sample_index)
+            trigger_source = "sample_failure_or_wrong_completion"
+            if current_sample_is_correct and pending_candidate is not None:
+                evaluation_target_sample = str(
+                    ((pending_candidate or {}).get("trigger_context") or {}).get(
+                        "sample_index"
+                    )
+                    or sample_index
+                ).strip() or str(sample_index)
+                trigger_source = "pending_candidate_after_trusted_success"
+                print(
+                    "[run_all_with_servers] Family evolution reactivated pending candidate "
+                    f"family={selected_family} boundary_sample={sample_index} "
+                    f"trigger_sample={evaluation_target_sample}"
+                )
+                _append_generated_tool_event(
+                    aggregate_output_dir / "generated_tools.log",
+                    {
+                        "event": "pal_family_policy_pending_candidate_reactivated",
+                        "family_name": selected_family,
+                        "boundary_sample_index": str(sample_index),
+                        "trigger_sample_index": evaluation_target_sample,
+                        "active_version": active_version,
+                        "candidate_version": str(
+                            (pending_candidate or {}).get("candidate_version") or ""
+                        ).strip(),
+                    },
+                )
+            if not _inline_family_evolution_allowed_for(selected_family):
+                print(
+                    "[run_all_with_servers] Family evolution skipped "
+                    f"family={selected_family} sample={evaluation_target_sample} reason=family_not_inline_eligible"
+                )
+                _append_generated_tool_event(
+                    aggregate_output_dir / "generated_tools.log",
+                    {
+                        "event": "pal_family_policy_evaluation_skipped",
+                        "family_name": selected_family,
+                        "sample_index": evaluation_target_sample,
+                        "reason": "family_not_inline_eligible",
+                        "active_version": active_version,
+                    },
+                )
+                continue
+            trigger_session_record = _load_session_for_sample(
+                aggregate_output_dir,
+                evaluation_target_sample,
+            )
+            if not isinstance(trigger_session_record, dict):
+                _append_generated_tool_event(
+                    aggregate_output_dir / "generated_tools.log",
+                    {
+                        "event": "pal_family_policy_evaluation_skipped",
+                        "family_name": selected_family,
+                        "sample_index": evaluation_target_sample,
+                        "reason": "trigger_session_missing",
+                        "active_version": active_version,
+                    },
+                )
+                continue
+            trigger_baseline_summary_path = _write_trigger_baseline_summary(
+                output_dir=aggregate_output_dir,
+                sample_index=evaluation_target_sample,
+                session_record=trigger_session_record,
+            )
+            label = f"inlineevo_{config_name}_{evaluation_target_sample}_{selected_family}"
+            try:
+                harness_code = _run_between_sample_family_evolution(
+                    repo_root=repo_root,
+                    family_name=selected_family,
+                    sample_index=evaluation_target_sample,
+                    store_path=store_path,
+                    label=label,
+                    progress_log_path=aggregate_output_dir / "generated_tools.log",
+                    trigger_baseline_summary_path=trigger_baseline_summary_path,
+                    parent_output_dir=aggregate_output_dir / "family_policy_inline_runs",
+                    trigger_source=trigger_source,
+                    boundary_sample_index=str(sample_index),
+                )
+            finally:
+                _delete_file_if_exists(trigger_baseline_summary_path)
+            if harness_code == 124:
+                store = build_family_policy_store(
+                    baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+                    store_path=store_path,
+                )
+                for candidate_payload in store.get_pending_candidates(selected_family):
+                    trigger_sample = str(
+                        (candidate_payload.get("trigger_context") or {}).get("sample_index") or ""
+                    ).strip()
+                    if trigger_sample != evaluation_target_sample:
+                        continue
+                    store.reject_candidate(
+                        selected_family,
+                        candidate_version=str(candidate_payload.get("candidate_version") or "").strip(),
+                        evaluation_results={
+                            "event": "family_policy_inline_timeout",
+                            "family_name": selected_family,
+                            "sample_index": evaluation_target_sample,
+                            "active_version": active_version,
+                            "timeout_s": INLINE_FAMILY_EVOLUTION_BUDGET_S,
+                        },
+                        rejection_reason="inline_timeout",
+                    )
+                _append_generated_tool_event(
+                    aggregate_output_dir / "generated_tools.log",
+                    {
+                        "event": "pal_family_policy_evaluation_timeout",
+                        "family_name": selected_family,
+                        "sample_index": evaluation_target_sample,
+                        "active_version": active_version,
+                        "timeout_s": INLINE_FAMILY_EVOLUTION_BUDGET_S,
+                    },
+                )
+                print(
+                    "[run_all_with_servers] Continuing after family evolution timeout rejection: "
+                    f"family={selected_family} sample={evaluation_target_sample}"
+                )
+            elif harness_code != 0:
+                print(
+                    "[run_all_with_servers] Continuing after family evolution harness failure: "
+                    f"family={selected_family} sample={evaluation_target_sample}"
+                )
+    finally:
+        for temp_config_path in temp_config_paths.values():
+            _delete_file_if_exists(temp_config_path)
+    return 0
+
+
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     combined_dir = repo_root / "outputs" / f"run_all_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
     combined_dir.mkdir(parents=True, exist_ok=True)
 
-    for config_path in CONFIG_PATHS:
-        code = _run_one(config_path, combined_dir)
+    config_paths_override = str(os.getenv(CONFIG_PATHS_ENV) or "").strip()
+    if config_paths_override:
+        configured_paths = [
+            item.strip()
+            for item in re.split(r"[\n,]+", config_paths_override)
+            if item.strip()
+        ]
+    else:
+        configured_paths = list(CONFIG_PATHS)
+
+    for config_path in configured_paths:
+        use_sample_boundary_evolution = (
+            ENABLE_STANDARD_FAMILY_EVOLUTION
+            and ENABLE_PAL_AGENT
+            and os.getenv(FAMILY_EVOLUTION_ENV) == "1"
+            and "knowledge_graph" in config_path
+        )
+        if use_sample_boundary_evolution:
+            code = _run_one_with_sample_boundary_family_evolution(
+                config_path,
+                combined_dir,
+            )
+        else:
+            code = _run_one(config_path, combined_dir)
         if code != 0:
             return code
     return 0

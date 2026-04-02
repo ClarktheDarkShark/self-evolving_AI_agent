@@ -9,6 +9,7 @@ import queue as queue_module
 import socket
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.error import URLError
 
 from .parser import ParsedPALProgram, parse_pal_code
 

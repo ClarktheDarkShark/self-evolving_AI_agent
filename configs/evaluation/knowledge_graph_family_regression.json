@@ -1,0 +1,27 @@
+{
+  "version": "2026-03-31",
+  "task_name": "knowledge_graph",
+  "policy": "Do not use held_out samples for family tuning decisions.",
+  "families": {
+    "count_over_direct_relation": {
+      "tuning": ["11", "20", "241"],
+      "held_out": ["15", "257"]
+    },
+    "single_anchor_lookup": {
+      "tuning": ["10", "22"],
+      "held_out": ["33", "386"]
+    },
+    "multi_anchor_intersection": {
+      "tuning": ["0", "2", "6"],
+      "held_out": ["26", "31"]
+    },
+    "shared_type_intersection": {
+      "tuning": ["7", "158"],
+      "held_out": ["28", "30"]
+    },
+    "superlative_chain": {
+      "tuning": ["12", "13"],
+      "held_out": ["32", "386"]
+    }
+  }
+}

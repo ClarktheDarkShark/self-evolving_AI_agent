@@ -126,21 +126,43 @@ def _summarize_run_dir(run_dir: Path) -> dict[str, Any]:
     return summary
 
 
-def run_sample(*, sample_index: str, label: str) -> dict[str, Any]:
+def run_sample(
+    *,
+    sample_index: str,
+    label: str,
+    parent_output_dir: Path | None = None,
+) -> dict[str, Any]:
     config_stem = f"pal_batch_{label}_{sample_index}"
     config_path = _write_single_sample_config(
         sample_index=sample_index,
         stem=config_stem,
     )
-    command = [
-        sys.executable,
-        "-c",
-        (
-            "import scripts.run_all_with_servers as m; "
-            f'm.CONFIG_PATHS=["{config_path.relative_to(PROJECT_ROOT).as_posix()}"]; '
-            "raise SystemExit(m.main())"
-        ),
-    ]
+    config_rel_path = config_path.relative_to(PROJECT_ROOT).as_posix()
+    run_dir: Path | None = None
+    if parent_output_dir is not None:
+        parent_output_dir = Path(parent_output_dir).resolve()
+        run_dir = parent_output_dir / config_stem
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "import scripts.run_all_with_servers as m; "
+                f'raise SystemExit(m._run_one("{config_rel_path}", '
+                f'Path(r"{parent_output_dir}"), '
+                f'output_dir_override=Path(r"{run_dir}")))'
+            ),
+        ]
+    else:
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import scripts.run_all_with_servers as m; "
+                f'm.CONFIG_PATHS=["{config_rel_path}"]; '
+                "raise SystemExit(m.main())"
+            ),
+        ]
     env = os.environ.copy()
     env["PYTHONPATH"] = ".:scripts"
     env["ENABLE_PAL_AGENT"] = "1"
@@ -151,7 +173,6 @@ def run_sample(*, sample_index: str, label: str) -> dict[str, Any]:
         text=True,
         capture_output=True,
     )
-    run_dir = _find_latest_run_dir(config_stem)
     summary = {
         "sample_index": sample_index,
         "config_path": str(config_path),
@@ -159,6 +180,8 @@ def run_sample(*, sample_index: str, label: str) -> dict[str, Any]:
         "stdout_tail": completed.stdout[-4000:],
         "stderr_tail": completed.stderr[-4000:],
     }
+    if run_dir is None:
+        run_dir = _find_latest_run_dir(config_stem)
     if run_dir is not None:
         summary.update(_summarize_run_dir(run_dir))
     return summary

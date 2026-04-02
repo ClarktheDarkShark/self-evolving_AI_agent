@@ -10,7 +10,22 @@ _FREEBASE_NS_PREFIX = "http://rdf.freebase.com/ns/"
 _MID_PATTERN = re.compile(r"[mg]\.[A-Za-z0-9_]+")
 _NUMERIC_PATTERN = re.compile(r"[-+]?\d+(?:\.\d+)?")
 _DATE_PATTERN = re.compile(r"\d{4}(?:-\d{2}(?:-\d{2})?)?")
+_COUNT_VAR_HINT_PATTERN = re.compile(r"(?:^|_)(?:count|counts?|result_count)(?:$|_)")
 PAL_BENCHMARK_BRIDGE_TOOL_NAME = "pal_benchmark_bridge_macro"
+_BRIDGE_BANNED_TOKENS = (
+    "SPARQLWrapper",
+    "requests.",
+    "urllib.",
+    "http://",
+    "https://",
+    "get_relations",
+    "get_neighbors",
+    "intersection(",
+    "count(",
+    "get_attributes",
+    "argmax(",
+    "argmin(",
+)
 
 
 @dataclass(frozen=True)
@@ -126,6 +141,30 @@ def classify_execution_artifact(raw_result: Any) -> PalExecutionArtifact:
         )
 
     answer_var, diagnostics = _select_answer_var(raw_result, bindings)
+    if answer_var is not None:
+        bindings_missing_selected_var = [
+            binding
+            for binding in bindings
+            if isinstance(binding, Mapping) and answer_var not in binding
+        ]
+        if bindings_missing_selected_var:
+            diagnostics["reason"] = "selected_head_var_missing_from_bindings"
+            diagnostics["available_binding_vars"] = sorted(
+                {
+                    str(key)
+                    for binding in bindings
+                    if isinstance(binding, Mapping)
+                    for key in binding.keys()
+                }
+            )
+            return PalExecutionArtifact(
+                raw_result=raw_result,
+                artifact_type="unresolved",
+                value=None,
+                is_structured=True,
+                source="raw_execution",
+                diagnostics=diagnostics,
+            )
     normalized_values = _extract_normalized_values(bindings, answer_var)
     diagnostics["binding_count"] = len(bindings)
     diagnostics["normalized_value_count"] = len(normalized_values)
@@ -152,9 +191,15 @@ def classify_execution_artifact(raw_result: Any) -> PalExecutionArtifact:
             diagnostics=diagnostics,
         )
     if kinds == {"numeric"} and len(normalized_values) == 1:
+        selected_var_token = _normalize_variable_hint(answer_var)
+        artifact_type = (
+            "count_scalar"
+            if _looks_like_count_variable(selected_var_token)
+            else "scalar_literal"
+        )
         return PalExecutionArtifact(
             raw_result=raw_result,
-            artifact_type="count_scalar",
+            artifact_type=artifact_type,
             value=normalized_values[0]["value"],
             is_structured=True,
             source="raw_execution",
@@ -202,9 +247,11 @@ def materialize_benchmark_artifact(
     *,
     context: BenchmarkAdapterContext,
 ) -> BenchmarkMaterialization:
-    if artifact.artifact_type == "unresolved":
+    if artifact.artifact_type in {"unresolved", "empty"}:
         return BenchmarkMaterialization(
-            materialization_type="unresolved_failure",
+            materialization_type=(
+                "empty_failure" if artifact.artifact_type == "empty" else "unresolved_failure"
+            ),
             needs_bridge=False,
             bridge_action=None,
             bridge_tool_name=None,
@@ -273,12 +320,25 @@ def adapt_pal_result_to_benchmark(
         and raw_artifact.source != "raw_execution_failure"
     ):
         parsed_solver_artifact = _classify_solver_output(solver_output)
-        if parsed_solver_artifact is not None:
+        if parsed_solver_artifact is not None and _solver_fallback_is_allowed(
+            parsed_solver_artifact
+        ):
             selected_artifact = parsed_solver_artifact
             _emit(
                 emit_event,
                 {
                     "event": "pal_adapter_solver_fallback_used",
+                    "pal_adapter": True,
+                    "run_id": context.run_id,
+                    "fallback_source": parsed_solver_artifact.source,
+                    "artifact_type": parsed_solver_artifact.artifact_type,
+                },
+            )
+        elif parsed_solver_artifact is not None:
+            _emit(
+                emit_event,
+                {
+                    "event": "pal_adapter_solver_fallback_rejected",
                     "pal_adapter": True,
                     "run_id": context.run_id,
                     "fallback_source": parsed_solver_artifact.source,
@@ -387,6 +447,40 @@ def run(payload: dict) -> dict:
         ),
     }
 """
+
+
+def assert_bridge_tool_code_narrow(tool_code: str) -> None:
+    code = str(tool_code or "")
+    violations = [
+        token
+        for token in _BRIDGE_BANNED_TOKENS
+        if token.lower() in code.lower()
+    ]
+    if violations:
+        raise ValueError(
+            "bridge_tool_contract_violation:" + ",".join(sorted(set(violations)))
+        )
+
+
+def evaluate_adapter_safety(
+    *,
+    artifact: PalExecutionArtifact,
+    materialization: BenchmarkMaterialization,
+) -> tuple[bool, tuple[str, ...]]:
+    reasons: list[str] = []
+    if artifact.artifact_type in {"unresolved", "empty"}:
+        reasons.append(f"adapter_rejected_artifact_type:{artifact.artifact_type}")
+    if artifact.source != "raw_execution":
+        reasons.append(f"adapter_non_raw_source:{artifact.source}")
+    if materialization.materialization_type != "bridge_action":
+        reasons.append(
+            f"adapter_materialization_type:{materialization.materialization_type}"
+        )
+    if not materialization.needs_bridge:
+        reasons.append("adapter_bridge_not_required")
+    if materialization.final_answer_text:
+        reasons.append("adapter_final_answer_text_forbidden")
+    return (not reasons, tuple(reasons))
 
 
 def _classify_solver_output(solver_output: Optional[str]) -> Optional[PalExecutionArtifact]:
@@ -512,6 +606,15 @@ def _select_answer_var(
     return None, diagnostics
 
 
+def _normalize_variable_hint(raw_value: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(raw_value or "").strip().lower()).strip("_")
+
+
+def _looks_like_count_variable(variable_hint: str) -> bool:
+    hint = _normalize_variable_hint(variable_hint)
+    return bool(hint and _COUNT_VAR_HINT_PATTERN.search(hint))
+
+
 def _extract_normalized_values(
     bindings: Sequence[Any],
     answer_var: Optional[str],
@@ -611,6 +714,10 @@ def _determinism_for_source(source: str) -> str:
     return "unknown"
 
 
+def _solver_fallback_is_allowed(artifact: PalExecutionArtifact) -> bool:
+    return False
+
+
 def _emit(
     emit_event: Optional[Callable[[Mapping[str, Any]], None]],
     payload: Mapping[str, Any],
@@ -630,7 +737,9 @@ __all__ = [
     "PalBenchmarkAdaptation",
     "PalExecutionArtifact",
     "adapt_pal_result_to_benchmark",
+    "assert_bridge_tool_code_narrow",
     "build_pal_benchmark_bridge_tool_code",
     "classify_execution_artifact",
+    "evaluate_adapter_safety",
     "materialize_benchmark_artifact",
 ]
