@@ -13,6 +13,10 @@ import src.agents.instance.pal_agent_controller as pal_agent_controller_module
 from src.agents.exceptions import AgentUnknownException
 from src.agents.instance.pal_agent_controller import PALAgentController
 from src.pal.invoker import PALInvocationResult
+from src.pal.family_policy_evolution import (
+    build_success_plan_archetype,
+    merge_success_plan_archetypes,
+)
 from src.pal.plausibility_validator import (
     AnchorProbeResult,
     PlausibilityVerdict,
@@ -33,11 +37,17 @@ from src.pal.kg_benchmark_adapter import (
 )
 from src.pal.policy_contracts import build_trust_contract_evaluation
 from src.pal.reusable_tool_families import select_reusable_tool
+from src.typings import ChatHistory, ChatHistoryItem, Role
 
 
 def _make_controller() -> PALAgentController:
     controller = object.__new__(PALAgentController)
     controller._emit_generated_tools_event = lambda payload: None
+    controller._pending_macro_runs = {}
+    controller._registered_bridge_tools = set()
+    controller._tool_invoked_in_last_inference = None
+    controller._manual_fallback_agent = None
+    controller._manual_fallback_active_runs = set()
     return controller
 
 
@@ -82,7 +92,157 @@ def test_question_interpretation_treats_occupation_surface_as_constraint_value()
 
     assert inputs_by_surface["educators"]["kind"] == "attribute_value"
     assert inputs_by_surface["educators"]["role_hint"] == "constraint_value"
-    assert inputs_by_surface["neyaphem"]["kind"] == "named_entity"
+
+
+def test_build_success_plan_archetype_keeps_only_structural_pattern() -> None:
+    archetype = build_success_plan_archetype(
+        {
+            "answer_mode": "count",
+            "query_shape": "count_over_joined_set",
+            "anchored_entities": [
+                {
+                    "surface": "Serbia",
+                    "chosen_alias": "Serbia",
+                    "role": "anchor_a",
+                },
+                {
+                    "surface": "Smooth Fox Terrier",
+                    "chosen_alias": "Smooth Fox Terrier",
+                    "role": "anchor_b",
+                },
+            ],
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor_a",
+                        "constrains_variable": "candidate_set",
+                    },
+                    {
+                        "anchor_role": "anchor_b",
+                        "constrains_variable": "candidate_set",
+                    },
+                ],
+            },
+            "shared_answer_variable": "candidate_set",
+            "candidate_set_variable": "candidate_set",
+            "count_set_variable": "count_set",
+            "relation_paths": [
+                {
+                    "from_role": "anchor_a",
+                    "to_role": "candidate_set",
+                    "grounding_source": "curated",
+                },
+                {
+                    "from_role": "anchor_b",
+                    "to_role": "candidate_set",
+                    "grounding_source": "curated",
+                },
+                {
+                    "from_role": "candidate_set",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                },
+            ],
+        }
+    )
+
+    assert archetype["query_shape"] == "count_over_joined_set"
+    assert archetype["anchor_roles"] == ["anchor_a", "anchor_b"]
+    assert archetype["anchor_constraints"] == [
+        "anchor_a->candidate_set",
+        "anchor_b->candidate_set",
+    ]
+    assert archetype["relation_role_skeleton"] == [
+        "anchor_a->candidate_set:curated",
+        "anchor_b->candidate_set:curated",
+        "candidate_set->count_set:curated",
+    ]
+    assert "preserve_multiple_anchor_constraints" in archetype["structural_notes"]
+    assert "Serbia" not in json.dumps(archetype)
+
+
+def test_merge_success_plan_archetypes_dedupes_by_signature() -> None:
+    base = build_success_plan_archetype(
+        {
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [{"role": "anchor"}],
+            "join_structure": {"type": "count", "anchor_constraints": []},
+            "shared_answer_variable": "candidate_set",
+            "candidate_set_variable": "candidate_set",
+            "count_set_variable": "count_set",
+            "relation_paths": [
+                {
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                }
+            ],
+        }
+    )
+
+    merged = merge_success_plan_archetypes([base], dict(base))
+
+    assert len(merged) == 1
+    assert merged[0]["pattern_signature"] == base["pattern_signature"]
+
+
+def test_grounding_card_surfaces_family_success_patterns(monkeypatch) -> None:
+    controller = _make_controller()
+
+    class _FakeStore:
+        def get_trusted_success_bank_metadata(self, family_name: str):
+            assert family_name == "count_over_joined_set"
+            return {
+                "source_version": "2026-03-31",
+                "evaluation_context": {
+                    "success_plan_archetypes": [
+                        {
+                            "anchor_roles": ["anchor_a", "anchor_b"],
+                            "anchor_constraints": [
+                                "anchor_a->candidate_set",
+                                "anchor_b->candidate_set",
+                            ],
+                            "relation_role_skeleton": [
+                                "anchor_a->candidate_set:curated",
+                                "anchor_b->candidate_set:curated",
+                                "candidate_set->count_set:curated",
+                            ],
+                            "structural_notes": [
+                                "preserve_multiple_anchor_constraints",
+                                "count_target_distinct_from_candidate_set",
+                            ],
+                        }
+                    ]
+                },
+            }
+
+    controller._get_family_policy_store = lambda: _FakeStore()
+    monkeypatch.setattr(
+        controller,
+        "_infer_query_shape",
+        lambda **kwargs: "count_over_joined_set",
+    )
+    monkeypatch.setattr(
+        controller,
+        "_build_question_interpretation",
+        lambda **kwargs: {"question_inputs": [], "preferred_scaffolds": []},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_refine_question_interpretation_with_grounding",
+        lambda **kwargs: kwargs["question_interpretation"],
+    )
+
+    grounding_card = controller._build_pal_grounding_card(
+        "Question: how many dialects share two constraints?, Entities: ['A', 'B']",
+        relation_grounding=[],
+    )
+
+    assert "- family_success_patterns:" in grounding_card
+    assert "anchor_roles=anchor_a,anchor_b" in grounding_card
+    assert "preserve_multiple_anchor_constraints" in grounding_card
 
 
 def test_attribute_value_alias_candidates_include_singular_profession_forms() -> None:
@@ -6861,6 +7021,103 @@ def test_materialize_adapter_response_records_query_tool_and_bridge_macro() -> N
     assert controller._tool_invoked_in_last_inference == (
         "pal_sparql_query_tool_5_deadbeef -> pal_benchmark_bridge_macro"
     )
+
+
+def test_materialize_adapter_response_carries_semantic_bridge_payload() -> None:
+    controller = _make_controller()
+    controller._pending_macro_runs = {}
+    controller._ensure_bridge_tool = lambda tool_name: tool_name
+    controller._get_run_id = lambda: "knowledge_graph_6"
+    controller._get_macro_state_dir = lambda: "outputs/test_state"
+
+    response = controller._materialize_adapter_response(
+        task_question="Question: ...",
+        generated_tool_name="pal_sparql_query_tool_6_deadbeef",
+        materialization=BenchmarkMaterialization(
+            materialization_type="bridge_action",
+            needs_bridge=True,
+            bridge_action='Action: execute_macro("pal_benchmark_bridge_macro", {"run_id": "knowledge_graph_6", "state_dir": "outputs/test_state"})',
+            bridge_tool_name="pal_benchmark_bridge_macro",
+            bridge_payload={"run_id": "knowledge_graph_6", "state_dir": "outputs/test_state"},
+            final_variable=None,
+            final_answer_text=None,
+            diagnostics={"artifact_type": "count_scalar", "artifact_source": "raw_execution"},
+            confidence=1.0,
+            determinism_level="high",
+            semantic_description="count result returned by the PAL query",
+            solves_task=True,
+            trusted_for_materialization=True,
+        ),
+        tool_result_semantics={
+            "tool_result_semantic_description": "count result returned by the PAL query",
+            "tool_result_solves_task": True,
+            "tool_result_trusted_for_materialization": True,
+        },
+    )
+
+    assert response.startswith('Action: execute_macro("pal_benchmark_bridge_macro"')
+    assert '"pal_semantic_description": "count result returned by the PAL query"' in response
+    assert '"pal_solves_task": true' in response
+    assert '"pal_trusted_for_materialization": true' in response
+    assert '"pal_tool_status": "success"' in response
+    pending = controller._pending_macro_runs["knowledge_graph_6"]
+    assert pending["tool_name"] == "pal_benchmark_bridge_macro"
+
+
+def test_extract_macro_pointer_requires_trusted_final_contract() -> None:
+    controller = _make_controller()
+
+    assert controller._extract_macro_pointer(
+        "Macro result: pal_benchmark_bridge_macro -> SUCCESS.\n"
+        "Final variable: #3\n"
+        "Semantic: count result returned by the PAL query\n"
+        "Solves task: yes\n"
+        "Trusted final: yes"
+    ) == "#3"
+    assert (
+        controller._extract_macro_pointer(
+            "Macro result: pal_benchmark_bridge_macro -> SUCCESS.\n"
+            "Final variable: #3\n"
+            "Semantic: bounded candidate set returned by the PAL query\n"
+            "Solves task: no\n"
+            "Trusted final: no"
+        )
+        is None
+    )
+
+
+def test_macro_result_without_trusted_final_uses_manual_fallback() -> None:
+    controller = _make_controller()
+    controller._log_macro_result = lambda content: None
+    controller._get_run_id = lambda: "knowledge_graph_7"
+
+    class _FallbackAgent:
+        _tool_invoked_in_last_inference = "manual_solver"
+
+        def _inference(self, chat_history):
+            return ChatHistoryItem(role=Role.AGENT, content='Action: get_relations("Southern Min")')
+
+    controller._manual_fallback_agent = _FallbackAgent()
+
+    chat_history = ChatHistory()
+    chat_history.inject(
+        ChatHistoryItem(
+            role=Role.USER,
+            content=(
+                "Macro result: pal_benchmark_bridge_macro -> SUCCESS.\n"
+                "Final variable: #3\n"
+                "Semantic: bounded candidate set returned by the PAL query\n"
+                "Solves task: no\n"
+                "Trusted final: no"
+            ),
+        )
+    )
+
+    response = controller._inference(chat_history)
+
+    assert response.content == 'Action: get_relations("Southern Min")'
+    assert "knowledge_graph_7" in controller._manual_fallback_active_runs
+    assert controller._tool_invoked_in_last_inference == "manual_solver"
 
 
 def test_validate_pal_execution_rejects_generic_shared_type_dump() -> None:

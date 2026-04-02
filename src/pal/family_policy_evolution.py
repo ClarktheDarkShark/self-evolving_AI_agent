@@ -157,6 +157,127 @@ def _dedupe_strings(items: Sequence[str]) -> tuple[str, ...]:
     return tuple(deduped)
 
 
+def _normalize_role_token(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def build_success_plan_archetype(
+    query_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(query_plan, Mapping):
+        return {}
+
+    query_shape = str(query_plan.get("query_shape") or "").strip().lower()
+    answer_mode = str(query_plan.get("answer_mode") or "").strip().lower()
+    join_structure = (
+        dict(query_plan.get("join_structure"))
+        if isinstance(query_plan.get("join_structure"), Mapping)
+        else {}
+    )
+    join_type = str(join_structure.get("type") or "").strip().lower()
+
+    anchor_roles: list[str] = []
+    for item in query_plan.get("anchored_entities") or []:
+        if not isinstance(item, Mapping):
+            continue
+        role = _normalize_role_token(item.get("role"))
+        if role and role not in anchor_roles:
+            anchor_roles.append(role)
+
+    anchor_constraints: list[str] = []
+    for item in join_structure.get("anchor_constraints") or []:
+        if not isinstance(item, Mapping):
+            continue
+        anchor_role = _normalize_role_token(item.get("anchor_role"))
+        target_variable = str(item.get("constrains_variable") or "").strip()
+        if anchor_role and target_variable:
+            anchor_constraints.append(f"{anchor_role}->{target_variable}")
+
+    relation_role_skeleton: list[str] = []
+    for relation_path in query_plan.get("relation_paths") or []:
+        if not isinstance(relation_path, Mapping):
+            continue
+        from_role = _normalize_role_token(relation_path.get("from_role"))
+        to_role = _normalize_role_token(relation_path.get("to_role"))
+        grounding_source = str(relation_path.get("grounding_source") or "").strip().lower()
+        if from_role and to_role:
+            relation_role_skeleton.append(
+                f"{from_role}->{to_role}"
+                + (f":{grounding_source}" if grounding_source else "")
+            )
+
+    candidate_set_variable = str(query_plan.get("candidate_set_variable") or "").strip()
+    count_set_variable = str(query_plan.get("count_set_variable") or "").strip()
+    shared_answer_variable = str(query_plan.get("shared_answer_variable") or "").strip()
+
+    structural_notes: list[str] = []
+    anchor_like_roles = [role for role in anchor_roles if role in {"anchor", "anchor_a", "anchor_b"}]
+    if len(anchor_like_roles) >= 2:
+        structural_notes.append("preserve_multiple_anchor_constraints")
+    if any(item.startswith("constraint_value->") for item in anchor_constraints):
+        structural_notes.append("explicit_constraint_value_binding")
+    if any(item.startswith("shared_type->") or item.startswith("type_set->") for item in anchor_constraints):
+        structural_notes.append("explicit_type_constraint_binding")
+    if count_set_variable and candidate_set_variable and count_set_variable != candidate_set_variable:
+        structural_notes.append("count_target_distinct_from_candidate_set")
+    if shared_answer_variable and shared_answer_variable == candidate_set_variable:
+        structural_notes.append("shared_answer_equals_candidate_set")
+    if query_shape == "count_over_joined_set" and join_type == "count":
+        structural_notes.append("count_join_requires_explicit_joined_set")
+
+    pattern_signature_parts = [
+        query_shape,
+        answer_mode,
+        join_type,
+        ",".join(anchor_roles),
+        ",".join(anchor_constraints),
+        ",".join(relation_role_skeleton),
+        candidate_set_variable,
+        count_set_variable,
+        shared_answer_variable,
+        ",".join(structural_notes),
+    ]
+    pattern_signature = "|".join(part for part in pattern_signature_parts if part)
+
+    return {
+        "query_shape": query_shape,
+        "answer_mode": answer_mode,
+        "join_type": join_type,
+        "anchor_roles": anchor_roles,
+        "anchor_constraints": anchor_constraints,
+        "relation_role_skeleton": relation_role_skeleton[:4],
+        "candidate_set_variable": candidate_set_variable,
+        "count_set_variable": count_set_variable,
+        "shared_answer_variable": shared_answer_variable,
+        "structural_notes": structural_notes,
+        "pattern_signature": pattern_signature,
+    }
+
+
+def merge_success_plan_archetypes(
+    existing_archetypes: Sequence[Mapping[str, Any]],
+    new_archetype: Mapping[str, Any],
+    *,
+    max_items: int = 3,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen_signatures: list[str] = []
+
+    def _append(item: Mapping[str, Any]) -> None:
+        if not isinstance(item, Mapping):
+            return
+        signature = str(item.get("pattern_signature") or "").strip()
+        if not signature or signature in seen_signatures:
+            return
+        seen_signatures.append(signature)
+        merged.append(dict(item))
+
+    for archetype in existing_archetypes:
+        _append(archetype)
+    _append(new_archetype)
+    return merged[-max_items:]
+
+
 class FamilyPolicyStore:
     def __init__(
         self,

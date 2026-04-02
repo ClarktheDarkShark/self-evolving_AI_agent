@@ -1,16 +1,19 @@
 import json
 from pathlib import Path
+import sys
 
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.factories.chat_history_item import ChatHistoryItemFactory
 from src.tasks.instance.knowledge_graph.task import KnowledgeGraph
 from src.tasks.server import TaskServer
 from src.typings import Role, SampleStatus, Session, TaskName
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = str(REPO_ROOT / "outputs" / "pal_runtime" / "tool_state")
 
 
@@ -114,9 +117,12 @@ def build_entity_id_final_answer_session(sample_index: str) -> Session:
         {
             "role": Role.USER,
             "content": (
-                "Macro result: pal_benchmark_bridge_macro -> SUCCESS. "
-                "Final variable: #0. Observation: PAL benchmark bridge "
-                "materialized entity_id into a benchmark variable."
+                "Macro result: pal_benchmark_bridge_macro -> SUCCESS.\n"
+                "Final variable: #0\n"
+                "Semantic: entity result returned by the PAL query\n"
+                "Solves task: yes\n"
+                "Trusted final: yes\n"
+                "Observation: PAL benchmark bridge materialized entity_id into a benchmark variable."
             ),
         }
     )

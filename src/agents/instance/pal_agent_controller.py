@@ -57,6 +57,7 @@ from src.pal.reusable_tool_families import (
     render_reusable_tool,
     select_reusable_tool,
 )
+from src.self_evolving_agent.controller import SelfEvolvingController
 from src.self_evolving_agent.tool_registry import get_registry
 from src.typings import ChatHistory, ChatHistoryItem, Role
 from src.utils.output_paths import prefix_filename
@@ -212,6 +213,8 @@ class PALAgentController(Agent):
         self._pending_macro_runs: dict[str, dict[str, Any]] = {}
         self._registered_bridge_tools: set[str] = set()
         self._tool_invoked_in_last_inference = None
+        self._manual_fallback_agent: Optional[SelfEvolvingController] = None
+        self._manual_fallback_active_runs: set[str] = set()
 
     @override
     def _inference(self, chat_history: ChatHistory) -> ChatHistoryItem:
@@ -220,12 +223,18 @@ class PALAgentController(Agent):
         generated_tool_name: Optional[str] = None
         try:
             last_user_content = chat_history.get_item_deep_copy(-1).content
+            if self._manual_fallback_active_for_current_run():
+                return self._delegate_to_manual_solver(chat_history=chat_history)
             if macro_pointer := self._extract_macro_pointer(last_user_content):
                 self._log_macro_result(last_user_content)
                 return ChatHistoryItem(
                     role=Role.AGENT,
                     content=f"Final Answer: {macro_pointer}",
                 )
+            if "Macro result:" in (last_user_content or ""):
+                self._log_macro_result(last_user_content)
+                self._activate_manual_fallback(chat_history=chat_history)
+                return self._delegate_to_manual_solver(chat_history=chat_history)
 
             task_question = last_user_content
             generated_tool_name = self._build_query_tool_name(task_question)
@@ -474,6 +483,10 @@ class PALAgentController(Agent):
                         generated_tool_name=generated_tool_name,
                         loop_log=_repair_loop_log,
                         trust_contract=trust_contract,
+                        tool_result_semantics=self._build_tool_result_semantics(
+                            materialization=materialization,
+                            trust_contract=trust_contract,
+                        ),
                     )
                     self._emit_generated_tools_event(
                         {
@@ -500,16 +513,25 @@ class PALAgentController(Agent):
                             repair_loop_log=_repair_loop_log,
                             trust_contract=trust_contract,
                         )
-                        raise AgentUnknownException(
-                            "pal_materialization_contract_failed:"
-                            + ",".join(trust_contract.denial_reasons)
+                        self._activate_manual_fallback(
+                            chat_history=chat_history,
+                            advisory_text=self._build_tool_advisory_text(
+                                materialization=materialization,
+                                trust_contract=trust_contract,
+                            ),
                         )
+                        return self._delegate_to_manual_solver(chat_history=chat_history)
+                    tool_result_semantics = self._build_tool_result_semantics(
+                        materialization=materialization,
+                        trust_contract=trust_contract,
+                    )
                     return ChatHistoryItem(
                         role=Role.AGENT,
                         content=self._materialize_adapter_response(
                             task_question=task_question,
                             materialization=materialization,
                             generated_tool_name=generated_tool_name,
+                            tool_result_semantics=tool_result_semantics,
                         ),
                     )
                 result_dict = invocation_result.payload
@@ -593,6 +615,10 @@ class PALAgentController(Agent):
                     generated_tool_name=generated_tool_name,
                     loop_log=_repair_loop_log,
                     trust_contract=trust_contract,
+                    tool_result_semantics=self._build_tool_result_semantics(
+                        materialization=materialization,
+                        trust_contract=trust_contract,
+                    ),
                 )
                 if not trust_contract.materialization_allowed:
                     self._maybe_record_family_policy_candidate(
@@ -605,16 +631,25 @@ class PALAgentController(Agent):
                         repair_loop_log=_repair_loop_log,
                         trust_contract=trust_contract,
                     )
-                    raise AgentUnknownException(
-                        "pal_materialization_contract_failed:"
-                        + ",".join(trust_contract.denial_reasons)
+                    self._activate_manual_fallback(
+                        chat_history=chat_history,
+                        advisory_text=self._build_tool_advisory_text(
+                            materialization=materialization,
+                            trust_contract=trust_contract,
+                        ),
                     )
+                    return self._delegate_to_manual_solver(chat_history=chat_history)
+                tool_result_semantics = self._build_tool_result_semantics(
+                    materialization=materialization,
+                    trust_contract=trust_contract,
+                )
                 return ChatHistoryItem(
                     role=Role.AGENT,
                     content=self._materialize_adapter_response(
                         task_question=task_question,
                         materialization=materialization,
                         generated_tool_name=generated_tool_name,
+                        tool_result_semantics=tool_result_semantics,
                     ),
                 )
 
@@ -675,6 +710,7 @@ class PALAgentController(Agent):
         task_question: str,
         materialization: BenchmarkMaterialization,
         generated_tool_name: Optional[str] = None,
+        tool_result_semantics: Optional[Mapping[str, Any]] = None,
     ) -> str:
         artifact_type = str(
             (materialization.diagnostics or {}).get("artifact_type") or ""
@@ -686,6 +722,55 @@ class PALAgentController(Agent):
             payload = dict(materialization.bridge_payload or {})
             payload.setdefault("run_id", self._get_run_id())
             payload.setdefault("state_dir", self._get_macro_state_dir())
+            payload.setdefault(
+                "pal_semantic_description",
+                str(
+                    (tool_result_semantics or {}).get("tool_result_semantic_description")
+                    or materialization.semantic_description
+                    or ""
+                ).strip(),
+            )
+            payload.setdefault(
+                "pal_solves_task",
+                bool(
+                    (tool_result_semantics or {}).get("tool_result_solves_task")
+                    or materialization.solves_task
+                ),
+            )
+            payload.setdefault(
+                "pal_trusted_for_materialization",
+                bool(
+                    (tool_result_semantics or {}).get(
+                        "tool_result_trusted_for_materialization"
+                    )
+                ),
+            )
+            payload.setdefault(
+                "pal_tool_status",
+                str(
+                    (tool_result_semantics or {}).get("tool_result_status")
+                    or (
+                        "success"
+                        if (
+                            materialization.solves_task
+                            and materialization.trusted_for_materialization
+                        )
+                        else (
+                            "partial" if materialization.useful_intermediate else "failed"
+                        )
+                    )
+                    or materialization.tool_status
+                ).strip(),
+            )
+            payload.setdefault(
+                "pal_failure_reason",
+                str(
+                    (tool_result_semantics or {}).get("tool_result_failure_reason")
+                    or materialization.failure_reason
+                    or ""
+                ).strip(),
+            )
+            payload.setdefault("pal_confidence", materialization.confidence)
             run_id = str(payload.get("run_id") or self._get_run_id())
             self._pending_macro_runs[run_id] = {
                 "tool_name": tool_name,
@@ -714,9 +799,6 @@ class PALAgentController(Agent):
                     "asked_for": self._summarize_text(task_question, max_len=160),
                 }
             )
-            bridge_action = materialization.bridge_action
-            if bridge_action:
-                return bridge_action
             return (
                 f"Action: execute_macro({json.dumps(tool_name)}, "
                 f"{json.dumps(payload, ensure_ascii=False)})"
@@ -864,6 +946,71 @@ class PALAgentController(Agent):
         return build_family_policy_store(
             baseline_bundles=get_baseline_reusable_family_policy_bundles()
         )
+
+    def _load_family_success_archetypes(
+        self,
+        *,
+        family_name: str,
+    ) -> list[dict[str, Any]]:
+        cleaned_family = str(family_name or "").strip()
+        if not cleaned_family:
+            return []
+        try:
+            store = self._get_family_policy_store()
+            metadata = store.get_trusted_success_bank_metadata(cleaned_family)
+        except Exception:
+            return []
+        evaluation_context = metadata.get("evaluation_context") or {}
+        if not isinstance(evaluation_context, Mapping):
+            return []
+        active_bundle = get_reusable_family_policy_bundle(cleaned_family)
+        source_version = str(metadata.get("source_version") or "").strip()
+        active_version = str(getattr(active_bundle, "version", "") or "").strip()
+        if source_version and active_version and source_version != active_version:
+            return []
+        return [
+            dict(item)
+            for item in (evaluation_context.get("success_plan_archetypes") or [])
+            if isinstance(item, Mapping)
+        ]
+
+    def _format_family_success_archetypes(
+        self,
+        *,
+        family_name: str,
+    ) -> list[str]:
+        archetypes = self._load_family_success_archetypes(family_name=family_name)
+        formatted: list[str] = []
+        for archetype in archetypes[:2]:
+            anchor_roles = ",".join(
+                str(item).strip()
+                for item in (archetype.get("anchor_roles") or [])
+                if str(item).strip()
+            )
+            anchor_constraints = " | ".join(
+                str(item).strip()
+                for item in (archetype.get("anchor_constraints") or [])
+                if str(item).strip()
+            )
+            relation_roles = " | ".join(
+                str(item).strip()
+                for item in (archetype.get("relation_role_skeleton") or [])
+                if str(item).strip()
+            )
+            structural_notes = ",".join(
+                str(item).strip()
+                for item in (archetype.get("structural_notes") or [])
+                if str(item).strip()
+            )
+            summary_bits = [
+                f"anchor_roles={anchor_roles or 'none'}",
+                f"anchor_constraints={anchor_constraints or 'none'}",
+                f"relation_roles={relation_roles or 'none'}",
+            ]
+            if structural_notes:
+                summary_bits.append(f"structural_notes={structural_notes}")
+            formatted.append("; ".join(summary_bits))
+        return formatted
 
     def _collect_family_policy_failure_reasons(
         self,
@@ -1073,6 +1220,7 @@ class PALAgentController(Agent):
         generated_tool_name: str,
         loop_log: Mapping[str, Any],
         trust_contract: TrustContractEvaluation,
+        tool_result_semantics: Optional[Mapping[str, Any]] = None,
     ) -> None:
         attempt_decisions = list(loop_log.get("attempt_decisions") or [])
         final_payload = dict(attempt_decisions[-1] if attempt_decisions else {})
@@ -1089,6 +1237,8 @@ class PALAgentController(Agent):
                 ),
             }
         )
+        if tool_result_semantics:
+            final_payload.update(dict(tool_result_semantics))
         self._emit_generated_tools_event(
             {
                 "event": "pal_attempt_decision_finalized",
@@ -13637,6 +13787,9 @@ class PALAgentController(Agent):
             question_inputs=interpreted_inputs,
             grounded_relation_candidates=grounded_relation_candidates,
         )
+        family_success_patterns = self._format_family_success_archetypes(
+            family_name=query_shape,
+        )
         lines = [
             "PAL grounding hints:",
             f"- question_text: {question_text}",
@@ -13770,6 +13923,10 @@ class PALAgentController(Agent):
             lines.append("- shape_guidance:")
             for guidance_line in shape_guidance:
                 lines.append(f"  - {guidance_line}")
+        if family_success_patterns:
+            lines.append("- family_success_patterns:")
+            for pattern in family_success_patterns:
+                lines.append(f"  - {pattern}")
         lines.extend(
             [
                 "- guidance:",
@@ -16174,6 +16331,8 @@ class PALAgentController(Agent):
     def _extract_macro_pointer(self, content: str) -> Optional[str]:
         if "Macro result:" not in (content or ""):
             return None
+        if not self._macro_result_is_trusted_final(content):
+            return None
         pointer_match = re.search(r"Final variable:\s*(#\d+)", content)
         if pointer_match is None:
             return None
@@ -16191,7 +16350,7 @@ class PALAgentController(Agent):
         if tool_name_match is not None:
             tool_name = tool_name_match.group(1)
             status = tool_name_match.group(2)
-        success = status == "SUCCESS"
+        success = status == "SUCCESS" and self._macro_result_is_trusted_final(content)
         pointer_match = re.search(r"Final variable:\s*(#\d+)", content or "")
         result_errors = None if success else [content]
         self._emit_generated_tools_event(
@@ -16218,10 +16377,145 @@ class PALAgentController(Agent):
                 "result_contract_ok": success,
                 "result_errors": result_errors,
                 "result_answer_recommendation": pointer_match.group(1)
-                if pointer_match is not None
+                if success and pointer_match is not None
                 else None,
             }
         )
+
+    def _macro_result_is_trusted_final(self, content: str) -> bool:
+        text = str(content or "")
+        return bool(
+            re.search(r"Trusted final:\s*yes\b", text, flags=re.IGNORECASE)
+            and re.search(r"Solves task:\s*yes\b", text, flags=re.IGNORECASE)
+        )
+
+    def _build_tool_result_semantics(
+        self,
+        *,
+        materialization: BenchmarkMaterialization,
+        trust_contract: TrustContractEvaluation,
+    ) -> dict[str, Any]:
+        trusted_final = bool(
+            trust_contract.materialization_allowed
+            and materialization.solves_task
+            and materialization.trusted_for_materialization
+        )
+        useful_intermediate = bool(
+            materialization.useful_intermediate
+            and not trusted_final
+            and str(materialization.semantic_description or "").strip()
+        )
+        status = "success" if trusted_final else ("partial" if useful_intermediate else "failed")
+        failure_reason = str(materialization.failure_reason or "").strip()
+        if not failure_reason and not trusted_final:
+            failure_reason = ",".join(
+                str(item).strip()
+                for item in trust_contract.denial_reasons
+                if str(item).strip()
+            )
+        return {
+            "tool_result_status": status,
+            "tool_result_semantic_description": str(
+                materialization.semantic_description or ""
+            ).strip(),
+            "tool_result_solves_task": bool(materialization.solves_task),
+            "tool_result_trusted_for_materialization": trusted_final,
+            "tool_result_useful_intermediate": useful_intermediate,
+            "tool_result_failure_reason": failure_reason,
+            "tool_result_confidence": materialization.confidence,
+        }
+
+    def _build_tool_advisory_text(
+        self,
+        *,
+        materialization: BenchmarkMaterialization,
+        trust_contract: TrustContractEvaluation,
+    ) -> str:
+        semantics = self._build_tool_result_semantics(
+            materialization=materialization,
+            trust_contract=trust_contract,
+        )
+        lines = [
+            f"PAL tool status: {semantics.get('tool_result_status')}.",
+        ]
+        semantic_description = str(
+            semantics.get("tool_result_semantic_description") or ""
+        ).strip()
+        if semantic_description:
+            lines.append(f"Semantic description: {semantic_description}.")
+        failure_reason = str(semantics.get("tool_result_failure_reason") or "").strip()
+        if failure_reason:
+            lines.append(f"Failure reason: {failure_reason}.")
+        if semantics.get("tool_result_useful_intermediate"):
+            lines.append(
+                "This is bounded advisory context only. Do not treat it as a final answer."
+            )
+        else:
+            lines.append(
+                "Ignore the PAL tool output if it does not help, and continue solving manually."
+            )
+        return " ".join(line.strip() for line in lines if line.strip())
+
+    def _manual_fallback_active_for_current_run(self) -> bool:
+        return self._get_run_id() in self._manual_fallback_active_runs
+
+    def _activate_manual_fallback(
+        self,
+        *,
+        chat_history: ChatHistory,
+        advisory_text: Optional[str] = None,
+    ) -> None:
+        self._manual_fallback_active_runs.add(self._get_run_id())
+        if advisory_text and chat_history.get_value_length() > 0:
+            last_item = chat_history.get_item_deep_copy(-1)
+            if last_item.role == Role.USER and advisory_text not in (last_item.content or ""):
+                separator = "\n\nPAL tool advisory (optional):\n"
+                chat_history.set(
+                    -1,
+                    ChatHistoryItem(
+                        role=Role.USER,
+                        content=(last_item.content or "") + separator + advisory_text,
+                    ),
+                )
+
+    def _get_manual_fallback_agent(self) -> SelfEvolvingController:
+        if self._manual_fallback_agent is None:
+            output_dir = Path(
+                os.environ.get("LIFELONG_OUTPUT_DIR", "outputs/pal_runtime")
+            )
+            tool_registry_path = str(output_dir / "tool_library")
+            environment_label = str(
+                getattr(getattr(self, "_current_session", None), "task_name", "knowledge_graph")
+            )
+            self._manual_fallback_agent = SelfEvolvingController(
+                language_model=self._language_model,
+                tool_registry_path=tool_registry_path,
+                inference_config_dict=dict(self._inference_config_dict),
+                environment_label=environment_label,
+            )
+        return self._manual_fallback_agent
+
+    def _delegate_to_manual_solver(
+        self,
+        *,
+        chat_history: ChatHistory,
+    ) -> ChatHistoryItem:
+        fallback_agent = self._get_manual_fallback_agent()
+        setattr(fallback_agent, "_current_session", getattr(self, "_current_session", None))
+        response = fallback_agent._inference(chat_history)
+        self._tool_invoked_in_last_inference = getattr(
+            fallback_agent,
+            "_tool_invoked_in_last_inference",
+            None,
+        )
+        self._emit_generated_tools_event(
+            {
+                "event": "pal_manual_solver_fallback_used",
+                "mode": "pal",
+                "run_id": self._get_run_id(),
+            }
+        )
+        return response
 
     def _build_adapter_context(self, task_question: str) -> BenchmarkAdapterContext:
         return BenchmarkAdapterContext(
@@ -16274,8 +16568,14 @@ class PALAgentController(Agent):
                     "optional_keys": [
                         "pal_artifact_source",
                         "pal_artifact_diagnostics",
-                        "variable_list",
-                    ],
+                            "pal_semantic_description",
+                            "pal_solves_task",
+                            "pal_trusted_for_materialization",
+                            "pal_tool_status",
+                            "pal_failure_reason",
+                            "pal_confidence",
+                            "variable_list",
+                        ],
                     "property_types": {
                         "pal_artifact_type": "string",
                         "run_id": "string",

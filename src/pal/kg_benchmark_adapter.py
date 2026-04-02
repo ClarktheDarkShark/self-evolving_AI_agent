@@ -58,6 +58,13 @@ class BenchmarkMaterialization:
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
     confidence: float = 0.0
     determinism_level: str = "unknown"
+    tool_status: str = "failed"
+    semantic_description: Optional[str] = None
+    solves_task: bool = False
+    trusted_for_materialization: bool = False
+    useful_intermediate: bool = False
+    intermediate_variables: tuple[str, ...] = ()
+    failure_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -248,6 +255,12 @@ def materialize_benchmark_artifact(
     context: BenchmarkAdapterContext,
 ) -> BenchmarkMaterialization:
     if artifact.artifact_type in {"unresolved", "empty"}:
+        failure_reason = str(
+            artifact.diagnostics.get("failure_kind")
+            or artifact.diagnostics.get("reason")
+            or artifact.artifact_type
+            or "unresolved_artifact"
+        ).strip()
         return BenchmarkMaterialization(
             materialization_type=(
                 "empty_failure" if artifact.artifact_type == "empty" else "unresolved_failure"
@@ -265,8 +278,30 @@ def materialize_benchmark_artifact(
             },
             confidence=0.0,
             determinism_level="none",
+            tool_status="failed",
+            semantic_description=_describe_artifact_semantics(artifact),
+            solves_task=False,
+            trusted_for_materialization=False,
+            useful_intermediate=False,
+            failure_reason=failure_reason,
         )
 
+    trusted_for_materialization = artifact.source == "raw_execution"
+    useful_intermediate = (
+        artifact.source != "raw_execution"
+        and artifact.artifact_type
+        in {
+            "entity_id",
+            "entity_set",
+            "count_scalar",
+            "boolean",
+            "scalar_literal",
+            "text_literal",
+        }
+    )
+    tool_status = "success" if trusted_for_materialization else (
+        "partial" if useful_intermediate else "failed"
+    )
     bridge_payload = {
         "pal_artifact_type": artifact.artifact_type,
         "pal_artifact_value": artifact.value,
@@ -293,6 +328,12 @@ def materialize_benchmark_artifact(
         },
         confidence=_confidence_for_source(artifact.source),
         determinism_level=_determinism_for_source(artifact.source),
+        tool_status=tool_status,
+        semantic_description=_describe_artifact_semantics(artifact),
+        solves_task=trusted_for_materialization,
+        trusted_for_materialization=trusted_for_materialization,
+        useful_intermediate=useful_intermediate,
+        failure_reason=None,
     )
 
 
@@ -437,14 +478,31 @@ def run(payload: dict) -> dict:
     )
     variable_list.append(variable)
     final_pointer = f"#{len(variable_list) - 1}"
+    semantic_description = str(
+        payload.get("pal_semantic_description")
+        or ("PAL artifact materialized as " + artifact_type)
+    ).strip()
+    tool_status = str(payload.get("pal_tool_status") or "success").strip().upper()
+    if tool_status not in {"SUCCESS", "PARTIAL", "ERROR", "FAILED"}:
+        tool_status = "SUCCESS"
+    solves_task = bool(payload.get("pal_solves_task"))
+    trusted_for_materialization = bool(payload.get("pal_trusted_for_materialization"))
+    failure_reason = str(payload.get("pal_failure_reason") or "").strip() or None
+    confidence = payload.get("pal_confidence")
     return {
-        "status": "SUCCESS",
+        "status": "ERROR" if tool_status == "FAILED" else tool_status,
         "final_variable": final_pointer,
         "observation": (
             "PAL benchmark bridge materialized "
             + artifact_type
             + " into a benchmark variable."
         ),
+        "semantic_description": semantic_description,
+        "solves_task": solves_task,
+        "trusted_for_materialization": trusted_for_materialization,
+        "intermediate_variables": [final_pointer],
+        "failure_reason": failure_reason,
+        "confidence": confidence,
     }
 """
 
@@ -716,6 +774,28 @@ def _determinism_for_source(source: str) -> str:
 
 def _solver_fallback_is_allowed(artifact: PalExecutionArtifact) -> bool:
     return False
+
+
+def _describe_artifact_semantics(artifact: PalExecutionArtifact) -> str:
+    artifact_type = str(artifact.artifact_type or "").strip()
+    if artifact_type == "count_scalar":
+        return "count result returned by the PAL query"
+    if artifact_type == "entity_id":
+        return "single entity id returned by the PAL query"
+    if artifact_type == "entity_set":
+        return "bounded set of entity ids returned by the PAL query"
+    if artifact_type == "boolean":
+        return "boolean result returned by the PAL query"
+    if artifact_type in {"scalar_literal", "text_literal"}:
+        return "literal value returned by the PAL query"
+    if artifact_type == "empty":
+        return "PAL query returned an empty result"
+    if artifact_type == "unresolved":
+        failure_kind = str(artifact.diagnostics.get("failure_kind") or "").strip()
+        if failure_kind:
+            return f"PAL query did not yield a trustworthy artifact ({failure_kind})"
+        return "PAL query did not yield a trustworthy artifact"
+    return "PAL query produced an execution artifact"
 
 
 def _emit(

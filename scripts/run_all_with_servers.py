@@ -27,7 +27,11 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import kg_sparql_server
 import yaml
-from src.pal.family_policy_evolution import build_family_policy_store
+from src.pal.family_policy_evolution import (
+    build_family_policy_store,
+    build_success_plan_archetype,
+    merge_success_plan_archetypes,
+)
 from src.pal.reusable_tool_families import get_baseline_reusable_family_policy_bundles
 
 CONFIG_PATHS = [
@@ -297,6 +301,32 @@ def _latest_attempt_decision_for_sample(output_dir: Path, sample_index: str) -> 
     return latest
 
 
+def _latest_query_plan_for_sample(output_dir: Path, sample_index: str) -> dict[str, object] | None:
+    generated_tools_path = output_dir / "generated_tools.log"
+    if not generated_tools_path.exists():
+        return None
+    latest_plan_path = ""
+    for line in generated_tools_path.read_text(encoding="utf-8").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if str(payload.get("sample_index") or "").strip() != str(sample_index or "").strip():
+            continue
+        if payload.get("event") not in {"pal_query_artifact_saved", "pal_query_plan_generated"}:
+            continue
+        plan_path = str(payload.get("plan_artifact_path") or "").strip()
+        if plan_path:
+            latest_plan_path = plan_path
+    if not latest_plan_path:
+        return None
+    try:
+        loaded = json.loads(Path(latest_plan_path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return dict(loaded) if isinstance(loaded, dict) else None
+
+
 def _build_inline_trigger_baseline_summary(
     *,
     output_dir: Path,
@@ -372,7 +402,18 @@ def _record_trusted_family_success(
         (trust_contract.get("dangerous_overreach") if isinstance(trust_contract, dict) else False)
         or decision_payload.get("dangerous_overreach")
     )
-    if not materialization_allowed or dangerous_overreach:
+    tool_result_status = str(decision_payload.get("tool_result_status") or "").strip().lower()
+    tool_result_solves_task = bool(decision_payload.get("tool_result_solves_task"))
+    tool_result_trusted = bool(
+        decision_payload.get("tool_result_trusted_for_materialization")
+    )
+    if (
+        not materialization_allowed
+        or dangerous_overreach
+        or tool_result_status != "success"
+        or not tool_result_solves_task
+        or not tool_result_trusted
+    ):
         return []
     store = build_family_policy_store(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),
@@ -380,8 +421,16 @@ def _record_trusted_family_success(
     )
     metadata = store.get_trusted_success_bank_metadata(family_name)
     existing_ids: list[str] = []
+    existing_archetypes: list[dict[str, object]] = []
     if str(metadata.get("source_version") or "").strip() == str(active_version or "").strip():
         existing_ids = store.get_trusted_success_bank(family_name)
+        evaluation_context = metadata.get("evaluation_context") or {}
+        if isinstance(evaluation_context, dict):
+            existing_archetypes = [
+                dict(item)
+                for item in (evaluation_context.get("success_plan_archetypes") or [])
+                if isinstance(item, dict)
+            ]
     updated_ids = [
         sample_id
         for sample_id in [*existing_ids, str(sample_index or "").strip()]
@@ -392,6 +441,21 @@ def _record_trusted_family_success(
         if sample_id not in deduped:
             deduped.append(sample_id)
     deduped = deduped[-INLINE_TRUSTED_SUCCESS_BANK_SIZE:]
+    query_plan = _latest_query_plan_for_sample(output_dir, sample_index)
+    success_archetypes = existing_archetypes
+    if query_plan:
+        archetype = build_success_plan_archetype(query_plan)
+        if archetype:
+            success_archetypes = merge_success_plan_archetypes(
+                existing_archetypes,
+                archetype,
+            )
+    evaluation_context = _build_trusted_success_bank_context(
+        family_name=family_name,
+        active_version=active_version,
+    )
+    if success_archetypes:
+        evaluation_context["success_plan_archetypes"] = success_archetypes
     store.set_trusted_success_bank(
         family_name,
         sample_ids=deduped,
@@ -400,10 +464,7 @@ def _record_trusted_family_success(
             "source": "inline_standard_run_success_harvest",
             "sample_index": str(sample_index or "").strip(),
         },
-        evaluation_context=_build_trusted_success_bank_context(
-            family_name=family_name,
-            active_version=active_version,
-        ),
+        evaluation_context=evaluation_context,
     )
     _append_generated_tool_event(
         progress_log_path,
@@ -414,6 +475,7 @@ def _record_trusted_family_success(
             "active_version": active_version,
             "trusted_success_bank": deduped,
             "trusted_success_bank_ready": len(deduped) >= INLINE_TRUSTED_SUCCESS_BANK_SIZE,
+            "success_plan_archetype_count": len(success_archetypes),
         },
     )
     return deduped

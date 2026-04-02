@@ -25,6 +25,7 @@ from src.pal.kg_benchmark_adapter import (
 )
 from src.pal.invoker import execute_pal_code_with_result
 from src.pal.invoker import _classify_invocation_exception
+from src.tasks.instance.knowledge_graph.task import KnowledgeGraph
 
 
 def test_unresolved_artifact_is_not_bridge_materialized() -> None:
@@ -68,6 +69,103 @@ def test_bridge_tool_refuses_unresolved_artifact() -> None:
 
     assert result["status"] == "ERROR"
     assert result["final_variable"] is None
+
+
+def test_bridge_tool_returns_semantic_contract_fields() -> None:
+    namespace: dict[str, object] = {}
+    bridge_code = build_pal_benchmark_bridge_tool_code()
+    assert_bridge_tool_code_narrow(bridge_code)
+    exec(bridge_code, namespace)
+
+    result = namespace["run"](
+        {
+            "variable_list": [],
+            "pal_artifact_type": "count_scalar",
+            "pal_artifact_value": "4",
+            "pal_semantic_description": "count result returned by the PAL query",
+            "pal_solves_task": True,
+            "pal_trusted_for_materialization": True,
+            "pal_confidence": 1.0,
+        }
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["semantic_description"] == "count result returned by the PAL query"
+    assert result["solves_task"] is True
+    assert result["trusted_for_materialization"] is True
+    assert result["intermediate_variables"] == ["#0"]
+
+
+def test_bridge_tool_returns_partial_advisory_contract_fields() -> None:
+    namespace: dict[str, object] = {}
+    bridge_code = build_pal_benchmark_bridge_tool_code()
+    assert_bridge_tool_code_narrow(bridge_code)
+    exec(bridge_code, namespace)
+
+    result = namespace["run"](
+        {
+            "variable_list": [],
+            "pal_artifact_type": "entity_set",
+            "pal_artifact_value": ["m.1", "m.2"],
+            "pal_semantic_description": "bounded candidate set returned by the PAL query",
+            "pal_solves_task": False,
+            "pal_trusted_for_materialization": False,
+            "pal_tool_status": "partial",
+            "pal_failure_reason": "needs_manual_disambiguation",
+            "pal_confidence": 0.4,
+        }
+    )
+
+    assert result["status"] == "PARTIAL"
+    assert result["semantic_description"] == "bounded candidate set returned by the PAL query"
+    assert result["solves_task"] is False
+    assert result["trusted_for_materialization"] is False
+    assert result["intermediate_variables"] == ["#0"]
+    assert result["failure_reason"] == "needs_manual_disambiguation"
+
+
+def test_macro_result_summary_surfaces_only_trusted_final_pointer() -> None:
+    trusted_summary = KnowledgeGraph._build_macro_result_summary(
+        tool_name="pal_benchmark_bridge_macro",
+        result={
+            "status": "SUCCESS",
+            "final_variable": "#3",
+            "observation": "ok",
+            "semantic_description": "count result returned by the PAL query",
+            "solves_task": True,
+            "trusted_for_materialization": True,
+            "confidence": 1.0,
+        },
+    )
+    partial_summary = KnowledgeGraph._build_macro_result_summary(
+        tool_name="pal_benchmark_bridge_macro",
+        result={
+            "status": "PARTIAL",
+            "final_variable": "#3",
+            "observation": "bounded candidate set only",
+            "semantic_description": "bounded candidate set returned by the tool",
+            "solves_task": False,
+            "trusted_for_materialization": False,
+            "intermediate_variables": ["#3"],
+        },
+    )
+    unsafe_summary = KnowledgeGraph._build_macro_result_summary(
+        tool_name="pal_benchmark_bridge_macro",
+        result={
+            "status": "SUCCESS",
+            "final_variable": "#9",
+            "observation": "weak vague result",
+            "solves_task": False,
+            "trusted_for_materialization": False,
+        },
+    )
+
+    assert "Final variable: #3" in trusted_summary
+    assert "Trusted final: yes" in trusted_summary
+    assert "Intermediate variables: #3" in partial_summary
+    assert "Trusted final: no" in partial_summary
+    assert "Final variable: #9" not in unsafe_summary
+    assert "Use manual solver fallback: yes" in unsafe_summary
 
 
 def test_bridge_tool_contract_rejects_retrieval_logic() -> None:

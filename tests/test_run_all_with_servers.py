@@ -96,6 +96,9 @@ def test_record_trusted_family_success_keeps_one_regression_guard(tmp_path: path
             "family_bundle_version": "2026-03-31",
             "dangerous_overreach": False,
             "trust_contract": {"materialization_allowed": True, "dangerous_overreach": False},
+            "tool_result_status": "success",
+            "tool_result_solves_task": True,
+            "tool_result_trusted_for_materialization": True,
         },
         {
             "event": "pal_attempt_decision_finalized",
@@ -104,6 +107,9 @@ def test_record_trusted_family_success_keeps_one_regression_guard(tmp_path: path
             "family_bundle_version": "2026-03-31",
             "dangerous_overreach": False,
             "trust_contract": {"materialization_allowed": True, "dangerous_overreach": False},
+            "tool_result_status": "success",
+            "tool_result_solves_task": True,
+            "tool_result_trusted_for_materialization": True,
         },
     ]
     log_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
@@ -140,6 +146,39 @@ def test_record_trusted_family_success_keeps_one_regression_guard(tmp_path: path
         family_name="count_over_direct_relation",
         active_version="2026-03-31",
     )
+
+
+def test_record_trusted_family_success_ignores_partial_or_untrusted_tool_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    output_dir = tmp_path / "run"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "generated_tools.log"
+    rows = [
+        {
+            "event": "pal_attempt_decision_finalized",
+            "sample_index": "11",
+            "selected_family": "count_over_direct_relation",
+            "family_bundle_version": "2026-03-31",
+            "dangerous_overreach": False,
+            "trust_contract": {"materialization_allowed": True, "dangerous_overreach": False},
+            "tool_result_status": "partial",
+            "tool_result_solves_task": False,
+            "tool_result_trusted_for_materialization": False,
+        }
+    ]
+    log_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    bank = _record_trusted_family_success(
+        output_dir=output_dir,
+        store_path=tmp_path / "store",
+        family_name="count_over_direct_relation",
+        sample_index="11",
+        active_version="2026-03-31",
+        progress_log_path=log_path,
+    )
+
+    assert bank == []
 
 
 def test_inline_trigger_baseline_summary_includes_run_dir(tmp_path: pathlib.Path) -> None:
@@ -225,6 +264,9 @@ def test_boundary_runner_revisits_pending_candidate_after_family_warms(
                 "family_bundle_version": "2026-03-31",
                 "dangerous_overreach": False,
                 "materialization_allowed": True,
+                "tool_result_status": "success",
+                "tool_result_solves_task": True,
+                "tool_result_trusted_for_materialization": True,
                 "trust_contract": {
                     "materialization_allowed": True,
                     "dangerous_overreach": False,
@@ -367,6 +409,9 @@ def test_boundary_runner_prioritizes_current_bad_sample_over_older_pending_candi
             "family_bundle_version": "2026-03-31",
             "dangerous_overreach": False,
             "materialization_allowed": True,
+            "tool_result_status": "success",
+            "tool_result_solves_task": True,
+            "tool_result_trusted_for_materialization": True,
             "trust_contract": {
                 "materialization_allowed": True,
                 "dangerous_overreach": False,

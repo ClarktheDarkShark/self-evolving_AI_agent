@@ -34,6 +34,16 @@ from .api import KnowledgeGraphAPI, Variable, KnowledgeGraphAPIException
 from .utils.sparql_executor import SparqlExecutor
 from src.self_evolving_agent import kg_utils as _kg_utils
 
+_MACRO_REQUIRED_OUTPUT_KEYS = {"status", "final_variable", "observation"}
+_MACRO_OPTIONAL_OUTPUT_KEYS = {
+    "semantic_description",
+    "solves_task",
+    "trusted_for_materialization",
+    "intermediate_variables",
+    "failure_reason",
+    "confidence",
+}
+
 
 class KnowledgeGraphSkillUtility(SkillUtility):
     _SKILL_TO_LEVEL_DICT = {}
@@ -85,6 +95,92 @@ class KnowledgeGraphDatasetItem(DatasetItem):
 
 
 class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
+    @staticmethod
+    def _normalize_macro_status(status: Any) -> str:
+        cleaned = str(status or "").strip().upper()
+        if cleaned in {"SUCCESS", "PARTIAL", "FAILED", "ERROR"}:
+            return cleaned
+        if cleaned == "FAIL":
+            return "FAILED"
+        return cleaned or "ERROR"
+
+    @staticmethod
+    def _coerce_macro_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        cleaned = str(value or "").strip().lower()
+        return cleaned in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _extract_macro_intermediate_variables(value: Any) -> list[str]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return []
+        pointers: list[str] = []
+        for item in value:
+            cleaned = str(item or "").strip()
+            if cleaned.startswith("#") and cleaned not in pointers:
+                pointers.append(cleaned)
+        return pointers
+
+    @classmethod
+    def _build_macro_result_summary(
+        cls,
+        *,
+        tool_name: str,
+        result: Mapping[str, Any],
+    ) -> str:
+        status = cls._normalize_macro_status(result.get("status"))
+        final_variable = str(result.get("final_variable") or "").strip()
+        observation = str(result.get("observation") or "").strip()
+        semantic_description = str(result.get("semantic_description") or "").strip()
+        solves_task = cls._coerce_macro_bool(result.get("solves_task"))
+        trusted_for_materialization = cls._coerce_macro_bool(
+            result.get("trusted_for_materialization")
+        )
+        failure_reason = str(result.get("failure_reason") or "").strip()
+        confidence = result.get("confidence")
+        intermediate_variables = cls._extract_macro_intermediate_variables(
+            result.get("intermediate_variables")
+        )
+        if final_variable.startswith("#") and final_variable not in intermediate_variables:
+            intermediate_variables.append(final_variable)
+
+        summary_lines = [f"Macro result: {tool_name} -> {status}."]
+        if (
+            status == "SUCCESS"
+            and final_variable.startswith("#")
+            and solves_task
+            and trusted_for_materialization
+        ):
+            summary_lines.append(f"Final variable: {final_variable}")
+            if semantic_description:
+                summary_lines.append(f"Semantic: {semantic_description}")
+            summary_lines.append("Solves task: yes")
+            summary_lines.append("Trusted final: yes")
+        elif (
+            status == "PARTIAL"
+            and semantic_description
+            and intermediate_variables
+        ):
+            summary_lines.append(
+                "Intermediate variables: " + ", ".join(intermediate_variables)
+            )
+            summary_lines.append(f"Semantic: {semantic_description}")
+            summary_lines.append("Solves task: no")
+            summary_lines.append("Trusted final: no")
+        else:
+            if failure_reason:
+                summary_lines.append(f"Failure reason: {failure_reason}")
+            elif observation:
+                summary_lines.append(f"Failure reason: {observation[:300]}")
+            summary_lines.append("Trusted final: no")
+            summary_lines.append("Use manual solver fallback: yes")
+        if observation:
+            summary_lines.append(f"Observation: {observation[:300]}")
+        if confidence not in (None, ""):
+            summary_lines.append(f"Confidence: {confidence}")
+        return "\n".join(summary_lines)
+
     def __init__(
         self,
         task_name: TaskName,
@@ -1275,21 +1371,35 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             )
             return
 
-        ssot_keys = {"status", "final_variable", "observation"}
-        if set(result.keys()) != ssot_keys:
+        result_keys = set(result.keys())
+        allowed_keys = _MACRO_REQUIRED_OUTPUT_KEYS | _MACRO_OPTIONAL_OUTPUT_KEYS
+        if not _MACRO_REQUIRED_OUTPUT_KEYS.issubset(result_keys):
             session.chat_history.inject(
                 {
                     "role": Role.USER,
                     "content": (
                         f"Error in executing '{api_str}'. Error: "
-                        "macro_invalid_output_schema: expected exact keys "
+                        "macro_invalid_output_schema: missing required keys "
                         "['status','final_variable','observation']"
                     ),
                 }
             )
             return
+        unknown_keys = sorted(result_keys - allowed_keys)
+        if unknown_keys:
+            session.chat_history.inject(
+                {
+                    "role": Role.USER,
+                    "content": (
+                        f"Error in executing '{api_str}'. Error: "
+                        "macro_invalid_output_schema: unknown keys "
+                        + ",".join(unknown_keys)
+                    ),
+                }
+            )
+            return
 
-        status = str(result.get("status") or "")
+        status = self._normalize_macro_status(result.get("status"))
         final_variable = result.get("final_variable")
         obs_text = str(result.get("observation") or "").strip()
 
@@ -1303,17 +1413,12 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         _type_m = re.search(r'instances of ([\w.]+)', obs_text)
         _type_hint = _type_m.group(1) if _type_m else None
 
-        if status == "SUCCESS" and final_variable not in (None, ""):
-            fv_str = str(final_variable)
-            obs_part = f" Observation: {obs_text}" if obs_text else ""
-            if _type_hint:
-                compact = (
-                    f"Macro result: {tool_name} -> SUCCESS. "
-                    f"Final variable: {fv_str} (instances of {_type_hint}).{obs_part}"
-                )
-            else:
-                compact = f"Macro result: {tool_name} -> SUCCESS. Final variable: {fv_str}.{obs_part}"
-        elif "EXHAUSTED" in status.upper():
+        if status == "SUCCESS" and _type_hint and not result.get("semantic_description"):
+            result = {
+                **result,
+                "semantic_description": f"instances of {_type_hint}",
+            }
+        if "EXHAUSTED" in status.upper():
             # Preserve candidate list verbatim — solver needs label->var_id mapping.
             compact = (
                 f"Macro result: {tool_name} -> {status}. {obs_text}"
@@ -1321,11 +1426,9 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                 else f"Macro result: {tool_name} -> {status}."
             )
         else:
-            short_obs = obs_text[:300] if obs_text else ""
-            compact = (
-                f"Macro result: {tool_name} -> {status}. {short_obs}"
-                if short_obs
-                else f"Macro result: {tool_name} -> {status}."
+            compact = self._build_macro_result_summary(
+                tool_name=tool_name,
+                result=result,
             )
 
         session.chat_history.inject(
