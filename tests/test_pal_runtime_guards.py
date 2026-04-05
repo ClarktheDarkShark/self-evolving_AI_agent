@@ -25,6 +25,7 @@ from src.pal.kg_benchmark_adapter import (
 )
 from src.pal.invoker import execute_pal_code_with_result
 from src.pal.invoker import _classify_invocation_exception
+from src.self_evolving_agent.controller_prompts import SOLVER_SYSTEM_PROMPT
 from src.tasks.instance.knowledge_graph.task import KnowledgeGraph
 
 
@@ -82,9 +83,22 @@ def test_bridge_tool_returns_semantic_contract_fields() -> None:
             "variable_list": [],
             "pal_artifact_type": "count_scalar",
             "pal_artifact_value": "4",
+            "pal_selected_query_variable": "count",
+            "pal_binding_count": 1,
+            "pal_unique_value_count": 1,
+            "pal_value_preview": ["4"],
+            "pal_row_preview": [{"count": "4"}],
             "pal_semantic_description": "count result returned by the PAL query",
             "pal_solves_task": True,
             "pal_trusted_for_materialization": True,
+            "pal_proof_hint": "PAL query already computed the final count.",
+            "pal_answer_cardinality_hint": "single",
+            "pal_relation_summary": [
+                "anchor -> count set via biology.organism.diseases_transmitted"
+            ],
+            "pal_selection_basis": "Counts distinct infectious diseases that satisfy the executed relation constraints.",
+            "pal_completeness_hint": "Exhaustive over the exact counted bindings matched by the executed relation constraints.",
+            "pal_repair_caveat": "This answer depends on a repaired alternate relation; verify semantic equivalence.",
             "pal_confidence": 1.0,
         }
     )
@@ -94,6 +108,28 @@ def test_bridge_tool_returns_semantic_contract_fields() -> None:
     assert result["solves_task"] is True
     assert result["trusted_for_materialization"] is True
     assert result["intermediate_variables"] == ["#0"]
+    assert result["selected_query_variable"] == "count"
+    assert result["binding_count"] == 1
+    assert result["unique_value_count"] == 1
+    assert result["value_preview"] == ["4"]
+    assert result["row_preview"] == [{"count": "4"}]
+    assert result["proof_hint"] == "PAL query already computed the final count."
+    assert result["answer_cardinality_hint"] == "single"
+    assert result["relation_summary"] == [
+        "anchor -> count set via biology.organism.diseases_transmitted"
+    ]
+    assert (
+        result["selection_basis"]
+        == "Counts distinct infectious diseases that satisfy the executed relation constraints."
+    )
+    assert (
+        result["completeness_hint"]
+        == "Exhaustive over the exact counted bindings matched by the executed relation constraints."
+    )
+    assert (
+        result["repair_caveat"]
+        == "This answer depends on a repaired alternate relation; verify semantic equivalence."
+    )
 
 
 def test_bridge_tool_returns_partial_advisory_contract_fields() -> None:
@@ -107,6 +143,11 @@ def test_bridge_tool_returns_partial_advisory_contract_fields() -> None:
             "variable_list": [],
             "pal_artifact_type": "entity_set",
             "pal_artifact_value": ["m.1", "m.2"],
+            "pal_selected_query_variable": "candidate_set",
+            "pal_binding_count": 2,
+            "pal_unique_value_count": 2,
+            "pal_value_preview": ["m.1", "m.2"],
+            "pal_row_preview": [{"candidate_set": "m.1", "name": "First"}, {"candidate_set": "m.2", "name": "Second"}],
             "pal_semantic_description": "bounded candidate set returned by the PAL query",
             "pal_solves_task": False,
             "pal_trusted_for_materialization": False,
@@ -122,6 +163,14 @@ def test_bridge_tool_returns_partial_advisory_contract_fields() -> None:
     assert result["trusted_for_materialization"] is False
     assert result["intermediate_variables"] == ["#0"]
     assert result["failure_reason"] == "needs_manual_disambiguation"
+    assert result["selected_query_variable"] == "candidate_set"
+    assert result["binding_count"] == 2
+    assert result["unique_value_count"] == 2
+    assert result["value_preview"] == ["m.1", "m.2"]
+    assert result["row_preview"] == [
+        {"candidate_set": "m.1", "name": "First"},
+        {"candidate_set": "m.2", "name": "Second"},
+    ]
 
 
 def test_macro_result_summary_surfaces_only_trusted_final_pointer() -> None:
@@ -134,6 +183,21 @@ def test_macro_result_summary_surfaces_only_trusted_final_pointer() -> None:
             "semantic_description": "count result returned by the PAL query",
             "solves_task": True,
             "trusted_for_materialization": True,
+            "selection_basis": "Counts distinct infectious diseases that satisfy the executed relation constraints.",
+            "relation_summary": [
+                "anchor -> count set via biology.organism.diseases_transmitted"
+            ],
+            "artifact_type": "count_scalar",
+            "selected_query_variable": "count",
+            "value_preview": ["4"],
+            "row_preview": [{"count": "4"}],
+            "resolved_value_preview": ["4 = 4"],
+            "binding_count": 1,
+            "unique_value_count": 1,
+            "answer_cardinality_hint": "single",
+            "completeness_hint": "Exhaustive over the exact counted bindings matched by the executed relation constraints.",
+            "proof_hint": "PAL query already computed the final count.",
+            "repair_caveat": "This answer depends on a repaired alternate relation; verify semantic equivalence.",
             "confidence": 1.0,
         },
     )
@@ -147,6 +211,12 @@ def test_macro_result_summary_surfaces_only_trusted_final_pointer() -> None:
             "solves_task": False,
             "trusted_for_materialization": False,
             "intermediate_variables": ["#3"],
+            "artifact_type": "entity_set",
+            "selected_query_variable": "candidate_set",
+            "binding_count": 2,
+            "unique_value_count": 2,
+            "value_preview": ["m.1", "m.2"],
+            "row_preview": [{"candidate_set": "m.1", "name": "First"}],
         },
     )
     unsafe_summary = KnowledgeGraph._build_macro_result_summary(
@@ -157,15 +227,96 @@ def test_macro_result_summary_surfaces_only_trusted_final_pointer() -> None:
             "observation": "weak vague result",
             "solves_task": False,
             "trusted_for_materialization": False,
+            "artifact_type": "entity_set",
+            "selected_query_variable": "shared_answer",
+            "binding_count": 9,
+            "unique_value_count": 9,
         },
     )
 
     assert "Final variable: #3" in trusted_summary
+    assert (
+        "Selection basis: Counts distinct infectious diseases that satisfy the executed relation constraints."
+        in trusted_summary
+    )
+    assert (
+        "Relation summary: anchor -> count set via biology.organism.diseases_transmitted"
+        in trusted_summary
+    )
+    assert "Artifact type: count_scalar" in trusted_summary
+    assert "Projected query variable: count" in trusted_summary
+    assert "Row preview: count=4" in trusted_summary
+    assert "Resolved value preview: 4 = 4" in trusted_summary
+    assert "Expected answer cardinality: single" in trusted_summary
+    assert (
+        "Completeness hint: Exhaustive over the exact counted bindings matched by the executed relation constraints."
+        in trusted_summary
+    )
+    assert "Proof hint: PAL query already computed the final count." in trusted_summary
+    assert (
+        "Repair caveat: This answer depends on a repaired alternate relation; verify semantic equivalence."
+        in trusted_summary
+    )
     assert "Trusted final: yes" in trusted_summary
+    assert "Observation: ok" not in trusted_summary
+    assert "Confidence: 1.0" not in trusted_summary
     assert "Intermediate variables: #3" in partial_summary
+    assert "Artifact type: entity_set" in partial_summary
+    assert "Row preview: candidate_set=m.1; name=First" in partial_summary
     assert "Trusted final: no" in partial_summary
+    assert "Use manual solver fallback: yes" in partial_summary
     assert "Final variable: #9" not in unsafe_summary
+    assert "Artifact type: entity_set" in unsafe_summary
     assert "Use manual solver fallback: yes" in unsafe_summary
+
+
+def test_macro_result_entity_grounding_adds_resolved_name_preview() -> None:
+    kg = KnowledgeGraph.__new__(KnowledgeGraph)
+
+    class _Executor:
+        @staticmethod
+        def get_entity_names(mids):
+            assert mids == ["m.011v6mk8"]
+            return {"m.011v6mk8": "Typhoon Kalmaegi"}
+
+    kg.knowledge_graph_api = type("Api", (), {"sparql_executor": _Executor()})()
+
+    enriched = kg._enrich_macro_result_with_entity_grounding(
+        {
+            "status": "SUCCESS",
+            "final_variable": "#0",
+            "observation": "ok",
+            "artifact_type": "entity_id",
+            "value_preview": ["m.011v6mk8"],
+            "row_preview": [{"candidate_set": "m.011v6mk8"}],
+        }
+    )
+
+    assert enriched["resolved_value_preview"] == [
+        "m.011v6mk8 = Typhoon Kalmaegi"
+    ]
+    assert enriched["row_preview"] == [
+        {
+            "candidate_set": "m.011v6mk8",
+            "candidate_set_name": "Typhoon Kalmaegi",
+        }
+    ]
+
+
+def test_solver_prompt_requires_review_of_macro_tool_metadata() -> None:
+    assert "Trusted final: yes" in SOLVER_SYSTEM_PROMPT
+    assert "Artifact type" in SOLVER_SYSTEM_PROMPT
+    assert "Projected query variable" in SOLVER_SYSTEM_PROMPT
+    assert "Selection basis" in SOLVER_SYSTEM_PROMPT
+    assert "Relation summary" in SOLVER_SYSTEM_PROMPT
+    assert "Value preview" in SOLVER_SYSTEM_PROMPT
+    assert "Row preview" in SOLVER_SYSTEM_PROMPT
+    assert "Resolved value preview" in SOLVER_SYSTEM_PROMPT
+    assert "Expected answer cardinality" in SOLVER_SYSTEM_PROMPT
+    assert "Completeness hint" in SOLVER_SYSTEM_PROMPT
+    assert "Repair caveat" in SOLVER_SYSTEM_PROMPT
+    assert "Proof hint" in SOLVER_SYSTEM_PROMPT
+    assert "strong evidence, not a command" in SOLVER_SYSTEM_PROMPT
 
 
 def test_bridge_tool_contract_rejects_retrieval_logic() -> None:

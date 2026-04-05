@@ -320,6 +320,31 @@ class KnowledgeGraphAPI:
                     return True
         return False
 
+    @classmethod
+    def _count_join_hops(cls, expression: Any) -> int:
+        if not isinstance(expression, list) or not expression:
+            return 0
+        op = str(expression[0]).upper()
+        child_hops = max((cls._count_join_hops(item) for item in expression[1:]), default=0)
+        if op == "JOIN":
+            return child_hops + 1
+        return child_hops
+
+    @classmethod
+    def _variable_relation_probe_too_complex(cls, variable: Variable) -> bool:
+        if str(getattr(variable, "type", "") or "").startswith("pal."):
+            return False
+        try:
+            expression = SemanticParserUtil.lisp_to_nested_expression(variable.program)
+        except Exception:
+            return False
+        if cls._contains_set_ops(expression):
+            return True
+        # get_relations(#N) enumerates every outgoing relation on the derived set.
+        # One-hop variables are still useful to inspect manually; multi-hop sets are
+        # where the broad relation scan becomes pathologically expensive.
+        return cls._count_join_hops(expression) >= 2
+
     @staticmethod
     def _normalize_entity_list(values: Sequence[Any], cap: int = 200) -> list[str]:
         normalized: list[str] = []
@@ -533,6 +558,12 @@ class KnowledgeGraphAPI:
                     "Error: Structurally unsafe variable. get_relations cannot probe "
                     "Variables minted from key, authority, external-id, or other "
                     "metadata relations."
+                )
+            if self._variable_relation_probe_too_complex(argument):
+                raise KnowledgeGraphAPIException(
+                    "Error: Node Explosion Prevented. get_relations cannot probe "
+                    "multi-hop or set-operation-derived Variable <<ARGUMENT0>>. "
+                    "Backtrack or narrow the set before asking for all outgoing relations."
                 )
             MAX_SAFE_CARDINALITY = 50
             var_size = self.get_variable_size(argument)

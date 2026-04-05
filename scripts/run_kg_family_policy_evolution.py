@@ -24,6 +24,7 @@ from src.pal.family_policy_evolution import (
     build_family_policy_store,
     classify_family_failure,
     summarize_sample_metrics,
+    version_reuse_compatible,
 )
 from src.pal.reusable_tool_families import get_baseline_reusable_family_policy_bundles
 
@@ -31,6 +32,7 @@ from src.pal.reusable_tool_families import get_baseline_reusable_family_policy_b
 PROMOTION_EVALUATION_MODE = "family_inline_promotion_gate"
 PROMOTION_EVALUATION_CONTRACT_VERSION = "2026-03-31__family_inline_promotion_gate_v1"
 MAX_PRIOR_SUCCESS_SAMPLES = 1
+ENV_PROMOTION_GATE_MODE = "PAL_FAMILY_POLICY_PROMOTION_GATE_MODE"
 POLICY_FINGERPRINT_FILES = (
     PROJECT_ROOT / "src" / "agents" / "instance" / "pal_agent_controller.py",
     PROJECT_ROOT / "src" / "pal" / "family_policy_evolution.py",
@@ -52,6 +54,7 @@ EXECUTION_ENV_KEYS = (
     "LIFELONG_KG_DATA_DIR",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
+    ENV_PROMOTION_GATE_MODE,
 )
 
 
@@ -133,8 +136,20 @@ def _build_success_bank_context(
     }
 
 
+def _promotion_gate_mode() -> str:
+    mode = str(os.environ.get(ENV_PROMOTION_GATE_MODE) or "").strip().lower()
+    if mode in {"soft_improvement", "non_regression"}:
+        return mode
+    return "trigger_first"
+
+
 def _contexts_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     return dict(left) == dict(right)
+
+
+def _context_contains(expected: Mapping[str, Any], observed: Mapping[str, Any]) -> bool:
+    observed_dict = dict(observed)
+    return all(observed_dict.get(key) == value for key, value in dict(expected).items())
 
 
 @contextlib.contextmanager
@@ -159,20 +174,18 @@ def _extract_run_metrics(summary: dict[str, Any]) -> dict[str, Any]:
         generated_tools_path = run_dir / "generated_tools.log"
         if generated_tools_path.exists():
             dangerous_overreach_count = 0
-            for line in generated_tools_path.read_text(encoding="utf-8").splitlines():
-                try:
-                    payload = json.loads(line)
-                except Exception:
-                    continue
+            for payload in _load_json_lines(generated_tools_path):
                 if payload.get("event") == "pal_attempt_decision_finalized" and bool(
                     payload.get("dangerous_overreach")
                 ):
                     dangerous_overreach_count += 1
+    sample_status = str(summary.get("sample_status") or "").strip()
+    evaluation_outcome = str(summary.get("evaluation_outcome") or "").strip()
     return {
         **summary,
         "dangerous_overreach_count": dangerous_overreach_count,
-        "sample_status": str(summary.get("sample_status") or "").strip(),
-        "evaluation_outcome": str(summary.get("evaluation_outcome") or "").strip(),
+        "sample_status": sample_status,
+        "evaluation_outcome": evaluation_outcome,
     }
 
 
@@ -489,6 +502,32 @@ def _evaluate_inline_promotion_gate(
             > int(trigger_baseline_summary["material_improvement_score"])
         )
     )
+    trigger_not_regressed = (
+        trigger_baseline_valid
+        and trigger_candidate_valid
+        and int(trigger_candidate_summary["correct_completed"])
+        >= int(trigger_baseline_summary["correct_completed"])
+        and int(trigger_candidate_summary["wrong_completed"])
+        <= int(trigger_baseline_summary["wrong_completed"])
+        and int(trigger_candidate_summary["dangerous_overreach_count"])
+        <= int(trigger_baseline_summary["dangerous_overreach_count"])
+        and int(trigger_candidate_summary["material_improvement_score"])
+        >= int(trigger_baseline_summary["material_improvement_score"])
+    )
+    trigger_soft_improved = (
+        trigger_baseline_valid
+        and trigger_candidate_valid
+        and (
+            int(trigger_candidate_summary["correct_completed"])
+            > int(trigger_baseline_summary["correct_completed"])
+            or int(trigger_candidate_summary["wrong_completed"])
+            < int(trigger_baseline_summary["wrong_completed"])
+            or int(trigger_candidate_summary["dangerous_overreach_count"])
+            < int(trigger_baseline_summary["dangerous_overreach_count"])
+            or int(trigger_candidate_summary["material_improvement_score"])
+            > int(trigger_baseline_summary["material_improvement_score"])
+        )
+    )
     prior_success_guard_present = bool(prior_success_baseline and prior_success_candidate)
     prior_success_evaluation_valid = (
         prior_success_guard_present
@@ -506,13 +545,20 @@ def _evaluate_inline_promotion_gate(
             and int(candidate_summary["dangerous_overreach_count"])
             <= int(baseline_summary["dangerous_overreach_count"])
         )
-    promote = trigger_improved and regression_guard_available and prior_success_not_regressed
+    gate_mode = _promotion_gate_mode()
+    if gate_mode == "soft_improvement":
+        trigger_gate_passed = trigger_soft_improved
+    elif gate_mode == "non_regression":
+        trigger_gate_passed = trigger_not_regressed
+    else:
+        trigger_gate_passed = trigger_improved
+    promote = trigger_gate_passed and regression_guard_available and prior_success_not_regressed
     reasons: list[str] = []
     if not trigger_baseline_valid:
         reasons.append("trigger_baseline_invalid")
     if not trigger_candidate_valid:
         reasons.append("trigger_evaluation_invalid")
-    if not trigger_improved:
+    if not trigger_gate_passed:
         reasons.append("trigger_failure_not_improved")
     if not prior_success_guard_present:
         reasons.append("awaiting_prior_trusted_success")
@@ -526,11 +572,15 @@ def _evaluate_inline_promotion_gate(
             "trigger_baseline_valid": trigger_baseline_valid,
             "trigger_candidate_valid": trigger_candidate_valid,
             "trigger_improved": trigger_improved,
+            "trigger_not_regressed": trigger_not_regressed,
+            "trigger_soft_improved": trigger_soft_improved,
+            "trigger_gate_passed": trigger_gate_passed,
             "regression_guard_present": prior_success_guard_present,
             "regression_guard_available": regression_guard_available,
             "prior_success_evaluation_valid": prior_success_evaluation_valid,
             "prior_success_not_regressed": prior_success_not_regressed,
         },
+        "gate_mode": gate_mode,
         "reasons": reasons,
         "baseline_summary": {
             "trigger": trigger_baseline_summary,
@@ -575,24 +625,34 @@ def _evaluate_candidate(
     prior_success_baseline: list[dict[str, Any]] = []
     prior_success_candidate: list[dict[str, Any]] = []
     prior_success_samples: list[str] = []
+    prior_success_baseline_reused = False
     success_bank = store.get_trusted_success_bank(family_name)
     bank_metadata = store.get_trusted_success_bank_metadata(family_name)
     expected_bank_context = _build_success_bank_context(
         family_name=family_name,
         active_version=active_version,
     )
-    if (
-        bank_metadata.get("source_version") == active_version
-        and _contexts_match(
-            bank_metadata.get("evaluation_context") or {},
-            expected_bank_context,
-        )
+    bank_context = bank_metadata.get("evaluation_context") or {}
+    if isinstance(bank_context, dict) and version_reuse_compatible(
+        str(bank_metadata.get("source_version") or "").strip(),
+        active_version,
     ):
-        prior_success_samples = [
-            sample_id
-            for sample_id in success_bank
-            if sample_id and sample_id != trigger_sample
-        ][:MAX_PRIOR_SUCCESS_SAMPLES]
+        if str(bank_context.get("source_version") or "").strip() and (
+            str(bank_context.get("source_version") or "").strip() != active_version
+        ):
+            bank_context = {
+                **dict(bank_context),
+                "source_version": active_version,
+            }
+        if _context_contains(
+            expected_bank_context,
+            bank_context,
+        ):
+            prior_success_samples = [
+                sample_id
+                for sample_id in success_bank
+                if sample_id and sample_id != trigger_sample
+            ][:MAX_PRIOR_SUCCESS_SAMPLES]
     if not prior_success_samples:
         evaluation_payload = {
             "family_name": family_name,
@@ -667,7 +727,7 @@ def _evaluate_candidate(
         prior_success_candidate=[],
     )
     all_results = [trigger_candidate]
-    if not gate_result["gate_checks"]["trigger_improved"]:
+    if not gate_result["gate_checks"]["trigger_gate_passed"]:
         reasons = [
             reason
             for reason in (gate_result.get("reasons") or [])
@@ -684,19 +744,33 @@ def _evaluate_candidate(
                 "regression_guard_available": bool(prior_success_samples),
             },
         }
-    elif gate_result["gate_checks"]["trigger_improved"]:
+    elif gate_result["gate_checks"]["trigger_gate_passed"]:
         sample_id = prior_success_samples[0]
-        prior_success_baseline.append(
-            _run_sample_with_policy(
-                sample_index=sample_id,
-                label=f"{label_prefix}_baseline_success",
-                family_name=family_name,
-                store_path=store_path,
-                promotion_enabled=False,
-                override_version=active_version,
-                parent_output_dir=parent_output_dir,
-            )
+        cached_success_summary = (
+            (bank_metadata.get("evaluation_results") or {}).get("run_summary")
+            if isinstance(bank_metadata, Mapping)
+            else None
         )
+        if (
+            isinstance(cached_success_summary, Mapping)
+            and str(cached_success_summary.get("sample_index") or "").strip() == sample_id
+        ):
+            prior_success_baseline.append(
+                _extract_run_metrics(dict(cached_success_summary))
+            )
+            prior_success_baseline_reused = True
+        else:
+            prior_success_baseline.append(
+                _run_sample_with_policy(
+                    sample_index=sample_id,
+                    label=f"{label_prefix}_baseline_success",
+                    family_name=family_name,
+                    store_path=store_path,
+                    promotion_enabled=False,
+                    override_version=active_version,
+                    parent_output_dir=parent_output_dir,
+                )
+            )
         prior_success_candidate.append(
             _run_sample_with_policy(
                 sample_index=sample_id,
@@ -726,13 +800,14 @@ def _evaluate_candidate(
             "baseline": trigger_baseline,
             "candidate": trigger_candidate,
         },
-        "prior_success": {
-            "sample_ids": prior_success_samples if prior_success_candidate else [],
-            "baseline": prior_success_baseline,
-            "candidate": prior_success_candidate,
-            "trusted_success_bank_reused": bool(prior_success_candidate),
-        },
-    }
+            "prior_success": {
+                "sample_ids": prior_success_samples if prior_success_candidate else [],
+                "baseline": prior_success_baseline,
+                "candidate": prior_success_candidate,
+                "trusted_success_bank_reused": bool(prior_success_candidate),
+                "baseline_reused_from_bank_metadata": prior_success_baseline_reused,
+            },
+        }
     cache_hits = sum(bool(item.get("evaluation_cache_hit")) for item in all_results)
     cache_misses = sum(not bool(item.get("evaluation_cache_hit")) for item in all_results)
     total_evaluation_requests = len(all_results)
@@ -748,6 +823,7 @@ def _evaluate_candidate(
             "prior_success_evaluated": len(prior_success_candidate),
             "prior_success_skipped": max(0, MAX_PRIOR_SUCCESS_SAMPLES - len(prior_success_candidate)),
             "regression_guard_available": bool(prior_success_candidate),
+            "prior_success_baseline_reused": prior_success_baseline_reused,
             "stage_reached": (
                 "trigger_only_rejected"
                 if not prior_success_candidate and not gate_result["promote"]

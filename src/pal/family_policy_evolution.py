@@ -62,6 +62,16 @@ def classify_family_failure(
         for item in failure_reasons
         if str(item or "").strip()
     ]
+    normalized_reasons = [reason.lower() for reason in cleaned_reasons]
+
+    def _has_reason_fragment(*fragments: str) -> bool:
+        for fragment in fragments:
+            cleaned_fragment = str(fragment or "").strip().lower()
+            if cleaned_fragment and any(
+                cleaned_fragment in reason for reason in normalized_reasons
+            ):
+                return True
+        return False
 
     if dangerous_overreach or any(
         reason.startswith("dangerous_overreach:") for reason in cleaned_reasons
@@ -69,6 +79,24 @@ def classify_family_failure(
         return "validator_miss"
     if any("query_uses_unplanned_predicate:" in reason for reason in cleaned_reasons):
         return "forbidden_relation_family_miss"
+    if cleaned_family in {
+        "count_over_direct_relation",
+        "count_over_joined_set",
+        "multi_anchor_intersection",
+        "shared_type_intersection",
+    } and _has_reason_fragment(
+        "repairable_bad_count_set",
+        "count_answer_target_unenforced",
+        "count_set_weak_or_broken",
+        "trusted_incorrect_completion",
+    ):
+        return "weak_applicability_boundary"
+    if cleaned_family == "single_anchor_lookup" and _has_reason_fragment(
+        "repairable_weak_grounding",
+        "repairable_anchor_path_empty",
+        "anchor_path_empty",
+    ):
+        return "bad_routing"
     if any(reason.startswith("sample_status:agent_unknown_error") for reason in cleaned_reasons):
         if any("anchor" in reason for reason in cleaned_reasons):
             return "bad_routing"
@@ -155,6 +183,84 @@ def _dedupe_strings(items: Sequence[str]) -> tuple[str, ...]:
         if cleaned and cleaned not in deduped:
             deduped.append(cleaned)
     return tuple(deduped)
+
+
+def version_reuse_compatible(source_version: str, active_version: str) -> bool:
+    cleaned_source = str(source_version or "").strip()
+    cleaned_active = str(active_version or "").strip()
+    if not cleaned_source or not cleaned_active:
+        return False
+    return cleaned_active == cleaned_source or cleaned_active.startswith(
+        f"{cleaned_source}__cand"
+    )
+
+
+def _constructive_policy_updates(
+    *,
+    family_name: str,
+    failure_class: str,
+) -> dict[str, tuple[str, ...]]:
+    applicability_conditions: list[str] = []
+    validator_expectations: list[str] = []
+    repair_policy: list[str] = []
+
+    if failure_class == "weak_applicability_boundary":
+        applicability_conditions.append("require_explicit_answer_role_alignment")
+        validator_expectations.append(
+            "verify_answer_target_semantics_not_just_executability"
+        )
+        repair_policy.append("prefer_structural_rebinding_before_relation_bans")
+    if failure_class in {"bad_routing", "bad_fallback_ordering"}:
+        repair_policy.extend(
+            (
+                "change_scaffold_family_after_dead_relation_evidence",
+                "prefer_unused_grounded_relations_before_retrying",
+            )
+        )
+    if family_name == "count_over_direct_relation":
+        if failure_class in {
+            "weak_applicability_boundary",
+            "bad_routing",
+            "bad_fallback_ordering",
+        }:
+            validator_expectations.append(
+                "verify_count_targets_requested_entity_set"
+            )
+            repair_policy.append(
+                "switch_to_joined_count_when_downstream_filter_or_projection_exists"
+            )
+    elif family_name == "count_over_joined_set":
+        if failure_class in {
+            "weak_applicability_boundary",
+            "bad_routing",
+            "bad_fallback_ordering",
+        }:
+            validator_expectations.append(
+                "verify_count_targets_requested_entity_set"
+            )
+            repair_policy.append("preserve_joined_count_target_semantics_during_repairs")
+    elif family_name in {"single_anchor_lookup", "single_anchor_chain_lookup"}:
+        if failure_class == "weak_applicability_boundary":
+            validator_expectations.append(
+                "verify_projected_entity_matches_question_target"
+            )
+    elif family_name == "superlative_chain":
+        if failure_class in {"weak_applicability_boundary", "bad_routing"}:
+            validator_expectations.append(
+                "verify_superlative_selection_basis_is_explicit"
+            )
+            repair_policy.append("preserve_candidate_set_and_ordering_path_together")
+    elif family_name in {"multi_anchor_intersection", "shared_type_intersection"}:
+        if failure_class == "weak_applicability_boundary":
+            validator_expectations.append(
+                "preserve_all_anchor_constraints_on_same_answer_variable"
+            )
+
+    return {
+        "applicability_conditions": _dedupe_strings(applicability_conditions),
+        "validator_expectations": _dedupe_strings(validator_expectations),
+        "repair_policy": _dedupe_strings(repair_policy),
+    }
 
 
 def _normalize_role_token(value: Any) -> str:
@@ -252,7 +358,6 @@ def build_success_plan_archetype(
         "structural_notes": structural_notes,
         "pattern_signature": pattern_signature,
     }
-
 
 def merge_success_plan_archetypes(
     existing_archetypes: Sequence[Mapping[str, Any]],
@@ -397,6 +502,34 @@ class FamilyPolicyStore:
         metadata = payload.get("trusted_success_bank_metadata") or {}
         return dict(metadata) if isinstance(metadata, Mapping) else {}
 
+    def get_tool_evolution_context(self, family_name: str) -> dict[str, Any]:
+        payload = self._load_family_payload(family_name)
+        context = payload.get("tool_evolution_context") or {}
+        return dict(context) if isinstance(context, Mapping) else {}
+
+    def set_tool_evolution_context(
+        self,
+        family_name: str,
+        *,
+        source_version: str,
+        preferred_patterns: Sequence[Mapping[str, Any]] | None = None,
+        avoid_patterns: Sequence[Mapping[str, Any]] | None = None,
+        last_signal: Mapping[str, Any] | None = None,
+    ) -> None:
+        payload = self._load_family_payload(family_name)
+        context: dict[str, Any] = {
+            "source_version": str(source_version or "").strip(),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        if preferred_patterns:
+            context["preferred_patterns"] = [dict(item) for item in preferred_patterns if isinstance(item, Mapping)]
+        if avoid_patterns:
+            context["avoid_patterns"] = [dict(item) for item in avoid_patterns if isinstance(item, Mapping)]
+        if last_signal:
+            context["last_signal"] = dict(last_signal)
+        payload["tool_evolution_context"] = context
+        self._save_family_payload(family_name, payload)
+
     def set_trusted_success_bank(
         self,
         family_name: str,
@@ -477,10 +610,8 @@ class FamilyPolicyStore:
         blocked_scaffolds = list(active_bundle.blocked_scaffold_signatures)
         cleaned_scaffold_signature = str(scaffold_signature or "").strip()
         if cleaned_failure_class in {
-            "weak_applicability_boundary",
             "bad_routing",
             "bad_fallback_ordering",
-            "validator_miss",
         } and cleaned_scaffold_signature and cleaned_scaffold_signature not in blocked_scaffolds:
             blocked_scaffolds.append(cleaned_scaffold_signature)
 
@@ -498,10 +629,6 @@ class FamilyPolicyStore:
                 forbidden_overreach_patterns.append(pattern)
 
         forbidden_relation_families = list(active_bundle.forbidden_relation_families)
-        trusted_incorrect_completion = any(
-            str(reason or "").strip() == "trusted_incorrect_completion"
-            for reason in failure_reasons
-        )
         if cleaned_failure_class in {
             "forbidden_relation_family_miss",
             "validator_miss",
@@ -510,17 +637,23 @@ class FamilyPolicyStore:
                 relation_text = str(relation_name or "").strip()
                 if not relation_text:
                     continue
-                if cleaned_failure_class == "validator_miss" and not (
-                    relation_text.startswith("type.") or dangerous_patterns
+                if cleaned_failure_class == "validator_miss" and not relation_text.startswith(
+                    "type."
                 ):
                     continue
                 if relation_text not in forbidden_relation_families:
                     forbidden_relation_families.append(relation_text)
-        if cleaned_failure_class == "weak_applicability_boundary" and trusted_incorrect_completion:
-            for relation_name in relation_names:
-                relation_text = str(relation_name or "").strip()
-                if relation_text and relation_text not in forbidden_relation_families:
-                    forbidden_relation_families.append(relation_text)
+        constructive_updates = _constructive_policy_updates(
+            family_name=family_name,
+            failure_class=cleaned_failure_class,
+        )
+        applicability_conditions.extend(
+            constructive_updates["applicability_conditions"]
+        )
+        validator_expectations.extend(
+            constructive_updates["validator_expectations"]
+        )
+        repair_policy.extend(constructive_updates["repair_policy"])
 
         if cleaned_failure_class == "weak_applicability_boundary":
             tightened_expectation = "tighten_answer_target_semantics"
@@ -533,6 +666,8 @@ class FamilyPolicyStore:
             validator_guard = "reject_known_dangerous_overreach_patterns"
             if validator_guard not in validator_expectations:
                 validator_expectations.append(validator_guard)
+            if cleaned_scaffold_signature and cleaned_scaffold_signature not in blocked_scaffolds:
+                blocked_scaffolds.append(cleaned_scaffold_signature)
         if cleaned_failure_class in {"bad_routing", "bad_fallback_ordering"}:
             retry_guard = "deprioritize_failed_scaffold_before_family_switch"
             if retry_guard not in repair_policy:
@@ -691,6 +826,24 @@ class FamilyPolicyStore:
             "promoted_at": datetime.now(UTC).isoformat(),
         }
         candidate_payload["updated_at"] = datetime.now(UTC).isoformat()
+        trusted_success_metadata = payload.get("trusted_success_bank_metadata")
+        if isinstance(trusted_success_metadata, dict) and (
+            str(trusted_success_metadata.get("source_version") or "").strip()
+            == active_version
+        ):
+            trusted_success_metadata["source_version"] = candidate_version
+            evaluation_context = trusted_success_metadata.get("evaluation_context")
+            if isinstance(evaluation_context, dict) and (
+                str(evaluation_context.get("source_version") or "").strip()
+                == active_version
+            ):
+                evaluation_context["source_version"] = candidate_version
+        tool_evolution_context = payload.get("tool_evolution_context")
+        if isinstance(tool_evolution_context, dict) and (
+            str(tool_evolution_context.get("source_version") or "").strip()
+            == active_version
+        ):
+            tool_evolution_context["source_version"] = candidate_version
         payload["active_version"] = candidate_version
         self._save_family_payload(family_name, payload)
 

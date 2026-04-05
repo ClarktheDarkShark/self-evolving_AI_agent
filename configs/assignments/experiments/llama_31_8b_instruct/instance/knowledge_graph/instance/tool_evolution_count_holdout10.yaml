@@ -11,7 +11,16 @@ assignment_config:
       name: consecutive_abnormal_agent_inference_process_handling_callback
   output_dir: outputs/{TIMESTAMP}
   sample_order:
+    - "32"
+    - "43"
+    - "102"
+    - "117"
+    - "132"
+    - "135"
     - "180"
+    - "196"
+    - "304"
+    - "381"
 
 environment_config:
   use_task_client_flag: true

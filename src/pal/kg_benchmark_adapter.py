@@ -175,6 +175,14 @@ def classify_execution_artifact(raw_result: Any) -> PalExecutionArtifact:
     normalized_values = _extract_normalized_values(bindings, answer_var)
     diagnostics["binding_count"] = len(bindings)
     diagnostics["normalized_value_count"] = len(normalized_values)
+    diagnostics["value_preview"] = [
+        str(item["value"]) for item in normalized_values[:5]
+    ]
+    diagnostics["row_preview"] = _build_binding_row_preview(
+        bindings,
+        answer_var=answer_var,
+        head_vars=diagnostics.get("head_vars"),
+    )
     if not normalized_values:
         return PalExecutionArtifact(
             raw_result=raw_result,
@@ -286,6 +294,47 @@ def materialize_benchmark_artifact(
             failure_reason=failure_reason,
         )
 
+    materialization_diagnostics = {
+        "artifact_type": artifact.artifact_type,
+        "artifact_source": artifact.source,
+    }
+    selected_query_variable = str(
+        artifact.diagnostics.get("selected_var") or ""
+    ).strip()
+    if selected_query_variable:
+        materialization_diagnostics["selected_query_variable"] = selected_query_variable
+    binding_count = artifact.diagnostics.get("binding_count")
+    if isinstance(binding_count, int):
+        materialization_diagnostics["binding_count"] = binding_count
+    unique_value_count = artifact.diagnostics.get("normalized_value_count")
+    if not isinstance(unique_value_count, int):
+        unique_value_count = artifact.diagnostics.get("parsed_value_count")
+    if isinstance(unique_value_count, int):
+        materialization_diagnostics["unique_value_count"] = unique_value_count
+    value_preview = artifact.diagnostics.get("value_preview")
+    if isinstance(value_preview, Sequence) and not isinstance(value_preview, (str, bytes)):
+        materialization_diagnostics["value_preview"] = [
+            str(item).strip()
+            for item in value_preview
+            if str(item).strip()
+        ][:5]
+    row_preview = artifact.diagnostics.get("row_preview")
+    if isinstance(row_preview, Sequence) and not isinstance(row_preview, (str, bytes)):
+        compact_rows: list[dict[str, str]] = []
+        for row in row_preview:
+            if not isinstance(row, Mapping):
+                continue
+            compact_row: dict[str, str] = {}
+            for key, value in row.items():
+                cleaned_key = str(key or "").strip()
+                cleaned_value = str(value or "").strip()
+                if cleaned_key and cleaned_value:
+                    compact_row[cleaned_key] = cleaned_value
+            if compact_row:
+                compact_rows.append(compact_row)
+        if compact_rows:
+            materialization_diagnostics["row_preview"] = compact_rows[:3]
+
     trusted_for_materialization = artifact.source == "raw_execution"
     useful_intermediate = (
         artifact.source != "raw_execution"
@@ -322,10 +371,7 @@ def materialize_benchmark_artifact(
         bridge_payload=bridge_payload,
         final_variable=None,
         final_answer_text=None,
-        diagnostics={
-            "artifact_type": artifact.artifact_type,
-            "artifact_source": artifact.source,
-        },
+        diagnostics=materialization_diagnostics,
         confidence=_confidence_for_source(artifact.source),
         determinism_level=_determinism_for_source(artifact.source),
         tool_status=tool_status,
@@ -482,6 +528,33 @@ def run(payload: dict) -> dict:
         payload.get("pal_semantic_description")
         or ("PAL artifact materialized as " + artifact_type)
     ).strip()
+    artifact_source = str(payload.get("pal_artifact_source") or "").strip() or None
+    selected_query_variable = str(
+        payload.get("pal_selected_query_variable") or ""
+    ).strip() or None
+    binding_count = payload.get("pal_binding_count")
+    unique_value_count = payload.get("pal_unique_value_count")
+    raw_value_preview = payload.get("pal_value_preview")
+    value_preview = []
+    if isinstance(raw_value_preview, list):
+        for item in raw_value_preview:
+            cleaned = str(item or "").strip()
+            if cleaned:
+                value_preview.append(cleaned)
+    raw_row_preview = payload.get("pal_row_preview")
+    row_preview = []
+    if isinstance(raw_row_preview, list):
+        for row in raw_row_preview:
+            if not isinstance(row, dict):
+                continue
+            compact_row = {}
+            for key, value in row.items():
+                cleaned_key = str(key or "").strip()
+                cleaned_value = str(value or "").strip()
+                if cleaned_key and cleaned_value:
+                    compact_row[cleaned_key] = cleaned_value
+            if compact_row:
+                row_preview.append(compact_row)
     tool_status = str(payload.get("pal_tool_status") or "success").strip().upper()
     if tool_status not in {"SUCCESS", "PARTIAL", "ERROR", "FAILED"}:
         tool_status = "SUCCESS"
@@ -489,6 +562,22 @@ def run(payload: dict) -> dict:
     trusted_for_materialization = bool(payload.get("pal_trusted_for_materialization"))
     failure_reason = str(payload.get("pal_failure_reason") or "").strip() or None
     confidence = payload.get("pal_confidence")
+    proof_hint = str(payload.get("pal_proof_hint") or "").strip() or None
+    answer_cardinality_hint = (
+        str(payload.get("pal_answer_cardinality_hint") or "").strip() or None
+    )
+    raw_relation_summary = payload.get("pal_relation_summary")
+    relation_summary = []
+    if isinstance(raw_relation_summary, list):
+        for item in raw_relation_summary:
+            cleaned = str(item or "").strip()
+            if cleaned:
+                relation_summary.append(cleaned)
+    selection_basis = str(payload.get("pal_selection_basis") or "").strip() or None
+    completeness_hint = (
+        str(payload.get("pal_completeness_hint") or "").strip() or None
+    )
+    repair_caveat = str(payload.get("pal_repair_caveat") or "").strip() or None
     return {
         "status": "ERROR" if tool_status == "FAILED" else tool_status,
         "final_variable": final_pointer,
@@ -503,6 +592,19 @@ def run(payload: dict) -> dict:
         "intermediate_variables": [final_pointer],
         "failure_reason": failure_reason,
         "confidence": confidence,
+        "artifact_type": artifact_type,
+        "artifact_source": artifact_source,
+        "selected_query_variable": selected_query_variable,
+        "binding_count": binding_count,
+        "unique_value_count": unique_value_count,
+        "value_preview": value_preview[:5],
+        "row_preview": row_preview[:3],
+        "proof_hint": proof_hint,
+        "answer_cardinality_hint": answer_cardinality_hint,
+        "relation_summary": relation_summary[:4],
+        "selection_basis": selection_basis,
+        "completeness_hint": completeness_hint,
+        "repair_caveat": repair_caveat,
     }
 """
 
@@ -699,6 +801,57 @@ def _extract_normalized_values(
     return normalized_values
 
 
+def _build_binding_row_preview(
+    bindings: Sequence[Any],
+    *,
+    answer_var: Optional[str],
+    head_vars: Any,
+) -> list[dict[str, str]]:
+    ordered_head_vars = [
+        str(item).strip()
+        for item in (head_vars or [])
+        if str(item).strip()
+    ]
+    preview: list[dict[str, str]] = []
+    seen_rows: set[tuple[tuple[str, str], ...]] = set()
+    for binding in bindings:
+        if not isinstance(binding, Mapping):
+            continue
+        ordered_keys: list[str] = []
+        if answer_var and answer_var in binding:
+            ordered_keys.append(answer_var)
+        for key in ordered_head_vars:
+            if key in binding and key not in ordered_keys:
+                ordered_keys.append(key)
+        for key in binding.keys():
+            cleaned_key = str(key or "").strip()
+            if cleaned_key and cleaned_key not in ordered_keys:
+                ordered_keys.append(cleaned_key)
+        row: dict[str, str] = {}
+        for key in ordered_keys[:4]:
+            cell = binding.get(key)
+            if not isinstance(cell, Mapping):
+                continue
+            normalized = _normalize_sparql_cell(cell)
+            if normalized is not None:
+                cleaned_value = str(normalized["value"]).strip()
+            else:
+                cleaned_value = str(cell.get("value") or "").strip()
+            cleaned_key = str(key or "").strip()
+            if cleaned_key and cleaned_value:
+                row[cleaned_key] = cleaned_value
+        if not row:
+            continue
+        row_signature = tuple(row.items())
+        if row_signature in seen_rows:
+            continue
+        seen_rows.add(row_signature)
+        preview.append(row)
+        if len(preview) >= 3:
+            break
+    return preview
+
+
 def _normalize_sparql_cell(cell: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     raw_value = str(cell.get("value") or "").strip()
     if not raw_value:
@@ -778,16 +931,34 @@ def _solver_fallback_is_allowed(artifact: PalExecutionArtifact) -> bool:
 
 def _describe_artifact_semantics(artifact: PalExecutionArtifact) -> str:
     artifact_type = str(artifact.artifact_type or "").strip()
+    details: list[str] = []
+    selected_var = str(artifact.diagnostics.get("selected_var") or "").strip()
+    if selected_var:
+        details.append(f"query variable '{selected_var}'")
+    binding_count = artifact.diagnostics.get("binding_count")
+    if isinstance(binding_count, int):
+        details.append(f"{binding_count} raw bindings")
+    unique_value_count = artifact.diagnostics.get("normalized_value_count")
+    if not isinstance(unique_value_count, int):
+        unique_value_count = artifact.diagnostics.get("parsed_value_count")
+    if isinstance(unique_value_count, int):
+        details.append(f"{unique_value_count} unique values")
+
+    def _with_details(label: str) -> str:
+        if not details:
+            return label
+        return f"{label} ({', '.join(details)})"
+
     if artifact_type == "count_scalar":
-        return "count result returned by the PAL query"
+        return _with_details("count result returned by the PAL query")
     if artifact_type == "entity_id":
-        return "single entity id returned by the PAL query"
+        return _with_details("single entity id returned by the PAL query")
     if artifact_type == "entity_set":
-        return "bounded set of entity ids returned by the PAL query"
+        return _with_details("bounded set of entity ids returned by the PAL query")
     if artifact_type == "boolean":
-        return "boolean result returned by the PAL query"
+        return _with_details("boolean result returned by the PAL query")
     if artifact_type in {"scalar_literal", "text_literal"}:
-        return "literal value returned by the PAL query"
+        return _with_details("literal value returned by the PAL query")
     if artifact_type == "empty":
         return "PAL query returned an empty result"
     if artifact_type == "unresolved":

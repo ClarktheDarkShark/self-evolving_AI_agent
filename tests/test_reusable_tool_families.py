@@ -1051,6 +1051,234 @@ def test_joined_count_renderer_preserves_explicit_constraint_value_entity() -> N
     assert "?count fb:biology.animal_breed.temperament" not in generated_code
 
 
+def test_joined_count_renderer_keeps_relation_hinted_anchor_binding_even_with_repeated_constraint_endpoint() -> None:
+    query_plan = {
+        "answer_mode": "count",
+        "query_shape": "count_over_joined_set",
+        "anchored_entities": [
+            {
+                "surface": "Percussionist",
+                "chosen_alias": "m.02h66l4",
+                "resolved_entity_id": "m.02h66l4",
+                "role": "anchor",
+            }
+        ],
+        "shared_answer_variable": "candidate_person",
+        "candidate_set_variable": "candidate_person",
+        "count_set_variable": "person",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "person",
+                    "notes": (
+                        "The profession anchor 'Percussionist' is used via "
+                        "people.profession.people_with_this_profession."
+                    ),
+                }
+            ],
+        },
+        "relation_paths": [
+            {
+                "relation": "people.profession.people_with_this_profession",
+                "direction": "forward",
+                "from": "profession",
+                "to": "person",
+                "from_role": "constraint_value",
+                "to_role": "count_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "people.person.profession",
+                "direction": "forward",
+                "from": "person",
+                "to": "profession",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+            },
+        ],
+        "projection": ["count"],
+        "ordering_attribute": {},
+        "allow_exploratory_predicates": False,
+    }
+
+    selection = select_reusable_tool(query_plan)
+    assert selection is not None
+
+    generated_output = render_reusable_tool(
+        query_plan=query_plan,
+        selection=selection,
+    )
+    generated_code = extract_and_validate_code(generated_output)
+
+    assert "fb:m.02h66l4 fb:people.profession.people_with_this_profession ?person ." in generated_code
+    assert "?profession fb:people.profession.people_with_this_profession ?person ." not in generated_code
+    assert "?person fb:people.person.profession ?profession ." in generated_code
+
+
+def test_joined_count_renderer_uses_relation_hinted_constraint_note_when_no_explicit_entity_exists() -> None:
+    query_plan = {
+        "answer_mode": "count",
+        "query_shape": "count_over_joined_set",
+        "anchored_entities": [
+            {
+                "surface": "Percussionist",
+                "chosen_alias": "m.02h66l4",
+                "resolved_entity_id": "m.02h66l4",
+                "role": "anchor",
+            }
+        ],
+        "shared_answer_variable": "person",
+        "candidate_set_variable": "person_set",
+        "count_set_variable": "person",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "person",
+                    "notes": (
+                        "Profession anchor (Percussionist, id m.02h66l4) -> persons "
+                        "via people.profession.people_with_this_profession"
+                    ),
+                },
+                {
+                    "anchor_role": "constraint_value",
+                    "constrains_variable": "person",
+                    "notes": (
+                        "Persons must also have profession = 'songwriter' "
+                        "(enforced via people.person.profession)"
+                    ),
+                },
+            ],
+        },
+        "relation_paths": [
+            {
+                "relation": "people.profession.people_with_this_profession",
+                "direction": "forward",
+                "from": "profession_anchor",
+                "to": "person",
+                "from_role": "constraint_value",
+                "to_role": "count_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "people.person.profession",
+                "direction": "forward",
+                "from": "person",
+                "to": "profession_value",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+            },
+        ],
+        "projection": ["count"],
+        "ordering_attribute": {},
+        "allow_exploratory_predicates": False,
+    }
+
+    selection = select_reusable_tool(query_plan)
+    assert selection is not None
+
+    generated_output = render_reusable_tool(
+        query_plan=query_plan,
+        selection=selection,
+    )
+    generated_code = extract_and_validate_code(generated_output)
+
+    assert "fb:m.02h66l4 fb:people.profession.people_with_this_profession ?person ." in generated_code
+    assert '?songwriter_constraint_value fb:type.object.name ?songwriter_constraint_value_label .' in generated_code
+    assert 'FILTER(LCASE(STR(?songwriter_constraint_value_label)) = "songwriter")' in generated_code
+    assert "?person fb:people.person.profession ?songwriter_constraint_value ." in generated_code
+    assert '"profession_value"' not in generated_code
+
+
+def test_joined_count_renderer_allows_explicit_constraint_note_to_override_anchor_hint_on_same_relation() -> None:
+    query_plan = {
+        "answer_mode": "count",
+        "query_shape": "count_over_joined_set",
+        "anchored_entities": [
+            {
+                "surface": "Percussionist",
+                "chosen_alias": "m.02h66l4",
+                "resolved_entity_id": "m.02h66l4",
+                "role": "anchor",
+            },
+            {
+                "surface": "songwriters",
+                "chosen_alias": "songwriter",
+                "role": "constraint_value",
+            },
+        ],
+        "shared_answer_variable": "shared_answer",
+        "candidate_set_variable": "shared_answer",
+        "count_set_variable": "shared_answer",
+        "join_structure": {
+            "type": "intersection",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "shared_answer",
+                    "notes": (
+                        "The primary anchor constrains the shared counted entity set "
+                        "via people.profession.people_with_this_profession."
+                    ),
+                },
+                {
+                    "anchor_role": "constraint_value",
+                    "constrains_variable": "shared_answer",
+                    "notes": (
+                        "The answer target phrase is treated as an explicit "
+                        "answer-class filter on the same counted set via "
+                        "people.profession.people_with_this_profession with value "
+                        "'songwriter'."
+                    ),
+                },
+            ],
+        },
+        "relation_paths": [
+            {
+                "relation": "people.profession.people_with_this_profession",
+                "direction": "forward",
+                "from": "anchor",
+                "to": "shared_answer",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "people.profession.people_with_this_profession",
+                "direction": "forward",
+                "from": "constraint_value",
+                "to": "shared_answer",
+                "from_role": "constraint_value",
+                "to_role": "candidate_set",
+                "grounding_source": "dynamic_probe",
+            },
+        ],
+        "projection": ["count"],
+        "ordering_attribute": {},
+        "allow_exploratory_predicates": False,
+    }
+
+    selection = select_reusable_tool(query_plan)
+    assert selection is not None
+
+    generated_output = render_reusable_tool(
+        query_plan=query_plan,
+        selection=selection,
+    )
+    generated_code = extract_and_validate_code(generated_output)
+
+    assert "fb:m.02h66l4 fb:people.profession.people_with_this_profession ?shared_answer ." in generated_code
+    assert '?constraint_value fb:type.object.name ?constraint_value_label .' in generated_code
+    assert 'FILTER(LCASE(STR(?constraint_value_label)) = "songwriter")' in generated_code
+    assert "?constraint_value fb:people.profession.people_with_this_profession ?shared_answer ." in generated_code
+    assert "?anchor fb:people.profession.people_with_this_profession ?shared_answer ." not in generated_code
+
+
 def test_joined_count_renderer_preserves_auxiliary_bridge_variable() -> None:
     query_plan = {
         "answer_mode": "count",
@@ -1556,6 +1784,73 @@ def test_reusable_count_renderer_prefers_candidate_set_over_shared_answer_alias(
     assert "COUNT(DISTINCT ?answer_set) AS ?count" in generated_code
     assert "?answer_count" not in generated_code
     assert "COUNT(DISTINCT ?answer) AS ?count" not in generated_code
+
+
+def test_reusable_joined_count_renderer_prefers_structural_shared_answer_over_helper_count_token() -> None:
+    query_plan = {
+        "answer_mode": "count",
+        "query_shape": "count_over_joined_set",
+        "anchored_entities": [
+            {
+                "surface": "lso",
+                "chosen_alias": "m.014hr0",
+                "resolved_entity_id": "m.014hr0",
+                "role": "anchor",
+            }
+        ],
+        "shared_answer_variable": "artist",
+        "candidate_set_variable": "artist_set",
+        "count_set_variable": "artist_count",
+        "relation_paths": [
+            {
+                "relation": "music.recording_contribution.contributor",
+                "direction": "reverse",
+                "from": "contribution",
+                "to": "m.014hr0",
+                "from_role": "count_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+            },
+            {
+                "relation": "music.recording_contribution.recording",
+                "direction": "forward",
+                "from": "contribution",
+                "to": "recording",
+                "from_role": "anchor",
+                "to_role": "count_set",
+                "grounding_source": "exploratory",
+            },
+            {
+                "relation": "music.recording.artist",
+                "direction": "forward",
+                "from": "recording",
+                "to": "artist",
+                "from_role": "anchor",
+                "to_role": "count_set",
+                "grounding_source": "dynamic_probe",
+            },
+        ],
+        "projection": ["artist_count"],
+        "ordering_attribute": {},
+        "allow_exploratory_predicates": True,
+    }
+
+    selection = select_reusable_tool(query_plan)
+    assert selection is not None
+    generated_output = render_reusable_tool(
+        query_plan=query_plan,
+        selection=selection,
+    )
+    generated_code = extract_and_validate_code(generated_output)
+
+    assert "COUNT(DISTINCT ?artist) AS ?count" in generated_code
+    assert "COUNT(DISTINCT ?contribution) AS ?count" not in generated_code
+    assert "COUNT(DISTINCT ?artist_count) AS ?count" not in generated_code
+    assert "?contribution fb:music.recording_contribution.contributor fb:m.014hr0 ." in generated_code
+    assert "?contribution fb:music.recording_contribution.recording ?recording ." in generated_code
+    assert "?recording fb:music.recording.artist ?artist ." in generated_code
+    assert "fb:m.014hr0 fb:music.recording_contribution.recording ?artist_count ." not in generated_code
+    assert "fb:m.014hr0 fb:music.recording.artist ?artist ." not in generated_code
 
 
 def test_reusable_multi_anchor_renderer_preserves_pivot_when_same_role_repeats() -> None:

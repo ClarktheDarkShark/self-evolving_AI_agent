@@ -110,6 +110,7 @@ Rules:
 - The plan must be grounded in the provided grounding card whenever grounded support exists.
 - Read the grounding card's `question_inputs` section first. It contains the typed semantic inputs the planner should preserve.
 - Read the grounding card's `scaffold_candidates` section next. Prefer the highest-priority scaffold candidate unless grounded evidence clearly disqualifies it.
+- Read the grounding card's `active_family_policy` section. Treat `use_when` as the current applicability boundary, `validate` as the semantic contract that must hold, and `repair` as the preferred repair bias for this family.
 - Choose aliases from the grounding card. Do not invent new surface normalizations unless absolutely required.
 - Prefer anchored named-entity bindings and named attribute-value bindings over broad graph exploration.
 - Read the grounding card's query_shape and shape_guidance carefully; they describe the required plan structure.

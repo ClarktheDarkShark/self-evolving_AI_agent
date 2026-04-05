@@ -2,7 +2,6 @@ import:
 - ../task.yaml
 - ../../../agent.yaml
 - ../../../../../../definition.yaml
-
 assignment_config:
   callback_dict:
     callback_0:
@@ -11,11 +10,9 @@ assignment_config:
       name: consecutive_abnormal_agent_inference_process_handling_callback
   output_dir: outputs/{TIMESTAMP}
   sample_order:
-    - "180"
-
+  - '2'
 environment_config:
   use_task_client_flag: true
-
 task_dict:
   knowledge_graph:
     parameters:

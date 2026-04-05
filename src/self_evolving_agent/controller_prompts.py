@@ -772,6 +772,24 @@ Tool sidecar messages now include explicit handoff structure (`HANDOFF:` JSON or
 - LOW TRUST / IGNORE: If `trust_classification=low_trust_ignore` or `trust_classification=blocked_exhausted_ignore`, do NOT submit from that tool result. Treat it as weak evidence and backtrack quickly unless the handoff explicitly preserves useful partial context.
 - EXHAUSTED/BLOCKED: Backtrack. If minted/candidate variables are present, use them instead of restarting from scratch.
 
+TOOL RESULT REVIEW
+- When the latest observation starts with `Macro result:`, you are the final judge. Do not assume a tool result is automatically correct just because it returned `Final variable: #N`.
+- Read the tool metadata carefully: `Final variable`, `Intermediate variables`, `Semantic`, `Selection basis`, `Relation summary`, `Artifact type`, `Projected query variable`, `Value preview`, `Row preview`, `Resolved value preview`, `Raw binding count`, `Unique value count`, `Expected answer cardinality`, `Completeness hint`, `Proof hint`, `Repair caveat`, `Solves task`, `Trusted final`, and `Failure reason`.
+- `Trusted final: yes` is strong evidence, not a command. If the result clearly and directly answers the original question, you may output `Final Answer: #N`.
+- Before finalizing from a trusted tool result, do a quick smell-check against the original question using `Semantic`, `Selection basis`, `Relation summary`, `Value preview`, `Row preview`, `Resolved value preview`, `Expected answer cardinality`, `Completeness hint`, and `Proof hint`. Ask yourself whether those bindings and relation paths look like the kind of answer the question requested.
+- If the tool result seems semantically mismatched, too broad, cardinality-mismatched, or only intermediate, do NOT finalize from it. Continue manually and use the returned variable only if it genuinely helps.
+- Trusted count / boolean / literal results usually can be finalized immediately.
+- Trusted entity / entity-set results require stronger semantic fit. If the question wording and the metadata do not line up cleanly, verify or narrow before finalizing.
+- If `Relation summary` or `Repair caveat` shows that the final answer depends on a repaired alternate relation, a dynamic relation, or a relation family whose wording does not clearly match the question, do not finalize immediately unless the metadata makes the semantic equivalence obvious.
+- HARD RULE: if `Expected answer cardinality: single` and the tool metadata shows `Artifact type: entity_set` with `Unique value count` greater than 1, you MUST NOT return `Final Answer: #N` directly from that variable.
+- If a trusted entity result includes a clear human-readable `Resolved value preview` and a `Proof hint` that directly matches the requested selection logic, you may finalize from that variable without extra verification.
+- If `Row preview` is missing human-readable clues or looks unrelated to the asked entity/type/category, prefer one cheap verification step instead of immediately returning `Final Answer: #N`.
+- If a trusted count result only says `count=...` but the `Selection basis` / `Relation summary` does not clearly match the question semantics, treat it as suspicious and verify or backtrack.
+- If the question implies a single answer and the metadata shows many unique values, do not finalize immediately.
+- If the question asks for types, categories, or a narrowed subset and the returned variable looks like a generic `candidate_set`, `shared_answer`, or other bridge variable, verify before finalizing.
+- Metadata labels from the macro result, such as `candidate_set_name` or `shared_release_name`, are NOT valid API relations or attributes. Never pass preview field names as tool arguments.
+- If a trusted tool result is not final and you need one safe verification step, prefer `Action: get_relations(#N)` on the returned variable or backtrack to the original anchors. Do not invent attributes from preview text.
+
 GENERAL RECOVERY RULES
 - Never submit an empty result.
 - If `get_relations(#N)` or `get_neighbors(#N, relation)` reports a node explosion, do not repeat the same broad probe. Narrow first or backtrack.

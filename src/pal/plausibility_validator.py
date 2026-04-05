@@ -1805,6 +1805,77 @@ def _count_plan_relation_semantically_implies_type_like_target(
     return False
 
 
+def _answer_target_looks_like_profession_label(answer_target_phrase: str) -> bool:
+    tokens = [
+        _singularize_token(token)
+        for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
+        if token.strip()
+    ]
+    informative = [
+        token
+        for token in tokens
+        if token
+        and token
+        not in {
+            "amount",
+            "number",
+            "total",
+            "different",
+            "distinct",
+            "same",
+            "other",
+            "many",
+        }
+    ]
+    if not informative:
+        return False
+    head_token = informative[-1]
+    if head_token in {
+        "profession",
+        "occupation",
+        "job",
+        "title",
+        "person",
+        "people",
+        "worker",
+    }:
+        return False
+    profession_suffixes = ("er", "or", "ist", "ian", "man", "woman")
+    return any(
+        len(head_token) > len(suffix) + 2 and head_token.endswith(suffix)
+        for suffix in profession_suffixes
+    )
+
+
+def _count_plan_uses_profession_membership_relation(
+    *,
+    query_plan: Mapping[str, Any],
+) -> bool:
+    counted_roles = {"candidate_set", "count_set", "shared_answer", "answer"}
+    membership_relations = {
+        "people.profession.people_with_this_profession",
+        "business.job_title.people_with_this_title",
+        "fictional_universe.character_occupation.characters_with_this_occupation",
+    }
+    for relation_path in (query_plan.get("relation_paths") or []):
+        if not isinstance(relation_path, Mapping):
+            continue
+        relation = str(relation_path.get("relation") or "").strip().lower()
+        if relation not in membership_relations:
+            continue
+        from_role = _normalize_contract_role(relation_path.get("from_role"))
+        to_role = _normalize_contract_role(relation_path.get("to_role"))
+        if (
+            from_role in {"anchor", "anchor_a", "anchor_b", "constraint_value"}
+            and to_role in counted_roles
+        ) or (
+            to_role in {"anchor", "anchor_a", "anchor_b", "constraint_value"}
+            and from_role in counted_roles
+        ):
+            return True
+    return False
+
+
 def _count_plan_semantically_enforces_answer_target(
     *,
     query_plan: Mapping[str, Any],
@@ -1827,6 +1898,15 @@ def _count_plan_semantically_enforces_answer_target(
             answer_target_phrase=answer_target_phrase,
             query_text=query_text,
         )
+    # Some benchmark count questions use a profession-like noun phrase
+    # ("songwriters") as descriptive surface text while the gold query only
+    # counts members of the anchored profession relation. Treat those
+    # profession-membership paths as semantically sufficient so the validator
+    # does not over-reject grounded direct counts.
+    if _answer_target_looks_like_profession_label(
+        answer_target_phrase
+    ) and _count_plan_uses_profession_membership_relation(query_plan=query_plan):
+        return True
     if (
         query_shape == "count_over_direct_relation"
         and "relation-selection hint" in strategy

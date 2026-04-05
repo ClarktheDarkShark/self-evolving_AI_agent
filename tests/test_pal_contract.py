@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import src.agents.instance.pal_agent_controller as pal_agent_controller_module
 from src.agents.exceptions import AgentUnknownException
+from src.agents.instance.language_model_agent import LanguageModelAgent
 from src.agents.instance.pal_agent_controller import PALAgentController
 from src.pal.invoker import PALInvocationResult
 from src.pal.family_policy_evolution import (
@@ -35,7 +36,7 @@ from src.pal.kg_benchmark_adapter import (
     adapt_pal_result_to_benchmark,
     classify_execution_artifact,
 )
-from src.pal.policy_contracts import build_trust_contract_evaluation
+from src.pal.policy_contracts import FamilyPolicyBundle, build_trust_contract_evaluation
 from src.pal.reusable_tool_families import select_reusable_tool
 from src.typings import ChatHistory, ChatHistoryItem, Role
 
@@ -188,7 +189,7 @@ def test_merge_success_plan_archetypes_dedupes_by_signature() -> None:
     assert merged[0]["pattern_signature"] == base["pattern_signature"]
 
 
-def test_grounding_card_surfaces_family_success_patterns(monkeypatch) -> None:
+def test_grounding_card_omits_family_success_patterns_by_default(monkeypatch) -> None:
     controller = _make_controller()
 
     class _FakeStore:
@@ -240,9 +241,260 @@ def test_grounding_card_surfaces_family_success_patterns(monkeypatch) -> None:
         relation_grounding=[],
     )
 
+    assert "- family_success_patterns:" not in grounding_card
+
+
+def test_grounding_card_can_surface_family_success_patterns_when_explicitly_enabled(
+    monkeypatch,
+) -> None:
+    controller = _make_controller()
+
+    class _FakeStore:
+        def get_trusted_success_bank_metadata(self, family_name: str):
+            assert family_name == "count_over_joined_set"
+            return {
+                "source_version": "2026-03-31",
+                "evaluation_context": {
+                    "success_plan_archetypes": [
+                        {
+                            "anchor_roles": ["anchor_a", "anchor_b"],
+                            "anchor_constraints": [
+                                "anchor_a->candidate_set",
+                                "anchor_b->candidate_set",
+                            ],
+                            "relation_role_skeleton": [
+                                "anchor_a->candidate_set:curated",
+                                "anchor_b->candidate_set:curated",
+                                "candidate_set->count_set:curated",
+                            ],
+                            "structural_notes": [
+                                "preserve_multiple_anchor_constraints",
+                                "count_target_distinct_from_candidate_set",
+                            ],
+                        }
+                    ]
+                },
+            }
+
+    controller._get_family_policy_store = lambda: _FakeStore()
+    monkeypatch.setattr(
+        controller,
+        "_infer_query_shape",
+        lambda **kwargs: "count_over_joined_set",
+    )
+    monkeypatch.setattr(
+        controller,
+        "_build_question_interpretation",
+        lambda **kwargs: {"question_inputs": [], "preferred_scaffolds": []},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_refine_question_interpretation_with_grounding",
+        lambda **kwargs: kwargs["question_interpretation"],
+    )
+    monkeypatch.setenv("PAL_TOOL_EVOLUTION_COARSE_SUCCESS_HINTS", "1")
+
+    grounding_card = controller._build_pal_grounding_card(
+        "Question: how many dialects share two constraints?, Entities: ['A', 'B']",
+        relation_grounding=[],
+    )
+
     assert "- family_success_patterns:" in grounding_card
     assert "anchor_roles=anchor_a,anchor_b" in grounding_card
     assert "preserve_multiple_anchor_constraints" in grounding_card
+
+
+def test_grounding_card_surfaces_tool_evolution_branch_and_anchor_patterns(
+    monkeypatch,
+) -> None:
+    controller = _make_controller()
+
+    class _FakeStore:
+        def get_trusted_success_bank_metadata(self, family_name: str):
+            return {}
+
+        def get_tool_evolution_context(self, family_name: str):
+            assert family_name == "single_anchor_lookup"
+            return {
+                "source_version": "2026-03-31",
+                "preferred_patterns": [
+                    {
+                        "pattern_signature": "success-1",
+                        "relation_signatures": [
+                            "anchor->royalty.kingdom.monarchs->answer:curated"
+                        ],
+                        "grounding_sources": ["curated"],
+                        "anchor_binding_modes": ["surface_alias_anchor"],
+                        "alias_strategy_tokens": ["feedback_repair"],
+                        "structural_notes": ["single_path"],
+                    }
+                ],
+                "avoid_patterns": [
+                    {
+                        "pattern_signature": "failure-1",
+                        "relation_signatures": [
+                            "anchor->biology.animal_owner.animals_owned->answer:dynamic_probe"
+                        ],
+                        "grounding_sources": ["dynamic_probe"],
+                        "anchor_binding_modes": ["resolved_entity_id"],
+                        "alias_strategy_tokens": ["live_probe_repair"],
+                        "failure_labels": ["rejected_dangerous_overreach"],
+                    }
+                ],
+            }
+
+    controller._get_family_policy_store = lambda: _FakeStore()
+    monkeypatch.setattr(
+        controller,
+        "_infer_query_shape",
+        lambda **kwargs: "single_anchor_lookup",
+    )
+    monkeypatch.setattr(
+        controller,
+        "_build_question_interpretation",
+        lambda **kwargs: {"question_inputs": [], "preferred_scaffolds": []},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_refine_question_interpretation_with_grounding",
+        lambda **kwargs: kwargs["question_interpretation"],
+    )
+    monkeypatch.setenv("PAL_TOOL_EVOLUTION_CONTRASTIVE_BRANCH", "1")
+    monkeypatch.setenv("PAL_TOOL_EVOLUTION_ANCHOR_HINTS", "1")
+
+    grounding_card = controller._build_pal_grounding_card(
+        "Question: what is the name of the monarch in saxe-coburg-gotha, Entities: ['saxe-coburg-gotha']",
+        relation_grounding=[],
+    )
+
+    assert "- tool_evolution_branch_patterns:" in grounding_card
+    assert (
+        "prefer relation_signatures=anchor->royalty.kingdom.monarchs->answer:curated"
+        in grounding_card
+    )
+    assert (
+        "avoid relation_signatures=anchor->biology.animal_owner.animals_owned->answer:dynamic_probe"
+        in grounding_card
+    )
+    assert "- tool_evolution_anchor_patterns:" in grounding_card
+    assert "alias_strategy=feedback_repair" in grounding_card
+    assert "failure_labels=rejected_dangerous_overreach" in grounding_card
+
+
+def test_family_policy_candidate_uses_current_session_status_when_available(
+    monkeypatch,
+) -> None:
+    controller = _make_controller()
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("PAL_ENABLE_FAMILY_POLICY_EVOLUTION", "1")
+
+    class _FakeStore:
+        def create_candidate_update(self, **kwargs):
+            captured.update(kwargs)
+            return type(
+                "_Candidate",
+                (),
+                {
+                    "base_version": "2026-03-31",
+                    "candidate_version": "2026-03-31__cand0001",
+                    "fields_changed": ("validator_expectations",),
+                    "reason_for_change": "family_failure:pal_query_not_accepted:repairable_bad_count_set",
+                    "trigger_context": dict(kwargs.get("trigger_context") or {}),
+                },
+            )()
+
+    controller._get_family_policy_store = lambda: _FakeStore()
+    controller._current_session = type(
+        "_Session",
+        (),
+        {
+            "task_name": "knowledge_graph",
+            "sample_index": "15",
+            "sample_status": "completed",
+            "evaluation_record": {"outcome": "incorrect"},
+        },
+    )()
+    controller._resolve_family_policy_trigger_query_plan = lambda **kwargs: {
+        "query_shape": "count_over_joined_set"
+    }
+    controller._relation_names_from_plan = lambda plan: ["music.recording.artist"]
+    controller._build_scaffold_signature = lambda plan: "count_over_joined_set|anchor|music.recording.artist"
+    controller._collect_family_policy_failure_reasons = lambda **kwargs: (
+        "pal_query_not_accepted:repairable_bad_count_set",
+        "count_answer_target_unenforced:artist",
+    )
+
+    controller._maybe_record_family_policy_candidate(
+        generated_tool_name="pal_sparql_query_tool_demo",
+        query_plan={"query_shape": "count_over_joined_set"},
+        failure_reason="pal_query_not_accepted:repairable_bad_count_set",
+        repair_loop_log=None,
+        trust_contract=None,
+    )
+
+    assert captured["failure_class"] == "weak_applicability_boundary"
+    assert captured["trigger_context"]["sample_index"] == "15"
+
+
+def test_grounding_card_surfaces_active_family_policy(monkeypatch) -> None:
+    controller = _make_controller()
+
+    monkeypatch.setattr(
+        pal_agent_controller_module,
+        "get_reusable_family_policy_bundle",
+        lambda family_name: FamilyPolicyBundle(
+            family_name=family_name,
+            version="2026-03-31__cand1234",
+            renderer_name="count",
+            applicability_conditions=(
+                "query_shape=count_over_direct_relation",
+                "counted relation grounded",
+                "require_explicit_answer_role_alignment",
+            ),
+            validator_expectations=(
+                "counted variable must be structurally bound",
+                "verify_answer_target_semantics_not_just_executability",
+                "verify_count_targets_requested_entity_set",
+            ),
+            repair_policy=(
+                "repair direct count relation family before escalating to joined-count family",
+                "switch_to_joined_count_when_downstream_filter_or_projection_exists",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_infer_query_shape",
+        lambda **kwargs: "count_over_direct_relation",
+    )
+    monkeypatch.setattr(
+        controller,
+        "_build_question_interpretation",
+        lambda **kwargs: {"question_inputs": [], "preferred_scaffolds": []},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_refine_question_interpretation_with_grounding",
+        lambda **kwargs: kwargs["question_interpretation"],
+    )
+
+    grounding_card = controller._build_pal_grounding_card(
+        "Question: how many breeds share the same temperament as bull terrier?, Entities: ['Bull Terrier']",
+        relation_grounding=[],
+    )
+
+    assert "- active_family_policy:" in grounding_card
+    assert "bundle_version=2026-03-31__cand1234" in grounding_card
+    assert "Keep the answer/count target aligned" in grounding_card
+    assert "use the joined-count family" in grounding_card
+    assert "counted relation grounded" not in grounding_card
+    assert (
+        "verify_answer_target_semantics_not_just_executability" not in grounding_card
+    )
+    assert (
+        "repair direct count relation family before escalating to joined-count family"
+        in grounding_card
+    )
 
 
 def test_attribute_value_alias_candidates_include_singular_profession_forms() -> None:
@@ -309,6 +561,60 @@ def test_grounding_candidates_include_camera_attribute_filters() -> None:
     )
 
 
+def test_probe_relation_endpoint_labels_keep_with_this_relation_target_type() -> None:
+    controller = _make_controller()
+
+    source_label, target_label = controller._infer_probe_relation_endpoint_labels(
+        "people.profession.people_with_this_profession"
+    )
+
+    assert source_label == "profession"
+    assert target_label == "person"
+
+
+def test_grounded_relation_sort_uses_explicit_anchor_clue_to_rank_curated_candidates() -> None:
+    controller = _make_controller()
+
+    ranked = controller._sort_grounded_relation_candidates_by_semantic_fit(
+        relation_candidates=[
+            {
+                "relation": "music.artist.track",
+                "direction": "forward",
+                "from": "artist",
+                "to": "track",
+                "grounding_source": "curated",
+                "from_role": "anchor",
+                "to_role": "count_set",
+                "support": "curated_music_predicate",
+                "use_when": "find tracks performed/recorded by a music artist",
+            },
+            {
+                "relation": "people.profession.people_with_this_profession",
+                "direction": "forward",
+                "from": "profession",
+                "to": "person",
+                "grounding_source": "curated",
+                "from_role": "constraint_value",
+                "to_role": "count_set",
+                "support": "curated_people_predicate",
+                "use_when": "find people who have the given profession",
+            },
+        ],
+        question_text="Question: how many songwriters work in the percussionist profession?",
+        answer_target_phrase="songwriters",
+        question_inputs=[
+            {
+                "surface": "Percussionist",
+                "kind": "named_entity",
+                "role_hint": "anchor",
+                "reason": "explicit_entity:attribute_value.profession",
+            }
+        ],
+    )
+
+    assert ranked[0]["relation"] == "people.profession.people_with_this_profession"
+
+
 def test_class_filtered_count_repair_plan_supports_constraint_value_filters() -> None:
     controller = _make_controller()
 
@@ -362,6 +668,83 @@ def test_class_filtered_count_repair_plan_supports_constraint_value_filters() ->
         str(item.get("role") or "") == "constraint_value"
         for item in rewritten["anchored_entities"]
     )
+
+
+def test_class_filtered_count_repair_plan_accepts_relation_hinted_constraint_anchor_path() -> None:
+    controller = _make_controller()
+
+    rewritten = controller._build_class_filtered_count_repair_plan(
+        task_question=(
+            "Question: how many songwriters work in the percussionist profession?, "
+            "Entities: ['Percussionist']"
+        ),
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_joined_set",
+            "answer_target_phrase": "songwriters",
+            "anchored_entities": [
+                {
+                    "surface": "Percussionist",
+                    "chosen_alias": "Percussionist",
+                    "role": "anchor",
+                }
+            ],
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "person",
+                        "notes": (
+                            "The anchor profession (Percussionist) is used via "
+                            "people.profession.people_with_this_profession to produce "
+                            "the candidate person set."
+                        ),
+                    }
+                ],
+            },
+            "relation_paths": [
+                {
+                    "relation": "people.profession.people_with_this_profession",
+                    "direction": "forward",
+                    "from": "profession",
+                    "to": "person",
+                    "from_role": "constraint_value",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                }
+            ],
+            "shared_answer_variable": "answer_person",
+            "candidate_set_variable": "candidate_person",
+            "count_set_variable": "person",
+            "strategy": "Count people in the anchor profession, then enforce songwriter.",
+            "plan_rationale": [],
+        },
+        relation_grounding=[
+            {
+                "relation": "people.person.profession",
+                "direction": "forward",
+                "from": "person",
+                "to": "profession",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+            }
+        ],
+    )
+
+    assert rewritten is not None
+    assert rewritten["query_shape"] == "count_over_joined_set"
+    assert any(
+        str(item.get("role") or "") == "constraint_value"
+        and str(item.get("chosen_alias") or "") == "songwriter"
+        for item in rewritten["anchored_entities"]
+    )
+    anchor_notes = rewritten["join_structure"]["anchor_constraints"][0]["notes"]
+    filter_notes = rewritten["join_structure"]["anchor_constraints"][1]["notes"]
+    assert "people.profession.people_with_this_profession" in anchor_notes
+    assert "people.person.profession" in filter_notes
+    assert "'songwriter'" in filter_notes
 
 
 def test_class_filtered_count_repair_plan_reuses_anchor_to_constraint_relation_for_candidate_filter() -> None:
@@ -510,6 +893,227 @@ def test_joined_count_boundary_repair_plan_reclassifies_downstream_constraint_fi
 
     assert rewritten is not None
     assert rewritten["query_shape"] == "count_over_joined_set"
+
+
+def test_normalize_pal_query_plan_reclassifies_direct_count_with_downstream_filter() -> None:
+    controller = _make_controller()
+
+    normalized = controller._normalize_pal_query_plan(
+        {
+            "answer_mode": "count",
+            "answer_type": "count",
+            "query_shape": "count_over_direct_relation",
+            "answer_target_phrase": "songwriters",
+            "anchored_entities": [
+                {
+                    "surface": "Percussionist",
+                    "chosen_alias": "Percussionist",
+                    "role": "anchor",
+                }
+            ],
+            "shared_answer_variable": "person",
+            "candidate_set_variable": "person",
+            "count_set_variable": "person",
+            "join_structure": {"type": "count", "anchor_constraints": []},
+            "relation_paths": [
+                {
+                    "relation": "people.profession.people_with_this_profession",
+                    "direction": "forward",
+                    "from": "profession",
+                    "to": "person",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "people.person.profession",
+                    "direction": "forward",
+                    "from": "person",
+                    "to": "profession",
+                    "from_role": "candidate_set",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                },
+            ],
+            "projection": ["count"],
+            "allow_exploratory_predicates": False,
+            "strategy": "Count persons with the anchor profession, then filter their profession.",
+            "plan_rationale": [],
+        }
+    )
+
+    assert normalized["query_shape"] == "count_over_joined_set"
+    assert any(
+        "joined-count family" in str(item)
+        for item in normalized["plan_rationale"]
+    )
+
+
+def test_normalize_pal_query_plan_reclassifies_two_hop_direct_count() -> None:
+    controller = _make_controller()
+
+    normalized = controller._normalize_pal_query_plan(
+        {
+            "answer_mode": "count",
+            "answer_type": "count",
+            "query_shape": "count_over_direct_relation",
+            "answer_target_phrase": "artists",
+            "anchored_entities": [
+                {
+                    "surface": "LSO",
+                    "chosen_alias": "LSO",
+                    "role": "anchor",
+                }
+            ],
+            "shared_answer_variable": "artist",
+            "candidate_set_variable": "recording",
+            "count_set_variable": "artist",
+            "join_structure": {"type": "count", "anchor_constraints": []},
+            "relation_paths": [
+                {
+                    "relation": "music.recording.featured_artists",
+                    "direction": "reverse",
+                    "from": "recording",
+                    "to": "LSO",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "dynamic_probe",
+                },
+                {
+                    "relation": "music.recording.artist",
+                    "direction": "forward",
+                    "from": "recording",
+                    "to": "artist",
+                    "from_role": "anchor",
+                    "to_role": "answer",
+                    "grounding_source": "dynamic_probe",
+                },
+            ],
+            "projection": ["count"],
+            "allow_exploratory_predicates": False,
+            "strategy": "Count artists by first binding recordings tied to the anchor.",
+            "plan_rationale": [],
+        }
+    )
+
+    assert normalized["query_shape"] == "count_over_joined_set"
+    assert any(
+        "joined-count family" in str(item)
+        for item in normalized["plan_rationale"]
+    )
+
+
+def test_normalize_pal_query_plan_repairs_nonstructural_joined_count_variables() -> None:
+    controller = _make_controller()
+
+    normalized = controller._normalize_pal_query_plan(
+        {
+            "answer_mode": "count",
+            "answer_type": "count",
+            "query_shape": "count_over_joined_set",
+            "answer_target_phrase": "artists recorded the contribution by lso",
+            "anchored_entities": [
+                {
+                    "surface": "lso",
+                    "chosen_alias": "lso",
+                    "role": "anchor",
+                }
+            ],
+            "shared_answer_variable": "artist",
+            "candidate_set_variable": "artist_set",
+            "count_set_variable": "artist_set",
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "recording",
+                        "notes": "recording pivot",
+                    },
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "artist_set",
+                        "notes": "counted answer set",
+                    },
+                ],
+            },
+            "relation_paths": [
+                {
+                    "relation": "music.recording_contribution.contributor",
+                    "direction": "reverse",
+                    "from": "recording",
+                    "to": "lso",
+                    "from_role": "count_set",
+                    "to_role": "anchor",
+                    "grounding_source": "curated",
+                },
+                {
+                    "relation": "music.recording.artist",
+                    "direction": "forward",
+                    "from": "recording",
+                    "to": "artist",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                },
+            ],
+            "projection": ["count"],
+            "allow_exploratory_predicates": False,
+            "strategy": "Count artists who recorded the contribution by lso.",
+            "plan_rationale": [],
+        }
+    )
+
+    assert normalized["candidate_set_variable"] == "recording"
+    assert normalized["count_set_variable"] == "artist"
+    assert normalized["shared_answer_variable"] == "artist"
+    assert normalized["join_structure"]["anchor_constraints"][1]["constrains_variable"] == "artist"
+
+
+def test_grounded_relation_candidates_prioritize_discriminative_answer_target_tokens() -> None:
+    controller = _make_controller()
+
+    ranked = controller._prune_redundant_grounded_relation_candidates(
+        relation_candidates=[
+            {
+                "relation": "music.recording.featured_artists",
+                "direction": "reverse",
+                "from": "recording",
+                "to": "lso",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+                "use_when": "find recordings that link to lso via featured artists",
+            },
+            {
+                "relation": "music.recording_contribution.contributor",
+                "direction": "reverse",
+                "from": "contribution",
+                "to": "lso",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+                "use_when": "find contributions that link to lso via recording contribution contributor",
+            },
+            {
+                "relation": "music.album.artist",
+                "direction": "reverse",
+                "from": "album",
+                "to": "lso",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+                "use_when": "find albums linked to lso by album artist",
+            },
+        ],
+        question_text="Question: how many artists recorded the contribution by lso?",
+        answer_target_phrase="artists recorded the contribution by lso",
+    )
+
+    assert ranked[0]["relation"] == "music.recording_contribution.contributor"
 
 
 def test_class_filtered_count_repair_plan_skips_relation_encoded_answer_class() -> None:
@@ -1027,6 +1631,32 @@ def test_build_type_constraint_alias_candidates_includes_title_cased_singular_fo
 
     assert "songwriter" in candidates
     assert "Songwriter" in candidates
+
+
+def test_build_grounded_type_constraint_alias_candidates_prefers_resolved_mid(
+    monkeypatch,
+) -> None:
+    controller = _make_controller()
+
+    monkeypatch.setattr(
+        controller,
+        "_probe_entity_name_count",
+        lambda anchor_name, timeout_s=2.5: 1 if anchor_name == "songwriter" else 0,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_probe_anchor_entity_ids",
+        lambda anchor_name, relation=None, anchor_position="subject", timeout_s=2.5: (
+            ["m.0fj9f"] if anchor_name == "songwriter" else []
+        ),
+    )
+
+    candidates = controller._build_grounded_type_constraint_alias_candidates(
+        "songwriters"
+    )
+
+    assert candidates[0] == "m.0fj9f"
+    assert "songwriter" in candidates
 
 
 def test_build_entity_alias_candidates_strips_trailing_generic_animal_class_word() -> None:
@@ -2580,6 +3210,132 @@ def test_retry_same_plan_after_alias_repair_yields_to_structural_repair_feedback
     assert should_retry is False
 
 
+def test_repair_feedback_constraints_reject_count_that_drops_preserved_relation_family() -> None:
+    controller = _make_controller()
+
+    constrained = controller._apply_repair_feedback_constraints(
+        query_plan={
+            "answer_mode": "count",
+            "relation_paths": [
+                {
+                    "relation": "medicine.infectious_disease.vector",
+                    "direction": "forward",
+                    "from_role": "count_set",
+                    "to_role": "anchor",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+        },
+        verdict=PlausibilityVerdict(verdict=VERDICT_ACCEPTED, reasons=[]),
+        repair_feedback=[
+            "repair_hint:preserve_count_target_family_after_pivot",
+            "relation_still_available_in_other_roles:biology.organism.diseases_transmitted",
+        ],
+    )
+
+    assert constrained.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert (
+        "count_repair_dropped_preserved_relation_family:"
+        "biology.organism.diseases_transmitted"
+    ) in constrained.reasons
+
+
+def test_repair_feedback_constraints_allow_count_that_preserves_relation_family() -> None:
+    controller = _make_controller()
+
+    constrained = controller._apply_repair_feedback_constraints(
+        query_plan={
+            "answer_mode": "count",
+            "relation_paths": [
+                {
+                    "relation": "location.country.form_of_government",
+                    "direction": "forward",
+                    "from_role": "anchor",
+                    "to_role": "constraint_value",
+                    "grounding_source": "dynamic_probe",
+                },
+                {
+                    "relation": "government.government_position_held.office_holder",
+                    "direction": "reverse",
+                    "from_role": "constraint_value",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                },
+            ],
+        },
+        verdict=PlausibilityVerdict(verdict=VERDICT_ACCEPTED, reasons=[]),
+        repair_feedback=[
+            "repair_hint:preserve_count_target_family_after_pivot",
+            "relation_still_available_in_other_roles:government.government_position_held.office_holder",
+        ],
+    )
+
+    assert constrained.verdict == VERDICT_ACCEPTED
+    assert constrained.reasons == []
+
+
+def test_repair_feedback_constraints_reject_dynamic_only_direct_count_after_grounded_failure() -> None:
+    controller = _make_controller()
+
+    constrained = controller._apply_repair_feedback_constraints(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "answer_target_phrase": "infectious diseases",
+            "relation_paths": [
+                {
+                    "relation": "medicine.infectious_disease.vector",
+                    "direction": "reverse",
+                    "from_role": "count_set",
+                    "to_role": "anchor",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+        },
+        verdict=PlausibilityVerdict(verdict=VERDICT_ACCEPTED, reasons=[]),
+        repair_feedback=[
+            "dead_relation_suppressed:biology.organism.diseases_transmitted[anchor=Aedes aegypti, direction=forward, from_role=anchor, to_role=count_set]",
+            "anchor_path_empty:'Aedes aegypti':biology.organism.diseases_transmitted",
+            "count_set_path_empty",
+        ],
+    )
+
+    assert constrained.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert (
+        "count_repair_collapsed_to_dynamic_only_after_grounded_count_failed"
+        in constrained.reasons
+    )
+
+
+def test_repair_feedback_constraints_allow_dynamic_only_direct_count_for_simple_target() -> None:
+    controller = _make_controller()
+
+    constrained = controller._apply_repair_feedback_constraints(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "answer_target_phrase": "albums",
+            "relation_paths": [
+                {
+                    "relation": "music.artist.album",
+                    "direction": "forward",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+        },
+        verdict=PlausibilityVerdict(verdict=VERDICT_ACCEPTED, reasons=[]),
+        repair_feedback=[
+            "dead_relation_suppressed:music.artist.track[anchor=Prince, direction=forward, from_role=anchor, to_role=count_set]",
+            "anchor_path_empty:'Prince':music.artist.track",
+        ],
+    )
+
+    assert constrained.verdict == VERDICT_ACCEPTED
+    assert constrained.reasons == []
+
+
 def test_apply_probe_guided_anchor_entity_repairs_adds_resolved_entity_override() -> None:
     controller = _make_controller()
 
@@ -2970,6 +3726,61 @@ def test_infer_query_shape_prefers_joined_count_when_count_question_has_constrai
     )
 
     assert query_shape == "count_over_joined_set"
+
+
+def test_infer_query_shape_detects_internal_how_many_count_cues() -> None:
+    controller = _make_controller()
+
+    direct_shape = controller._infer_query_shape(
+        question_text="the rank of goro has been given to how many book characters?",
+        entities=["Goro"],
+        answer_target_phrase="book characters",
+        question_inputs=[
+            {
+                "surface": "Goro",
+                "kind": "named_entity",
+                "role_hint": "anchor",
+            },
+            {
+                "surface": "book characters",
+                "kind": "answer_target",
+                "role_hint": "answer_target",
+            },
+        ],
+    )
+    joined_shape = controller._infer_query_shape(
+        question_text=(
+            "the czecho-slovakia has how many breeds of dogs that has the same "
+            "temperament as the cairn terriers?"
+        ),
+        entities=["czecho-slovakia", "cairn terriers"],
+        answer_target_phrase="breeds",
+        question_inputs=[
+            {
+                "surface": "czecho-slovakia",
+                "kind": "named_entity",
+                "role_hint": "anchor_a",
+            },
+            {
+                "surface": "cairn terriers",
+                "kind": "named_entity",
+                "role_hint": "anchor_b",
+            },
+            {
+                "surface": "temperament",
+                "kind": "shared_attribute",
+                "role_hint": "shared_attribute",
+            },
+            {
+                "surface": "breeds",
+                "kind": "answer_target",
+                "role_hint": "answer_target",
+            },
+        ],
+    )
+
+    assert direct_shape == "count_over_direct_relation"
+    assert joined_shape == "count_over_joined_set"
 
 
 def test_superlative_anchor_alternative_repair_prefers_grounded_objects_relation() -> None:
@@ -3900,6 +4711,70 @@ def test_apply_question_scaffold_rewrite_keeps_surface_anchor_joined_type_filter
     )
     assert rewritten["count_set_variable"] == "videogame"
     assert "game expansion" in rewritten["strategy"].lower()
+
+
+def test_grounding_candidates_include_cvg_publisher_release_relations() -> None:
+    controller = _make_controller()
+
+    candidates = controller._build_grounded_relation_candidates(
+        "Question: how many game expansions has valve corp released?, Entities: ['valve corp']"
+    )
+
+    assert any(
+        candidate.get("relation") == "cvg.cvg_publisher.games_published"
+        for candidate in candidates
+    )
+    assert any(
+        candidate.get("relation") == "cvg.cvg_publisher.game_versions_published"
+        for candidate in candidates
+    )
+
+
+def test_grounded_relation_sort_prefers_publisher_relations_for_has_released_game_query() -> None:
+    controller = _make_controller()
+
+    ranked = controller._sort_grounded_relation_candidates_by_semantic_fit(
+        relation_candidates=[
+            {
+                "relation": "cvg.computer_game_distribution_system.games_distributed",
+                "direction": "reverse",
+                "from": "distribution_system",
+                "to": "candidate_set",
+                "grounding_source": "curated",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "support": "curated_cvg_predicate",
+                "use_when": "retrieve game versions distributed by a known distribution system",
+            },
+            {
+                "relation": "cvg.cvg_developer.game_versions_developed",
+                "direction": "reverse",
+                "from": "developer",
+                "to": "candidate_set",
+                "grounding_source": "curated",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "support": "curated_cvg_predicate",
+                "use_when": "retrieve game versions developed by a known developer",
+            },
+            {
+                "relation": "cvg.cvg_publisher.games_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "grounding_source": "curated",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "support": "curated_cvg_predicate",
+                "use_when": "retrieve games published or released by a known publisher",
+            },
+        ],
+        question_text="Question: how many game expansions has valve corp released?",
+        answer_target_phrase="game expansions",
+        question_inputs=[],
+    )
+
+    assert ranked[0]["relation"] == "cvg.cvg_publisher.games_published"
 
 
 def test_single_anchor_answer_target_count_rewrite_keeps_surface_anchor_semantics() -> None:
@@ -5193,6 +6068,71 @@ def test_grounding_card_surfaces_answer_target_as_type_constraint() -> None:
     assert "raw='book characters'" in grounding_card
     assert "clue=type_constraint" in grounding_card
     assert "recommended_alias='book character'" in grounding_card
+
+
+def test_grounding_card_prefers_grounded_mid_for_type_constraint_answer_target(
+    monkeypatch,
+) -> None:
+    controller = _make_controller()
+
+    monkeypatch.setattr(
+        controller,
+        "_probe_entity_name_count",
+        lambda anchor_name, timeout_s=2.5: 1 if anchor_name == "songwriter" else 0,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_probe_anchor_entity_ids",
+        lambda anchor_name, relation=None, anchor_position="subject", timeout_s=2.5: (
+            ["m.0fj9f"] if anchor_name == "songwriter" else []
+        ),
+    )
+
+    grounding_card = controller._build_pal_grounding_card(
+        "Question: how many songwriters work in the percussionist profession?, Entities: ['Percussionist']",
+        question_interpretation={
+            "question_inputs": [
+                {
+                    "surface": "Percussionist",
+                    "kind": "named_entity",
+                    "role_hint": "anchor",
+                },
+                {
+                    "surface": "songwriters",
+                    "kind": "answer_target",
+                    "role_hint": "answer_target",
+                },
+            ],
+            "preferred_scaffolds": [{"name": "direct_count", "priority": 1}],
+        },
+        relation_grounding=[
+            {
+                "relation": "people.profession.people_with_this_profession",
+                "direction": "forward",
+                "from": "profession",
+                "to": "person",
+                "from_role": "constraint_value",
+                "to_role": "count_set",
+                "grounding_source": "curated",
+                "support": "curated_people_predicate",
+                "use_when": "find people who have the given profession",
+            },
+            {
+                "relation": "people.person.profession",
+                "direction": "forward",
+                "from": "person",
+                "to": "profession",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+                "support": "curated_people_predicate",
+                "use_when": "find the profession(s) of a person",
+            },
+        ],
+    )
+
+    assert "surface='songwriters'" in grounding_card
+    assert "recommended_alias='m.0fj9f'" in grounding_card
 
 
 def test_plan_normalization_unifies_anchor_join_and_relation_roles() -> None:
@@ -7033,6 +7973,19 @@ def test_materialize_adapter_response_carries_semantic_bridge_payload() -> None:
     response = controller._materialize_adapter_response(
         task_question="Question: ...",
         generated_tool_name="pal_sparql_query_tool_6_deadbeef",
+        query_plan={
+            "query_shape": "count_over_direct_relation",
+            "answer_mode": "count",
+            "answer_target_phrase": "infectious diseases",
+            "relation_paths": [
+                {
+                    "relation": "biology.organism.diseases_transmitted",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                }
+            ],
+        },
         materialization=BenchmarkMaterialization(
             materialization_type="bridge_action",
             needs_bridge=True,
@@ -7041,7 +7994,15 @@ def test_materialize_adapter_response_carries_semantic_bridge_payload() -> None:
             bridge_payload={"run_id": "knowledge_graph_6", "state_dir": "outputs/test_state"},
             final_variable=None,
             final_answer_text=None,
-            diagnostics={"artifact_type": "count_scalar", "artifact_source": "raw_execution"},
+            diagnostics={
+                "artifact_type": "count_scalar",
+                "artifact_source": "raw_execution",
+                "selected_query_variable": "count",
+                "binding_count": 1,
+                "unique_value_count": 1,
+                "value_preview": ["4"],
+                "row_preview": [{"count": "4"}],
+            },
             confidence=1.0,
             determinism_level="high",
             semantic_description="count result returned by the PAL query",
@@ -7049,17 +8010,42 @@ def test_materialize_adapter_response_carries_semantic_bridge_payload() -> None:
             trusted_for_materialization=True,
         ),
         tool_result_semantics={
-            "tool_result_semantic_description": "count result returned by the PAL query",
+            "tool_result_semantic_description": "count of infectious diseases returned by the executed PAL query",
             "tool_result_solves_task": True,
             "tool_result_trusted_for_materialization": True,
         },
     )
 
     assert response.startswith('Action: execute_macro("pal_benchmark_bridge_macro"')
-    assert '"pal_semantic_description": "count result returned by the PAL query"' in response
+    assert (
+        '"pal_semantic_description": "count of infectious diseases returned by the executed PAL query"'
+        in response
+    )
     assert '"pal_solves_task": true' in response
     assert '"pal_trusted_for_materialization": true' in response
     assert '"pal_tool_status": "success"' in response
+    assert '"pal_selected_query_variable": "count"' in response
+    assert '"pal_binding_count": 1' in response
+    assert '"pal_unique_value_count": 1' in response
+    assert '"pal_value_preview": ["4"]' in response
+    assert '"pal_row_preview": [{"count": "4"}]' in response
+    assert (
+        '"pal_relation_summary": ["anchor -> count set via biology.organism.diseases_transmitted"]'
+        in response
+    )
+    assert (
+        '"pal_selection_basis": "Counts distinct infectious diseases that satisfy the executed relation constraints."'
+        in response
+    )
+    assert (
+        '"pal_completeness_hint": "Exhaustive over the exact counted bindings matched by the executed relation constraints."'
+        in response
+    )
+    assert (
+        '"pal_proof_hint": "PAL query already computed the final count from the exact relation constraints listed above."'
+        in response
+    )
+    assert '"pal_answer_cardinality_hint": "single"' in response
     pending = controller._pending_macro_runs["knowledge_graph_6"]
     assert pending["tool_name"] == "pal_benchmark_bridge_macro"
 
@@ -7086,10 +8072,92 @@ def test_extract_macro_pointer_requires_trusted_final_contract() -> None:
     )
 
 
-def test_macro_result_without_trusted_final_uses_manual_fallback() -> None:
+def test_trusted_macro_result_uses_solver_review_before_finalizing() -> None:
     controller = _make_controller()
     controller._log_macro_result = lambda content: None
     controller._get_run_id = lambda: "knowledge_graph_7"
+
+    class _FallbackAgent:
+        _tool_invoked_in_last_inference = "manual_solver"
+
+        def _inference(self, chat_history):
+            return ChatHistoryItem(role=Role.AGENT, content="Final Answer: #3")
+
+    controller._manual_fallback_agent = _FallbackAgent()
+
+    chat_history = ChatHistory()
+    chat_history.inject(
+        ChatHistoryItem(
+            role=Role.USER,
+            content=(
+                "Macro result: pal_benchmark_bridge_macro -> SUCCESS.\n"
+                "Final variable: #3\n"
+                "Semantic: count result returned by the PAL query\n"
+                "Artifact type: count_scalar\n"
+                "Projected query variable: count\n"
+                "Raw binding count: 1\n"
+                "Unique value count: 1\n"
+                "Row preview: count=4\n"
+                "Solves task: yes\n"
+                "Trusted final: yes"
+            ),
+        )
+    )
+
+    response = controller._inference(chat_history)
+
+    assert response.content == "Final Answer: #3"
+    assert "knowledge_graph_7" in controller._manual_fallback_active_runs
+    assert controller._tool_invoked_in_last_inference == "manual_solver"
+
+
+def test_default_manual_fallback_agent_is_plain_solver() -> None:
+    controller = _make_controller()
+    controller._language_model = type("LM", (), {"role_dict": {Role.USER: "user", Role.AGENT: "assistant"}})()
+    controller._inference_config_dict = {
+        "tool_choice": "auto",
+        "tools": [{"name": "ignored"}],
+    }
+
+    agent = controller._get_manual_fallback_agent()
+
+    assert isinstance(agent, LanguageModelAgent)
+    assert "Output EXACTLY ONE LINE" in agent._system_prompt
+    assert agent._inference_config_dict["tool_choice"] == "none"
+    assert "tools" not in agent._inference_config_dict
+
+
+def test_tool_evolution_failure_bypass_raises_without_manual_solver(monkeypatch) -> None:
+    controller = _make_controller()
+    emitted_events: list[dict[str, object]] = []
+    controller._emit_generated_tools_event = lambda payload: emitted_events.append(
+        dict(payload)
+    )
+    monkeypatch.setenv("PAL_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK", "1")
+
+    with pytest.raises(
+        AgentUnknownException,
+        match="pal_tool_failure_bypassed:repairable_bad_count_set",
+    ):
+        controller._bypass_manual_solver_after_tool_failure(
+            generated_tool_name="pal_sparql_query_tool_demo",
+            failure_reason="repairable_bad_count_set",
+            advisory_text=(
+                "The repaired PAL count plan is low-trust and should be recorded "
+                "for evolution without waiting for the manual solver."
+            ),
+        )
+
+    assert controller._tool_invoked_in_last_inference == "pal_tool_failure_bypass"
+    assert emitted_events[-1]["event"] == "pal_tool_failure_bypassed"
+    assert emitted_events[-1]["tool_name"] == "pal_sparql_query_tool_demo"
+    assert emitted_events[-1]["failure_reason"] == "repairable_bad_count_set"
+
+
+def test_macro_result_without_trusted_final_uses_manual_fallback() -> None:
+    controller = _make_controller()
+    controller._log_macro_result = lambda content: None
+    controller._get_run_id = lambda: "knowledge_graph_8"
 
     class _FallbackAgent:
         _tool_invoked_in_last_inference = "manual_solver"
@@ -7116,6 +8184,92 @@ def test_macro_result_without_trusted_final_uses_manual_fallback() -> None:
     response = controller._inference(chat_history)
 
     assert response.content == 'Action: get_relations("Southern Min")'
+    assert "knowledge_graph_8" in controller._manual_fallback_active_runs
+    assert controller._tool_invoked_in_last_inference == "manual_solver"
+
+
+def test_sample6_trusted_entity_set_still_requires_solver_review() -> None:
+    controller = _make_controller()
+    controller._log_macro_result = lambda content: None
+    controller._get_run_id = lambda: "knowledge_graph_6"
+
+    class _FallbackAgent:
+        _tool_invoked_in_last_inference = "manual_solver"
+
+        def _inference(self, chat_history):
+            return ChatHistoryItem(role=Role.AGENT, content="Action: get_relations(#0)")
+
+    controller._manual_fallback_agent = _FallbackAgent()
+
+    chat_history = ChatHistory()
+    chat_history.inject(
+        ChatHistoryItem(
+            role=Role.USER,
+            content=(
+                "Macro result: pal_benchmark_bridge_macro -> SUCCESS.\n"
+                "Final variable: #0\n"
+                "Semantic: bounded set of entity ids returned by the PAL query "
+                "(query variable 'release', 13 raw bindings, 13 unique values)\n"
+                "Artifact type: entity_set\n"
+                "Projected query variable: release\n"
+                "Raw binding count: 13\n"
+                "Unique value count: 13\n"
+                "Value preview: m.0ff7bxz, m.039v5j5, m.0dntcfd\n"
+                "Row preview: release=m.0ff7bxz; release_name=First Release\n"
+                "Solves task: yes\n"
+                "Trusted final: yes\n"
+                "Observation: PAL benchmark bridge materialized entity_set into a benchmark variable.\n"
+                "Confidence: 1.0"
+            ),
+        )
+    )
+
+    response = controller._inference(chat_history)
+
+    assert response.content == "Action: get_relations(#0)"
+    assert "knowledge_graph_6" in controller._manual_fallback_active_runs
+    assert controller._tool_invoked_in_last_inference == "manual_solver"
+
+
+def test_sample7_trusted_shared_type_result_still_requires_solver_review() -> None:
+    controller = _make_controller()
+    controller._log_macro_result = lambda content: None
+    controller._get_run_id = lambda: "knowledge_graph_7"
+
+    class _FallbackAgent:
+        _tool_invoked_in_last_inference = "manual_solver"
+
+        def _inference(self, chat_history):
+            return ChatHistoryItem(role=Role.AGENT, content="Action: get_neighbors(#0, type.type.instance)")
+
+    controller._manual_fallback_agent = _FallbackAgent()
+
+    chat_history = ChatHistory()
+    chat_history.inject(
+        ChatHistoryItem(
+            role=Role.USER,
+            content=(
+                "Macro result: pal_benchmark_bridge_macro -> SUCCESS.\n"
+                "Final variable: #0\n"
+                "Semantic: single entity id returned by the PAL query "
+                "(query variable 'shared_type', 29 raw bindings, 1 unique values)\n"
+                "Artifact type: entity_id\n"
+                "Projected query variable: shared_type\n"
+                "Raw binding count: 29\n"
+                "Unique value count: 1\n"
+                "Value preview: m.0hhbr\n"
+                "Row preview: shared_type=m.0hhbr; name=Art museum\n"
+                "Solves task: yes\n"
+                "Trusted final: yes\n"
+                "Observation: PAL benchmark bridge materialized entity_id into a benchmark variable.\n"
+                "Confidence: 1.0"
+            ),
+        )
+    )
+
+    response = controller._inference(chat_history)
+
+    assert response.content == "Action: get_neighbors(#0, type.type.instance)"
     assert "knowledge_graph_7" in controller._manual_fallback_active_runs
     assert controller._tool_invoked_in_last_inference == "manual_solver"
 
@@ -8809,6 +9963,63 @@ def test_anchor_path_probe_supports_object_side_triples() -> None:
     )
 
 
+def test_anchor_path_probe_falls_back_to_opposite_side_when_initial_probe_is_empty() -> None:
+    controller = _make_controller()
+    captured_sparql: list[str] = []
+    controller._get_runtime_sparql_endpoint = lambda: "http://127.0.0.1:3001/kb/sparql"
+
+    def _fake_probe(endpoint: str, sparql: str, timeout_s: float) -> list[str]:
+        captured_sparql.append(sparql)
+        if "?answer fb:biology.breed_origin.breeds_originating_here ?anchor ." in sparql:
+            return ["0"]
+        if "?anchor fb:biology.breed_origin.breeds_originating_here ?answer ." in sparql:
+            return ["4"]
+        return []
+
+    controller._run_probe_sparql_query = _fake_probe
+
+    count = controller._probe_anchor_path_count(
+        "Serbia",
+        "biology.breed_origin.breeds_originating_here",
+        anchor_position="object",
+        timeout_s=1.0,
+    )
+
+    assert count == 4
+    assert len(captured_sparql) == 2
+    assert (
+        "?answer fb:biology.breed_origin.breeds_originating_here ?anchor ."
+        in captured_sparql[0]
+    )
+    assert (
+        "?anchor fb:biology.breed_origin.breeds_originating_here ?answer ."
+        in captured_sparql[1]
+    )
+
+
+def test_anchor_entity_id_probe_falls_back_to_opposite_side_when_initial_probe_is_empty() -> None:
+    controller = _make_controller()
+    controller._get_runtime_sparql_endpoint = lambda: "http://127.0.0.1:3001/kb/sparql"
+
+    def _fake_probe(endpoint: str, sparql: str, timeout_s: float) -> list[str]:
+        if "?answer fb:biology.breed_origin.breeds_originating_here ?anchor ." in sparql:
+            return []
+        if "?anchor fb:biology.breed_origin.breeds_originating_here ?answer ." in sparql:
+            return ["http://rdf.freebase.com/ns/m.077qn"]
+        return []
+
+    controller._run_probe_sparql_query = _fake_probe
+
+    resolved_ids = controller._probe_anchor_entity_ids(
+        anchor_name="Serbia",
+        relation="biology.breed_origin.breeds_originating_here",
+        anchor_position="object",
+        timeout_s=1.0,
+    )
+
+    assert resolved_ids == ["m.077qn"]
+
+
 def test_anchor_existence_probes_map_multi_anchor_constraint_paths() -> None:
     controller = _make_controller()
     controller._probe_entity_name_count = lambda alias, timeout_s=2.5: 1
@@ -8879,15 +10090,17 @@ def test_anchor_existence_probes_map_multi_anchor_constraint_paths() -> None:
 def test_anchor_existence_probes_capture_unique_resolved_entity_id_from_live_path() -> None:
     controller = _make_controller()
     controller._probe_entity_name_count = lambda alias, timeout_s=2.5: 3
-    controller._probe_anchor_path_count = (
-        lambda alias, relation, anchor_position="subject", timeout_s=2.5: 4
+    controller._probe_anchor_path_count_with_position_fallback = (
+        lambda alias, relation, anchor_position="subject", timeout_s=2.5: (4, "object")
     )
-    controller._probe_anchor_entity_ids = (
-        lambda *, anchor_name, relation=None, anchor_position="subject", timeout_s=2.5: ["m.01c44b"]
+    controller._probe_anchor_entity_ids_with_position_fallback = (
+        lambda *, anchor_name, relation=None, anchor_position="subject", timeout_s=2.5: (
+            ["m.01c44b"],
+            "object",
+        )
         if anchor_name == "Southern Min"
         and relation == "language.language_dialect.language"
-        and anchor_position == "object"
-        else []
+        else ([], anchor_position)
     )
 
     results = controller._run_anchor_existence_probes(
@@ -15227,6 +16440,60 @@ def test_validate_pal_execution_rejects_count_when_answer_target_semantics_are_u
 
     assert verdict.verdict == VERDICT_REJECTED_DANGEROUS_OVERREACH
     assert "count_answer_target_unenforced:game expansions" in verdict.reasons
+
+
+def test_validate_pal_execution_accepts_profession_membership_count_with_profession_like_target() -> None:
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "answer_target_phrase": "songwriters",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {
+                    "surface": "Percussionist",
+                    "chosen_alias": "m.02h66l4",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "people.profession.people_with_this_profession",
+                    "direction": "forward",
+                    "from": "profession",
+                    "to": "person",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                }
+            ],
+            "candidate_set_variable": "person",
+            "count_set_variable": "person",
+            "allow_exploratory_predicates": False,
+        },
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/> "
+            "SELECT (COUNT(DISTINCT ?person) AS ?count) WHERE { "
+            "fb:m.02h66l4 fb:people.profession.people_with_this_profession ?person . }"
+        ),
+        result_dict={
+            "head": {"vars": ["count"]},
+            "results": {"bindings": [{"count": {"type": "literal", "value": "921"}}]},
+        },
+        entities=["Percussionist"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Percussionist",
+                entity_count=1,
+                path_count=921,
+                relation_probed="people.profession.people_with_this_profession",
+                anchor_position="subject",
+                resolved_entity_id="m.02h66l4",
+            )
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_ACCEPTED
+    assert "count_answer_target_unenforced:songwriters" not in verdict.reasons
 
 
 def test_validate_pal_execution_accepts_prepositional_count_target_when_head_is_enforced() -> None:

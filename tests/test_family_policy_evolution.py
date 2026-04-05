@@ -13,6 +13,7 @@ from src.pal.family_policy_evolution import (
     ENV_ENABLED_FAMILIES,
     ENV_STORE_PATH,
     build_family_policy_store,
+    build_success_plan_archetype,
     classify_family_failure,
 )
 from src.pal.reusable_tool_families import (
@@ -59,10 +60,15 @@ def test_family_policy_candidate_creation_preserves_active_version(tmp_path) -> 
     pending = store.get_pending_candidates("count_over_direct_relation")
     assert len(pending) == 1
     assert pending[0]["candidate_version"] == candidate.candidate_version
-    assert "blocked_scaffold_signatures" in pending[0]["fields_changed"]
+    assert "repair_policy" in pending[0]["fields_changed"]
+    assert (
+        "switch_to_joined_count_when_downstream_filter_or_projection_exists"
+        in pending[0]["bundle"]["repair_policy"]
+    )
+    assert not pending[0]["bundle"]["blocked_scaffold_signatures"]
 
 
-def test_wrong_trusted_completion_can_forbid_failed_relation_family(tmp_path) -> None:
+def test_wrong_trusted_completion_prefers_constructive_count_guidance(tmp_path) -> None:
     store = build_family_policy_store(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),
         store_path=tmp_path,
@@ -80,10 +86,15 @@ def test_wrong_trusted_completion_can_forbid_failed_relation_family(tmp_path) ->
     assert candidate is not None
     pending = store.get_pending_candidates("count_over_direct_relation")
     assert len(pending) == 1
-    assert "forbidden_relation_families" in pending[0]["fields_changed"]
+    assert "validator_expectations" in pending[0]["fields_changed"]
+    assert "repair_policy" in pending[0]["fields_changed"]
     assert (
-        "medicine.vector_of_disease.disease"
-        in pending[0]["bundle"]["forbidden_relation_families"]
+        "verify_count_targets_requested_entity_set"
+        in pending[0]["bundle"]["validator_expectations"]
+    )
+    assert (
+        "switch_to_joined_count_when_downstream_filter_or_projection_exists"
+        in pending[0]["bundle"]["repair_policy"]
     )
 
 
@@ -148,9 +159,142 @@ def test_family_policy_promotion_switches_active_version(tmp_path, monkeypatch) 
     assert active_bundle is not None
     assert active_bundle.version == candidate.candidate_version
     assert (
-        "multi_anchor_intersection|answer|type.object.type"
-        in active_bundle.blocked_scaffold_signatures
+        "dangerous_overreach:broad_type_expansion"
+        in active_bundle.forbidden_overreach_patterns
     )
+
+
+def test_promotion_preserves_trusted_success_bank_and_tool_evolution_context(tmp_path) -> None:
+    family_name = "count_over_direct_relation"
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+    active_version = store.get_active_version(family_name)
+    store.set_trusted_success_bank(
+        family_name,
+        sample_ids=["11"],
+        source_version=active_version,
+        evaluation_results={
+            "run_summary": {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        },
+        evaluation_context=family_policy_harness._build_success_bank_context(
+            family_name=family_name,
+            active_version=active_version,
+        ),
+    )
+    store.set_tool_evolution_context(
+        family_name,
+        source_version=active_version,
+        preferred_patterns=[{"pattern_signature": "success-1"}],
+        avoid_patterns=[{"pattern_signature": "failure-1"}],
+        last_signal={"signal_type": "trusted_success"},
+    )
+    candidate = store.create_candidate_update(
+        family_name=family_name,
+        scaffold_signature="count_over_direct_relation|candidate_set|cvg.game_version.publisher",
+        relation_names=["cvg.game_version.publisher"],
+        failure_reasons=["trusted_incorrect_completion"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "20"},
+    )
+    assert candidate is not None
+
+    store.promote_candidate(
+        family_name,
+        candidate_version=candidate.candidate_version,
+        evaluation_results={"gate": "passed"},
+        promotion_reason="all_regression_gates_passed",
+    )
+
+    payload = json.loads((tmp_path / f"{family_name}.json").read_text(encoding="utf-8"))
+    metadata = payload["trusted_success_bank_metadata"]
+    assert metadata["source_version"] == candidate.candidate_version
+    assert metadata["evaluation_context"]["source_version"] == candidate.candidate_version
+    context = payload["tool_evolution_context"]
+    assert context["source_version"] == candidate.candidate_version
+    assert payload["trusted_success_bank"] == ["11"]
+
+
+def test_inline_promotion_gate_reuses_success_bank_with_extra_context_fields(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    family_name = "count_over_direct_relation"
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+    active_version = store.get_active_version(family_name)
+    bank_context = family_policy_harness._build_success_bank_context(
+        family_name=family_name,
+        active_version=active_version,
+    )
+    bank_context["success_plan_archetypes"] = [{"pattern_signature": "success-241"}]
+    store.set_trusted_success_bank(
+        family_name,
+        sample_ids=["241"],
+        source_version=active_version,
+        evaluation_context=bank_context,
+    )
+    candidate = store.create_candidate_update(
+        family_name=family_name,
+        scaffold_signature="count_over_direct_relation|disease|medicine.infectious_disease.vector",
+        relation_names=["medicine.infectious_disease.vector"],
+        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "15"},
+    )
+    assert candidate is not None
+
+    def _fake_run_sample_with_policy(**kwargs):
+        label = str(kwargs.get("label") or "")
+        sample_index = str(kwargs.get("sample_index") or "")
+        if label.endswith("_candidate_trigger"):
+            return {
+                "sample_index": sample_index,
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+                "evaluation_cache_hit": False,
+            }
+        return {
+            "sample_index": sample_index,
+            "sample_status": "completed",
+            "evaluation_outcome": "correct",
+            "dangerous_overreach_count": 0,
+            "evaluation_cache_hit": False,
+        }
+
+    monkeypatch.setattr(
+        family_policy_harness,
+        "_run_sample_with_policy",
+        _fake_run_sample_with_policy,
+    )
+
+    evaluation = family_policy_harness._evaluate_candidate(
+        family_name=family_name,
+        candidate_version=candidate.candidate_version,
+        promote=True,
+        store_path=tmp_path,
+        label_prefix="inline_test",
+        trigger_baseline_summary={
+            "sample_index": "15",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "dangerous_overreach_count": 0,
+        },
+        parent_output_dir=None,
+    )
+
+    assert evaluation["prior_success"]["trusted_success_bank_reused"] is True
+    assert evaluation["evaluation_stats"]["prior_success_evaluated"] == 1
+    assert evaluation["promotion_gate"]["gate_checks"]["regression_guard_available"] is True
 
 
 def test_harness_synthesizes_candidate_from_wrong_completed_run(tmp_path) -> None:
@@ -294,12 +438,64 @@ def test_harness_synthesizes_candidate_from_matching_sample_decision_only(tmp_pa
     )
     pending = store.get_pending_candidates("count_over_direct_relation")
     assert len(pending) == 1
-    blocked = tuple(pending[0]["bundle"]["blocked_scaffold_signatures"])
+    repair_policy = tuple(pending[0]["bundle"]["repair_policy"])
     assert (
-        "count_over_direct_relation|species_set|fictional_universe.fictional_universe.species"
-        in blocked
+        "switch_to_joined_count_when_downstream_filter_or_projection_exists"
+        in repair_policy
     )
-    assert "count_over_direct_relation|answer|people.person.profession" not in blocked
+    blocked = tuple(pending[0]["bundle"]["blocked_scaffold_signatures"])
+    assert not blocked
+
+
+def test_tool_evolution_context_round_trips_patterns(tmp_path) -> None:
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+    success_pattern = build_success_plan_archetype(
+        {
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {
+                    "surface": "Percussionist",
+                    "chosen_alias": "Percussionist",
+                    "resolved_entity_id": "m.02h66l4",
+                    "role": "anchor",
+                }
+            ],
+            "normalized_aliases": [
+                {
+                    "surface": "Percussionist",
+                    "chosen_alias": "Percussionist",
+                    "reason": "explicit_entity:attribute_value.profession",
+                }
+            ],
+            "join_structure": {"type": "count", "anchor_constraints": []},
+            "relation_paths": [
+                {
+                    "relation": "people.profession.people_with_this_profession",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+        }
+    )
+    store.set_tool_evolution_context(
+        "count_over_direct_relation",
+        source_version="2026-03-31",
+        preferred_patterns=[success_pattern],
+        avoid_patterns=[{"pattern_signature": "count-over-vector"}],
+        last_signal={"signal_type": "clean_failure"},
+    )
+
+    context = store.get_tool_evolution_context("count_over_direct_relation")
+    assert context["source_version"] == "2026-03-31"
+    assert context["preferred_patterns"][0]["relation_role_skeleton"] == [
+        "anchor->count_set:dynamic_probe"
+    ]
+    assert context["avoid_patterns"][0]["pattern_signature"] == "count-over-vector"
 
 
 def test_classify_wrong_trusted_count_failure_as_weak_applicability_boundary() -> None:
@@ -313,6 +509,35 @@ def test_classify_wrong_trusted_count_failure_as_weak_applicability_boundary() -
     )
 
     assert failure_class == "weak_applicability_boundary"
+
+
+def test_classify_repairable_count_failure_without_hardcoded_unknown_error_path() -> None:
+    failure_class = classify_family_failure(
+        family_name="count_over_joined_set",
+        sample_status="",
+        evaluation_outcome="",
+        relation_names=["music.recording.artist"],
+        failure_reasons=(
+            "pal_query_not_accepted:repairable_bad_count_set",
+            "count_answer_target_unenforced:artist",
+        ),
+        dangerous_overreach=False,
+    )
+
+    assert failure_class == "weak_applicability_boundary"
+
+
+def test_classify_repairable_anchor_grounding_failure_as_bad_routing() -> None:
+    failure_class = classify_family_failure(
+        family_name="single_anchor_lookup",
+        sample_status="",
+        evaluation_outcome="",
+        relation_names=["location.country.languages_spoken"],
+        failure_reasons=("pal_query_not_accepted:repairable_weak_grounding",),
+        dangerous_overreach=False,
+    )
+
+    assert failure_class == "bad_routing"
 
 
 def test_run_sample_with_policy_reuses_cache_only_for_identical_context(
@@ -451,6 +676,14 @@ def test_evaluate_candidate_fails_fast_when_trigger_not_improved(
         family_name,
         sample_ids=["11"],
         source_version=active_version,
+        evaluation_results={
+            "run_summary": {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        },
         evaluation_context=family_policy_harness._build_success_bank_context(
             family_name=family_name,
             active_version=active_version,
@@ -520,6 +753,14 @@ def test_evaluate_candidate_rejects_when_trigger_not_improved_with_regression_gu
         family_name,
         sample_ids=["11"],
         source_version=active_version,
+        evaluation_results={
+            "run_summary": {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        },
         evaluation_context=family_policy_harness._build_success_bank_context(
             family_name=family_name,
             active_version=active_version,
@@ -722,6 +963,14 @@ def test_evaluate_candidate_promotes_when_trigger_and_prior_success_pass(
         family_name,
         sample_ids=["11"],
         source_version=active_version,
+        evaluation_results={
+            "run_summary": {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        },
         evaluation_context=family_policy_harness._build_success_bank_context(
             family_name=family_name,
             active_version=active_version,
@@ -745,6 +994,10 @@ def test_evaluate_candidate_promotes_when_trigger_and_prior_success_pass(
             "sample_status": status,
             "evaluation_outcome": outcome,
             "dangerous_overreach_count": 0,
+            "answer_target_failure_count": 0,
+            "anchor_failure_count": 0,
+            "wrong_executable_count": int(status == "completed" and outcome != "correct"),
+            "semantic_quality_score": 3 if outcome == "correct" else 1,
             "evaluation_cache_hit": False,
         }
 
@@ -766,13 +1019,183 @@ def test_evaluate_candidate_promotes_when_trigger_and_prior_success_pass(
 
     assert evaluation["gate_stage"] == "inline"
     assert evaluation["evaluation_stats"]["prior_success_evaluated"] == 1
+    assert evaluation["evaluation_stats"]["prior_success_baseline_reused"] is True
     assert evaluation["promotion_gate"]["promote"] is True
     assert store.get_active_version(family_name) == candidate.candidate_version
     assert calls == [
         ("20", candidate.candidate_version),
-        ("11", active_version),
         ("11", candidate.candidate_version),
     ]
+
+
+def test_evaluate_candidate_non_regression_mode_replays_prior_success_without_trigger_win(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    family_name = "count_over_joined_set"
+    store_path = tmp_path / "store"
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=store_path,
+    )
+    candidate = store.create_candidate_update(
+        family_name=family_name,
+        scaffold_signature="count_over_joined_set|disease|medicine.infectious_disease.vector",
+        relation_names=["medicine.infectious_disease.vector"],
+        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "15"},
+    )
+    assert candidate is not None
+    active_version = store.get_active_version(family_name)
+    store.set_trusted_success_bank(
+        family_name,
+        sample_ids=["11"],
+        source_version=active_version,
+        evaluation_results={
+            "run_summary": {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        },
+        evaluation_context=family_policy_harness._build_success_bank_context(
+            family_name=family_name,
+            active_version=active_version,
+        ),
+    )
+    monkeypatch.setenv("PAL_FAMILY_POLICY_PROMOTION_GATE_MODE", "non_regression")
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_run_sample_with_policy(**kwargs):
+        sample_index = str(kwargs["sample_index"])
+        version = str(kwargs.get("override_version") or "")
+        calls.append((sample_index, version))
+        table = {
+            ("15", candidate.candidate_version): ("agent_unknown_error", "incorrect"),
+            ("11", active_version): ("completed", "correct"),
+            ("11", candidate.candidate_version): ("completed", "correct"),
+        }
+        status, outcome = table[(sample_index, version)]
+        return {
+            "sample_index": sample_index,
+            "sample_status": status,
+            "evaluation_outcome": outcome,
+            "dangerous_overreach_count": 0,
+            "answer_target_failure_count": 0,
+            "anchor_failure_count": 0,
+            "wrong_executable_count": int(status == "completed" and outcome != "correct"),
+            "semantic_quality_score": 3 if outcome == "correct" else 1,
+            "evaluation_cache_hit": False,
+        }
+
+    monkeypatch.setattr(family_policy_harness, "_run_sample_with_policy", fake_run_sample_with_policy)
+
+    evaluation = family_policy_harness._evaluate_candidate(
+        family_name=family_name,
+        candidate_version=candidate.candidate_version,
+        promote=True,
+        store_path=store_path,
+        label_prefix="non_regression_replay",
+        trigger_baseline_summary={
+            "sample_index": "15",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "run_dir": str(tmp_path / "baseline_run"),
+        },
+    )
+
+    assert evaluation["promotion_gate"]["gate_mode"] == "non_regression"
+    assert evaluation["promotion_gate"]["gate_checks"]["trigger_improved"] is False
+    assert evaluation["promotion_gate"]["gate_checks"]["trigger_not_regressed"] is True
+    assert evaluation["evaluation_stats"]["prior_success_evaluated"] == 1
+    assert evaluation["evaluation_stats"]["prior_success_baseline_reused"] is True
+    assert evaluation["prior_success"]["trusted_success_bank_reused"] is True
+    assert evaluation["prior_success"]["baseline_reused_from_bank_metadata"] is True
+    assert evaluation["promotion_gate"]["promote"] is True
+    assert calls == [
+        ("15", candidate.candidate_version),
+        ("11", candidate.candidate_version),
+    ]
+
+
+def test_inline_promotion_gate_soft_improvement_mode_rewards_safer_failure() -> None:
+    gate = family_policy_harness._evaluate_inline_promotion_gate(
+        trigger_baseline={
+            "sample_index": "20",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "dangerous_overreach_count": 1,
+        },
+        trigger_candidate={
+            "sample_index": "20",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "dangerous_overreach_count": 0,
+        },
+        prior_success_baseline=[
+            {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        ],
+        prior_success_candidate=[
+            {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        ],
+    )
+
+    assert gate["gate_checks"]["trigger_improved"] is False
+    assert gate["gate_checks"]["trigger_soft_improved"] is True
+    assert gate["gate_checks"]["trigger_gate_passed"] is False
+    assert gate["promote"] is False
+
+
+def test_inline_promotion_gate_soft_improvement_mode_can_be_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("PAL_FAMILY_POLICY_PROMOTION_GATE_MODE", "soft_improvement")
+    gate = family_policy_harness._evaluate_inline_promotion_gate(
+        trigger_baseline={
+            "sample_index": "20",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "dangerous_overreach_count": 1,
+        },
+        trigger_candidate={
+            "sample_index": "20",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "dangerous_overreach_count": 0,
+        },
+        prior_success_baseline=[
+            {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        ],
+        prior_success_candidate=[
+            {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        ],
+    )
+
+    assert gate["gate_mode"] == "soft_improvement"
+    assert gate["gate_checks"]["trigger_soft_improved"] is True
+    assert gate["gate_checks"]["trigger_gate_passed"] is True
+    assert gate["promote"] is True
 
 
 def test_evaluate_candidate_stays_pending_until_prior_success_exists(
@@ -859,6 +1282,40 @@ def test_candidate_update_can_forbid_relation_family_for_validator_miss(tmp_path
     assert "forbidden_relation_families" in pending[0]["fields_changed"]
 
 
+def test_candidate_update_does_not_ban_non_type_relation_for_semantic_validator_miss(
+    tmp_path,
+) -> None:
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+
+    candidate = store.create_candidate_update(
+        family_name="count_over_joined_set",
+        scaffold_signature=(
+            "count_over_joined_set|candidate|people.person.profession|"
+            "people.profession.people_with_this_profession"
+        ),
+        relation_names=[
+            "people.profession.people_with_this_profession",
+            "people.person.profession",
+        ],
+        failure_reasons=["dangerous_overreach:weak_count_semantics"],
+        failure_class="validator_miss",
+        trigger_context={"sample_index": "11"},
+    )
+
+    assert candidate is not None
+    pending = store.get_pending_candidates("count_over_joined_set")
+    assert pending
+    bundle = pending[0]["bundle"]
+    assert (
+        "dangerous_overreach:weak_count_semantics"
+        in bundle["forbidden_overreach_patterns"]
+    )
+    assert bundle["forbidden_relation_families"] == []
+
+
 def test_candidate_update_can_tighten_validator_and_repair_policy(tmp_path) -> None:
     store = build_family_policy_store(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),
@@ -877,3 +1334,4 @@ def test_candidate_update_can_tighten_validator_and_repair_policy(tmp_path) -> N
     assert candidate is not None
     pending = store.get_pending_candidates("multi_anchor_intersection")
     assert "repair_policy" in pending[0]["fields_changed"]
+

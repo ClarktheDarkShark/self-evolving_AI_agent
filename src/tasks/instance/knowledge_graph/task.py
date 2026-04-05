@@ -42,6 +42,20 @@ _MACRO_OPTIONAL_OUTPUT_KEYS = {
     "intermediate_variables",
     "failure_reason",
     "confidence",
+    "artifact_type",
+    "artifact_source",
+    "selected_query_variable",
+    "binding_count",
+    "unique_value_count",
+    "value_preview",
+    "row_preview",
+    "resolved_value_preview",
+    "proof_hint",
+    "answer_cardinality_hint",
+    "relation_summary",
+    "selection_basis",
+    "completeness_hint",
+    "repair_caveat",
 }
 
 
@@ -122,6 +136,71 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                 pointers.append(cleaned)
         return pointers
 
+    @staticmethod
+    def _coerce_macro_int(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return None
+        try:
+            return int(cleaned)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_macro_value_preview(value: Any) -> list[str]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return []
+        preview: list[str] = []
+        for item in value:
+            cleaned = str(item or "").strip()
+            if cleaned:
+                preview.append(cleaned)
+        return preview[:5]
+
+    @staticmethod
+    def _extract_macro_row_preview(value: Any) -> list[str]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return []
+        preview_lines: list[str] = []
+        for row in value:
+            if not isinstance(row, Mapping):
+                continue
+            parts: list[str] = []
+            for key, item in row.items():
+                cleaned_key = str(key or "").strip()
+                cleaned_value = str(item or "").strip()
+                if cleaned_key and cleaned_value:
+                    parts.append(f"{cleaned_key}={cleaned_value}")
+            if parts:
+                preview_lines.append("; ".join(parts))
+        return preview_lines[:3]
+
+    @staticmethod
+    def _extract_macro_resolved_value_preview(value: Any) -> list[str]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return []
+        preview: list[str] = []
+        for item in value:
+            cleaned = str(item or "").strip()
+            if cleaned:
+                preview.append(cleaned)
+        return preview[:5]
+
+    @staticmethod
+    def _extract_macro_text_list(value: Any) -> list[str]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return []
+        preview: list[str] = []
+        for item in value:
+            cleaned = str(item or "").strip()
+            if cleaned:
+                preview.append(cleaned)
+        return preview[:5]
+
     @classmethod
     def _build_macro_result_summary(
         cls,
@@ -139,11 +218,65 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         )
         failure_reason = str(result.get("failure_reason") or "").strip()
         confidence = result.get("confidence")
+        artifact_type = str(result.get("artifact_type") or "").strip()
+        artifact_source = str(result.get("artifact_source") or "").strip()
+        selected_query_variable = str(
+            result.get("selected_query_variable") or ""
+        ).strip()
+        binding_count = cls._coerce_macro_int(result.get("binding_count"))
+        unique_value_count = cls._coerce_macro_int(result.get("unique_value_count"))
+        value_preview = cls._extract_macro_value_preview(result.get("value_preview"))
+        row_preview = cls._extract_macro_row_preview(result.get("row_preview"))
+        resolved_value_preview = cls._extract_macro_resolved_value_preview(
+            result.get("resolved_value_preview")
+        )
+        relation_summary = cls._extract_macro_text_list(result.get("relation_summary"))
+        selection_basis = str(result.get("selection_basis") or "").strip()
+        completeness_hint = str(result.get("completeness_hint") or "").strip()
+        repair_caveat = str(result.get("repair_caveat") or "").strip()
+        proof_hint = str(result.get("proof_hint") or "").strip()
+        answer_cardinality_hint = str(
+            result.get("answer_cardinality_hint") or ""
+        ).strip()
         intermediate_variables = cls._extract_macro_intermediate_variables(
             result.get("intermediate_variables")
         )
         if final_variable.startswith("#") and final_variable not in intermediate_variables:
             intermediate_variables.append(final_variable)
+
+        metadata_lines: list[str] = []
+        if selection_basis:
+            metadata_lines.append(f"Selection basis: {selection_basis}")
+        if relation_summary:
+            metadata_lines.append("Relation summary: " + " | ".join(relation_summary))
+        if artifact_type:
+            metadata_lines.append(f"Artifact type: {artifact_type}")
+        if selected_query_variable:
+            metadata_lines.append(f"Projected query variable: {selected_query_variable}")
+        if value_preview:
+            metadata_lines.append("Value preview: " + ", ".join(value_preview))
+        if row_preview:
+            metadata_lines.append("Row preview: " + " | ".join(row_preview))
+        if resolved_value_preview:
+            metadata_lines.append(
+                "Resolved value preview: " + " | ".join(resolved_value_preview)
+            )
+        if binding_count is not None:
+            metadata_lines.append(f"Raw binding count: {binding_count}")
+        if unique_value_count is not None:
+            metadata_lines.append(f"Unique value count: {unique_value_count}")
+        if answer_cardinality_hint:
+            metadata_lines.append(
+                f"Expected answer cardinality: {answer_cardinality_hint}"
+            )
+        if completeness_hint:
+            metadata_lines.append(f"Completeness hint: {completeness_hint}")
+        if proof_hint:
+            metadata_lines.append(f"Proof hint: {proof_hint}")
+        if repair_caveat:
+            metadata_lines.append(f"Repair caveat: {repair_caveat}")
+        if artifact_source and artifact_source != "raw_execution":
+            metadata_lines.append(f"Artifact source: {artifact_source}")
 
         summary_lines = [f"Macro result: {tool_name} -> {status}."]
         if (
@@ -155,6 +288,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             summary_lines.append(f"Final variable: {final_variable}")
             if semantic_description:
                 summary_lines.append(f"Semantic: {semantic_description}")
+            summary_lines.extend(metadata_lines)
             summary_lines.append("Solves task: yes")
             summary_lines.append("Trusted final: yes")
         elif (
@@ -166,20 +300,137 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                 "Intermediate variables: " + ", ".join(intermediate_variables)
             )
             summary_lines.append(f"Semantic: {semantic_description}")
+            summary_lines.extend(metadata_lines)
             summary_lines.append("Solves task: no")
             summary_lines.append("Trusted final: no")
+            summary_lines.append("Use manual solver fallback: yes")
         else:
+            if semantic_description:
+                summary_lines.append(f"Semantic: {semantic_description}")
+            summary_lines.extend(metadata_lines)
             if failure_reason:
                 summary_lines.append(f"Failure reason: {failure_reason}")
             elif observation:
                 summary_lines.append(f"Failure reason: {observation[:300]}")
             summary_lines.append("Trusted final: no")
             summary_lines.append("Use manual solver fallback: yes")
-        if observation:
+        observation_is_boilerplate = observation.startswith(
+            "PAL benchmark bridge materialized "
+        )
+        if (
+            observation
+            and not observation_is_boilerplate
+            and not (status == "SUCCESS" and solves_task and trusted_for_materialization)
+        ):
             summary_lines.append(f"Observation: {observation[:300]}")
-        if confidence not in (None, ""):
+        if confidence not in (None, "") and (
+            status != "SUCCESS"
+            or not solves_task
+            or not trusted_for_materialization
+            or str(confidence).strip() not in {"1", "1.0"}
+        ):
             summary_lines.append(f"Confidence: {confidence}")
         return "\n".join(summary_lines)
+
+    def _enrich_macro_result_with_entity_grounding(
+        self,
+        result: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        artifact_type = str(result.get("artifact_type") or "").strip()
+        if artifact_type not in {"entity_id", "entity_set"}:
+            return result
+
+        mids: list[str] = []
+        seen: set[str] = set()
+
+        def _collect_mid(raw: Any) -> None:
+            cleaned = str(raw or "").strip()
+            if not re.fullmatch(r"[mg]\.[A-Za-z0-9_]+", cleaned):
+                return
+            if cleaned in seen:
+                return
+            seen.add(cleaned)
+            mids.append(cleaned)
+
+        raw_value_preview = result.get("value_preview")
+        if isinstance(raw_value_preview, Sequence) and not isinstance(
+            raw_value_preview, (str, bytes)
+        ):
+            for item in raw_value_preview:
+                _collect_mid(item)
+
+        raw_row_preview = result.get("row_preview")
+        if isinstance(raw_row_preview, Sequence) and not isinstance(
+            raw_row_preview, (str, bytes)
+        ):
+            for row in raw_row_preview:
+                if not isinstance(row, Mapping):
+                    continue
+                for value in row.values():
+                    _collect_mid(value)
+
+        if not mids:
+            return result
+
+        name_map: dict[str, str] = {}
+        try:
+            sparql_executor = getattr(self.knowledge_graph_api, "sparql_executor", None)
+            if sparql_executor is not None:
+                resolved = sparql_executor.get_entity_names(mids)
+                if isinstance(resolved, Mapping):
+                    for key, value in resolved.items():
+                        cleaned_key = str(key or "").strip()
+                        cleaned_value = str(value or "").strip()
+                        if cleaned_key and cleaned_value:
+                            name_map[cleaned_key] = cleaned_value
+        except Exception:
+            name_map = {}
+
+        if not name_map:
+            return result
+
+        resolved_value_preview: list[str] = []
+        if isinstance(raw_value_preview, Sequence) and not isinstance(
+            raw_value_preview, (str, bytes)
+        ):
+            for item in raw_value_preview:
+                cleaned = str(item or "").strip()
+                if not cleaned:
+                    continue
+                resolved_name = name_map.get(cleaned)
+                if resolved_name:
+                    resolved_value_preview.append(f"{cleaned} = {resolved_name}")
+
+        enriched_rows: list[dict[str, str]] = []
+        changed_rows = False
+        if isinstance(raw_row_preview, Sequence) and not isinstance(
+            raw_row_preview, (str, bytes)
+        ):
+            for row in raw_row_preview:
+                if not isinstance(row, Mapping):
+                    continue
+                enriched_row = {
+                    str(key or "").strip(): str(value or "").strip()
+                    for key, value in row.items()
+                    if str(key or "").strip() and str(value or "").strip()
+                }
+                for key, value in list(enriched_row.items()):
+                    resolved_name = name_map.get(value)
+                    if not resolved_name:
+                        continue
+                    name_key = f"{key}_name"
+                    if name_key not in enriched_row:
+                        enriched_row[name_key] = resolved_name
+                        changed_rows = True
+                if enriched_row:
+                    enriched_rows.append(enriched_row)
+
+        updated_result = dict(result)
+        if resolved_value_preview:
+            updated_result["resolved_value_preview"] = resolved_value_preview[:5]
+        if changed_rows and enriched_rows:
+            updated_result["row_preview"] = enriched_rows[:3]
+        return updated_result
 
     def __init__(
         self,
@@ -1418,6 +1669,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                 **result,
                 "semantic_description": f"instances of {_type_hint}",
             }
+        result = self._enrich_macro_result_with_entity_grounding(result)
         if "EXHAUSTED" in status.upper():
             # Preserve candidate list verbatim — solver needs label->var_id mapping.
             compact = (

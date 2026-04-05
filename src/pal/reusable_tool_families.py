@@ -776,12 +776,30 @@ def _expand_anchor_specific_relation_paths(
             for item in (query_plan.get("anchored_entities") or [])
             if isinstance(item, Mapping) and _normalize_token(item.get("role"))
         }
+        anchored_endpoint_tokens = {
+            _normalize_token(value)
+            for entity in anchored_entities_by_role.values()
+            if isinstance(entity, Mapping)
+            for value in (
+                entity.get("surface"),
+                entity.get("chosen_alias"),
+                entity.get("resolved_entity_id"),
+                entity.get("role"),
+            )
+            if _normalize_token(value)
+        }
+        single_anchor_joined_count = len(anchored_entities_by_role) <= 1
         expanded_paths: list[dict[str, Any]] = []
         for relation_path in relation_paths:
             generic_anchor_sides = [
                 side
                 for side in ("from", "to")
                 if _normalize_token(relation_path.get(f"{side}_role")) == "anchor"
+                and (
+                    not single_anchor_joined_count
+                    or _normalize_token(relation_path.get(side)) in _ANCHOR_ROLES
+                    or _normalize_token(relation_path.get(side)) in anchored_endpoint_tokens
+                )
             ]
             if len(generic_anchor_sides) != 1:
                 expanded_paths.append(dict(relation_path))
@@ -1028,10 +1046,24 @@ def _derive_joined_set_endpoint_overrides(
     has_explicit_constraint_entities = any(
         role in _CONSTRAINT_NODE_ROLES for role in anchor_entities_by_role
     )
+    anchored_endpoint_tokens = {
+        _normalize_token(value)
+        for entity in anchor_entities_by_role.values()
+        if isinstance(entity, Mapping)
+        for value in (
+            entity.get("surface"),
+            entity.get("chosen_alias"),
+            entity.get("resolved_entity_id"),
+            entity.get("role"),
+        )
+        if _normalize_token(value)
+    }
     candidate_constraint_paths_by_relation: dict[str, list[tuple[int, str]]] = {}
     anchor_constraint_paths_by_relation: dict[str, list[tuple[int, str, str]]] = {}
     ordered_candidate_constraint_paths: list[tuple[int, str, str]] = []
     auxiliary_bridge_occurrences: dict[str, list[tuple[int, str, str]]] = {}
+    structural_bridge_occurrences: dict[str, list[tuple[int, str]]] = {}
+    misclassified_anchor_bridge_occurrences: dict[str, list[tuple[int, str]]] = {}
     constraint_endpoint_tokens_by_path: dict[tuple[int, str], str] = {}
     constraint_endpoint_occurrence_counts: dict[str, int] = {}
 
@@ -1046,9 +1078,30 @@ def _derive_joined_set_endpoint_overrides(
         if from_side_is_constraint == to_side_is_constraint:
             for side in ("from", "to"):
                 side_role = _normalize_token(relation_path.get(f"{side}_role"))
+                endpoint_token = _normalize_token(relation_path.get(side))
+                if (
+                    side_role in {"candidate_set", "count_set", "shared_answer", "answer"}
+                    and endpoint_token
+                    and endpoint_token not in counted_variable_tokens
+                    and endpoint_token not in _GENERIC_NAMED_ROLE_TOKENS
+                    and endpoint_token not in anchored_endpoint_tokens
+                ):
+                    structural_bridge_occurrences.setdefault(endpoint_token, []).append(
+                        (index, side)
+                    )
+                elif (
+                    side_role in _ANCHOR_ROLES
+                    and endpoint_token
+                    and endpoint_token not in _ANCHOR_ROLES
+                    and endpoint_token not in _GENERIC_NAMED_ROLE_TOKENS
+                    and endpoint_token not in anchored_endpoint_tokens
+                ):
+                    misclassified_anchor_bridge_occurrences.setdefault(
+                        endpoint_token,
+                        [],
+                    ).append((index, side))
                 if side_role not in {"candidate_set", "count_set", "shared_answer"}:
                     continue
-                endpoint_token = _normalize_token(relation_path.get(side))
                 if (
                     not endpoint_token
                     or endpoint_token in counted_variable_tokens
@@ -1113,6 +1166,16 @@ def _derive_joined_set_endpoint_overrides(
         for index, side, _other_role in occurrences:
             overrides.setdefault((index, side), shared_spec)
 
+    for endpoint_token, anchor_occurrences in misclassified_anchor_bridge_occurrences.items():
+        structural_occurrences = structural_bridge_occurrences.get(endpoint_token) or []
+        if not structural_occurrences:
+            continue
+        shared_spec = _NodeSpec(term=f"?{endpoint_token}")
+        for index, side in structural_occurrences:
+            overrides.setdefault((index, side), shared_spec)
+        for index, side in anchor_occurrences:
+            overrides.setdefault((index, side), shared_spec)
+
     anchor_constraints = (
         (query_plan.get("join_structure") or {}).get("anchor_constraints") or []
     )
@@ -1120,32 +1183,47 @@ def _derive_joined_set_endpoint_overrides(
         if not isinstance(anchor_constraint, Mapping):
             continue
         anchor_role = _normalize_token(anchor_constraint.get("anchor_role"))
-        if anchor_role not in _ANCHOR_ROLES:
-            continue
         relation_hints = _extract_relation_hints_from_notes(
             str(anchor_constraint.get("notes") or "")
         )
-        matched_relation_hint = False
         if not relation_hints:
             relation_hints = []
-        if any(
-            role == anchor_role
-            for relation in relation_hints
-            for _idx, _side, role in anchor_constraint_paths_by_relation.get(relation, ())
-        ):
-            matched_relation_hint = True
-        anchor_entity = anchor_entities_by_role.get(anchor_role)
-        anchor_spec = _build_anchor_node_spec(
-            anchor_role=anchor_role,
-            anchor_entity=anchor_entity,
-        )
-        if anchor_spec is None:
-            continue
-        for relation in relation_hints:
-            for index, constraint_side in candidate_constraint_paths_by_relation.get(
-                relation,
-                (),
-            ):
+
+        if anchor_role in _ANCHOR_ROLES:
+            matched_relation_hint = any(
+                role == anchor_role
+                for relation in relation_hints
+                for _idx, _side, role in anchor_constraint_paths_by_relation.get(
+                    relation, ()
+                )
+            )
+            anchor_entity = anchor_entities_by_role.get(anchor_role)
+            anchor_spec = _build_anchor_node_spec(
+                anchor_role=anchor_role,
+                anchor_entity=anchor_entity,
+            )
+            if anchor_spec is None:
+                continue
+            for relation in relation_hints:
+                for index, constraint_side in candidate_constraint_paths_by_relation.get(
+                    relation,
+                    (),
+                ):
+                    if has_explicit_constraint_entities:
+                        continue
+                    # A relation-hinted anchor constraint should keep its anchor
+                    # binding even when another constraint edge reuses the same
+                    # lexical endpoint token.
+                    overrides.setdefault((index, constraint_side), anchor_spec)
+                    matched_relation_hint = True
+            if matched_relation_hint or has_explicit_constraint_entities:
+                continue
+
+            for index, constraint_side, relation in ordered_candidate_constraint_paths:
+                if (index, constraint_side) in overrides:
+                    continue
+                if anchor_constraint_paths_by_relation.get(relation):
+                    continue
                 constraint_endpoint_token = constraint_endpoint_tokens_by_path.get(
                     (index, constraint_side),
                     "",
@@ -1159,31 +1237,27 @@ def _derive_joined_set_endpoint_overrides(
                     > 1
                 ):
                     continue
-                overrides.setdefault((index, constraint_side), anchor_spec)
-                matched_relation_hint = True
-        if matched_relation_hint or has_explicit_constraint_entities:
+                overrides[(index, constraint_side)] = anchor_spec
+                break
             continue
 
-        for index, constraint_side, relation in ordered_candidate_constraint_paths:
-            if (index, constraint_side) in overrides:
-                continue
-            if anchor_constraint_paths_by_relation.get(relation):
-                continue
-            constraint_endpoint_token = constraint_endpoint_tokens_by_path.get(
-                (index, constraint_side),
-                "",
-            )
-            if (
-                constraint_endpoint_token
-                and constraint_endpoint_token not in _GENERIC_NAMED_ROLE_TOKENS
-                and constraint_endpoint_occurrence_counts.get(
-                    constraint_endpoint_token, 0
-                )
-                > 1
+        if anchor_role not in _CONSTRAINT_NODE_ROLES or has_explicit_constraint_entities:
+            continue
+        constraint_spec = _build_constraint_anchor_note_spec(
+            anchor_role=anchor_role,
+            anchor_constraint=anchor_constraint,
+        )
+        if constraint_spec is None:
+            continue
+        for relation in relation_hints:
+            for index, constraint_side in candidate_constraint_paths_by_relation.get(
+                relation,
+                (),
             ):
-                continue
-            overrides[(index, constraint_side)] = anchor_spec
-            break
+                # Explicit answer-class / constraint guidance should be able to
+                # override a tentative anchor-hinted binding on the same
+                # relation when both appear in the repaired plan.
+                overrides[(index, constraint_side)] = constraint_spec
     return overrides
 
 
@@ -1258,6 +1332,35 @@ def _build_anchor_node_spec(
         binding_clause=_build_anchor_binding_clause(
             variable_name=role_token,
             labels=labels,
+        ),
+    )
+
+
+def _build_constraint_anchor_note_spec(
+    *,
+    anchor_role: str,
+    anchor_constraint: Mapping[str, Any],
+) -> _NodeSpec | None:
+    role_token = _normalize_token(anchor_role)
+    if role_token not in _CONSTRAINT_NODE_ROLES:
+        return None
+    notes = str(anchor_constraint.get("notes") or "")
+    if not notes:
+        return None
+    match = re.search(r"'([^']+)'|\"([^\"]+)\"", notes)
+    if match is None:
+        return None
+    label = str(match.group(1) or match.group(2) or "").strip()
+    if not label:
+        return None
+    if _looks_like_mid(label):
+        return _NodeSpec(term=f"fb:{label}")
+    variable_name = _build_named_node_variable_name(label, role_token)
+    return _NodeSpec(
+        term=f"?{variable_name}",
+        binding_clause=_build_name_binding_clause(
+            variable_name=variable_name,
+            label=label,
         ),
     )
 
@@ -1616,6 +1719,17 @@ def _resolve_count_variable_name(*, query_plan: Mapping[str, Any]) -> str:
             ):
                 return endpoint_token
         return candidate_set_token
+    if query_shape == "count_over_joined_set":
+        if (
+            shared_answer_token
+            and _token_is_structural_in_relation_paths(shared_answer_token, relation_paths)
+        ):
+            return shared_answer_token
+        if (
+            candidate_set_token
+            and _token_is_structural_in_relation_paths(candidate_set_token, relation_paths)
+        ):
+            return candidate_set_token
     for endpoint_token in explicit_count_role_tokens:
         if _token_is_structural_in_relation_paths(endpoint_token, relation_paths):
             return endpoint_token

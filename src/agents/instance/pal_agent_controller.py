@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -14,11 +15,13 @@ from typing_extensions import override
 
 from src.agents.agent import Agent
 from src.agents.exceptions import AgentUnknownException
+from src.agents.instance.language_model_agent import LanguageModelAgent
 from src.language_models import LanguageModel
 from src.pal.family_policy_evolution import (
     build_family_policy_store,
     classify_family_failure,
     family_policy_enabled_for,
+    version_reuse_compatible,
 )
 from src.pal.invoker import (
     build_pal_execution_failure_payload,
@@ -42,6 +45,7 @@ from src.pal.parser import extract_and_validate_code
 from src.pal.plausibility_validator import (
     AnchorProbeResult,
     PlausibilityVerdict,
+    VERDICT_REPAIRABLE_BAD_COUNT_SET,
     build_repair_feedback,
     validate_pal_execution,
 )
@@ -57,7 +61,9 @@ from src.pal.reusable_tool_families import (
     render_reusable_tool,
     select_reusable_tool,
 )
-from src.self_evolving_agent.controller import SelfEvolvingController
+from src.self_evolving_agent.controller_prompts import (
+    SOLVER_SYSTEM_PROMPT as MANUAL_FALLBACK_SOLVER_SYSTEM_PROMPT,
+)
 from src.self_evolving_agent.tool_registry import get_registry
 from src.typings import ChatHistory, ChatHistoryItem, Role
 from src.utils.output_paths import prefix_filename
@@ -73,6 +79,13 @@ except ImportError:  # pragma: no cover
     _ProbeSPARQLWrapper = None  # type: ignore[assignment,misc]
     _ProbeSPARQLJSON = None  # type: ignore[assignment]
     _SPARQL_PROBE_AVAILABLE = False
+
+
+_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK_ENV = "PAL_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK"
+_TOOL_EVOLUTION_CONTRASTIVE_BRANCH_ENV = "PAL_TOOL_EVOLUTION_CONTRASTIVE_BRANCH"
+_TOOL_EVOLUTION_ANCHOR_HINTS_ENV = "PAL_TOOL_EVOLUTION_ANCHOR_HINTS"
+_TOOL_EVOLUTION_COUNT_TRANSFER_ENV = "PAL_TOOL_EVOLUTION_COUNT_CROSSFAMILY_TRANSFER"
+_TOOL_EVOLUTION_COARSE_SUCCESS_HINTS_ENV = "PAL_TOOL_EVOLUTION_COARSE_SUCCESS_HINTS"
 
 
 class PALAgentController(Agent):
@@ -213,7 +226,7 @@ class PALAgentController(Agent):
         self._pending_macro_runs: dict[str, dict[str, Any]] = {}
         self._registered_bridge_tools: set[str] = set()
         self._tool_invoked_in_last_inference = None
-        self._manual_fallback_agent: Optional[SelfEvolvingController] = None
+        self._manual_fallback_agent: Optional[Agent] = None
         self._manual_fallback_active_runs: set[str] = set()
 
     @override
@@ -225,16 +238,15 @@ class PALAgentController(Agent):
             last_user_content = chat_history.get_item_deep_copy(-1).content
             if self._manual_fallback_active_for_current_run():
                 return self._delegate_to_manual_solver(chat_history=chat_history)
-            if macro_pointer := self._extract_macro_pointer(last_user_content):
-                self._log_macro_result(last_user_content)
-                return ChatHistoryItem(
-                    role=Role.AGENT,
-                    content=f"Final Answer: {macro_pointer}",
-                )
             if "Macro result:" in (last_user_content or ""):
                 self._log_macro_result(last_user_content)
                 self._activate_manual_fallback(chat_history=chat_history)
-                return self._delegate_to_manual_solver(chat_history=chat_history)
+                response = self._delegate_to_manual_solver(chat_history=chat_history)
+                self._emit_macro_solver_review(
+                    macro_result_content=last_user_content,
+                    solver_response=response.content,
+                )
+                return response
 
             task_question = last_user_content
             generated_tool_name = self._build_query_tool_name(task_question)
@@ -378,11 +390,27 @@ class PALAgentController(Agent):
                         relation_grounding=relation_grounding,
                     )
                 )
-                self._ensure_repair_loop_accepted(
+                repair_failure_reason = self._ensure_repair_loop_accepted(
                     generated_tool_name=generated_tool_name,
                     query_plan=query_plan,
                     repair_loop_log=_repair_loop_log,
                 )
+                if repair_failure_reason:
+                    advisory_text = self._build_repair_loop_failure_advisory(
+                        repair_failure_reason=repair_failure_reason,
+                        repair_loop_log=_repair_loop_log,
+                    )
+                    if self._tool_evolution_skip_manual_fallback_enabled():
+                        self._bypass_manual_solver_after_tool_failure(
+                            generated_tool_name=generated_tool_name,
+                            failure_reason=repair_failure_reason,
+                            advisory_text=advisory_text,
+                        )
+                    self._activate_manual_fallback(
+                        chat_history=chat_history,
+                        advisory_text=advisory_text,
+                    )
+                    return self._delegate_to_manual_solver(chat_history=chat_history)
                 pipeline_stage = "parser"
                 query_artifacts = self._capture_pal_query_artifacts(
                     generated_tool_name=generated_tool_name,
@@ -513,12 +541,23 @@ class PALAgentController(Agent):
                             repair_loop_log=_repair_loop_log,
                             trust_contract=trust_contract,
                         )
+                        advisory_text = self._build_tool_advisory_text(
+                            materialization=materialization,
+                            trust_contract=trust_contract,
+                            query_plan=query_plan,
+                        )
+                        if self._tool_evolution_skip_manual_fallback_enabled():
+                            self._bypass_manual_solver_after_tool_failure(
+                                generated_tool_name=generated_tool_name,
+                                failure_reason=(
+                                    "pal_materialization_contract_failed:"
+                                    + ",".join(trust_contract.denial_reasons)
+                                ),
+                                advisory_text=advisory_text,
+                            )
                         self._activate_manual_fallback(
                             chat_history=chat_history,
-                            advisory_text=self._build_tool_advisory_text(
-                                materialization=materialization,
-                                trust_contract=trust_contract,
-                            ),
+                            advisory_text=advisory_text,
                         )
                         return self._delegate_to_manual_solver(chat_history=chat_history)
                     tool_result_semantics = self._build_tool_result_semantics(
@@ -531,6 +570,7 @@ class PALAgentController(Agent):
                             task_question=task_question,
                             materialization=materialization,
                             generated_tool_name=generated_tool_name,
+                            query_plan=query_plan,
                             tool_result_semantics=tool_result_semantics,
                         ),
                     )
@@ -631,12 +671,23 @@ class PALAgentController(Agent):
                         repair_loop_log=_repair_loop_log,
                         trust_contract=trust_contract,
                     )
+                    advisory_text = self._build_tool_advisory_text(
+                        materialization=materialization,
+                        trust_contract=trust_contract,
+                        query_plan=query_plan,
+                    )
+                    if self._tool_evolution_skip_manual_fallback_enabled():
+                        self._bypass_manual_solver_after_tool_failure(
+                            generated_tool_name=generated_tool_name,
+                            failure_reason=(
+                                "pal_materialization_contract_failed:"
+                                + ",".join(trust_contract.denial_reasons)
+                            ),
+                            advisory_text=advisory_text,
+                        )
                     self._activate_manual_fallback(
                         chat_history=chat_history,
-                        advisory_text=self._build_tool_advisory_text(
-                            materialization=materialization,
-                            trust_contract=trust_contract,
-                        ),
+                        advisory_text=advisory_text,
                     )
                     return self._delegate_to_manual_solver(chat_history=chat_history)
                 tool_result_semantics = self._build_tool_result_semantics(
@@ -649,11 +700,14 @@ class PALAgentController(Agent):
                         task_question=task_question,
                         materialization=materialization,
                         generated_tool_name=generated_tool_name,
+                        query_plan=query_plan,
                         tool_result_semantics=tool_result_semantics,
                     ),
                 )
 
             raise AgentUnknownException("pal_orchestrator_refused_generate_tool")
+        except AgentUnknownException:
+            raise
         except Exception as e:
             self._emit_generated_tools_event(
                 {
@@ -689,6 +743,29 @@ class PALAgentController(Agent):
                 )
             raise AgentUnknownException(str(e)) from e
 
+    def _tool_evolution_skip_manual_fallback_enabled(self) -> bool:
+        return os.environ.get(_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK_ENV) == "1"
+
+    def _bypass_manual_solver_after_tool_failure(
+        self,
+        *,
+        generated_tool_name: Optional[str],
+        failure_reason: str,
+        advisory_text: str,
+    ) -> None:
+        cleaned_reason = str(failure_reason or "tool_failure").strip() or "tool_failure"
+        self._tool_invoked_in_last_inference = "pal_tool_failure_bypass"
+        self._emit_generated_tools_event(
+            {
+                "event": "pal_tool_failure_bypassed",
+                "mode": "pal",
+                "tool_name": generated_tool_name,
+                "failure_reason": cleaned_reason,
+                "advisory_preview": self._summarize_text(advisory_text, max_len=280),
+            }
+        )
+        raise AgentUnknownException(f"pal_tool_failure_bypassed:{cleaned_reason}")
+
     def _adapt_pal_result(
         self,
         *,
@@ -710,6 +787,7 @@ class PALAgentController(Agent):
         task_question: str,
         materialization: BenchmarkMaterialization,
         generated_tool_name: Optional[str] = None,
+        query_plan: Optional[Mapping[str, Any]] = None,
         tool_result_semantics: Optional[Mapping[str, Any]] = None,
     ) -> str:
         artifact_type = str(
@@ -726,6 +804,10 @@ class PALAgentController(Agent):
                 "pal_semantic_description",
                 str(
                     (tool_result_semantics or {}).get("tool_result_semantic_description")
+                    or self._build_tool_semantic_description(
+                        query_plan=query_plan,
+                        materialization=materialization,
+                    )
                     or materialization.semantic_description
                     or ""
                 ).strip(),
@@ -771,6 +853,62 @@ class PALAgentController(Agent):
                 ).strip(),
             )
             payload.setdefault("pal_confidence", materialization.confidence)
+            payload.setdefault(
+                "pal_selected_query_variable",
+                str(
+                    (materialization.diagnostics or {}).get("selected_query_variable")
+                    or ""
+                ).strip(),
+            )
+            payload.setdefault(
+                "pal_binding_count",
+                (materialization.diagnostics or {}).get("binding_count"),
+            )
+            payload.setdefault(
+                "pal_unique_value_count",
+                (materialization.diagnostics or {}).get("unique_value_count"),
+            )
+            payload.setdefault(
+                "pal_value_preview",
+                list((materialization.diagnostics or {}).get("value_preview") or []),
+            )
+            payload.setdefault(
+                "pal_row_preview",
+                list((materialization.diagnostics or {}).get("row_preview") or []),
+            )
+            payload.setdefault(
+                "pal_proof_hint",
+                self._build_tool_proof_hint(
+                    query_plan=query_plan,
+                    materialization=materialization,
+                ),
+            )
+            payload.setdefault(
+                "pal_relation_summary",
+                self._build_tool_relation_summary(query_plan=query_plan),
+            )
+            payload.setdefault(
+                "pal_selection_basis",
+                self._build_tool_selection_basis(
+                    query_plan=query_plan,
+                    materialization=materialization,
+                ),
+            )
+            payload.setdefault(
+                "pal_completeness_hint",
+                self._build_tool_completeness_hint(
+                    query_plan=query_plan,
+                    materialization=materialization,
+                ),
+            )
+            payload.setdefault(
+                "pal_repair_caveat",
+                self._build_tool_repair_caveat(query_plan=query_plan),
+            )
+            payload.setdefault(
+                "pal_answer_cardinality_hint",
+                self._infer_answer_cardinality_hint(task_question),
+            )
             run_id = str(payload.get("run_id") or self._get_run_id())
             self._pending_macro_runs[run_id] = {
                 "tool_name": tool_name,
@@ -966,13 +1104,19 @@ class PALAgentController(Agent):
         active_bundle = get_reusable_family_policy_bundle(cleaned_family)
         source_version = str(metadata.get("source_version") or "").strip()
         active_version = str(getattr(active_bundle, "version", "") or "").strip()
-        if source_version and active_version and source_version != active_version:
+        if source_version and active_version and not version_reuse_compatible(
+            source_version,
+            active_version,
+        ):
             return []
         return [
             dict(item)
             for item in (evaluation_context.get("success_plan_archetypes") or [])
             if isinstance(item, Mapping)
         ]
+
+    def _tool_evolution_coarse_success_hints_enabled(self) -> bool:
+        return os.getenv(_TOOL_EVOLUTION_COARSE_SUCCESS_HINTS_ENV) == "1"
 
     def _format_family_success_archetypes(
         self,
@@ -1011,6 +1155,242 @@ class PALAgentController(Agent):
                 summary_bits.append(f"structural_notes={structural_notes}")
             formatted.append("; ".join(summary_bits))
         return formatted
+
+    def _tool_evolution_contrastive_branch_enabled(self) -> bool:
+        return os.getenv(_TOOL_EVOLUTION_CONTRASTIVE_BRANCH_ENV) == "1"
+
+    def _tool_evolution_anchor_hints_enabled(self) -> bool:
+        return os.getenv(_TOOL_EVOLUTION_ANCHOR_HINTS_ENV) == "1"
+
+    def _tool_evolution_count_transfer_enabled(self) -> bool:
+        return os.getenv(_TOOL_EVOLUTION_COUNT_TRANSFER_ENV) == "1"
+
+    def _load_tool_evolution_context(
+        self,
+        *,
+        family_name: str,
+    ) -> dict[str, Any]:
+        cleaned_family = str(family_name or "").strip()
+        if not cleaned_family:
+            return {}
+        try:
+            store = self._get_family_policy_store()
+            context = store.get_tool_evolution_context(cleaned_family)
+        except Exception:
+            return {}
+        if not isinstance(context, Mapping):
+            return {}
+        active_bundle = get_reusable_family_policy_bundle(cleaned_family)
+        source_version = str(context.get("source_version") or "").strip()
+        active_version = str(getattr(active_bundle, "version", "") or "").strip()
+        if source_version and active_version and not version_reuse_compatible(
+            source_version,
+            active_version,
+        ):
+            return {}
+        return dict(context)
+
+    def _tool_evolution_peer_families(self, family_name: str) -> list[str]:
+        cleaned = str(family_name or "").strip()
+        if cleaned not in {"count_over_direct_relation", "count_over_joined_set"}:
+            return []
+        return [
+            name
+            for name in ("count_over_direct_relation", "count_over_joined_set")
+            if name != cleaned
+        ]
+
+    def _collect_tool_evolution_patterns(
+        self,
+        *,
+        family_name: str,
+        key: str,
+    ) -> list[dict[str, Any]]:
+        families = [str(family_name or "").strip()]
+        if self._tool_evolution_count_transfer_enabled():
+            families.extend(self._tool_evolution_peer_families(family_name))
+        collected: list[dict[str, Any]] = []
+        seen_signatures: set[str] = set()
+        for current_family in families:
+            context = self._load_tool_evolution_context(family_name=current_family)
+            for item in (context.get(key) or []):
+                if not isinstance(item, Mapping):
+                    continue
+                signature = str(item.get("pattern_signature") or "").strip()
+                if not signature or signature in seen_signatures:
+                    continue
+                seen_signatures.add(signature)
+                collected.append(dict(item))
+        return collected
+
+    def _format_tool_evolution_branch_patterns(
+        self,
+        *,
+        family_name: str,
+    ) -> list[str]:
+        if not self._tool_evolution_contrastive_branch_enabled():
+            return []
+
+        def _render(item: Mapping[str, Any], *, prefix: str) -> str:
+            relation_signatures = " | ".join(
+                str(value).strip()
+                for value in (item.get("relation_signatures") or [])
+                if str(value).strip()
+            )
+            structural_notes = ",".join(
+                str(value).strip()
+                for value in (item.get("structural_notes") or [])
+                if str(value).strip()
+            )
+            grounding_sources = ",".join(
+                str(value).strip()
+                for value in (item.get("grounding_sources") or [])
+                if str(value).strip()
+            )
+            failure_labels = ",".join(
+                str(value).strip()
+                for value in (item.get("failure_labels") or [])
+                if str(value).strip()
+            )
+            bits = [f"{prefix} relation_signatures={relation_signatures or 'none'}"]
+            if structural_notes:
+                bits.append(f"structural_notes={structural_notes}")
+            if grounding_sources:
+                bits.append(f"grounding_sources={grounding_sources}")
+            if failure_labels:
+                bits.append(f"failure_labels={failure_labels}")
+            return "; ".join(bits)
+
+        lines: list[str] = []
+        for archetype in self._collect_tool_evolution_patterns(
+            family_name=family_name,
+            key="preferred_patterns",
+        )[:2]:
+            lines.append(_render(archetype, prefix="prefer"))
+        for archetype in self._collect_tool_evolution_patterns(
+            family_name=family_name,
+            key="avoid_patterns",
+        )[:2]:
+            lines.append(_render(archetype, prefix="avoid"))
+        return lines
+
+    def _format_tool_evolution_anchor_patterns(
+        self,
+        *,
+        family_name: str,
+    ) -> list[str]:
+        if not self._tool_evolution_anchor_hints_enabled():
+            return []
+
+        def _render(item: Mapping[str, Any], *, prefix: str) -> str:
+            anchor_binding_modes = ",".join(
+                str(value).strip()
+                for value in (item.get("anchor_binding_modes") or [])
+                if str(value).strip()
+            )
+            alias_strategy_tokens = ",".join(
+                str(value).strip()
+                for value in (item.get("alias_strategy_tokens") or [])
+                if str(value).strip()
+            )
+            relation_signatures = " | ".join(
+                str(value).strip()
+                for value in (item.get("relation_signatures") or [])
+                if str(value).strip()
+            )
+            failure_labels = ",".join(
+                str(value).strip()
+                for value in (item.get("failure_labels") or [])
+                if str(value).strip()
+            )
+            bits = [
+                f"{prefix} anchor_binding={anchor_binding_modes or 'none'}",
+                f"alias_strategy={alias_strategy_tokens or 'none'}",
+            ]
+            if relation_signatures:
+                bits.append(f"relation_signatures={relation_signatures}")
+            if failure_labels:
+                bits.append(f"failure_labels={failure_labels}")
+            return "; ".join(bits)
+
+        lines: list[str] = []
+        for archetype in self._collect_tool_evolution_patterns(
+            family_name=family_name,
+            key="preferred_patterns",
+        )[:2]:
+            lines.append(_render(archetype, prefix="prefer"))
+        for archetype in self._collect_tool_evolution_patterns(
+            family_name=family_name,
+            key="avoid_patterns",
+        )[:2]:
+            lines.append(_render(archetype, prefix="avoid"))
+        return lines
+
+    def _render_family_policy_guidance_item(self, item: str) -> str:
+        cleaned = str(item or "").strip()
+        if not cleaned:
+            return ""
+        token_map = {
+            "require_explicit_answer_role_alignment": "Keep the answer/count target aligned with the role the question asks for.",
+            "verify_answer_target_semantics_not_just_executability": "Prefer plans whose returned set clearly matches the requested answer target, not just any executable set.",
+            "prefer_structural_rebinding_before_relation_bans": "When semantics drift, first retarget the answer/count role or scaffold before banning relation families.",
+            "change_scaffold_family_after_dead_relation_evidence": "If the current scaffold is dead, switch scaffold family instead of repeating the same relation shape.",
+            "prefer_unused_grounded_relations_before_retrying": "Before retrying, prefer grounded relations from the card that have not already failed.",
+            "verify_count_targets_requested_entity_set": "For count tasks, make sure the counted set is the requested entity set, not an auxiliary bridge or attribute set.",
+            "switch_to_joined_count_when_downstream_filter_or_projection_exists": "If a downstream filter or projection exists beyond the anchor-side relation, use the joined-count family.",
+            "preserve_joined_count_target_semantics_during_repairs": "Keep the joined counted set explicit during repairs; do not drift back to counting a helper bridge.",
+            "verify_projected_entity_matches_question_target": "Projected entities should match the question's requested entity type, not a nearby bridge node.",
+            "verify_superlative_selection_basis_is_explicit": "Make the candidate set and ordering basis explicit for superlatives.",
+            "preserve_candidate_set_and_ordering_path_together": "When repairing a superlative, preserve the candidate set and ordering path as one structure.",
+            "preserve_all_anchor_constraints_on_same_answer_variable": "All anchors should continue to constrain the same answer variable.",
+            "tighten_answer_target_semantics": "Use a structurally tighter answer target if the broader one caused wrong completions.",
+            "avoid_broad_family_applicability": "Avoid broad family reuse when the answer semantics are weakly specified.",
+            "reject_known_dangerous_overreach_patterns": "Reject plans that repeat previously observed dangerous overreach patterns.",
+            "deprioritize_failed_scaffold_before_family_switch": "After a failed scaffold, do not immediately retry the same scaffold ordering.",
+        }
+        if cleaned in token_map:
+            return token_map[cleaned]
+        if cleaned.startswith("query_shape="):
+            return f"Use this family only when {cleaned.replace('query_shape=', 'query shape is ')}."
+        return cleaned.replace("_", " ")
+
+    def _format_active_family_policy_guidance(
+        self,
+        *,
+        family_name: str,
+    ) -> list[str]:
+        bundle = get_reusable_family_policy_bundle(str(family_name or "").strip())
+        if bundle is None:
+            return []
+        lines: list[str] = [f"bundle_version={bundle.version}"]
+
+        def _select_policy_items(raw_items: Sequence[str]) -> list[str]:
+            cleaned = [
+                str(item or "").strip()
+                for item in raw_items
+                if str(item or "").strip()
+            ]
+            if len(cleaned) <= 2:
+                return cleaned
+            # Surface both the stable baseline guidance and the newest
+            # candidate-added delta without bloating the grounding card.
+            return [cleaned[0], cleaned[-1]]
+
+        sections: tuple[tuple[str, Sequence[str]], ...] = (
+            ("use_when", _select_policy_items(bundle.applicability_conditions)),
+            ("validate", _select_policy_items(bundle.validator_expectations)),
+            ("repair", _select_policy_items(bundle.repair_policy)),
+        )
+        for section_name, raw_items in sections:
+            rendered = [
+                self._render_family_policy_guidance_item(str(item or "").strip())
+                for item in raw_items
+                if str(item or "").strip()
+            ]
+            rendered = [item for item in rendered if item]
+            if rendered:
+                lines.append(f"{section_name}=" + " | ".join(rendered))
+        return lines
 
     def _collect_family_policy_failure_reasons(
         self,
@@ -1086,10 +1466,16 @@ class PALAgentController(Agent):
             repair_loop_log=repair_loop_log,
             trust_contract=trust_contract,
         )
+        current_session = getattr(self, "_current_session", None)
+        sample_status = str(getattr(current_session, "sample_status", "") or "").strip()
+        evaluation_outcome = ""
+        evaluation_record = getattr(current_session, "evaluation_record", None)
+        if isinstance(evaluation_record, Mapping):
+            evaluation_outcome = str(evaluation_record.get("outcome") or "").strip()
         failure_class = classify_family_failure(
             family_name=selected_family,
-            sample_status="agent_unknown_error",
-            evaluation_outcome="incorrect",
+            sample_status=sample_status,
+            evaluation_outcome=evaluation_outcome,
             relation_names=relation_names,
             failure_reasons=failure_reasons,
             dangerous_overreach=bool(
@@ -1700,6 +2086,20 @@ class PALAgentController(Agent):
             join_structure=join_structure,
             relation_paths=relation_paths,
         )
+        (
+            shared_answer_variable,
+            candidate_set_variable,
+            count_set_variable,
+            join_structure,
+        ) = self._repair_nonstructural_count_variables(
+            answer_mode=answer_mode,
+            query_shape=query_shape,
+            relation_paths=relation_paths,
+            join_structure=join_structure,
+            shared_answer_variable=shared_answer_variable,
+            candidate_set_variable=candidate_set_variable,
+            count_set_variable=count_set_variable,
+        )
         projection = self._normalize_string_list(plan.get("projection"))
         if query_shape == "superlative_chain":
             answer_mode = "entity"
@@ -1794,6 +2194,25 @@ class PALAgentController(Agent):
         if allow_exploratory_predicates and not plan_rationale:
             raise ValueError("query_plan_exploratory_requires_rationale")
 
+        if self._count_plan_needs_joined_set_boundary(
+            answer_mode=answer_mode,
+            query_shape=query_shape,
+            relation_paths=relation_paths,
+            anchored_entities=anchored_entities,
+        ):
+            query_shape = "count_over_joined_set"
+            if not any(
+                "joined-count" in str(item or "").lower()
+                for item in plan_rationale
+            ):
+                plan_rationale.append(
+                    "The initial plan already contains downstream joins or constraint filters beyond the anchor-side count relation, so it should start in the joined-count family rather than waiting for a failed direct-count repair."
+                )
+            if "joined counted set" not in strategy.lower():
+                strategy = (
+                    f"{strategy} Start in joined-count mode because the candidate set is filtered or projected beyond the anchor-side relation."
+                ).strip()
+
         return {
             "answer_type": answer_type,
             "answer_mode": answer_mode,
@@ -1813,6 +2232,243 @@ class PALAgentController(Agent):
             "strategy": strategy,
             "plan_rationale": plan_rationale,
         }
+
+    def _repair_nonstructural_count_variables(
+        self,
+        *,
+        answer_mode: str,
+        query_shape: str,
+        relation_paths: Sequence[Mapping[str, Any]],
+        join_structure: Mapping[str, Any],
+        shared_answer_variable: str,
+        candidate_set_variable: str,
+        count_set_variable: str,
+    ) -> tuple[str, str, str, dict[str, Any]]:
+        if answer_mode != "count" or not relation_paths:
+            return (
+                shared_answer_variable,
+                candidate_set_variable,
+                count_set_variable,
+                dict(join_structure or {}),
+            )
+
+        ignored_roles = {
+            "anchor",
+            "anchor_a",
+            "anchor_b",
+            "constraint_value",
+            "type_set",
+            "shared_type",
+            "anchor_value",
+            "ordering_attribute",
+        }
+        structural_labels: dict[str, str] = {}
+        structural_degree: Counter[str] = Counter()
+        anchor_adjacent_tokens: list[str] = []
+        semantic_role_tokens: dict[str, list[str]] = {
+            "answer": [],
+            "shared_answer": [],
+            "candidate_set": [],
+            "count_set": [],
+        }
+        anchor_roles = {"anchor", "anchor_a", "anchor_b"}
+
+        def _register(token: str, label: str) -> None:
+            if token and token not in structural_labels:
+                structural_labels[token] = label
+
+        for relation_path in relation_paths:
+            endpoints = (
+                (
+                    str(relation_path.get("from") or "").strip(),
+                    self._normalize_relation_role(relation_path.get("from_role")),
+                    self._normalize_relation_role(relation_path.get("to_role")),
+                ),
+                (
+                    str(relation_path.get("to") or "").strip(),
+                    self._normalize_relation_role(relation_path.get("to_role")),
+                    self._normalize_relation_role(relation_path.get("from_role")),
+                ),
+            )
+            for raw_label, role, opposite_role in endpoints:
+                token = self._normalize_variable_token(raw_label)
+                if not token or role in ignored_roles:
+                    continue
+                _register(token, raw_label)
+                structural_degree[token] += 1
+                if role in semantic_role_tokens:
+                    semantic_role_tokens[role].append(token)
+                if opposite_role in anchor_roles:
+                    anchor_adjacent_tokens.append(token)
+
+        def _choose_label(
+            current_label: str,
+            *,
+            fallbacks: Sequence[str],
+        ) -> str:
+            current_token = self._normalize_variable_token(current_label)
+            if current_token and current_token in structural_labels:
+                return structural_labels[current_token]
+            for token in fallbacks:
+                if token in structural_labels:
+                    return structural_labels[token]
+            return current_label
+
+        shared_answer_token = self._normalize_variable_token(shared_answer_variable)
+        candidate_set_token = self._normalize_variable_token(candidate_set_variable)
+        count_set_token = self._normalize_variable_token(count_set_variable)
+        original_candidate_token = candidate_set_token
+        original_count_token = count_set_token
+
+        if (not shared_answer_token or shared_answer_token not in structural_labels) and (
+            semantic_role_tokens["shared_answer"] or semantic_role_tokens["answer"]
+        ):
+            preferred_token = (
+                semantic_role_tokens["shared_answer"][0]
+                if semantic_role_tokens["shared_answer"]
+                else semantic_role_tokens["answer"][0]
+            )
+            shared_answer_variable = structural_labels.get(
+                preferred_token, shared_answer_variable
+            )
+            shared_answer_token = self._normalize_variable_token(shared_answer_variable)
+
+        if not count_set_token or count_set_token not in structural_labels:
+            fallback_tokens: list[str] = []
+            if shared_answer_token:
+                fallback_tokens.append(shared_answer_token)
+            if semantic_role_tokens["answer"]:
+                fallback_tokens.extend(semantic_role_tokens["answer"])
+            if semantic_role_tokens["count_set"]:
+                fallback_tokens.extend(semantic_role_tokens["count_set"])
+            if candidate_set_token:
+                fallback_tokens.append(candidate_set_token)
+            if structural_degree:
+                fallback_tokens.extend(
+                    token
+                    for token, _ in structural_degree.most_common()
+                )
+            count_set_variable = _choose_label(
+                count_set_variable,
+                fallbacks=fallback_tokens,
+            )
+            count_set_token = self._normalize_variable_token(count_set_variable)
+
+        if (
+            query_shape == "count_over_joined_set"
+            and (not candidate_set_token or candidate_set_token not in structural_labels)
+        ):
+            fallback_tokens = [
+                token
+                for token in anchor_adjacent_tokens
+                if token != count_set_token
+            ]
+            if not fallback_tokens:
+                fallback_tokens = [
+                    token
+                    for token, _ in structural_degree.most_common()
+                    if token != count_set_token
+                ]
+            candidate_set_variable = _choose_label(
+                candidate_set_variable,
+                fallbacks=fallback_tokens,
+            )
+            candidate_set_token = self._normalize_variable_token(candidate_set_variable)
+
+        rewritten_join_structure = {
+            "type": str((join_structure or {}).get("type") or "").strip(),
+            "anchor_constraints": [],
+        }
+        for constraint in ((join_structure or {}).get("anchor_constraints") or []):
+            if not isinstance(constraint, Mapping):
+                continue
+            rewritten_constraint = dict(constraint)
+            constraint_var = str(constraint.get("constrains_variable") or "").strip()
+            constraint_token = self._normalize_variable_token(constraint_var)
+            if constraint_token:
+                if count_set_token and constraint_token == original_count_token:
+                    rewritten_constraint["constrains_variable"] = count_set_variable
+                elif candidate_set_token and constraint_token == original_candidate_token:
+                    rewritten_constraint["constrains_variable"] = candidate_set_variable
+                elif constraint_token not in structural_labels:
+                    if count_set_token and constraint_token == original_count_token:
+                        rewritten_constraint["constrains_variable"] = count_set_variable
+                    elif candidate_set_token and constraint_token == original_candidate_token:
+                        rewritten_constraint["constrains_variable"] = candidate_set_variable
+            rewritten_join_structure["anchor_constraints"].append(rewritten_constraint)
+        if not rewritten_join_structure["type"]:
+            rewritten_join_structure["type"] = str(
+                (join_structure or {}).get("type") or "count"
+            )
+
+        return (
+            shared_answer_variable,
+            candidate_set_variable,
+            count_set_variable,
+            rewritten_join_structure,
+        )
+
+    def _count_plan_needs_joined_set_boundary(
+        self,
+        *,
+        answer_mode: str,
+        query_shape: str,
+        relation_paths: Sequence[Mapping[str, Any]],
+        anchored_entities: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        if str(answer_mode or "").strip().lower() != "count":
+            return False
+        if str(query_shape or "").strip().lower() != "count_over_direct_relation":
+            return False
+        # A direct-count scaffold should reach the counted set with one semantic KG
+        # relation path. Once the plan needs two or more semantic relation paths, it
+        # is already operating like a joined-count scaffold and should be treated as
+        # such before repair loops start reinforcing the wrong family.
+        if len(relation_paths) >= 2:
+            return True
+        if len(relation_paths) < 2:
+            return False
+
+        anchor_roles = {
+            self._normalize_relation_role(item.get("role"))
+            for item in anchored_entities
+            if self._normalize_relation_role(item.get("role"))
+            in {"anchor", "anchor_a", "anchor_b"}
+        }
+        variable_roles = {"candidate_set", "count_set", "shared_answer", "answer"}
+        constraint_roles = {
+            "constraint_value",
+            "type_set",
+            "shared_type",
+            "anchor_value",
+        }
+        has_non_anchor_downstream_path = False
+        has_candidate_constraint_filter = False
+        observed_variable_roles: set[str] = set()
+        for path in relation_paths:
+            from_role = self._normalize_relation_role(path.get("from_role"))
+            to_role = self._normalize_relation_role(path.get("to_role"))
+            roles = {from_role, to_role}
+            if roles & variable_roles and roles & constraint_roles:
+                has_candidate_constraint_filter = True
+            observed_variable_roles.update(
+                role for role in roles if role in variable_roles
+            )
+            touches_anchor = any(
+                self._path_touches_anchor_role(path, anchor_role=anchor_role)
+                for anchor_role in anchor_roles
+            )
+            if not touches_anchor and roles & variable_roles:
+                has_non_anchor_downstream_path = True
+        has_mixed_count_projection_roles = (
+            "candidate_set" in observed_variable_roles
+            and "count_set" in observed_variable_roles
+        )
+        return bool(
+            has_candidate_constraint_filter
+            or has_non_anchor_downstream_path
+            or has_mixed_count_projection_roles
+        )
 
     def _ensure_distinct_constraint_value_variables(
         self,
@@ -3796,6 +4452,23 @@ class PALAgentController(Agent):
             return count_set_variable
         return raw_text
 
+    def _extract_relation_hints_from_notes(self, notes: str) -> list[str]:
+        text = str(notes or "")
+        seen: set[str] = set()
+        hints: list[str] = []
+        for match in re.finditer(
+            r"\b[a-z0-9_]+\.[a-z0-9_]+\.[a-z0-9_]+\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            relation = match.group(0).strip()
+            lowered = relation.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            hints.append(relation)
+        return hints
+
     def _expand_projected_answer_intersection_paths(
         self,
         *,
@@ -3909,14 +4582,14 @@ class PALAgentController(Agent):
         generated_tool_name: str,
         query_plan: Mapping[str, Any] | None = None,
         repair_loop_log: Mapping[str, Any],
-    ) -> None:
+    ) -> Optional[str]:
         final_verdict = str(repair_loop_log.get("final_verdict") or "").strip()
         accepted_attempt = repair_loop_log.get("accepted_attempt")
         if accepted_attempt is not None or final_verdict in {
             "accepted",
             "accepted_best_effort",
         }:
-            return
+            return None
         last_verdict = str(
             repair_loop_log.get("last_verdict") or final_verdict or "no_accepted_candidate"
         ).strip()
@@ -3939,7 +4612,7 @@ class PALAgentController(Agent):
             failure_reason=f"pal_query_not_accepted:{last_verdict}",
             repair_loop_log=repair_loop_log,
         )
-        raise AgentUnknownException(f"pal_query_not_accepted:{last_verdict}")
+        return f"pal_query_not_accepted:{last_verdict}"
 
     def _build_best_executing_candidate_metadata(
         self,
@@ -4380,6 +5053,8 @@ class PALAgentController(Agent):
         relation_candidates: Sequence[Mapping[str, Any]],
         question_text: str,
         answer_target_phrase: str,
+        question_inputs: Sequence[Mapping[str, Any]] = (),
+        query_shape: str = "",
     ) -> list[dict[str, str]]:
         if not relation_candidates:
             return []
@@ -4394,7 +5069,17 @@ class PALAgentController(Agent):
             and "pet" not in lower_text
         )
         if not prefers_biology_breed_temperament:
-            return [dict(candidate) for candidate in relation_candidates if isinstance(candidate, Mapping)]
+            return self._sort_grounded_relation_candidates_by_semantic_fit(
+                relation_candidates=[
+                    dict(candidate)
+                    for candidate in relation_candidates
+                    if isinstance(candidate, Mapping)
+                ],
+                question_text=question_text,
+                answer_target_phrase=answer_target_phrase,
+                question_inputs=question_inputs,
+                query_shape=query_shape,
+            )
 
         pruned_candidates: list[dict[str, str]] = []
         saw_biology_breed_temperament = any(
@@ -4412,7 +5097,144 @@ class PALAgentController(Agent):
             ):
                 continue
             pruned_candidates.append(dict(candidate))
-        return pruned_candidates
+        return self._sort_grounded_relation_candidates_by_semantic_fit(
+            relation_candidates=pruned_candidates,
+            question_text=question_text,
+            answer_target_phrase=answer_target_phrase,
+            question_inputs=question_inputs,
+            query_shape=query_shape,
+        )
+
+    def _sort_grounded_relation_candidates_by_semantic_fit(
+        self,
+        *,
+        relation_candidates: Sequence[Mapping[str, Any]],
+        question_text: str,
+        answer_target_phrase: str,
+        question_inputs: Sequence[Mapping[str, Any]] = (),
+        query_shape: str = "",
+    ) -> list[dict[str, str]]:
+        candidates = [
+            dict(candidate)
+            for candidate in relation_candidates
+            if isinstance(candidate, Mapping)
+        ]
+        if len(candidates) < 2:
+            return candidates
+
+        target_tokens = self._semantic_hint_tokens(answer_target_phrase)
+        anchor_clues = self._extract_anchor_clues_from_question_inputs(question_inputs)
+        domain_hints = self._infer_domain_hints(question_text)
+        prefers_publisher_release = self._question_prefers_publisher_release_relation(
+            question_text
+        )
+        if not target_tokens:
+            if not anchor_clues:
+                return candidates
+        question_tokens = self._semantic_hint_tokens(question_text)
+        candidate_tokens: list[set[str]] = []
+        overlap_frequency: Counter[str] = Counter()
+        for candidate in candidates:
+            tokens = self._semantic_hint_tokens(
+                " ".join(
+                    str(candidate.get(field) or "").strip()
+                    for field in (
+                        "relation",
+                        "from",
+                        "to",
+                        "support",
+                        "use_when",
+                    )
+                )
+            )
+            candidate_tokens.append(tokens)
+            for token in target_tokens & tokens:
+                overlap_frequency[token] += 1
+
+        ranked: list[tuple[int, int, dict[str, str]]] = []
+        for index, candidate in enumerate(candidates):
+            tokens = candidate_tokens[index]
+            overlap = target_tokens & tokens
+            score = 0
+            if overlap:
+                for token in overlap:
+                    score += 4 if overlap_frequency[token] == 1 else 2
+                non_anchor_overlap = overlap - (question_tokens - target_tokens)
+                score += len(non_anchor_overlap)
+            grounding_source = str(candidate.get("grounding_source") or "").strip().lower()
+            if grounding_source == "curated":
+                score += 1
+            relation_name = str(candidate.get("relation") or "").strip()
+            relation_name_lower = relation_name.lower()
+            if prefers_publisher_release:
+                if "publisher" in relation_name_lower or "published" in relation_name_lower:
+                    score += 12
+                if any(
+                    token in relation_name_lower
+                    for token in ("distributed", "developer", "developed")
+                ):
+                    score -= 4
+            if relation_name and anchor_clues:
+                clue_score = max(
+                    self._score_probe_predicate(
+                        relation_name,
+                        answer_target_phrase,
+                        domain_hints,
+                        question_text,
+                        anchor_clue=anchor_clue,
+                    )
+                    for anchor_clue in anchor_clues
+                )
+                score += clue_score
+            ranked.append((score, index, candidate))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [candidate for _, _, candidate in ranked]
+
+    def _relation_root_from_name(self, relation_name: str) -> str:
+        cleaned = str(relation_name or "").strip()
+        if not cleaned:
+            return ""
+        parts = [part for part in cleaned.split(".") if part]
+        if len(parts) >= 2:
+            return ".".join(parts[:2])
+        return cleaned
+
+    def _generic_relation_role(self, raw_role: Any) -> str:
+        normalized = self._normalize_relation_role(raw_role)
+        if normalized in {"anchor", "anchor_a", "anchor_b"}:
+            return "anchor"
+        return normalized
+
+    def _extract_anchor_clues_from_question_inputs(
+        self,
+        question_inputs: Sequence[Mapping[str, Any]],
+    ) -> list[str]:
+        clues: list[str] = []
+        for item in question_inputs or ():
+            if not isinstance(item, Mapping):
+                continue
+            reason = str(item.get("reason") or "").strip().lower()
+            if not reason.startswith("explicit_entity:"):
+                continue
+            clue = reason.split(":", 1)[1].strip()
+            if clue and clue not in clues:
+                clues.append(clue)
+        return clues
+
+    def _question_prefers_publisher_release_relation(
+        self,
+        question_text: str,
+    ) -> bool:
+        lower_text = str(question_text or "").lower()
+        if "released where" in lower_text:
+            return False
+        if not re.search(r"\bhas\b.+\b(?:released|published)\b", lower_text):
+            return False
+        return any(
+            token in lower_text
+            for token in ("game", "games", "video game", "expansion", "expansions")
+        )
 
     def _normalize_relation_contract_item(
         self,
@@ -6294,6 +7116,9 @@ class PALAgentController(Agent):
             for kw in (
                 "video game",
                 "game version",
+                "publisher",
+                "published",
+                "released",
                 "games distributed",
                 "distribution system",
                 "platform",
@@ -6325,6 +7150,26 @@ class PALAgentController(Agent):
                         "to_role": "candidate_set",
                         "support": "curated_cvg_predicate",
                         "use_when": "retrieve game versions developed by a known developer",
+                    },
+                    {
+                        "relation": "cvg.cvg_publisher.games_published",
+                        "direction": "reverse",
+                        "from": "publisher",
+                        "to": "candidate_set",
+                        "from_role": "anchor",
+                        "to_role": "candidate_set",
+                        "support": "curated_cvg_predicate",
+                        "use_when": "retrieve games published or released by a known publisher",
+                    },
+                    {
+                        "relation": "cvg.cvg_publisher.game_versions_published",
+                        "direction": "reverse",
+                        "from": "publisher",
+                        "to": "candidate_set",
+                        "from_role": "anchor",
+                        "to_role": "candidate_set",
+                        "support": "curated_cvg_predicate",
+                        "use_when": "retrieve game versions published or released by a known publisher",
                     },
                     {
                         "relation": "cvg.game_version.regions",
@@ -7606,6 +8451,11 @@ class PALAgentController(Agent):
             query_plan.clear()
             query_plan.update(copy.deepcopy(dict(plan_to_sync)))
 
+        def _repair_feedback_for_attempt() -> list[str]:
+            if cumulative_plan_feedback:
+                return list(cumulative_plan_feedback)
+            return self._canonicalize_feedback_items(plausibility_feedback)
+
         if str(working_query_plan.get("query_shape") or "").strip().lower() == "multi_anchor_intersection":
             if self._has_asymmetric_anchor_clues(
                 task_question=task_question,
@@ -7636,9 +8486,7 @@ class PALAgentController(Agent):
                     grounding_card=working_grounding_card,
                     query_plan=working_query_plan,
                     generated_tool_name=generated_tool_name,
-                    extra_repair_feedback=(
-                        plausibility_feedback if is_repair else ()
-                    ),
+                    extra_repair_feedback=(_repair_feedback_for_attempt() if is_repair else ()),
                 )
             except Exception as exc:
                 if not is_repair:
@@ -7797,6 +8645,28 @@ class PALAgentController(Agent):
                     or None
                 ),
             )
+            constrained_verdict = self._apply_repair_feedback_constraints(
+                query_plan=working_query_plan,
+                verdict=verdict,
+                repair_feedback=(_repair_feedback_for_attempt() if is_repair else ()),
+            )
+            if (
+                constrained_verdict.verdict != verdict.verdict
+                or constrained_verdict.reasons != verdict.reasons
+            ):
+                self._emit_generated_tools_event(
+                    {
+                        "event": "pal_repair_feedback_constraint_triggered",
+                        "mode": "pal",
+                        "tool_name": generated_tool_name,
+                        "attempt": attempt,
+                        "prior_verdict": verdict.verdict,
+                        "prior_reasons": list(verdict.reasons),
+                        "constrained_verdict": constrained_verdict.verdict,
+                        "constraint_reasons": list(constrained_verdict.reasons),
+                    }
+                )
+            verdict = constrained_verdict
 
             self._emit_generated_tools_event(
                 {
@@ -7860,7 +8730,7 @@ class PALAgentController(Agent):
                     "verdict": verdict.verdict,
                     "verdict_reasons": verdict.reasons,
                     "repair_feedback_used": (
-                        list(plausibility_feedback) if is_repair else []
+                        _repair_feedback_for_attempt() if is_repair else []
                     ),
                     "accepted": verdict.is_accepted,
                 }
@@ -8394,65 +9264,21 @@ class PALAgentController(Agent):
         *,
         query_plan: Mapping[str, Any],
     ) -> Optional[dict[str, Any]]:
-        if str(query_plan.get("answer_mode") or "").strip().lower() != "count":
-            return None
-        if (
-            str(query_plan.get("query_shape") or "").strip().lower()
-            != "count_over_direct_relation"
-        ):
-            return None
-
         relation_paths = [
             dict(path)
             for path in (query_plan.get("relation_paths") or [])
             if isinstance(path, Mapping)
         ]
-        if len(relation_paths) < 2:
-            return None
-
         anchored_entities = [
             dict(item)
             for item in (query_plan.get("anchored_entities") or [])
             if isinstance(item, Mapping)
         ]
-        anchor_roles = {
-            self._normalize_relation_role(item.get("role"))
-            for item in anchored_entities
-            if self._normalize_relation_role(item.get("role"))
-            in {"anchor", "anchor_a", "anchor_b"}
-        }
-        variable_roles = {"candidate_set", "count_set", "shared_answer", "answer"}
-        constraint_roles = {
-            "constraint_value",
-            "type_set",
-            "shared_type",
-            "anchor_value",
-        }
-        has_non_anchor_downstream_path = False
-        has_candidate_constraint_filter = False
-        observed_variable_roles: set[str] = set()
-        for path in relation_paths:
-            from_role = self._normalize_relation_role(path.get("from_role"))
-            to_role = self._normalize_relation_role(path.get("to_role"))
-            roles = {from_role, to_role}
-            if roles & variable_roles and roles & constraint_roles:
-                has_candidate_constraint_filter = True
-            observed_variable_roles.update(role for role in roles if role in variable_roles)
-            touches_anchor = any(
-                self._path_touches_anchor_role(path, anchor_role=anchor_role)
-                for anchor_role in anchor_roles
-            )
-            if not touches_anchor and roles & variable_roles:
-                has_non_anchor_downstream_path = True
-        has_mixed_count_projection_roles = (
-            "candidate_set" in observed_variable_roles
-            and "count_set" in observed_variable_roles
-        )
-
-        if not (
-            has_candidate_constraint_filter
-            or has_non_anchor_downstream_path
-            or has_mixed_count_projection_roles
+        if not self._count_plan_needs_joined_set_boundary(
+            answer_mode=str(query_plan.get("answer_mode") or "").strip().lower(),
+            query_shape=str(query_plan.get("query_shape") or "").strip().lower(),
+            relation_paths=relation_paths,
+            anchored_entities=anchored_entities,
         ):
             return None
 
@@ -8595,7 +9421,9 @@ class PALAgentController(Agent):
                     entity_clue=clue,
                 )
             elif anchor_role in {"type_set", "shared_type", "anchor_value"} or clue.startswith("type_constraint"):
-                alias_candidates = self._build_type_constraint_alias_candidates(surface)
+                alias_candidates = self._build_grounded_type_constraint_alias_candidates(
+                    surface
+                )
             else:
                 alias_candidates = self._build_entity_alias_candidates(
                     surface,
@@ -8614,22 +9442,6 @@ class PALAgentController(Agent):
                     anchor_position=anchor_position,
                     timeout_s=1.5,
                 )
-                if (
-                    probe_target_inferred
-                    and int(candidate_path_count or 0) <= 0
-                    and anchor_position in {"subject", "object"}
-                ):
-                    fallback_anchor_position = (
-                        "object" if anchor_position == "subject" else "subject"
-                    )
-                    fallback_path_count = self._probe_anchor_path_count(
-                        candidate_alias,
-                        relation_probed,
-                        anchor_position=fallback_anchor_position,
-                        timeout_s=1.5,
-                )
-                    if int(fallback_path_count or 0) > int(candidate_path_count or 0):
-                        return fallback_path_count
                 return candidate_path_count
 
             for candidate_alias in alias_candidates:
@@ -8968,6 +9780,162 @@ class PALAgentController(Agent):
         new_feedback: Sequence[str],
     ) -> list[str]:
         return self._canonicalize_feedback_items([*existing_feedback, *new_feedback])
+
+    def _extract_feedback_prefixed_values(
+        self,
+        feedback_items: Sequence[str],
+        *,
+        prefix: str,
+    ) -> list[str]:
+        values: list[str] = []
+        for item in feedback_items:
+            normalized_item = str(item or "").strip()
+            if not normalized_item.startswith(prefix):
+                continue
+            remainder = normalized_item[len(prefix) :]
+            for chunk in remainder.split(","):
+                value = str(chunk or "").strip()
+                if value:
+                    values.append(value)
+        return self._canonicalize_feedback_items(values)
+
+    def _collect_repair_feedback_constraint_reasons(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+        repair_feedback: Sequence[str],
+    ) -> list[str]:
+        answer_mode = str(query_plan.get("answer_mode") or "").strip().lower()
+        if answer_mode != "count":
+            return []
+        normalized_feedback = self._canonicalize_feedback_items(repair_feedback)
+        if not any(
+            item.startswith("repair_hint:preserve_count_target_family_after_pivot")
+            for item in normalized_feedback
+        ):
+            return []
+        preserved_relations = self._extract_feedback_prefixed_values(
+            normalized_feedback,
+            prefix="relation_still_available_in_other_roles:",
+        )
+        if not preserved_relations:
+            return []
+        plan_relations = set(self._relation_names_from_plan(query_plan))
+        if any(relation in plan_relations for relation in preserved_relations):
+            return []
+        reasons = [
+            "count_repair_dropped_preserved_relation_family:"
+            + ", ".join(preserved_relations[:3]),
+            "repair:preserve_live_count_target_family_after_pivot",
+        ]
+        dynamic_direct_reasons = (
+            self._collect_dynamic_direct_count_collapse_reasons(
+                query_plan=query_plan,
+                repair_feedback=normalized_feedback,
+            )
+        )
+        if dynamic_direct_reasons:
+            reasons = self._merge_feedback_items(reasons, dynamic_direct_reasons)
+        return reasons
+
+    def _count_answer_target_requires_explicit_semantics(
+        self,
+        answer_target_phrase: str,
+    ) -> bool:
+        tokens = [
+            self._singularize_surface_token(token)
+            for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
+            if token.strip()
+        ]
+        if not tokens:
+            return False
+        generic_tokens = {
+            "amount",
+            "number",
+            "total",
+            "item",
+            "entity",
+            "thing",
+            "result",
+            "answer",
+            "one",
+        }
+        informative = [token for token in tokens if token not in generic_tokens]
+        if not informative:
+            return False
+        return len(informative) > 1 or informative[0] not in {
+            "release",
+            "track",
+            "recording",
+            "album",
+            "song",
+            "artist",
+        }
+
+    def _collect_dynamic_direct_count_collapse_reasons(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+        repair_feedback: Sequence[str],
+    ) -> list[str]:
+        if str(query_plan.get("query_shape") or "").strip().lower() != "count_over_direct_relation":
+            return []
+        answer_target = str(query_plan.get("answer_target_phrase") or "").strip()
+        if not self._count_answer_target_requires_explicit_semantics(answer_target):
+            return []
+        relation_paths = [
+            relation_path
+            for relation_path in (query_plan.get("relation_paths") or [])
+            if isinstance(relation_path, Mapping)
+        ]
+        if not relation_paths:
+            return []
+        grounding_sources = {
+            str(relation_path.get("grounding_source") or "").strip().lower()
+            for relation_path in relation_paths
+        }
+        if not grounding_sources or not grounding_sources <= {"dynamic_probe", "exploratory"}:
+            return []
+        if not any(
+            item.startswith("dead_relation_suppressed:")
+            for item in repair_feedback
+        ):
+            return []
+        if not any(
+            item.startswith("anchor_path_empty:") or item == "count_set_path_empty"
+            for item in repair_feedback
+        ):
+            return []
+        return [
+            "count_repair_collapsed_to_dynamic_only_after_grounded_count_failed",
+            "repair:do_not_trust_dynamic_only_direct_count_after_grounded_count_failure",
+        ]
+
+    def _apply_repair_feedback_constraints(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+        verdict: PlausibilityVerdict,
+        repair_feedback: Sequence[str],
+    ) -> PlausibilityVerdict:
+        constraint_reasons = self._collect_repair_feedback_constraint_reasons(
+            query_plan=query_plan,
+            repair_feedback=repair_feedback,
+        )
+        if not constraint_reasons:
+            constraint_reasons = self._collect_dynamic_direct_count_collapse_reasons(
+                query_plan=query_plan,
+                repair_feedback=self._canonicalize_feedback_items(repair_feedback),
+            )
+        if not constraint_reasons:
+            return verdict
+        merged_reasons = self._merge_feedback_items(verdict.reasons, constraint_reasons)
+        if verdict.is_accepted:
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=merged_reasons,
+            )
+        return PlausibilityVerdict(verdict=verdict.verdict, reasons=merged_reasons)
 
     def _feedback_override_key(self, item: str) -> tuple[str, str] | None:
         normalized_item = str(item or "").strip()
@@ -10834,6 +11802,36 @@ class PALAgentController(Agent):
             None,
         )
         if anchor_path is None:
+            hinted_anchor_relations: list[str] = []
+            for constraint in (query_plan.get("join_structure") or {}).get(
+                "anchor_constraints"
+            ) or []:
+                if not isinstance(constraint, Mapping):
+                    continue
+                if (
+                    self._normalize_relation_role(constraint.get("anchor_role"))
+                    != anchor_role
+                ):
+                    continue
+                hinted_anchor_relations.extend(
+                    self._extract_relation_hints_from_notes(
+                        str(constraint.get("notes") or "")
+                    )
+                )
+            anchor_path = next(
+                (
+                    path
+                    for path in relation_paths
+                    if str(path.get("relation") or "").strip() in hinted_anchor_relations
+                    and {
+                        self._normalize_relation_role(path.get("from_role")),
+                        self._normalize_relation_role(path.get("to_role")),
+                    }
+                    & {"candidate_set", "shared_answer", "count_set"}
+                ),
+                None,
+            )
+        if anchor_path is None:
             return None
 
         preferred_relation_root = str(anchor_path.get("relation") or "").split(".", 1)[0]
@@ -10939,12 +11937,20 @@ class PALAgentController(Agent):
                 {
                     "anchor_role": anchor_role,
                     "constrains_variable": shared_variable,
-                    "notes": "The primary anchor constrains the shared counted entity set.",
+                    "notes": (
+                        "The primary anchor constrains the shared counted entity set "
+                        f"via {str(rewritten_anchor_path.get('relation') or '').strip()}."
+                    ),
                 },
                 {
                     "anchor_role": filter_role,
                     "constrains_variable": shared_variable,
-                    "notes": "The answer target phrase is treated as an explicit answer-class or answer-constraint filter on the same counted set.",
+                    "notes": (
+                        "The answer target phrase is treated as an explicit "
+                        f"answer-class or answer-constraint filter on the same counted "
+                        f"set via {str(rewritten_class_path.get('relation') or '').strip()} "
+                        f"with value '{class_surface}'."
+                    ),
                 },
             ],
         }
@@ -13787,7 +14793,18 @@ class PALAgentController(Agent):
             question_inputs=interpreted_inputs,
             grounded_relation_candidates=grounded_relation_candidates,
         )
-        family_success_patterns = self._format_family_success_archetypes(
+        family_success_patterns = []
+        if self._tool_evolution_coarse_success_hints_enabled():
+            family_success_patterns = self._format_family_success_archetypes(
+                family_name=query_shape,
+            )
+        active_family_policy = self._format_active_family_policy_guidance(
+            family_name=query_shape,
+        )
+        tool_evolution_branch_patterns = self._format_tool_evolution_branch_patterns(
+            family_name=query_shape,
+        )
+        tool_evolution_anchor_patterns = self._format_tool_evolution_anchor_patterns(
             family_name=query_shape,
         )
         lines = [
@@ -13834,13 +14851,18 @@ class PALAgentController(Agent):
                 kind = self._normalize_question_input_kind(item.get("kind"))
                 role_hint = self._normalize_question_input_role(item.get("role_hint"))
                 if kind in {"class_phrase", "type_constraint", "answer_target"}:
-                    alias_candidates = self._build_type_constraint_alias_candidates(surface)
+                    alias_entity_clue = "type_constraint"
+                    alias_candidates = self._build_grounded_type_constraint_alias_candidates(
+                        surface
+                    )
                 elif kind == "attribute_value":
+                    alias_entity_clue = "attribute_value.dynamic"
                     alias_candidates = self._build_entity_alias_candidates(
                         surface,
                         entity_clue="attribute_value",
                     )
                 else:
+                    alias_entity_clue = "surface_constraint"
                     alias_candidates = self._build_entity_alias_candidates(
                         surface,
                         entity_clue="surface_constraint",
@@ -13904,7 +14926,7 @@ class PALAgentController(Agent):
                 answer_target_phrase=answer_target_phrase,
                 grounded_relation_candidates=grounded_relation_candidates,
             ):
-                type_alias_candidates = self._build_type_constraint_alias_candidates(
+                type_alias_candidates = self._build_grounded_type_constraint_alias_candidates(
                     answer_target_phrase
                 )
                 if type_alias_candidates:
@@ -13926,6 +14948,18 @@ class PALAgentController(Agent):
         if family_success_patterns:
             lines.append("- family_success_patterns:")
             for pattern in family_success_patterns:
+                lines.append(f"  - {pattern}")
+        if active_family_policy:
+            lines.append("- active_family_policy:")
+            for policy_line in active_family_policy:
+                lines.append(f"  - {policy_line}")
+        if tool_evolution_branch_patterns:
+            lines.append("- tool_evolution_branch_patterns:")
+            for pattern in tool_evolution_branch_patterns:
+                lines.append(f"  - {pattern}")
+        if tool_evolution_anchor_patterns:
+            lines.append("- tool_evolution_anchor_patterns:")
+            for pattern in tool_evolution_anchor_patterns:
                 lines.append(f"  - {pattern}")
         lines.extend(
             [
@@ -13992,12 +15026,7 @@ class PALAgentController(Agent):
                 relation_candidates=grounded_relation_candidates,
             ):
                 is_type_target = False
-        is_count = (
-            lower_text.startswith("how many")
-            or "number of" in lower_text
-            or "amount of" in lower_text
-            or lower_text.startswith("how much")
-        )
+        is_count = self._is_count_question_text(lower_text)
         if any(
             phrase in lower_text
             for phrase in (
@@ -14159,6 +15188,8 @@ class PALAgentController(Agent):
             relation_candidates=curated,
             question_text=question_text,
             answer_target_phrase=answer_target_phrase,
+            question_inputs=interpreted_inputs,
+            query_shape=query_shape,
         )
         if curated:
             self._emit_generated_tools_event(
@@ -14240,6 +15271,8 @@ class PALAgentController(Agent):
             relation_candidates=dynamic,
             question_text=question_text,
             answer_target_phrase=answer_target_phrase,
+            question_inputs=interpreted_inputs,
+            query_shape=query_shape,
         )
 
     def _probe_answer_class_dynamic_candidates(
@@ -14539,10 +15572,57 @@ class PALAgentController(Agent):
             0          — path is empty
             -1         — probe failed / timed out
         """
+        count, _ = self._probe_anchor_path_count_with_position_fallback(
+            anchor_name,
+            relation,
+            anchor_position=anchor_position,
+            timeout_s=timeout_s,
+        )
+        return count
+
+    def _probe_anchor_path_count_with_position_fallback(
+        self,
+        anchor_name: str,
+        relation: str,
+        *,
+        anchor_position: str = "subject",
+        timeout_s: float = 2.5,
+    ) -> tuple[int, str]:
         if not _SPARQL_PROBE_AVAILABLE or not anchor_name.strip() or not relation.strip():
-            return -1
+            return -1, str(anchor_position or "subject").strip().lower() or "subject"
         normalized_anchor_position = str(anchor_position or "subject").strip().lower()
-        if normalized_anchor_position == "object":
+        if normalized_anchor_position not in {"subject", "object"}:
+            normalized_anchor_position = "subject"
+        count = self._probe_anchor_path_count_once(
+            anchor_name,
+            relation,
+            anchor_position=normalized_anchor_position,
+            timeout_s=timeout_s,
+        )
+        if count > 0:
+            return count, normalized_anchor_position
+        fallback_anchor_position = (
+            "object" if normalized_anchor_position == "subject" else "subject"
+        )
+        fallback_count = self._probe_anchor_path_count_once(
+            anchor_name,
+            relation,
+            anchor_position=fallback_anchor_position,
+            timeout_s=timeout_s,
+        )
+        if fallback_count > count:
+            return fallback_count, fallback_anchor_position
+        return count, normalized_anchor_position
+
+    def _probe_anchor_path_count_once(
+        self,
+        anchor_name: str,
+        relation: str,
+        *,
+        anchor_position: str,
+        timeout_s: float,
+    ) -> int:
+        if anchor_position == "object":
             triple_pattern = f"  ?answer fb:{relation} ?anchor .\n"
         else:
             triple_pattern = f"  ?anchor fb:{relation} ?answer .\n"
@@ -14592,17 +15672,64 @@ class PALAgentController(Agent):
         anchor_position: str = "subject",
         timeout_s: float = 2.5,
     ) -> list[str]:
+        entity_ids, _ = self._probe_anchor_entity_ids_with_position_fallback(
+            anchor_name=anchor_name,
+            relation=relation,
+            anchor_position=anchor_position,
+            timeout_s=timeout_s,
+        )
+        return entity_ids
+
+    def _probe_anchor_entity_ids_with_position_fallback(
+        self,
+        *,
+        anchor_name: str,
+        relation: str | None = None,
+        anchor_position: str = "subject",
+        timeout_s: float = 2.5,
+    ) -> tuple[list[str], str]:
         if not _SPARQL_PROBE_AVAILABLE or not anchor_name.strip():
-            return []
+            return [], str(anchor_position or "subject").strip().lower() or "subject"
+        normalized_anchor_position = str(anchor_position or "subject").strip().lower()
+        if normalized_anchor_position not in {"subject", "object"}:
+            normalized_anchor_position = "subject"
+        entity_ids = self._probe_anchor_entity_ids_once(
+            anchor_name=anchor_name,
+            relation=relation,
+            anchor_position=normalized_anchor_position,
+            timeout_s=timeout_s,
+        )
+        if entity_ids or not relation:
+            return entity_ids, normalized_anchor_position
+        fallback_anchor_position = (
+            "object" if normalized_anchor_position == "subject" else "subject"
+        )
+        fallback_entity_ids = self._probe_anchor_entity_ids_once(
+            anchor_name=anchor_name,
+            relation=relation,
+            anchor_position=fallback_anchor_position,
+            timeout_s=timeout_s,
+        )
+        if fallback_entity_ids:
+            return fallback_entity_ids, fallback_anchor_position
+        return entity_ids, normalized_anchor_position
+
+    def _probe_anchor_entity_ids_once(
+        self,
+        *,
+        anchor_name: str,
+        relation: str | None = None,
+        anchor_position: str,
+        timeout_s: float,
+    ) -> list[str]:
         anchor_match = self._build_probe_anchor_match_block(
             anchor_var="?anchor",
             label_var="?anchor_label",
             anchor_name=anchor_name,
         )
         triple_pattern = ""
-        normalized_anchor_position = str(anchor_position or "subject").strip().lower()
         if relation:
-            if normalized_anchor_position == "object":
+            if anchor_position == "object":
                 triple_pattern = f"  ?answer fb:{relation} ?anchor .\n"
             else:
                 triple_pattern = f"  ?anchor fb:{relation} ?answer .\n"
@@ -14953,18 +16080,22 @@ class PALAgentController(Agent):
                         used_path_indexes=used_path_indexes,
                     )
                     if relation:
-                        path_count = self._probe_anchor_path_count(
-                            probe_binding,
-                            relation,
-                            anchor_position=anchor_position or "subject",
-                            timeout_s=timeout_s,
-                        )
-                        if path_count and path_count > 0:
-                            resolved_ids = self._probe_anchor_entity_ids(
-                                anchor_name=probe_binding,
-                                relation=relation,
+                        path_count, anchor_position = (
+                            self._probe_anchor_path_count_with_position_fallback(
+                                probe_binding,
+                                relation,
                                 anchor_position=anchor_position or "subject",
                                 timeout_s=timeout_s,
+                            )
+                        )
+                        if path_count and path_count > 0:
+                            resolved_ids, anchor_position = (
+                                self._probe_anchor_entity_ids_with_position_fallback(
+                                    anchor_name=probe_binding,
+                                    relation=relation,
+                                    anchor_position=anchor_position or "subject",
+                                    timeout_s=timeout_s,
+                                )
                             )
                             if len(resolved_ids) == 1:
                                 resolved_entity_id = resolved_ids[0]
@@ -15337,6 +16468,15 @@ class PALAgentController(Agent):
         segments = [segment for segment in str(short_name or "").split(".") if segment]
         relation_tail = segments[-1] if segments else ""
         source_segment = segments[-2] if len(segments) >= 2 else ""
+        with_this_match = re.match(
+            r"^([a-z0-9]+)_with_this_[a-z0-9_]+$",
+            relation_tail,
+        )
+        if with_this_match is not None:
+            return (
+                self._semantic_label_from_relation_phrase(source_segment),
+                self._semantic_label_from_relation_phrase(with_this_match.group(1)),
+            )
         if "_of_" in relation_tail:
             left, right = relation_tail.split("_of_", 1)
             return (
@@ -15556,6 +16696,11 @@ class PALAgentController(Agent):
                 score += 30
             if any(token in name_lower for token in ("predecess", "successor", "succeed")):
                 score += 20
+        if self._question_prefers_publisher_release_relation(question_lower):
+            if "publisher" in name_lower or "published" in name_lower:
+                score += 90
+            if any(token in name_lower for token in ("distributed", "developer", "developed")):
+                score -= 25
         if " has " in question_lower or re.search(
             r"\b(?:which|what|who)\b.+\bhas\b", question_lower
         ):
@@ -15718,6 +16863,44 @@ class PALAgentController(Agent):
                 candidates.append(cleaned_candidate)
         return candidates
 
+    def _build_grounded_type_constraint_alias_candidates(
+        self,
+        phrase: str,
+        *,
+        timeout_s: float = 1.0,
+    ) -> list[str]:
+        candidates = self._build_type_constraint_alias_candidates(phrase)
+        if not candidates:
+            return []
+        for candidate in candidates:
+            if re.fullmatch(r"[mg]\.[A-Za-z0-9_]+", str(candidate or "").strip()):
+                return candidates
+        for candidate in candidates:
+            cleaned_candidate = str(candidate or "").strip()
+            if not cleaned_candidate:
+                continue
+            entity_count = self._probe_entity_name_count(
+                cleaned_candidate,
+                timeout_s=timeout_s,
+            )
+            if entity_count != 1:
+                continue
+            resolved_ids = self._probe_anchor_entity_ids(
+                anchor_name=cleaned_candidate,
+                timeout_s=timeout_s,
+            )
+            if len(resolved_ids) != 1:
+                continue
+            resolved_id = resolved_ids[0]
+            grounded_candidates = [resolved_id]
+            grounded_candidates.extend(
+                alias
+                for alias in candidates
+                if str(alias or "").strip() and str(alias or "").strip() != resolved_id
+            )
+            return grounded_candidates
+        return candidates
+
     def _singularize_phrase(self, phrase: str) -> str:
         tokens = [token for token in str(phrase or "").split() if token]
         if not tokens:
@@ -15757,6 +16940,15 @@ class PALAgentController(Agent):
 
     def _singularize_surface_token(self, token: str) -> str:
         lower_token = token.lower()
+        irregular_singulars = {
+            "people": "person",
+            "men": "man",
+            "women": "woman",
+            "children": "child",
+        }
+        if lower_token in irregular_singulars:
+            singular = irregular_singulars[lower_token]
+            return singular.capitalize() if token[:1].isupper() else singular
         if lower_token.endswith("ies") and len(token) > 3:
             return token[:-3] + "y"
         if (
@@ -16389,6 +17581,36 @@ class PALAgentController(Agent):
             and re.search(r"Solves task:\s*yes\b", text, flags=re.IGNORECASE)
         )
 
+    def _emit_macro_solver_review(
+        self,
+        *,
+        macro_result_content: str,
+        solver_response: Optional[str],
+    ) -> None:
+        response_text = str(solver_response or "").strip()
+        macro_pointer = self._extract_macro_pointer(macro_result_content)
+        accepted_final = bool(
+            macro_pointer
+            and re.fullmatch(
+                rf"Final Answer:\s*{re.escape(macro_pointer)}\s*",
+                response_text,
+                flags=re.IGNORECASE,
+            )
+        )
+        self._emit_generated_tools_event(
+            {
+                "event": "pal_macro_solver_review",
+                "mode": "pal",
+                "run_id": self._get_run_id(),
+                "trusted_final": self._macro_result_is_trusted_final(
+                    macro_result_content
+                ),
+                "macro_pointer": macro_pointer,
+                "accepted_final": accepted_final,
+                "solver_response": self._summarize_text(response_text, max_len=180),
+            }
+        )
+
     def _build_tool_result_semantics(
         self,
         *,
@@ -16425,11 +17647,284 @@ class PALAgentController(Agent):
             "tool_result_confidence": materialization.confidence,
         }
 
+    @staticmethod
+    def _normalize_plan_role_label(
+        raw_role: str,
+        *,
+        anchored_role_map: Mapping[str, str],
+    ) -> str:
+        cleaned = str(raw_role or "").strip()
+        if not cleaned:
+            return ""
+        if cleaned in anchored_role_map:
+            return anchored_role_map[cleaned]
+        normalized = cleaned.replace("_", " ").strip()
+        if normalized in {"count set", "candidate set", "shared answer", "shared type"}:
+            return normalized
+        if normalized == "constraint value":
+            return "constraint"
+        return normalized
+
+    def _build_tool_relation_summary(
+        self,
+        *,
+        query_plan: Optional[Mapping[str, Any]],
+    ) -> list[str]:
+        if not query_plan:
+            return []
+        anchored_role_map = {
+            str(item.get("role") or "").strip(): str(item.get("surface") or "").strip()
+            for item in (query_plan.get("anchored_entities") or [])
+            if isinstance(item, Mapping)
+            and str(item.get("role") or "").strip()
+            and str(item.get("surface") or "").strip()
+        }
+        summaries: list[str] = []
+        seen: set[str] = set()
+        for raw_path in (query_plan.get("relation_paths") or []):
+            if not isinstance(raw_path, Mapping):
+                continue
+            relation = str(raw_path.get("relation") or "").strip()
+            if not relation:
+                continue
+            from_label = self._normalize_plan_role_label(
+                str(raw_path.get("from_role") or raw_path.get("from") or "").strip(),
+                anchored_role_map=anchored_role_map,
+            )
+            to_label = self._normalize_plan_role_label(
+                str(raw_path.get("to_role") or raw_path.get("to") or "").strip(),
+                anchored_role_map=anchored_role_map,
+            )
+            grounding_source = str(raw_path.get("grounding_source") or "").strip()
+            summary = f"{from_label or 'source'} -> {to_label or 'target'} via {relation}"
+            if grounding_source and grounding_source != "curated":
+                summary += f" [{grounding_source}]"
+            if summary in seen:
+                continue
+            seen.add(summary)
+            summaries.append(summary)
+            if len(summaries) >= 3:
+                break
+
+        ordering = query_plan.get("ordering_attribute") or {}
+        ordering_relation = str(ordering.get("relation") or "").strip()
+        if ordering_relation and len(summaries) < 4:
+            order_source = self._normalize_plan_role_label(
+                str(ordering.get("source_variable") or "").strip(),
+                anchored_role_map=anchored_role_map,
+            ) or "candidate set"
+            direction = str(
+                query_plan.get("ordering_direction") or ordering.get("direction") or ""
+            ).strip()
+            summary = f"order {order_source} by {ordering_relation}"
+            if direction:
+                summary += f" [{direction}]"
+            if summary not in seen:
+                summaries.append(summary)
+        return summaries[:4]
+
+    def _build_tool_semantic_description(
+        self,
+        *,
+        query_plan: Optional[Mapping[str, Any]],
+        materialization: BenchmarkMaterialization,
+    ) -> str:
+        base_description = str(materialization.semantic_description or "").strip()
+        if not query_plan:
+            return base_description
+        answer_target = str(query_plan.get("answer_target_phrase") or "").strip()
+        artifact_type = str(
+            (materialization.diagnostics or {}).get("artifact_type") or ""
+        ).strip()
+        if not answer_target:
+            return base_description
+        if artifact_type == "count_scalar":
+            return f"count of {answer_target} returned by the executed PAL query"
+        if artifact_type == "entity_id":
+            return f"single {answer_target} returned by the executed PAL query"
+        if artifact_type == "entity_set":
+            return f"set of {answer_target} returned by the executed PAL query"
+        if artifact_type == "boolean":
+            return f"boolean result for {answer_target} returned by the executed PAL query"
+        if artifact_type in {"scalar_literal", "text_literal"}:
+            return f"value for {answer_target} returned by the executed PAL query"
+        return base_description
+
+    def _build_tool_selection_basis(
+        self,
+        *,
+        query_plan: Optional[Mapping[str, Any]],
+        materialization: BenchmarkMaterialization,
+    ) -> str:
+        if not query_plan:
+            return ""
+        answer_target = str(query_plan.get("answer_target_phrase") or "").strip()
+        answer_mode = str(query_plan.get("answer_mode") or "").strip().lower()
+        query_shape = str(query_plan.get("query_shape") or "").strip().lower()
+        artifact_type = str(
+            (materialization.diagnostics or {}).get("artifact_type") or ""
+        ).strip()
+        if answer_mode == "count" or artifact_type == "count_scalar":
+            if answer_target:
+                return (
+                    f"Counts distinct {answer_target} that satisfy the executed relation constraints."
+                )
+            return "Counts distinct bindings that satisfy the executed relation constraints."
+        if query_shape == "superlative_chain":
+            if answer_target:
+                return (
+                    f"Selects the single {answer_target} that wins the executed ordering rule."
+                )
+            return "Selects the single entity that wins the executed ordering rule."
+        unique_value_count = (materialization.diagnostics or {}).get("unique_value_count")
+        if artifact_type == "entity_set":
+            if answer_target:
+                return f"Returns the distinct {answer_target} bindings produced by the executed query."
+            return "Returns the distinct bindings produced by the executed query."
+        if artifact_type == "entity_id" or unique_value_count == 1:
+            if answer_target:
+                return f"Returns the single {answer_target} binding produced by the executed query."
+            return "Returns the single binding produced by the executed query."
+        return ""
+
+    def _build_tool_completeness_hint(
+        self,
+        *,
+        query_plan: Optional[Mapping[str, Any]],
+        materialization: BenchmarkMaterialization,
+    ) -> str:
+        if not query_plan:
+            return ""
+        answer_mode = str(query_plan.get("answer_mode") or "").strip().lower()
+        query_shape = str(query_plan.get("query_shape") or "").strip().lower()
+        artifact_type = str(
+            (materialization.diagnostics or {}).get("artifact_type") or ""
+        ).strip()
+        unique_value_count = (materialization.diagnostics or {}).get("unique_value_count")
+        if query_shape == "superlative_chain":
+            return "Selected after applying the executed ordering rule to the grounded candidate set."
+        if answer_mode == "count" or artifact_type == "count_scalar":
+            return "Exhaustive over the exact counted bindings matched by the executed relation constraints."
+        if artifact_type == "entity_set":
+            return "Complete set of distinct bindings returned by the executed query."
+        if artifact_type == "entity_id" or unique_value_count == 1:
+            return "Single unique binding returned by the executed query."
+        return ""
+
+    def _build_tool_repair_caveat(
+        self,
+        *,
+        query_plan: Optional[Mapping[str, Any]],
+    ) -> str:
+        if not query_plan:
+            return ""
+        relation_paths = [
+            item
+            for item in (query_plan.get("relation_paths") or [])
+            if isinstance(item, Mapping)
+        ]
+        uses_dynamic = any(
+            str(item.get("grounding_source") or "").strip() == "dynamic_probe"
+            for item in relation_paths
+        )
+        plan_text = " ".join(
+            str(item).strip()
+            for item in (query_plan.get("plan_rationale") or [])
+            if str(item).strip()
+        ).lower()
+        has_repair_signal = any(
+            token in plan_text
+            for token in (
+                "previously",
+                "failed",
+                "dead",
+                "avoid reusing",
+                "repair",
+                "dynamic_probe",
+            )
+        )
+        if not has_repair_signal:
+            return ""
+        if uses_dynamic:
+            return (
+                "This answer depends on a repaired alternate relation; verify that the alternate relation still matches the question semantics."
+            )
+        return (
+            "This answer follows a repaired query path after an earlier grounded path failed; verify that the final path still matches the question semantics."
+        )
+
+    def _build_tool_proof_hint(
+        self,
+        *,
+        query_plan: Optional[Mapping[str, Any]],
+        materialization: BenchmarkMaterialization,
+    ) -> str:
+        if not query_plan:
+            return ""
+        if not (
+            materialization.solves_task and materialization.trusted_for_materialization
+        ):
+            return ""
+
+        query_shape = str(query_plan.get("query_shape") or "").strip().lower()
+        answer_mode = str(query_plan.get("answer_mode") or "").strip().lower()
+        answer_target = str(query_plan.get("answer_target_phrase") or "").strip()
+        selected_query_variable = str(
+            (materialization.diagnostics or {}).get("selected_query_variable") or ""
+        ).strip()
+        unique_value_count = (materialization.diagnostics or {}).get(
+            "unique_value_count"
+        )
+        relation_summary = self._build_tool_relation_summary(query_plan=query_plan)
+
+        if query_shape == "superlative_chain":
+            ordering = query_plan.get("ordering_attribute") or {}
+            relation = str(ordering.get("relation") or "").strip()
+            direction = str(
+                query_plan.get("ordering_direction") or ordering.get("direction") or ""
+            ).strip().lower()
+            direction_text = (
+                "maximum" if direction == "max" else
+                "minimum" if direction == "min" else
+                "requested"
+            )
+            target_text = answer_target or "answer entity"
+            if relation:
+                return (
+                    f"PAL query already selected the single {target_text} with the "
+                    f"{direction_text} value of {relation} from the grounded candidate set."
+                )
+            return (
+                f"PAL query already applied the requested superlative and selected the "
+                f"single final {target_text} from the grounded candidate set."
+            )
+
+        if answer_mode == "count" or query_shape.startswith("count_"):
+            if relation_summary:
+                return (
+                    "PAL query already computed the final count from the exact relation constraints listed above."
+                )
+            return "PAL query already computed the final count over the grounded answer set."
+
+        if (
+            isinstance(unique_value_count, int)
+            and unique_value_count == 1
+            and selected_query_variable in {"candidate_set", "shared_answer", "answer"}
+        ):
+            target_text = answer_target or "answer entity"
+            return (
+                f"PAL query already narrowed the grounded {selected_query_variable} "
+                f"to a single final {target_text}."
+            )
+
+        return ""
+
     def _build_tool_advisory_text(
         self,
         *,
         materialization: BenchmarkMaterialization,
         trust_contract: TrustContractEvaluation,
+        query_plan: Optional[Mapping[str, Any]] = None,
     ) -> str:
         semantics = self._build_tool_result_semantics(
             materialization=materialization,
@@ -16438,14 +17933,27 @@ class PALAgentController(Agent):
         lines = [
             f"PAL tool status: {semantics.get('tool_result_status')}.",
         ]
-        semantic_description = str(
-            semantics.get("tool_result_semantic_description") or ""
-        ).strip()
+        semantic_description = self._build_tool_semantic_description(
+            query_plan=query_plan,
+            materialization=materialization,
+        )
         if semantic_description:
             lines.append(f"Semantic description: {semantic_description}.")
+        selection_basis = self._build_tool_selection_basis(
+            query_plan=query_plan,
+            materialization=materialization,
+        )
+        if selection_basis:
+            lines.append(f"Selection basis: {selection_basis}.")
+        relation_summary = self._build_tool_relation_summary(query_plan=query_plan)
+        if relation_summary:
+            lines.append("Relation summary: " + " | ".join(relation_summary) + ".")
         failure_reason = str(semantics.get("tool_result_failure_reason") or "").strip()
         if failure_reason:
             lines.append(f"Failure reason: {failure_reason}.")
+        repair_caveat = self._build_tool_repair_caveat(query_plan=query_plan)
+        if repair_caveat:
+            lines.append(repair_caveat)
         if semantics.get("tool_result_useful_intermediate"):
             lines.append(
                 "This is bounded advisory context only. Do not treat it as a final answer."
@@ -16455,6 +17963,67 @@ class PALAgentController(Agent):
                 "Ignore the PAL tool output if it does not help, and continue solving manually."
             )
         return " ".join(line.strip() for line in lines if line.strip())
+
+    def _build_repair_loop_failure_advisory(
+        self,
+        *,
+        repair_failure_reason: str,
+        repair_loop_log: Mapping[str, Any],
+    ) -> str:
+        last_reasons = [
+            str(item).strip()
+            for item in (repair_loop_log.get("last_reasons") or [])
+            if str(item).strip()
+        ][:3]
+        lines = [
+            "PAL tool generation did not produce a trustworthy tool result.",
+            f"Failure reason: {repair_failure_reason}.",
+        ]
+        if last_reasons:
+            lines.append("Recent PAL repair hints: " + "; ".join(last_reasons) + ".")
+        lines.append(
+            "Continue manually from the original task. Use the PAL hints only if they help."
+        )
+        return " ".join(line.strip() for line in lines if line.strip())
+
+    def _infer_answer_cardinality_hint(self, task_question: str) -> str:
+        question = str(task_question or "").strip().lower()
+        if not question:
+            return ""
+        if any(
+            token in question
+            for token in (
+                "how many",
+                "is there",
+                "are there",
+                "does ",
+                "do ",
+                "was ",
+                "is ",
+                "what was ",
+                "what is ",
+                "which was ",
+                "which is ",
+                "who was ",
+                "who is ",
+                "where is ",
+                "when was ",
+                "when is ",
+            )
+        ):
+            return "single"
+        if any(
+            token in question
+            for token in (
+                "what are ",
+                "which are ",
+                "who are ",
+                "list ",
+                "name all",
+            )
+        ):
+            return "multi"
+        return "single"
 
     def _manual_fallback_active_for_current_run(self) -> bool:
         return self._get_run_id() in self._manual_fallback_active_runs
@@ -16478,20 +18047,17 @@ class PALAgentController(Agent):
                     ),
                 )
 
-    def _get_manual_fallback_agent(self) -> SelfEvolvingController:
+    def _get_manual_fallback_agent(self) -> Agent:
         if self._manual_fallback_agent is None:
-            output_dir = Path(
-                os.environ.get("LIFELONG_OUTPUT_DIR", "outputs/pal_runtime")
-            )
-            tool_registry_path = str(output_dir / "tool_library")
-            environment_label = str(
-                getattr(getattr(self, "_current_session", None), "task_name", "knowledge_graph")
-            )
-            self._manual_fallback_agent = SelfEvolvingController(
+            solver_cfg = dict(self._inference_config_dict)
+            for key in ("tools", "tool_choice", "functions", "function_call"):
+                solver_cfg.pop(key, None)
+            solver_cfg["tool_choice"] = "none"
+            self._manual_fallback_agent = LanguageModelAgent(
                 language_model=self._language_model,
-                tool_registry_path=tool_registry_path,
-                inference_config_dict=dict(self._inference_config_dict),
-                environment_label=environment_label,
+                system_prompt=MANUAL_FALLBACK_SOLVER_SYSTEM_PROMPT,
+                inference_config_dict=solver_cfg,
+                agent_name="pal_manual_solver",
             )
         return self._manual_fallback_agent
 

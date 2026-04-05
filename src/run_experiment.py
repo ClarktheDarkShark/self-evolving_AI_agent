@@ -177,14 +177,38 @@ body{font-family:'Segoe UI',system-ui,sans-serif;display:flex;height:100vh;overf
 .act-op{color:#c88af0}
 
 /* Bridge block */
-.bridge-block{background:#081828;border:1px solid #1d4060;border-radius:8px;padding:10px 14px;border-left:3px solid #5ba8ff}
-.bridge-top{display:flex;align-items:center;gap:8px;margin-bottom:8px}
-.bridge-title{font-size:12px;font-weight:600;color:#5ba8ff}
-.atype-chip{background:#0e2035;border:1px solid #1d4060;border-radius:4px;padding:1px 7px;font-size:10px;color:#7ab4ff}
-.bridge-rows{display:flex;flex-direction:column;gap:4px}
-.bridge-row{display:flex;gap:8px;font-size:11px;align-items:flex-start}
-.bk{color:#3a5070;min-width:56px;flex-shrink:0}
-.bv{color:#c0d0e8;font-family:monospace;word-break:break-all}
+.bridge-block{background:#081828;border:1px solid #1d4060;border-radius:10px;padding:12px 14px;border-left:3px solid #5ba8ff}
+.bridge-block.bridge-ok{border-left-color:#6fcf7c}
+.bridge-block.bridge-warn{border-left-color:#f0a030}
+.bridge-block.bridge-fail{border-left-color:#f07070}
+.bridge-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}
+.bridge-head{display:flex;align-items:center;gap:8px;min-width:0}
+.bridge-title-wrap{display:flex;flex-direction:column;gap:2px;min-width:0}
+.bridge-title{font-size:12px;font-weight:700;color:#dde7ff}
+.bridge-subtitle{font-size:10px;color:#6f87ad;line-height:1.4}
+.bridge-badges{display:flex;flex-wrap:wrap;gap:5px;justify-content:flex-end}
+.bridge-badge,.atype-chip{background:#0e2035;border:1px solid #1d4060;border-radius:999px;padding:2px 8px;font-size:10px;color:#7ab4ff;white-space:nowrap}
+.bridge-badge.bridge-good{border-color:#2a5c35;background:#102015;color:#8cda97}
+.bridge-badge.bridge-warn{border-color:#5c4620;background:#231707;color:#f0c060}
+.bridge-badge.bridge-bad{border-color:#5c2a2a;background:#220d0d;color:#f09090}
+.bridge-primary{background:#091321;border:1px solid #15263d;border-radius:8px;padding:10px 12px;margin-bottom:10px}
+.bridge-primary-k{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:#52719b;margin-bottom:4px}
+.bridge-primary-v{font-size:16px;font-weight:700;color:#edf3ff;line-height:1.35;word-break:break-word}
+.bridge-body{display:flex;flex-direction:column;gap:8px}
+.bridge-note{display:flex;gap:8px;align-items:flex-start;font-size:11px;line-height:1.5}
+.bridge-note-k{color:#6f87ad;min-width:112px;flex-shrink:0}
+.bridge-note-v{color:#d4def2}
+.bridge-paths{display:flex;flex-direction:column;gap:5px}
+.bridge-path{background:#0b1320;border:1px solid #152030;border-radius:6px;padding:7px 9px;font-size:11px;line-height:1.45;color:#c7d5ec}
+.bridge-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.bridge-stat{background:#0a1220;border-radius:6px;padding:8px 10px;border:1px solid #152030}
+.bridge-stat-k{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:#48617f;margin-bottom:4px}
+.bridge-stat-v{font-size:12px;font-weight:600;color:#d6e3f8;word-break:break-word}
+.bridge-stat-v.bridge-mono{font-family:monospace}
+.bridge-raw{background:#0a1220;border:1px solid #152030;border-radius:6px;padding:8px 10px}
+.bridge-raw-k{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:#48617f;margin-bottom:4px}
+.bridge-raw-v{font-size:11px;color:#c7d5ec;white-space:pre-wrap;word-break:break-word;line-height:1.5}
+.bridge-raw-v.bridge-mono{font-family:monospace}
 
 /* Final answer block */
 .final-block{background:#0a1c0a;border:1px solid #2a5c35;border-radius:8px;padding:9px 14px;border-left:3px solid #6fcf7c;display:flex;align-items:center;gap:10px}
@@ -257,6 +281,258 @@ function parseBridgePayload(turns){
     break;
   }
   return null;
+}
+
+function humanizeToken(s){
+  const txt=String(s??'').trim();
+  if(!txt)return'—';
+  return txt
+    .replace(/[_-]+/g,' ')
+    .replace(/\b\w/g,m=>m.toUpperCase());
+}
+
+function artifactMeta(type){
+  const map={
+    count_scalar:{icon:'#',label:'Count result',headline:'Final count',valueLabel:'Count'},
+    entity_id:{icon:'🏷️',label:'Single entity',headline:'Selected entity',valueLabel:'Entity ID'},
+    entity_set:{icon:'🗂️',label:'Entity set',headline:'Returned set',valueLabel:'Entity IDs'},
+    scalar_literal:{icon:'🔢',label:'Literal value',headline:'Literal value',valueLabel:'Value'},
+    text_literal:{icon:'📝',label:'Text value',headline:'Text value',valueLabel:'Value'},
+    empty:{icon:'∅',label:'Empty result',headline:'Empty result',valueLabel:'Value'},
+  };
+  return map[type]||{icon:'🧩',label:humanizeToken(type||'result'),headline:'Result',valueLabel:'Value'};
+}
+
+function sourceLabel(source){
+  const map={raw_execution:'Direct PAL query result'};
+  return map[source]||humanizeToken(source||'result source');
+}
+
+function asList(value){
+  if(Array.isArray(value))return value.filter(v=>v!=null&&String(v).trim()!=='').map(v=>String(v));
+  if(value==null)return[];
+  const txt=String(value).trim();
+  return txt?[txt]:[];
+}
+
+function splitRelationSummary(value){
+  if(Array.isArray(value))return value.filter(Boolean).map(v=>String(v));
+  const txt=String(value??'').trim();
+  if(!txt)return[];
+  return txt.split(/\s+\|\s+/).map(v=>v.trim()).filter(Boolean);
+}
+
+function formatPreviewValue(value){
+  if(Array.isArray(value))return value.map(v=>String(v)).join(', ');
+  if(value&&typeof value==='object')return JSON.stringify(value);
+  const txt=String(value??'').trim();
+  return txt||'—';
+}
+
+function formatRowPreview(rows){
+  const items=Array.isArray(rows)?rows:[];
+  if(!items.length)return'';
+  return items.slice(0,3).map(row=>{
+    if(row&&typeof row==='object'&&!Array.isArray(row)){
+      return Object.entries(row).map(([k,v])=>`${k}=${v}`).join('; ');
+    }
+    return String(row);
+  }).join(' | ');
+}
+
+function parseResolvedPreview(value){
+  const txt=String(value??'').trim();
+  if(!txt)return null;
+  const m=txt.match(/^(.+?)\s*=\s*(.+)$/);
+  return m?{raw:m[1].trim(),label:m[2].trim()}:null;
+}
+
+function deriveResolvedPreview(info){
+  const direct=parseResolvedPreview(info.resolvedValuePreview);
+  if(direct)return direct;
+  const rows=Array.isArray(info.rowPreview)?info.rowPreview:[];
+  for(const row of rows){
+    if(!row||typeof row!=='object'||Array.isArray(row))continue;
+    const keys=Object.keys(row);
+    const nameKey=keys.find(k=>/_name$/i.test(k));
+    if(!nameKey)continue;
+    const valueKey=(info.projectedVar&&row[info.projectedVar]!=null)?info.projectedVar:keys.find(k=>k!==nameKey&&row[k]!=null);
+    if(!valueKey)continue;
+    return{raw:String(row[valueKey]),label:String(row[nameKey])};
+  }
+  return null;
+}
+
+function parseMacroResultText(text){
+  const lines=String(text??'').split(String.fromCharCode(10)).map(line=>line.trim()).filter(Boolean);
+  const header=lines[0]||'';
+  const m=header.match(/^Macro result:\s*(\S+)\s*->\s*(\w+)/);
+  if(!m)return null;
+  const fields={};
+  for(const line of lines.slice(1)){
+    const idx=line.indexOf(':');
+    if(idx<0)continue;
+    const key=line.slice(0,idx).trim();
+    const value=line.slice(idx+1).trim();
+    fields[key]=value;
+  }
+  return{macroName:m[1],status:m[2],fields};
+}
+
+function normalizeFlag(value){
+  const txt=String(value??'').trim().toLowerCase();
+  if(txt==='yes'||txt==='true')return'yes';
+  if(txt==='no'||txt==='false')return'no';
+  return'';
+}
+
+function buildBridgeInfoFromPayload(payload){
+  const diag=payload?.pal_artifact_diagnostics||{};
+  return{
+    artifactType:payload?.pal_artifact_type||'',
+    primaryValue:payload?.pal_artifact_value,
+    source:payload?.pal_artifact_source||'',
+    semantic:payload?.pal_semantic_description||'',
+    selectionBasis:payload?.pal_selection_basis||'',
+    relationSummary:payload?.pal_relation_summary||[],
+    projectedVar:payload?.pal_selected_query_variable||diag.selected_var||'',
+    bindingCount:payload?.pal_binding_count??diag.binding_count,
+    uniqueValueCount:payload?.pal_unique_value_count??diag.normalized_value_count,
+    valuePreview:payload?.pal_value_preview??diag.value_preview,
+    rowPreview:payload?.pal_row_preview??diag.row_preview,
+    resolvedValuePreview:payload?.pal_resolved_value_preview||'',
+    answerCardinality:payload?.pal_answer_cardinality_hint||'',
+    completenessHint:payload?.pal_completeness_hint||'',
+    proofHint:payload?.pal_proof_hint||'',
+    repairCaveat:payload?.pal_repair_caveat||'',
+    failureReason:payload?.pal_failure_reason||'',
+    trustedFinal:normalizeFlag(payload?.pal_trusted_for_materialization),
+    solvesTask:normalizeFlag(payload?.pal_solves_task),
+    confidence:payload?.pal_confidence,
+    finalVariable:'',
+    status:String(payload?.pal_tool_status||'success'),
+    observation:'',
+  };
+}
+
+function buildBridgeInfoFromMacroText(text){
+  const parsed=parseMacroResultText(text);
+  if(!parsed||parsed.macroName!=='pal_benchmark_bridge_macro')return null;
+  const f=parsed.fields;
+  return{
+    artifactType:f['Artifact type']||'',
+    primaryValue:f['Value preview']||'',
+    source:'',
+    semantic:f['Semantic']||'',
+    selectionBasis:f['Selection basis']||'',
+    relationSummary:f['Relation summary']||'',
+    projectedVar:f['Projected query variable']||'',
+    bindingCount:f['Raw binding count']||'',
+    uniqueValueCount:f['Unique value count']||'',
+    valuePreview:f['Value preview']||'',
+    rowPreview:f['Row preview']||'',
+    resolvedValuePreview:f['Resolved value preview']||'',
+    answerCardinality:f['Expected answer cardinality']||'',
+    completenessHint:f['Completeness hint']||'',
+    proofHint:f['Proof hint']||'',
+    repairCaveat:f['Repair caveat']||'',
+    failureReason:f['Failure reason']||'',
+    trustedFinal:normalizeFlag(f['Trusted final']),
+    solvesTask:normalizeFlag(f['Solves task']),
+    confidence:f['Confidence']||'',
+    finalVariable:f['Final variable']||'',
+    status:String(parsed.status||'').toLowerCase(),
+    observation:f['Observation']||'',
+  };
+}
+
+function summarizePrimaryValue(info){
+  const meta=artifactMeta(info.artifactType);
+  const rawValue=formatPreviewValue(info.primaryValue);
+  const resolved=deriveResolvedPreview(info);
+  if(info.artifactType==='count_scalar')return{headline:rawValue,subline:meta.headline};
+  if(info.artifactType==='entity_id'){
+    if(resolved)return{headline:resolved.label,subline:meta.headline};
+    return{headline:rawValue,subline:meta.valueLabel};
+  }
+  if(info.artifactType==='entity_set'){
+    const count=info.uniqueValueCount!=null&&String(info.uniqueValueCount)!==''?String(info.uniqueValueCount):String(asList(info.valuePreview).length||'—');
+    return{headline:`${count} value${count==='1'?'':'s'}`,subline:meta.headline};
+  }
+  if(info.artifactType==='empty')return{headline:'No value returned',subline:meta.headline};
+  return{headline:rawValue,subline:meta.headline};
+}
+
+function renderBridgeInfoCard(info,mode){
+  if(!info)return'';
+  const meta=artifactMeta(info.artifactType);
+  const primary=summarizePrimaryValue(info);
+  const status=String(info.status||'').toLowerCase();
+  const ok=status==='success';
+  const trusted=info.trustedFinal==='yes';
+  const solves=info.solvesTask==='yes';
+  const variant=ok?(trusted?'bridge-ok':'bridge-warn'):'bridge-fail';
+  const title=mode==='action'
+    ? `PAL produced a ${meta.label.toLowerCase()}`
+    : ok
+      ? 'Bridge recorded the PAL result'
+      : 'Bridge reported a PAL failure';
+  const subtitle=mode==='action'
+    ? sourceLabel(info.source)
+    : trusted
+      ? 'Marked as trusted for finalization'
+      : 'Recorded for review before finalization';
+  const relations=splitRelationSummary(info.relationSummary);
+  const resolved=deriveResolvedPreview(info);
+  const rawValue=formatPreviewValue(info.primaryValue);
+  const valuePreview=formatPreviewValue(info.valuePreview);
+  const rowPreview=typeof info.rowPreview==='string'?info.rowPreview:formatRowPreview(info.rowPreview);
+  const badges=[
+    `<span class="atype-chip">${esc(meta.label)}</span>`,
+    trusted?'<span class="bridge-badge bridge-good">Trusted final</span>':'',
+    solves?'<span class="bridge-badge bridge-good">Solves task</span>':'',
+    info.repairCaveat?'<span class="bridge-badge bridge-warn">Repaired path</span>':'',
+    !ok?'<span class="bridge-badge bridge-bad">Failure</span>':'',
+  ].filter(Boolean).join('');
+  return`<div class="bridge-block ${variant}">
+    <div class="bridge-top">
+      <div class="bridge-head">
+        <span style="font-size:16px">${esc(meta.icon)}</span>
+        <div class="bridge-title-wrap">
+          <div class="bridge-title">${esc(title)}</div>
+          <div class="bridge-subtitle">${esc(subtitle)}</div>
+        </div>
+      </div>
+      <div class="bridge-badges">${badges}</div>
+    </div>
+    <div class="bridge-primary">
+      <div class="bridge-primary-k">${esc(primary.subline)}</div>
+      <div class="bridge-primary-v">${esc(primary.headline)}</div>
+    </div>
+    <div class="bridge-body">
+      ${info.semantic?`<div class="bridge-note"><span class="bridge-note-k">Interpreted as</span><span class="bridge-note-v">${esc(info.semantic)}</span></div>`:''}
+      ${info.selectionBasis?`<div class="bridge-note"><span class="bridge-note-k">Why PAL chose it</span><span class="bridge-note-v">${esc(info.selectionBasis)}</span></div>`:''}
+      ${relations.length?`<div class="bridge-note"><span class="bridge-note-k">Query path</span><div class="bridge-paths">${relations.map(path=>`<div class="bridge-path">${esc(path.replace(/\s*->\s*/g,' → '))}</div>`).join('')}</div></div>`:''}
+      <div class="bridge-grid">
+        <div class="bridge-stat"><div class="bridge-stat-k">Result type</div><div class="bridge-stat-v">${esc(meta.label)}</div></div>
+        ${info.finalVariable?`<div class="bridge-stat"><div class="bridge-stat-k">Stored as</div><div class="bridge-stat-v bridge-mono">${esc(info.finalVariable)}</div></div>`:''}
+        ${info.projectedVar?`<div class="bridge-stat"><div class="bridge-stat-k">Query column</div><div class="bridge-stat-v bridge-mono">${esc(info.projectedVar)}</div></div>`:''}
+        ${info.bindingCount!==''&&info.bindingCount!=null?`<div class="bridge-stat"><div class="bridge-stat-k">Raw rows</div><div class="bridge-stat-v">${esc(String(info.bindingCount))}</div></div>`:''}
+        ${info.uniqueValueCount!==''&&info.uniqueValueCount!=null?`<div class="bridge-stat"><div class="bridge-stat-k">Unique values</div><div class="bridge-stat-v">${esc(String(info.uniqueValueCount))}</div></div>`:''}
+        ${info.answerCardinality?`<div class="bridge-stat"><div class="bridge-stat-k">Expected shape</div><div class="bridge-stat-v">${esc(info.answerCardinality)}</div></div>`:''}
+        ${info.confidence!==''&&info.confidence!=null?`<div class="bridge-stat"><div class="bridge-stat-k">Confidence</div><div class="bridge-stat-v">${esc(String(info.confidence))}</div></div>`:''}
+      </div>
+      ${resolved?`<div class="bridge-raw"><div class="bridge-raw-k">Resolved value</div><div class="bridge-raw-v">${esc(resolved.label)}</div><div class="bridge-raw-v bridge-mono">RAW VALUE  ${esc(resolved.raw)}</div></div>`:''}
+      ${!resolved&&rawValue!=='—'?`<div class="bridge-raw"><div class="bridge-raw-k">Raw value</div><div class="bridge-raw-v bridge-mono">${esc(rawValue)}</div></div>`:''}
+      ${valuePreview&&valuePreview!=='—'&&valuePreview!==rawValue?`<div class="bridge-raw"><div class="bridge-raw-k">Value preview</div><div class="bridge-raw-v bridge-mono">${esc(valuePreview)}</div></div>`:''}
+      ${rowPreview?`<div class="bridge-raw"><div class="bridge-raw-k">Sample rows</div><div class="bridge-raw-v bridge-mono">${esc(rowPreview)}</div></div>`:''}
+      ${info.completenessHint?`<div class="bridge-note"><span class="bridge-note-k">Coverage</span><span class="bridge-note-v">${esc(info.completenessHint)}</span></div>`:''}
+      ${info.proofHint?`<div class="bridge-note"><span class="bridge-note-k">Proof hint</span><span class="bridge-note-v">${esc(info.proofHint)}</span></div>`:''}
+      ${info.repairCaveat?`<div class="bridge-note"><span class="bridge-note-k">Caveat</span><span class="bridge-note-v">${esc(info.repairCaveat)}</span></div>`:''}
+      ${info.failureReason?`<div class="bridge-note"><span class="bridge-note-k">Failure reason</span><span class="bridge-note-v">${esc(info.failureReason)}</span></div>`:''}
+      ${info.observation?`<div class="bridge-note"><span class="bridge-note-k">Observation</span><span class="bridge-note-v">${esc(info.observation)}</span></div>`:''}
+    </div>
+  </div>`;
 }
 
 // ── 1. Pipeline stage timeline ─────────────────────────────────────────────
@@ -353,24 +629,20 @@ function renderPalDetails(s){
   const turns=s.chat_history?.value||[];
   const p=parseBridgePayload(turns);
   if(!p)return'';
-  const atype=p.pal_artifact_type||'\\u2014';
-  const aval=p.pal_artifact_value;
-  const avalStr=Array.isArray(aval)?aval.join(', '):String(aval??'\\u2014');
-  const diag=p.pal_artifact_diagnostics||{};
-  const bcount=diag.binding_count;
-  const bcountStr=bcount!=null?String(bcount):'\\u2014';
-  const bcountClass=bcount==null?'':bcount>0?'pv-good':'pv-empty';
-  const selvar=diag.selected_var||'\\u2014';
-  const normcount=diag.normalized_value_count;
-  const normStr=normcount!=null?String(normcount):'\\u2014';
+  const info=buildBridgeInfoFromPayload(p);
+  const meta=artifactMeta(info.artifactType);
+  const rawValue=formatPreviewValue(info.primaryValue);
+  const rowPreview=Array.isArray(info.rowPreview)?formatRowPreview(info.rowPreview):String(info.rowPreview||'');
   return`<div class="pal-card">
-    <div class="pal-card-title">🌉 PAL Execution Details</div>
+    <div class="pal-card-title">🌉 PAL Result Snapshot</div>
+    ${info.selectionBasis?`<div style="font-size:12px;color:#d8e4f8;line-height:1.55;margin-bottom:10px">${esc(info.selectionBasis)}</div>`:''}
     <div class="pal-grid">
-      <div class="pal-stat"><div class="pal-stat-k">Artifact Type</div><div class="pal-stat-v">${esc(atype)}</div></div>
-      <div class="pal-stat"><div class="pal-stat-k">SPARQL Bindings</div><div class="pal-stat-v ${bcountClass}">${esc(bcountStr)}</div></div>
-      <div class="pal-stat"><div class="pal-stat-k">Answer Variable</div><div class="pal-stat-v pv-mono">${esc(selvar)}</div></div>
-      <div class="pal-stat"><div class="pal-stat-k">Normalized Count</div><div class="pal-stat-v">${esc(normStr)}</div></div>
-      <div class="pal-stat" style="grid-column:span 2"><div class="pal-stat-k">Raw Value</div><div class="pal-stat-v pv-mono" style="font-size:11px">${esc(avalStr)}</div></div>
+      <div class="pal-stat"><div class="pal-stat-k">Result Type</div><div class="pal-stat-v">${esc(meta.label)}</div></div>
+      <div class="pal-stat"><div class="pal-stat-k">Query Rows</div><div class="pal-stat-v ${(Number(info.bindingCount)||0)>0?'pv-good':'pv-empty'}">${esc(String(info.bindingCount??'—'))}</div></div>
+      <div class="pal-stat"><div class="pal-stat-k">Query Column</div><div class="pal-stat-v pv-mono">${esc(info.projectedVar||'—')}</div></div>
+      <div class="pal-stat"><div class="pal-stat-k">Unique Values</div><div class="pal-stat-v">${esc(String(info.uniqueValueCount??'—'))}</div></div>
+      <div class="pal-stat" style="grid-column:span 2"><div class="pal-stat-k">Raw Value</div><div class="pal-stat-v pv-mono" style="font-size:11px">${esc(rawValue)}</div></div>
+      ${rowPreview?`<div class="pal-stat" style="grid-column:span 3"><div class="pal-stat-k">Sample Rows</div><div class="pal-stat-v pv-mono" style="font-size:11px;line-height:1.5">${esc(rowPreview)}</div></div>`:''}
     </div>
   </div>`;
 }
@@ -409,19 +681,9 @@ function renderTurnContent(t,ti){
   // PAL bridge macro call
   if(c.includes('pal_benchmark_bridge_macro')){
     const pm=c.match(/execute_macro\\([^,]+,\\s*(\\{[\\s\\S]*\\})\\)/);
-    let atype='',aval='',src='';
-    if(pm){try{const p=JSON.parse(pm[1]);atype=p.pal_artifact_type||'';aval=JSON.stringify(p.pal_artifact_value);src=p.pal_artifact_source||'';}catch{}}
-    return`<div class="bridge-block">
-      <div class="bridge-top">
-        <span style="font-size:16px">🌉</span>
-        <span class="bridge-title">PAL Benchmark Bridge</span>
-        ${atype?`<span class="atype-chip">${esc(atype)}</span>`:''}
-      </div>
-      <div class="bridge-rows">
-        <div class="bridge-row"><span class="bk">Value</span><span class="bv">${esc(aval)}</span></div>
-        ${src?`<div class="bridge-row"><span class="bk">Source</span><span class="bv">${esc(src)}</span></div>`:''}
-      </div>
-    </div>`;
+    if(pm){
+      try{return renderBridgeInfoCard(buildBridgeInfoFromPayload(JSON.parse(pm[1])),'action');}catch{}
+    }
   }
 
   // Final Answer
@@ -430,6 +692,8 @@ function renderTurnContent(t,ti){
 
   // Macro result observation
   if(role==='user'&&c.includes('Macro result:')){
+    const bridgeInfo=buildBridgeInfoFromMacroText(c);
+    if(bridgeInfo)return renderBridgeInfoCard(bridgeInfo,'result');
     const sm=c.match(/Macro result:\\s*(\\S+)\\s*->\\s*(\\w+)/);
     const vm=c.match(/Final variable:\\s*(#\\d+)/);
     if(sm){

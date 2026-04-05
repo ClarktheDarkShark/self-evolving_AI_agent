@@ -31,6 +31,7 @@ from src.pal.family_policy_evolution import (
     build_family_policy_store,
     build_success_plan_archetype,
     merge_success_plan_archetypes,
+    version_reuse_compatible,
 )
 from src.pal.reusable_tool_families import get_baseline_reusable_family_policy_bundles
 
@@ -63,6 +64,9 @@ FAMILY_EVOLUTION_ENV = "PAL_ENABLE_FAMILY_POLICY_EVOLUTION"
 FAMILY_PROMOTION_ENV = "PAL_ENABLE_FAMILY_POLICY_PROMOTION"
 FAMILY_ENABLED_FAMILIES_ENV = "PAL_FAMILY_POLICY_EVOLUTION_FAMILIES"
 FAMILY_STORE_PATH_ENV = "PAL_FAMILY_POLICY_STORE_PATH"
+PERSISTENT_FAMILY_STORE_ENV = "PAL_PERSISTENT_FAMILY_POLICY_STORE"
+RESET_FAMILY_STORE_ENV = "PAL_RESET_FAMILY_POLICY_STORE"
+TOOL_EVOLUTION_SIGNAL_ENV = "PAL_RECORD_TOOL_EVOLUTION_SIGNAL"
 INLINE_FAMILY_EVOLUTION_FAMILIES_ENV = "PAL_INLINE_FAMILY_EVOLUTION_FAMILIES"
 INLINE_FAMILY_EVOLUTION_BUDGET_S = int(
     os.getenv("PAL_STANDARD_FAMILY_EVOLUTION_BUDGET_S", "360")
@@ -74,6 +78,7 @@ DEFAULT_FAMILY_REGRESSION_MANIFEST = (
     / "evaluation"
     / "knowledge_graph_family_regression.json"
 )
+_RESETTED_FAMILY_STORE_PATHS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,51 @@ def _inline_family_evolution_allowed_for(family_name: str) -> bool:
     if not configured:
         return True
     return str(family_name or "").strip() in configured
+
+
+def _persistent_family_store_enabled() -> bool:
+    configured = str(os.getenv(PERSISTENT_FAMILY_STORE_ENV) or "").strip()
+    if configured:
+        return configured == "1"
+    return ENABLE_STANDARD_FAMILY_EVOLUTION or (
+        os.getenv("PAL_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
+    )
+
+
+def _default_persistent_family_store_path(repo_root: Path, task_name: str) -> Path:
+    return (
+        repo_root
+        / "outputs"
+        / "persistent_family_policy_store"
+        / str(task_name or "default").strip()
+    ).resolve()
+
+
+def _resolve_family_policy_store_path(
+    *,
+    repo_root: Path,
+    aggregate_output_dir: Path,
+    task_name: str,
+) -> Path:
+    configured_store_path = str(os.getenv(FAMILY_STORE_PATH_ENV) or "").strip()
+    if configured_store_path:
+        store_path = Path(configured_store_path)
+        if not store_path.is_absolute():
+            store_path = repo_root / store_path
+        return store_path.resolve()
+    if _persistent_family_store_enabled():
+        return _default_persistent_family_store_path(repo_root, task_name)
+    return (aggregate_output_dir / "family_policy_store").resolve()
+
+
+def _maybe_reset_family_policy_store(store_path: Path) -> None:
+    if os.getenv(RESET_FAMILY_STORE_ENV) != "1":
+        return
+    store_key = str(store_path.resolve())
+    if store_key in _RESETTED_FAMILY_STORE_PATHS:
+        return
+    shutil.rmtree(store_path, ignore_errors=True)
+    _RESETTED_FAMILY_STORE_PATHS.add(store_key)
 
 
 def _load_sample_order_from_config(config_path: Path) -> list[str] | None:
@@ -289,6 +339,7 @@ def _latest_attempt_decision_for_sample(output_dir: Path, sample_index: str) -> 
     if not generated_tools_path.exists():
         return {}
     latest: dict[str, object] = {}
+    fallback: dict[str, object] = {}
     for line in generated_tools_path.read_text(encoding="utf-8").splitlines():
         try:
             payload = json.loads(line)
@@ -296,7 +347,29 @@ def _latest_attempt_decision_for_sample(output_dir: Path, sample_index: str) -> 
             continue
         if str(payload.get("sample_index") or "").strip() != str(sample_index or "").strip():
             continue
+        if payload.get("event") == "pal_attempt_decision":
+            fallback = payload
         if payload.get("event") == "pal_attempt_decision_finalized":
+            latest = payload
+    return latest or fallback
+
+
+def _latest_macro_solver_review_for_sample(
+    output_dir: Path,
+    sample_index: str,
+) -> dict[str, object]:
+    generated_tools_path = output_dir / "generated_tools.log"
+    if not generated_tools_path.exists():
+        return {}
+    latest: dict[str, object] = {}
+    for line in generated_tools_path.read_text(encoding="utf-8").splitlines():
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if str(payload.get("sample_index") or "").strip() != str(sample_index or "").strip():
+            continue
+        if payload.get("event") == "pal_macro_solver_review":
             latest = payload
     return latest
 
@@ -386,6 +459,7 @@ def _record_trusted_family_success(
     family_name: str,
     sample_index: str,
     active_version: str,
+    session_record: dict[str, object] | None = None,
     progress_log_path: Path | None = None,
 ) -> list[str]:
     decision_payload = _latest_attempt_decision_for_sample(output_dir, sample_index)
@@ -407,12 +481,19 @@ def _record_trusted_family_success(
     tool_result_trusted = bool(
         decision_payload.get("tool_result_trusted_for_materialization")
     )
+    macro_solver_review = _latest_macro_solver_review_for_sample(
+        output_dir,
+        sample_index,
+    )
+    solver_review_present = "accepted_final" in macro_solver_review
+    solver_accepted_final = bool(macro_solver_review.get("accepted_final"))
     if (
         not materialization_allowed
         or dangerous_overreach
         or tool_result_status != "success"
         or not tool_result_solves_task
         or not tool_result_trusted
+        or (solver_review_present and not solver_accepted_final)
     ):
         return []
     store = build_family_policy_store(
@@ -422,7 +503,10 @@ def _record_trusted_family_success(
     metadata = store.get_trusted_success_bank_metadata(family_name)
     existing_ids: list[str] = []
     existing_archetypes: list[dict[str, object]] = []
-    if str(metadata.get("source_version") or "").strip() == str(active_version or "").strip():
+    if version_reuse_compatible(
+        str(metadata.get("source_version") or "").strip(),
+        str(active_version or "").strip(),
+    ):
         existing_ids = store.get_trusted_success_bank(family_name)
         evaluation_context = metadata.get("evaluation_context") or {}
         if isinstance(evaluation_context, dict):
@@ -456,14 +540,21 @@ def _record_trusted_family_success(
     )
     if success_archetypes:
         evaluation_context["success_plan_archetypes"] = success_archetypes
+    evaluation_results: dict[str, object] = {
+        "source": "inline_standard_run_success_harvest",
+        "sample_index": str(sample_index or "").strip(),
+    }
+    if isinstance(session_record, dict):
+        evaluation_results["run_summary"] = _build_inline_trigger_baseline_summary(
+            output_dir=output_dir,
+            sample_index=sample_index,
+            session_record=session_record,
+        )
     store.set_trusted_success_bank(
         family_name,
         sample_ids=deduped,
         source_version=active_version,
-        evaluation_results={
-            "source": "inline_standard_run_success_harvest",
-            "sample_index": str(sample_index or "").strip(),
-        },
+        evaluation_results=evaluation_results,
         evaluation_context=evaluation_context,
     )
     _append_generated_tool_event(
@@ -479,6 +570,197 @@ def _record_trusted_family_success(
         },
     )
     return deduped
+
+
+def _tool_evolution_phase_enabled() -> bool:
+    configured = str(os.getenv(TOOL_EVOLUTION_SIGNAL_ENV) or "").strip()
+    if configured:
+        return configured == "1"
+    if os.getenv(FAMILY_EVOLUTION_ENV) == "1":
+        return True
+    return os.getenv("PAL_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
+
+
+def _is_trusted_tool_success(
+    *,
+    decision_payload: dict[str, object],
+    macro_solver_review: dict[str, object],
+) -> bool:
+    trust_contract = decision_payload.get("trust_contract") or {}
+    materialization_allowed = bool(
+        (trust_contract.get("materialization_allowed") if isinstance(trust_contract, dict) else False)
+        or decision_payload.get("materialization_allowed")
+    )
+    dangerous_overreach = bool(
+        (trust_contract.get("dangerous_overreach") if isinstance(trust_contract, dict) else False)
+        or decision_payload.get("dangerous_overreach")
+    )
+    tool_result_status = str(decision_payload.get("tool_result_status") or "").strip().lower()
+    tool_result_solves_task = bool(decision_payload.get("tool_result_solves_task"))
+    tool_result_trusted = bool(
+        decision_payload.get("tool_result_trusted_for_materialization")
+    )
+    solver_review_present = "accepted_final" in macro_solver_review
+    solver_accepted_final = bool(macro_solver_review.get("accepted_final"))
+    return bool(
+        materialization_allowed
+        and not dangerous_overreach
+        and tool_result_status == "success"
+        and tool_result_solves_task
+        and tool_result_trusted
+        and (not solver_review_present or solver_accepted_final)
+    )
+
+
+def _normalize_tool_evolution_failure_labels(raw_reason: str) -> list[str]:
+    cleaned = str(raw_reason or "").strip()
+    if not cleaned:
+        return []
+    labels = [cleaned]
+    leaf = cleaned.split(":")[-1].strip()
+    if leaf and leaf not in labels:
+        labels.append(leaf)
+    return labels
+
+
+def _record_tool_evolution_signal(
+    *,
+    output_dir: Path,
+    store_path: Path,
+    family_name: str,
+    sample_index: str,
+    active_version: str,
+    session_record: dict[str, object],
+    progress_log_path: Path | None = None,
+) -> None:
+    if not _tool_evolution_phase_enabled():
+        return
+    decision_payload = _latest_attempt_decision_for_sample(output_dir, sample_index)
+    if str(decision_payload.get("selected_family") or "").strip() != str(family_name or "").strip():
+        return
+    if str(decision_payload.get("family_bundle_version") or "").strip() != str(active_version or "").strip():
+        return
+    query_plan = _latest_query_plan_for_sample(output_dir, sample_index)
+    if not query_plan:
+        return
+    macro_solver_review = _latest_macro_solver_review_for_sample(
+        output_dir,
+        sample_index,
+    )
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=store_path,
+    )
+    context = store.get_tool_evolution_context(family_name)
+    if not version_reuse_compatible(
+        str(context.get("source_version") or "").strip(),
+        str(active_version or "").strip(),
+    ):
+        preferred_patterns: list[dict[str, object]] = []
+        avoid_patterns: list[dict[str, object]] = []
+    else:
+        preferred_patterns = [
+            dict(item)
+            for item in (context.get("preferred_patterns") or [])
+            if isinstance(item, dict)
+        ]
+        avoid_patterns = [
+            dict(item)
+            for item in (context.get("avoid_patterns") or [])
+            if isinstance(item, dict)
+        ]
+
+    sample_status = str(session_record.get("sample_status") or "").strip()
+    evaluation_record = session_record.get("evaluation_record")
+    evaluation_outcome = ""
+    if isinstance(evaluation_record, dict):
+        evaluation_outcome = str(evaluation_record.get("outcome") or "").strip()
+
+    last_signal: dict[str, object] = {
+        "sample_index": str(sample_index or "").strip(),
+        "sample_status": sample_status,
+        "evaluation_outcome": evaluation_outcome,
+    }
+    if sample_status == "completed" and evaluation_outcome == "correct":
+        if not _is_trusted_tool_success(
+            decision_payload=decision_payload,
+            macro_solver_review=macro_solver_review,
+        ):
+            return
+        preferred_patterns = merge_success_plan_archetypes(
+            preferred_patterns,
+            build_success_plan_archetype(query_plan),
+        )
+        last_signal["signal_type"] = "trusted_success"
+    else:
+        finish_reason = str(session_record.get("finish_reason") or "").strip()
+        failure_labels: list[str] = []
+        bypass_prefix = "pal_tool_failure_bypassed:"
+        if bypass_prefix in finish_reason:
+            failure_labels.extend(
+                _normalize_tool_evolution_failure_labels(
+                    finish_reason.split(bypass_prefix, 1)[1]
+                )
+            )
+        elif sample_status == "completed" and evaluation_outcome and evaluation_outcome != "correct":
+            if _is_trusted_tool_success(
+                decision_payload=decision_payload,
+                macro_solver_review=macro_solver_review,
+            ):
+                failure_labels.append("trusted_incorrect_completion")
+            else:
+                failure_labels.append("completed_incorrect")
+        failure_labels = list(dict.fromkeys(label for label in failure_labels if label))
+        if not failure_labels:
+            return
+        failure_pattern = build_success_plan_archetype(query_plan)
+        if failure_pattern:
+            failure_pattern = {
+                **failure_pattern,
+                "failure_labels": failure_labels,
+            }
+            existing_index = {
+                str(item.get("pattern_signature") or "").strip(): idx
+                for idx, item in enumerate(avoid_patterns)
+                if str(item.get("pattern_signature") or "").strip()
+            }
+            signature = str(failure_pattern.get("pattern_signature") or "").strip()
+            if signature and signature in existing_index:
+                prior = dict(avoid_patterns[existing_index[signature]])
+                prior_labels = [
+                    str(label or "").strip()
+                    for label in (prior.get("failure_labels") or [])
+                    if str(label or "").strip()
+                ]
+                prior["failure_labels"] = list(
+                    dict.fromkeys([*prior_labels, *failure_labels])
+                )
+                avoid_patterns[existing_index[signature]] = prior
+            elif signature:
+                avoid_patterns.append(failure_pattern)
+                avoid_patterns = avoid_patterns[-4:]
+        last_signal["signal_type"] = "clean_failure"
+        last_signal["failure_labels"] = failure_labels
+
+    store.set_tool_evolution_context(
+        family_name,
+        source_version=active_version,
+        preferred_patterns=preferred_patterns,
+        avoid_patterns=avoid_patterns,
+        last_signal=last_signal,
+    )
+    _append_generated_tool_event(
+        progress_log_path,
+        {
+            "event": "pal_tool_evolution_signal_recorded",
+            "family_name": family_name,
+            "sample_index": str(sample_index or "").strip(),
+            "active_version": active_version,
+            "preferred_pattern_count": len(preferred_patterns),
+            "avoid_pattern_count": len(avoid_patterns),
+            **last_signal,
+        },
+    )
 
 
 def _oldest_pending_candidate_for_family(
@@ -1618,13 +1900,12 @@ def _run_one_with_sample_boundary_family_evolution(
     config_name = Path(config_path).stem
     aggregate_output_dir = combined_dir / task_name / config_name
     aggregate_output_dir.mkdir(parents=True, exist_ok=True)
-    configured_store_path = str(os.getenv(FAMILY_STORE_PATH_ENV) or "").strip()
-    if configured_store_path:
-        store_path = Path(configured_store_path)
-        if not store_path.is_absolute():
-            store_path = repo_root / store_path
-    else:
-        store_path = aggregate_output_dir / "family_policy_store"
+    store_path = _resolve_family_policy_store_path(
+        repo_root=repo_root,
+        aggregate_output_dir=aggregate_output_dir,
+        task_name=task_name,
+    )
+    _maybe_reset_family_policy_store(store_path)
 
     extra_env = {
         FAMILY_EVOLUTION_ENV: "1",
@@ -1636,13 +1917,19 @@ def _run_one_with_sample_boundary_family_evolution(
         extra_env[FAMILY_ENABLED_FAMILIES_ENV] = configured_families
 
     temp_config_paths: dict[str, Path] = {}
+    created_temp_config_paths: list[Path] = []
     for sample_index in sample_order:
+        if len(sample_order) == 1:
+            temp_config_paths[str(sample_index)] = full_path
+            continue
         temp_stem = f"{config_name}__sample_{sample_index}"
-        temp_config_paths[str(sample_index)] = _write_single_sample_config(
+        temp_config_path = _write_single_sample_config(
             source_config_path=full_path,
             sample_index=str(sample_index),
             stem=temp_stem,
         )
+        temp_config_paths[str(sample_index)] = temp_config_path
+        created_temp_config_paths.append(temp_config_path)
 
     try:
         for sample_index in sample_order:
@@ -1688,8 +1975,18 @@ def _run_one_with_sample_boundary_family_evolution(
                     family_name=selected_family,
                     sample_index=str(sample_index),
                     active_version=active_version,
+                    session_record=session_record,
                     progress_log_path=aggregate_output_dir / "generated_tools.log",
                 )
+            _record_tool_evolution_signal(
+                output_dir=aggregate_output_dir,
+                store_path=store_path,
+                family_name=selected_family,
+                sample_index=str(sample_index),
+                active_version=active_version,
+                session_record=session_record,
+                progress_log_path=aggregate_output_dir / "generated_tools.log",
+            )
             current_sample_is_correct = (
                 sample_status == "completed" and evaluation_outcome == "correct"
             )
@@ -1823,7 +2120,7 @@ def _run_one_with_sample_boundary_family_evolution(
                     f"family={selected_family} sample={evaluation_target_sample}"
                 )
     finally:
-        for temp_config_path in temp_config_paths.values():
+        for temp_config_path in created_temp_config_paths:
             _delete_file_if_exists(temp_config_path)
     return 0
 
@@ -1847,7 +2144,6 @@ def main() -> int:
         use_sample_boundary_evolution = (
             ENABLE_STANDARD_FAMILY_EVOLUTION
             and ENABLE_PAL_AGENT
-            and os.getenv(FAMILY_EVOLUTION_ENV) == "1"
             and "knowledge_graph" in config_path
         )
         if use_sample_boundary_evolution:
