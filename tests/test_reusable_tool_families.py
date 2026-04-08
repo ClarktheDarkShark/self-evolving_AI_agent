@@ -142,6 +142,145 @@ def test_direct_count_renderer_reverses_reverse_anchor_candidate_relation() -> N
     assert "fb:m.09f96 fb:medicine.disease.transmitted_by ?disease ." not in generated_code
 
 
+def test_reusable_render_canonicalizes_role_swap_match_for_reverse_projection(
+    monkeypatch,
+) -> None:
+    controller = _make_controller()
+    monkeypatch.setenv("PAL_RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION", "1")
+
+    query_plan = {
+        "answer_mode": "entity",
+        "query_shape": "single_anchor_lookup",
+        "anchored_entities": [
+            {
+                "surface": "Ibiza Euphoria",
+                "chosen_alias": "m.03_9dcv",
+                "role": "anchor",
+            }
+        ],
+        "shared_answer_variable": "answer",
+        "candidate_set_variable": "candidate_set",
+        "relation_paths": [
+            {
+                "relation": "music.recording.releases",
+                "direction": "reverse",
+                "from": "recording",
+                "to": "m.03_9dcv",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+            },
+            {
+                "relation": "music.artist.track",
+                "direction": "reverse",
+                "from": "track",
+                "to": "artist",
+                "from_role": "candidate_set",
+                "to_role": "answer",
+                "grounding_source": "curated",
+            },
+        ],
+        "projection": ["answer", "answer_name"],
+        "ordering_attribute": {},
+        "allow_exploratory_predicates": False,
+    }
+    relation_grounding = [
+        {
+            "relation": "music.recording.releases",
+            "direction": "reverse",
+            "from": "recording",
+            "to": "m.03_9dcv",
+            "from_role": "candidate_set",
+            "to_role": "anchor",
+            "grounding_source": "dynamic_probe",
+        },
+        {
+            "relation": "music.artist.track",
+            "direction": "forward",
+            "from": "artist",
+            "to": "track",
+            "from_role": "anchor",
+            "to_role": "answer",
+            "grounding_source": "curated",
+        },
+    ]
+
+    canonicalized = controller._canonicalize_reusable_query_plan_for_render(
+        query_plan=query_plan,
+        relation_grounding=relation_grounding,
+    )
+
+    second_path = canonicalized["relation_paths"][1]
+    assert second_path["from"] == "artist"
+    assert second_path["to"] == "track"
+    assert second_path["from_role"] == "answer"
+    assert second_path["to_role"] == "candidate_set"
+
+    selection = select_reusable_tool(query_plan)
+    assert selection is not None
+    generated_output = render_reusable_tool(
+        query_plan=canonicalized,
+        selection=selection,
+    )
+    generated_code = extract_and_validate_code(generated_output)
+
+    assert "?answer fb:music.artist.track ?candidate_set ." in generated_code
+    assert "?candidate_set fb:music.artist.track ?answer ." not in generated_code
+
+
+def test_reusable_render_does_not_rewrite_canonical_reverse_anchor_path(
+    monkeypatch,
+) -> None:
+    controller = _make_controller()
+    monkeypatch.setenv("PAL_RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION", "1")
+
+    query_plan = {
+        "answer_mode": "entity",
+        "query_shape": "single_anchor_lookup",
+        "anchored_entities": [
+            {
+                "surface": "Ibiza Euphoria",
+                "chosen_alias": "m.03_9dcv",
+                "role": "anchor",
+            }
+        ],
+        "shared_answer_variable": "answer",
+        "candidate_set_variable": "candidate_set",
+        "relation_paths": [
+            {
+                "relation": "music.recording.releases",
+                "direction": "reverse",
+                "from": "recording",
+                "to": "m.03_9dcv",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+        "projection": ["answer", "answer_name"],
+        "ordering_attribute": {},
+        "allow_exploratory_predicates": False,
+    }
+    relation_grounding = [
+        {
+            "relation": "music.recording.releases",
+            "direction": "reverse",
+            "from": "recording",
+            "to": "m.03_9dcv",
+            "from_role": "candidate_set",
+            "to_role": "anchor",
+            "grounding_source": "dynamic_probe",
+        }
+    ]
+
+    canonicalized = controller._canonicalize_reusable_query_plan_for_render(
+        query_plan=query_plan,
+        relation_grounding=relation_grounding,
+    )
+
+    assert canonicalized["relation_paths"][0] == query_plan["relation_paths"][0]
+
+
 def test_direct_count_renderer_counts_terminal_count_set_leaf_in_pivot_chain() -> None:
     query_plan = {
         "answer_mode": "count",
@@ -1049,7 +1188,6 @@ def test_joined_count_renderer_preserves_explicit_constraint_value_entity() -> N
     assert 'FILTER(LCASE(STR(?constraint_value_label)) = "songwriter")' in generated_code
     assert "?shared_answer fb:people.person.profession ?constraint_value ." in generated_code
     assert "?count fb:biology.animal_breed.temperament" not in generated_code
-
 
 def test_joined_count_renderer_keeps_relation_hinted_anchor_binding_even_with_repeated_constraint_endpoint() -> None:
     query_plan = {

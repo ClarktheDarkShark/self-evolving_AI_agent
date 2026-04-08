@@ -244,143 +244,6 @@ def test_grounding_card_omits_family_success_patterns_by_default(monkeypatch) ->
     assert "- family_success_patterns:" not in grounding_card
 
 
-def test_grounding_card_can_surface_family_success_patterns_when_explicitly_enabled(
-    monkeypatch,
-) -> None:
-    controller = _make_controller()
-
-    class _FakeStore:
-        def get_trusted_success_bank_metadata(self, family_name: str):
-            assert family_name == "count_over_joined_set"
-            return {
-                "source_version": "2026-03-31",
-                "evaluation_context": {
-                    "success_plan_archetypes": [
-                        {
-                            "anchor_roles": ["anchor_a", "anchor_b"],
-                            "anchor_constraints": [
-                                "anchor_a->candidate_set",
-                                "anchor_b->candidate_set",
-                            ],
-                            "relation_role_skeleton": [
-                                "anchor_a->candidate_set:curated",
-                                "anchor_b->candidate_set:curated",
-                                "candidate_set->count_set:curated",
-                            ],
-                            "structural_notes": [
-                                "preserve_multiple_anchor_constraints",
-                                "count_target_distinct_from_candidate_set",
-                            ],
-                        }
-                    ]
-                },
-            }
-
-    controller._get_family_policy_store = lambda: _FakeStore()
-    monkeypatch.setattr(
-        controller,
-        "_infer_query_shape",
-        lambda **kwargs: "count_over_joined_set",
-    )
-    monkeypatch.setattr(
-        controller,
-        "_build_question_interpretation",
-        lambda **kwargs: {"question_inputs": [], "preferred_scaffolds": []},
-    )
-    monkeypatch.setattr(
-        controller,
-        "_refine_question_interpretation_with_grounding",
-        lambda **kwargs: kwargs["question_interpretation"],
-    )
-    monkeypatch.setenv("PAL_TOOL_EVOLUTION_COARSE_SUCCESS_HINTS", "1")
-
-    grounding_card = controller._build_pal_grounding_card(
-        "Question: how many dialects share two constraints?, Entities: ['A', 'B']",
-        relation_grounding=[],
-    )
-
-    assert "- family_success_patterns:" in grounding_card
-    assert "anchor_roles=anchor_a,anchor_b" in grounding_card
-    assert "preserve_multiple_anchor_constraints" in grounding_card
-
-
-def test_grounding_card_surfaces_tool_evolution_branch_and_anchor_patterns(
-    monkeypatch,
-) -> None:
-    controller = _make_controller()
-
-    class _FakeStore:
-        def get_trusted_success_bank_metadata(self, family_name: str):
-            return {}
-
-        def get_tool_evolution_context(self, family_name: str):
-            assert family_name == "single_anchor_lookup"
-            return {
-                "source_version": "2026-03-31",
-                "preferred_patterns": [
-                    {
-                        "pattern_signature": "success-1",
-                        "relation_signatures": [
-                            "anchor->royalty.kingdom.monarchs->answer:curated"
-                        ],
-                        "grounding_sources": ["curated"],
-                        "anchor_binding_modes": ["surface_alias_anchor"],
-                        "alias_strategy_tokens": ["feedback_repair"],
-                        "structural_notes": ["single_path"],
-                    }
-                ],
-                "avoid_patterns": [
-                    {
-                        "pattern_signature": "failure-1",
-                        "relation_signatures": [
-                            "anchor->biology.animal_owner.animals_owned->answer:dynamic_probe"
-                        ],
-                        "grounding_sources": ["dynamic_probe"],
-                        "anchor_binding_modes": ["resolved_entity_id"],
-                        "alias_strategy_tokens": ["live_probe_repair"],
-                        "failure_labels": ["rejected_dangerous_overreach"],
-                    }
-                ],
-            }
-
-    controller._get_family_policy_store = lambda: _FakeStore()
-    monkeypatch.setattr(
-        controller,
-        "_infer_query_shape",
-        lambda **kwargs: "single_anchor_lookup",
-    )
-    monkeypatch.setattr(
-        controller,
-        "_build_question_interpretation",
-        lambda **kwargs: {"question_inputs": [], "preferred_scaffolds": []},
-    )
-    monkeypatch.setattr(
-        controller,
-        "_refine_question_interpretation_with_grounding",
-        lambda **kwargs: kwargs["question_interpretation"],
-    )
-    monkeypatch.setenv("PAL_TOOL_EVOLUTION_CONTRASTIVE_BRANCH", "1")
-    monkeypatch.setenv("PAL_TOOL_EVOLUTION_ANCHOR_HINTS", "1")
-
-    grounding_card = controller._build_pal_grounding_card(
-        "Question: what is the name of the monarch in saxe-coburg-gotha, Entities: ['saxe-coburg-gotha']",
-        relation_grounding=[],
-    )
-
-    assert "- tool_evolution_branch_patterns:" in grounding_card
-    assert (
-        "prefer relation_signatures=anchor->royalty.kingdom.monarchs->answer:curated"
-        in grounding_card
-    )
-    assert (
-        "avoid relation_signatures=anchor->biology.animal_owner.animals_owned->answer:dynamic_probe"
-        in grounding_card
-    )
-    assert "- tool_evolution_anchor_patterns:" in grounding_card
-    assert "alias_strategy=feedback_repair" in grounding_card
-    assert "failure_labels=rejected_dangerous_overreach" in grounding_card
-
-
 def test_family_policy_candidate_uses_current_session_status_when_available(
     monkeypatch,
 ) -> None:
@@ -5947,6 +5810,69 @@ def test_infer_query_shape_uses_single_anchor_chain_for_leader_of_question() -> 
     )
 
     assert query_shape == "single_anchor_chain_lookup"
+
+
+def test_infer_query_shape_broader_chain_inference_for_does_have_question(monkeypatch) -> None:
+    monkeypatch.setenv("PAL_RUNTIME_BROADER_SINGLE_ANCHOR_CHAIN_INFERENCE", "1")
+    controller = _make_controller()
+    question_text = "what animals does paul reddam have?"
+    answer_target = controller._extract_answer_target_phrase(question_text)
+    interpretation = controller._build_question_interpretation(
+        question_text=question_text,
+        explicit_entities=["paul reddam"],
+        answer_target_phrase=answer_target,
+    )
+
+    query_shape = controller._infer_query_shape(
+        question_text=question_text,
+        entities=["paul reddam"],
+        answer_target_phrase=answer_target,
+        question_inputs=interpretation["question_inputs"],
+    )
+
+    assert query_shape == "single_anchor_chain_lookup"
+
+
+def test_infer_query_shape_broader_chain_inference_for_similar_relation_question(monkeypatch) -> None:
+    monkeypatch.setenv("PAL_RUNTIME_BROADER_SINGLE_ANCHOR_CHAIN_INFERENCE", "1")
+    controller = _make_controller()
+    question_text = "which architect has a similar architectural style to josef fanta?"
+    answer_target = controller._extract_answer_target_phrase(question_text)
+    interpretation = controller._build_question_interpretation(
+        question_text=question_text,
+        explicit_entities=["josef fanta"],
+        answer_target_phrase=answer_target,
+    )
+
+    query_shape = controller._infer_query_shape(
+        question_text=question_text,
+        entities=["josef fanta"],
+        answer_target_phrase=answer_target,
+        question_inputs=interpretation["question_inputs"],
+    )
+
+    assert query_shape == "single_anchor_chain_lookup"
+
+
+def test_infer_query_shape_broader_chain_inference_preserves_direct_guard(monkeypatch) -> None:
+    monkeypatch.setenv("PAL_RUNTIME_BROADER_SINGLE_ANCHOR_CHAIN_INFERENCE", "1")
+    controller = _make_controller()
+    question_text = "which institution has national wine centre of australia?"
+    answer_target = controller._extract_answer_target_phrase(question_text)
+    interpretation = controller._build_question_interpretation(
+        question_text=question_text,
+        explicit_entities=["National Wine Centre of Australia"],
+        answer_target_phrase=answer_target,
+    )
+
+    query_shape = controller._infer_query_shape(
+        question_text=question_text,
+        entities=["National Wine Centre of Australia"],
+        answer_target_phrase=answer_target,
+        question_inputs=interpretation["question_inputs"],
+    )
+
+    assert query_shape == "single_anchor_lookup"
 
 
 def test_grounding_prunes_redundant_pet_breed_temperament_when_biology_variant_exists() -> None:
@@ -13088,6 +13014,53 @@ def test_dynamic_probe_candidate_uses_semantic_endpoint_labels() -> None:
     )
 
 
+def test_dynamic_probe_query_can_filter_to_freebase_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _make_controller()
+    monkeypatch.setenv("PAL_RUNTIME_DYNAMIC_PROBE_FB_FILTER", "1")
+    captured_queries: list[str] = []
+
+    def _fake_run_probe_sparql_query(
+        *,
+        endpoint: str,
+        sparql: str,
+        timeout_s: float = 5.0,
+    ) -> list[str]:
+        captured_queries.append(sparql)
+        return []
+
+    controller._run_probe_sparql_query = _fake_run_probe_sparql_query
+
+    candidates = controller._probe_dynamic_relation_candidates_for_anchor(
+        anchor_entity="J. Paul Reddam",
+        answer_target_phrase="animals",
+        domain_hints=[],
+        question_text="Question: what animals does paul reddam have?",
+    )
+
+    assert candidates == []
+    assert len(captured_queries) == 2
+    assert all('FILTER(STRSTARTS(STR(?p), "http://rdf.freebase.com/ns/"))' in q for q in captured_queries)
+
+
+def test_dynamic_probe_can_keep_base_namespace_relations_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _make_controller()
+
+    base_predicate = (
+        "http://rdf.freebase.com/ns/base.thoroughbredracing."
+        "thoroughbred_racehorse_owner.horses_owned"
+    )
+
+    assert controller._is_noise_predicate(base_predicate) is True
+
+    monkeypatch.setenv("PAL_RUNTIME_DYNAMIC_PROBE_ALLOW_BASE", "1")
+
+    assert controller._is_noise_predicate(base_predicate) is False
+
+
 def test_curated_grounding_includes_bridge_candidates_for_medicine_and_fictional_worlds() -> None:
     controller = _make_controller()
 
@@ -13879,6 +13852,130 @@ def test_probe_dynamic_relation_candidates_for_live_pivots_targets_shared_answer
 
     assert result == []
     assert captured == ["shared_answer"]
+
+
+def test_probe_dynamic_relation_candidates_for_live_pivots_targets_answer_for_single_anchor_entity_tasks() -> None:
+    controller = _make_controller()
+    captured: list[str] = []
+
+    controller._sample_live_pivot_entity_ids = lambda **kwargs: [  # type: ignore[method-assign]
+        {
+            "anchor_role": "anchor",
+            "pivot_entity_id": "m.0t4c9w",
+            "pivot_relation": "music.release.track",
+        }
+    ]
+
+    def _fake_probe(**kwargs):
+        captured.append(str(kwargs.get("target_role") or ""))
+        return []
+
+    controller._probe_dynamic_relation_candidates_for_entity_id = _fake_probe  # type: ignore[method-assign]
+
+    result = controller._probe_dynamic_relation_candidates_for_live_pivots(
+        query_plan={
+            "query_shape": "single_anchor_lookup",
+            "answer_mode": "entity",
+        },
+        anchor_probe_results=[],
+        answer_target_phrase="featured artist",
+        domain_hints=[],
+        question_text="what is the name of the featured artist for musical recording which releases ibiza euphoria?",
+    )
+
+    assert result == []
+    assert captured == ["answer"]
+
+
+def test_structural_repair_adds_pivot_dynamic_candidates_for_single_anchor_projection_empty(
+    monkeypatch,
+) -> None:
+    controller = _make_controller()
+    monkeypatch.setenv("PAL_RUNTIME_SINGLE_ANCHOR_PIVOT_DYNAMIC", "1")
+    controller._build_pal_grounding_card = lambda *args, **kwargs: "grounding-card"  # type: ignore[method-assign]
+    controller._split_task_question = lambda task_question: (task_question, "")  # type: ignore[method-assign]
+    controller._extract_answer_target_phrase = lambda question_text: "featured artist"  # type: ignore[method-assign]
+    controller._infer_domain_hints = lambda task_question: []  # type: ignore[method-assign]
+    controller._extract_anchor_alias_overrides = lambda query_plan: {}  # type: ignore[method-assign]
+    controller._probe_dynamic_relation_candidates_for_live_pivots = lambda **kwargs: [  # type: ignore[method-assign]
+        {
+            "relation": "music.recording.featured_artists",
+            "direction": "forward",
+            "from": "pivot",
+            "to": "featured_artist",
+            "from_role": "candidate_set",
+            "to_role": "answer",
+            "grounding_source": "dynamic_probe",
+            "support": "dynamic_probe_pivot_outgoing",
+        }
+    ]
+
+    grounding_card, grounded_candidates, feedback = controller._augment_grounding_for_structural_repair(
+        task_question="what is the name of the featured artist for musical recording which releases ibiza euphoria?",
+        query_plan={
+            "answer_mode": "entity",
+            "query_shape": "single_anchor_lookup",
+            "anchored_entities": [
+                {
+                    "surface": "Ibiza Euphoria",
+                    "chosen_alias": "m.03_9dcv",
+                    "role": "anchor",
+                }
+            ],
+            "relation_paths": [
+                {
+                    "relation": "music.release.track",
+                    "direction": "forward",
+                    "from_role": "anchor",
+                    "to_role": "candidate_set",
+                },
+                {
+                    "relation": "music.artist.track",
+                    "direction": "reverse",
+                    "from_role": "candidate_set",
+                    "to_role": "answer",
+                },
+            ],
+        },
+        relation_grounding=[
+            {
+                "relation": "music.release.track",
+                "direction": "forward",
+                "from": "Ibiza Euphoria",
+                "to": "track",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Ibiza Euphoria",
+                entity_count=1,
+                path_count=36,
+                relation_probed="music.release.track",
+                anchor_position="subject",
+                resolved_entity_id="m.03_9dcv",
+            )
+        ],
+        verdict=PlausibilityVerdict(
+            verdict="repairable_anchor_path_empty",
+            reasons=[
+                "grounded_single_anchor_empty_result",
+                "anchor_paths_live_but_projection_empty",
+            ],
+        ),
+    )
+
+    assert grounding_card == "grounding-card"
+    assert any(
+        candidate.get("relation") == "music.recording.featured_artists"
+        for candidate in grounded_candidates
+    )
+    assert any(
+        "single_anchor_pivot_dynamic_grounding_augmented" in item
+        for item in feedback
+    )
 
 
 def test_shared_type_pivot_bridge_can_synthesize_shared_answer_type_relation_from_live_anchor_family() -> None:
@@ -17517,3 +17614,300 @@ def test_validate_pal_execution_repairs_missing_selected_head_var_in_bindings() 
 
     assert verdict.verdict == "repairable_bad_projection"
     assert "selected_head_var_missing_from_bindings:answer" in verdict.reasons
+
+
+# ---------------------------------------------------------------------------
+# Zero-count fix tests (Fix A, Fix B1, Fix B2)
+# ---------------------------------------------------------------------------
+
+def test_fix_a_curated_plan_with_undeclared_type_filter_zero_is_repairable() -> None:
+    """
+    Fix A — Sample-4-like pattern.
+    A curated plan with a single anchor→candidate_set relation path whose
+    rendered SPARQL adds an unplanned fb:type.object.type + FILTER that was
+    never declared in relation_paths.  The type filter prevents any matches
+    and the count returns 0.  Should be REPAIRABLE, not accepted.
+    """
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "answer_target_phrase": "medical treatments",
+            "anchored_entities": [
+                {
+                    "surface": "Unsteadiness",
+                    "chosen_alias": "Unsteadiness",
+                    "role": "anchor",
+                }
+            ],
+            "candidate_set_variable": "candidate_set",
+            "count_set_variable": "treatment",
+            "relation_paths": [
+                {
+                    "relation": "medicine.symptom.side_effect_of",
+                    "direction": "forward",
+                    "from": "Unsteadiness",
+                    "from_role": "anchor",
+                    "to": "treatment",
+                    "to_role": "candidate_set",
+                    "grounding_source": "curated",
+                }
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "traverse medicine.symptom.side_effect_of from symptom to treatment",
+        },
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/>\n"
+            "SELECT (COUNT(DISTINCT ?treatment) AS ?count) WHERE {\n"
+            "  {\n"
+            "    ?symptom fb:type.object.name ?symname .\n"
+            "    FILTER(LCASE(STR(?symname)) = \"unsteadiness\")\n"
+            "  }\n"
+            "  ?symptom fb:medicine.symptom.side_effect_of ?treatment .\n"
+            "  ?treatment fb:type.object.type ?t .\n"
+            "  ?t fb:type.object.name ?tname .\n"
+            "  FILTER(LCASE(?tname) = \"medical treatment\")\n"
+            "} LIMIT 50"
+        ),
+        result_dict={
+            "head": {"vars": ["count"]},
+            "results": {"bindings": [{"count": {"type": "literal", "value": "0"}}]},
+        },
+        entities=["Unsteadiness"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Unsteadiness",
+                entity_count=1,
+                path_count=1,
+                relation_probed="medicine.symptom.side_effect_of",
+                anchor_position="subject",
+                resolved_entity_id="m.0unsteadiness",
+            )
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "count_query_zero_with_undeclared_type_filter" in verdict.reasons
+    assert "count_scalar_returned:0" in verdict.reasons
+
+
+def test_fix_a_curated_plan_no_type_filter_zero_is_not_flagged_by_fix_a() -> None:
+    """
+    Fix A regression guard — a curated plan with no type filter in the SPARQL
+    should NOT be flagged by Fix A even when count is 0.
+    """
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "answer_target_phrase": "albums",
+            "anchored_entities": [
+                {
+                    "surface": "NoAlbumsArtist",
+                    "chosen_alias": "NoAlbumsArtist",
+                    "role": "anchor",
+                }
+            ],
+            "candidate_set_variable": "album",
+            "count_set_variable": "album",
+            "relation_paths": [
+                {
+                    "relation": "music.artist.album",
+                    "direction": "forward",
+                    "from": "NoAlbumsArtist",
+                    "from_role": "anchor",
+                    "to": "album",
+                    "to_role": "candidate_set",
+                    "grounding_source": "curated",
+                }
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count albums for the artist",
+        },
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/>\n"
+            "SELECT (COUNT(DISTINCT ?album) AS ?count) WHERE {\n"
+            "  VALUES ?artist { fb:m.0noalbums }\n"
+            "  ?artist fb:music.artist.album ?album .\n"
+            "} LIMIT 50"
+        ),
+        result_dict={
+            "head": {"vars": ["count"]},
+            "results": {"bindings": [{"count": {"type": "literal", "value": "0"}}]},
+        },
+        entities=["NoAlbumsArtist"],
+        anchor_probe_results=None,
+    )
+
+    # Fix A must NOT fire — no type filter in SPARQL.
+    assert "count_query_zero_with_undeclared_type_filter" not in verdict.reasons
+
+
+def test_fix_b1_count_projected_over_unbound_variable_is_repairable() -> None:
+    """
+    Fix B1 — Sample-5-like pattern.
+    COUNT(DISTINCT ?candidate_genre_set) where ?candidate_genre_set never
+    appears in WHERE.  Structurally guaranteed zero; must be REPAIRABLE.
+    """
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "answer_target_phrase": "different media genres",
+            "anchored_entities": [
+                {
+                    "surface": "Hentai",
+                    "chosen_alias": "Hentai",
+                    "role": "anchor",
+                }
+            ],
+            "candidate_set_variable": "candidate_genre_set",
+            "count_set_variable": "count_candidate_genres",
+            "relation_paths": [
+                {
+                    "relation": "media_common.media_genre.child_genres",
+                    "direction": "forward",
+                    "from": "parent_genre",
+                    "from_role": "constraint_value",
+                    "to": "child_genre",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                }
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count child genres of Hentai via child_genres relation",
+        },
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/>\n"
+            "SELECT (COUNT(DISTINCT ?candidate_genre_set) AS ?count) WHERE {\n"
+            "  ?parent_genre_constraint_value fb:type.object.name"
+            " ?parent_genre_constraint_value_label .\n"
+            "  FILTER(LCASE(STR(?parent_genre_constraint_value_label)) = \"parent_genre\")\n"
+            "  ?child_genre_constraint_value fb:type.object.name"
+            " ?child_genre_constraint_value_label .\n"
+            "  FILTER(LCASE(STR(?child_genre_constraint_value_label)) = \"child_genre\")\n"
+            "  ?parent_genre_constraint_value"
+            " fb:media_common.media_genre.child_genres ?child_genre_constraint_value .\n"
+            "} LIMIT 50"
+        ),
+        result_dict={
+            "head": {"vars": ["count"]},
+            "results": {"bindings": [{"count": {"type": "literal", "value": "0"}}]},
+        },
+        entities=["Hentai"],
+        anchor_probe_results=None,
+    )
+
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "count_projection_variable_unbound_in_where" in verdict.reasons
+    assert "count_scalar_returned:0" in verdict.reasons
+
+
+def test_fix_b2_direct_count_plan_all_constraint_value_paths_is_repairable() -> None:
+    """
+    Fix B2 — count_over_direct_relation plan where every relation path has
+    constraint_value roles on both sides (anchor never connected to the
+    counted variable).  Must be REPAIRABLE regardless of query text.
+    """
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "answer_target_phrase": "child genres",
+            "anchored_entities": [
+                {
+                    "surface": "Horror",
+                    "chosen_alias": "Horror",
+                    "role": "anchor",
+                }
+            ],
+            "candidate_set_variable": "genre",
+            "count_set_variable": "genre",
+            "relation_paths": [
+                {
+                    "relation": "media_common.media_genre.child_genres",
+                    "direction": "forward",
+                    "from": "parent",
+                    "from_role": "constraint_value",
+                    "to": "child",
+                    "to_role": "constraint_value",
+                    "grounding_source": "curated",
+                }
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count child genres",
+        },
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/>\n"
+            "SELECT (COUNT(DISTINCT ?genre) AS ?count) WHERE {\n"
+            "  VALUES ?parent { fb:m.0horror }\n"
+            "  ?parent fb:media_common.media_genre.child_genres ?genre .\n"
+            "} LIMIT 50"
+        ),
+        result_dict={
+            "head": {"vars": ["count"]},
+            "results": {"bindings": [{"count": {"type": "literal", "value": "0"}}]},
+        },
+        entities=["Horror"],
+        anchor_probe_results=None,
+    )
+
+    assert verdict.verdict == VERDICT_REPAIRABLE_BAD_COUNT_SET
+    assert "count_direct_relation_plan_no_anchor_to_count_path" in verdict.reasons
+    assert "count_scalar_returned:0" in verdict.reasons
+
+
+def test_legitimate_nonzero_count_is_not_blocked() -> None:
+    """
+    Control case — a structurally correct curated count_over_direct_relation
+    plan returning a non-zero count must be ACCEPTED.  Regression guard for
+    all three fixes.
+    """
+    verdict = validate_pal_execution(
+        query_plan={
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "answer_target_phrase": "species",
+            "anchored_entities": [
+                {
+                    "surface": "Seventh sphere",
+                    "chosen_alias": "Seventh sphere",
+                    "role": "anchor",
+                }
+            ],
+            "candidate_set_variable": "species",
+            "count_set_variable": "species",
+            "relation_paths": [
+                {
+                    "relation": "fictional_universe.fictional_universe.species",
+                    "direction": "forward",
+                    "from": "Seventh sphere",
+                    "from_role": "anchor",
+                    "to": "species",
+                    "to_role": "candidate_set",
+                    "grounding_source": "curated",
+                }
+            ],
+            "allow_exploratory_predicates": False,
+            "strategy": "count species in the fictional universe",
+        },
+        query_text=(
+            "PREFIX fb: <http://rdf.freebase.com/ns/>\n"
+            "SELECT (COUNT(DISTINCT ?species) AS ?count) WHERE {\n"
+            "  VALUES ?universe { fb:m.07th_sphere }\n"
+            "  ?universe fb:fictional_universe.fictional_universe.species ?species .\n"
+            "} LIMIT 50"
+        ),
+        result_dict={
+            "head": {"vars": ["count"]},
+            "results": {"bindings": [{"count": {"type": "literal", "value": "45"}}]},
+        },
+        entities=["Seventh sphere"],
+        anchor_probe_results=None,
+    )
+
+    assert verdict.verdict == VERDICT_ACCEPTED
+    # None of the new fix reasons should appear for a correct result.
+    assert "count_query_zero_with_undeclared_type_filter" not in verdict.reasons
+    assert "count_projection_variable_unbound_in_where" not in verdict.reasons
+    assert "count_direct_relation_plan_no_anchor_to_count_path" not in verdict.reasons

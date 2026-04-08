@@ -20,6 +20,7 @@ from src.language_models import LanguageModel
 from src.pal.family_policy_evolution import (
     build_family_policy_store,
     classify_family_failure,
+    compare_locked_family_name,
     family_policy_enabled_for,
     version_reuse_compatible,
 )
@@ -46,6 +47,7 @@ from src.pal.plausibility_validator import (
     AnchorProbeResult,
     PlausibilityVerdict,
     VERDICT_REPAIRABLE_BAD_COUNT_SET,
+    _count_answer_target_requires_explicit_semantics,
     build_repair_feedback,
     validate_pal_execution,
 )
@@ -82,10 +84,16 @@ except ImportError:  # pragma: no cover
 
 
 _TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK_ENV = "PAL_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK"
-_TOOL_EVOLUTION_CONTRASTIVE_BRANCH_ENV = "PAL_TOOL_EVOLUTION_CONTRASTIVE_BRANCH"
-_TOOL_EVOLUTION_ANCHOR_HINTS_ENV = "PAL_TOOL_EVOLUTION_ANCHOR_HINTS"
-_TOOL_EVOLUTION_COUNT_TRANSFER_ENV = "PAL_TOOL_EVOLUTION_COUNT_CROSSFAMILY_TRANSFER"
-_TOOL_EVOLUTION_COARSE_SUCCESS_HINTS_ENV = "PAL_TOOL_EVOLUTION_COARSE_SUCCESS_HINTS"
+_RUNTIME_SINGLE_ANCHOR_BINDING_ENV = "PAL_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING"
+_RUNTIME_SINGLE_ANCHOR_TARGET_ENV = "PAL_RUNTIME_SINGLE_ANCHOR_TARGET_SEMANTICS"
+_RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC_ENV = "PAL_RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC"
+_RUNTIME_SINGLE_ANCHOR_PIVOT_DYNAMIC_ENV = "PAL_RUNTIME_SINGLE_ANCHOR_PIVOT_DYNAMIC"
+_RUNTIME_JOINED_COUNT_TARGET_ENV = "PAL_RUNTIME_JOINED_COUNT_TARGET_BOUNDARY"
+_RUNTIME_DYNAMIC_PROBE_FB_FILTER_ENV = "PAL_RUNTIME_DYNAMIC_PROBE_FB_FILTER"
+_RUNTIME_DYNAMIC_PROBE_ALLOW_BASE_ENV = "PAL_RUNTIME_DYNAMIC_PROBE_ALLOW_BASE"
+_RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION_ENV = (
+    "PAL_RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION"
+)
 
 
 class PALAgentController(Agent):
@@ -572,6 +580,7 @@ class PALAgentController(Agent):
                             generated_tool_name=generated_tool_name,
                             query_plan=query_plan,
                             tool_result_semantics=tool_result_semantics,
+                            verdict=failure_verdict,
                         ),
                     )
                 result_dict = invocation_result.payload
@@ -702,6 +711,7 @@ class PALAgentController(Agent):
                         generated_tool_name=generated_tool_name,
                         query_plan=query_plan,
                         tool_result_semantics=tool_result_semantics,
+                        verdict=final_verdict,
                     ),
                 )
 
@@ -709,13 +719,29 @@ class PALAgentController(Agent):
         except AgentUnknownException:
             raise
         except Exception as e:
+            failure_reason = str(e).strip()
+            if failure_reason.startswith("pal_query_plan_invalid:"):
+                advisory_text = self._build_pal_plan_failure_advisory(
+                    failure_reason=failure_reason
+                )
+                if self._tool_evolution_skip_manual_fallback_enabled():
+                    self._bypass_manual_solver_after_tool_failure(
+                        generated_tool_name=generated_tool_name,
+                        failure_reason=failure_reason,
+                        advisory_text=advisory_text,
+                    )
+                self._activate_manual_fallback(
+                    chat_history=chat_history,
+                    advisory_text=advisory_text,
+                )
+                return self._delegate_to_manual_solver(chat_history=chat_history)
             self._emit_generated_tools_event(
                 {
                     "event": "pal_adapter_failed" if pipeline_stage == "adapter" else "tool_generation_failed",
                     "phase": pipeline_stage,
                     "mode": "pal",
                     "tool_name": generated_tool_name,
-                    "error": str(e),
+                    "error": failure_reason,
                 }
             )
             if pipeline_stage == "parser":
@@ -726,7 +752,7 @@ class PALAgentController(Agent):
                         "round": 1,
                         "tool_name": generated_tool_name,
                         "ok": False,
-                        "error": str(e),
+                        "error": failure_reason,
                     }
                 )
             elif pipeline_stage == "invoker":
@@ -738,10 +764,10 @@ class PALAgentController(Agent):
                         "tool_name": generated_tool_name,
                         "ok": False,
                         "failure_kind": "execution_error",
-                        "error": str(e),
+                        "error": failure_reason,
                     }
                 )
-            raise AgentUnknownException(str(e)) from e
+            raise AgentUnknownException(failure_reason) from e
 
     def _tool_evolution_skip_manual_fallback_enabled(self) -> bool:
         return os.environ.get(_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK_ENV) == "1"
@@ -789,6 +815,7 @@ class PALAgentController(Agent):
         generated_tool_name: Optional[str] = None,
         query_plan: Optional[Mapping[str, Any]] = None,
         tool_result_semantics: Optional[Mapping[str, Any]] = None,
+        verdict: Optional[PlausibilityVerdict] = None,
     ) -> str:
         artifact_type = str(
             (materialization.diagnostics or {}).get("artifact_type") or ""
@@ -909,6 +936,40 @@ class PALAgentController(Agent):
                 "pal_answer_cardinality_hint",
                 self._infer_answer_cardinality_hint(task_question),
             )
+            # ----------------------------------------------------------
+            # Fix C — zero-count safety net
+            # If a count_scalar of 0 is about to be sent as trusted-final
+            # but the upstream plausibility checks did not add a strong
+            # explicit-zero-acceptance reason, downgrade the trust flags
+            # and attach a verification caveat.  This is a conservative
+            # last-resort: Fixes A/B in the plausibility validator should
+            # catch structural bad zeros before reaching here.
+            # ----------------------------------------------------------
+            if (
+                str(payload.get("pal_artifact_type") or "").strip() == "count_scalar"
+                and payload.get("pal_artifact_value") == 0
+                and payload.get("pal_trusted_for_materialization")
+            ):
+                _zero_verdict_reasons = list(
+                    getattr(verdict, "reasons", []) if verdict is not None else []
+                )
+                _strong_zero_accepted = any(
+                    r in _zero_verdict_reasons
+                    for r in (
+                        "accepted_exact_grounded_zero_joined_count",
+                        "accepted_pinned_semantic_dynamic_count",
+                    )
+                )
+                if not _strong_zero_accepted:
+                    payload["pal_trusted_for_materialization"] = False
+                    payload["pal_solves_task"] = False
+                    payload["pal_tool_status"] = "partial"
+                    payload["pal_repair_caveat"] = (
+                        "Count result is zero but no strong structural justification "
+                        "for an exact zero was established. Verify the query traverses "
+                        "the intended anchor-to-count-set path before accepting this "
+                        "as a final answer."
+                    )
             run_id = str(payload.get("run_id") or self._get_run_id())
             self._pending_macro_runs[run_id] = {
                 "tool_name": tool_name,
@@ -1084,247 +1145,6 @@ class PALAgentController(Agent):
         return build_family_policy_store(
             baseline_bundles=get_baseline_reusable_family_policy_bundles()
         )
-
-    def _load_family_success_archetypes(
-        self,
-        *,
-        family_name: str,
-    ) -> list[dict[str, Any]]:
-        cleaned_family = str(family_name or "").strip()
-        if not cleaned_family:
-            return []
-        try:
-            store = self._get_family_policy_store()
-            metadata = store.get_trusted_success_bank_metadata(cleaned_family)
-        except Exception:
-            return []
-        evaluation_context = metadata.get("evaluation_context") or {}
-        if not isinstance(evaluation_context, Mapping):
-            return []
-        active_bundle = get_reusable_family_policy_bundle(cleaned_family)
-        source_version = str(metadata.get("source_version") or "").strip()
-        active_version = str(getattr(active_bundle, "version", "") or "").strip()
-        if source_version and active_version and not version_reuse_compatible(
-            source_version,
-            active_version,
-        ):
-            return []
-        return [
-            dict(item)
-            for item in (evaluation_context.get("success_plan_archetypes") or [])
-            if isinstance(item, Mapping)
-        ]
-
-    def _tool_evolution_coarse_success_hints_enabled(self) -> bool:
-        return os.getenv(_TOOL_EVOLUTION_COARSE_SUCCESS_HINTS_ENV) == "1"
-
-    def _format_family_success_archetypes(
-        self,
-        *,
-        family_name: str,
-    ) -> list[str]:
-        archetypes = self._load_family_success_archetypes(family_name=family_name)
-        formatted: list[str] = []
-        for archetype in archetypes[:2]:
-            anchor_roles = ",".join(
-                str(item).strip()
-                for item in (archetype.get("anchor_roles") or [])
-                if str(item).strip()
-            )
-            anchor_constraints = " | ".join(
-                str(item).strip()
-                for item in (archetype.get("anchor_constraints") or [])
-                if str(item).strip()
-            )
-            relation_roles = " | ".join(
-                str(item).strip()
-                for item in (archetype.get("relation_role_skeleton") or [])
-                if str(item).strip()
-            )
-            structural_notes = ",".join(
-                str(item).strip()
-                for item in (archetype.get("structural_notes") or [])
-                if str(item).strip()
-            )
-            summary_bits = [
-                f"anchor_roles={anchor_roles or 'none'}",
-                f"anchor_constraints={anchor_constraints or 'none'}",
-                f"relation_roles={relation_roles or 'none'}",
-            ]
-            if structural_notes:
-                summary_bits.append(f"structural_notes={structural_notes}")
-            formatted.append("; ".join(summary_bits))
-        return formatted
-
-    def _tool_evolution_contrastive_branch_enabled(self) -> bool:
-        return os.getenv(_TOOL_EVOLUTION_CONTRASTIVE_BRANCH_ENV) == "1"
-
-    def _tool_evolution_anchor_hints_enabled(self) -> bool:
-        return os.getenv(_TOOL_EVOLUTION_ANCHOR_HINTS_ENV) == "1"
-
-    def _tool_evolution_count_transfer_enabled(self) -> bool:
-        return os.getenv(_TOOL_EVOLUTION_COUNT_TRANSFER_ENV) == "1"
-
-    def _load_tool_evolution_context(
-        self,
-        *,
-        family_name: str,
-    ) -> dict[str, Any]:
-        cleaned_family = str(family_name or "").strip()
-        if not cleaned_family:
-            return {}
-        try:
-            store = self._get_family_policy_store()
-            context = store.get_tool_evolution_context(cleaned_family)
-        except Exception:
-            return {}
-        if not isinstance(context, Mapping):
-            return {}
-        active_bundle = get_reusable_family_policy_bundle(cleaned_family)
-        source_version = str(context.get("source_version") or "").strip()
-        active_version = str(getattr(active_bundle, "version", "") or "").strip()
-        if source_version and active_version and not version_reuse_compatible(
-            source_version,
-            active_version,
-        ):
-            return {}
-        return dict(context)
-
-    def _tool_evolution_peer_families(self, family_name: str) -> list[str]:
-        cleaned = str(family_name or "").strip()
-        if cleaned not in {"count_over_direct_relation", "count_over_joined_set"}:
-            return []
-        return [
-            name
-            for name in ("count_over_direct_relation", "count_over_joined_set")
-            if name != cleaned
-        ]
-
-    def _collect_tool_evolution_patterns(
-        self,
-        *,
-        family_name: str,
-        key: str,
-    ) -> list[dict[str, Any]]:
-        families = [str(family_name or "").strip()]
-        if self._tool_evolution_count_transfer_enabled():
-            families.extend(self._tool_evolution_peer_families(family_name))
-        collected: list[dict[str, Any]] = []
-        seen_signatures: set[str] = set()
-        for current_family in families:
-            context = self._load_tool_evolution_context(family_name=current_family)
-            for item in (context.get(key) or []):
-                if not isinstance(item, Mapping):
-                    continue
-                signature = str(item.get("pattern_signature") or "").strip()
-                if not signature or signature in seen_signatures:
-                    continue
-                seen_signatures.add(signature)
-                collected.append(dict(item))
-        return collected
-
-    def _format_tool_evolution_branch_patterns(
-        self,
-        *,
-        family_name: str,
-    ) -> list[str]:
-        if not self._tool_evolution_contrastive_branch_enabled():
-            return []
-
-        def _render(item: Mapping[str, Any], *, prefix: str) -> str:
-            relation_signatures = " | ".join(
-                str(value).strip()
-                for value in (item.get("relation_signatures") or [])
-                if str(value).strip()
-            )
-            structural_notes = ",".join(
-                str(value).strip()
-                for value in (item.get("structural_notes") or [])
-                if str(value).strip()
-            )
-            grounding_sources = ",".join(
-                str(value).strip()
-                for value in (item.get("grounding_sources") or [])
-                if str(value).strip()
-            )
-            failure_labels = ",".join(
-                str(value).strip()
-                for value in (item.get("failure_labels") or [])
-                if str(value).strip()
-            )
-            bits = [f"{prefix} relation_signatures={relation_signatures or 'none'}"]
-            if structural_notes:
-                bits.append(f"structural_notes={structural_notes}")
-            if grounding_sources:
-                bits.append(f"grounding_sources={grounding_sources}")
-            if failure_labels:
-                bits.append(f"failure_labels={failure_labels}")
-            return "; ".join(bits)
-
-        lines: list[str] = []
-        for archetype in self._collect_tool_evolution_patterns(
-            family_name=family_name,
-            key="preferred_patterns",
-        )[:2]:
-            lines.append(_render(archetype, prefix="prefer"))
-        for archetype in self._collect_tool_evolution_patterns(
-            family_name=family_name,
-            key="avoid_patterns",
-        )[:2]:
-            lines.append(_render(archetype, prefix="avoid"))
-        return lines
-
-    def _format_tool_evolution_anchor_patterns(
-        self,
-        *,
-        family_name: str,
-    ) -> list[str]:
-        if not self._tool_evolution_anchor_hints_enabled():
-            return []
-
-        def _render(item: Mapping[str, Any], *, prefix: str) -> str:
-            anchor_binding_modes = ",".join(
-                str(value).strip()
-                for value in (item.get("anchor_binding_modes") or [])
-                if str(value).strip()
-            )
-            alias_strategy_tokens = ",".join(
-                str(value).strip()
-                for value in (item.get("alias_strategy_tokens") or [])
-                if str(value).strip()
-            )
-            relation_signatures = " | ".join(
-                str(value).strip()
-                for value in (item.get("relation_signatures") or [])
-                if str(value).strip()
-            )
-            failure_labels = ",".join(
-                str(value).strip()
-                for value in (item.get("failure_labels") or [])
-                if str(value).strip()
-            )
-            bits = [
-                f"{prefix} anchor_binding={anchor_binding_modes or 'none'}",
-                f"alias_strategy={alias_strategy_tokens or 'none'}",
-            ]
-            if relation_signatures:
-                bits.append(f"relation_signatures={relation_signatures}")
-            if failure_labels:
-                bits.append(f"failure_labels={failure_labels}")
-            return "; ".join(bits)
-
-        lines: list[str] = []
-        for archetype in self._collect_tool_evolution_patterns(
-            family_name=family_name,
-            key="preferred_patterns",
-        )[:2]:
-            lines.append(_render(archetype, prefix="prefer"))
-        for archetype in self._collect_tool_evolution_patterns(
-            family_name=family_name,
-            key="avoid_patterns",
-        )[:2]:
-            lines.append(_render(archetype, prefix="avoid"))
-        return lines
 
     def _render_family_policy_guidance_item(self, item: str) -> str:
         cleaned = str(item or "").strip()
@@ -6299,6 +6119,413 @@ class PALAgentController(Agent):
             return []
         return [str(item).strip() for item in raw_value if str(item).strip()]
 
+    def _runtime_single_anchor_binding_enabled(self) -> bool:
+        return os.getenv(_RUNTIME_SINGLE_ANCHOR_BINDING_ENV) == "1"
+
+    def _runtime_single_anchor_target_semantics_enabled(self) -> bool:
+        return os.getenv(_RUNTIME_SINGLE_ANCHOR_TARGET_ENV) == "1"
+
+    def _runtime_single_anchor_low_trust_dynamic_enabled(self) -> bool:
+        return os.getenv(_RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC_ENV) == "1"
+
+    def _runtime_single_anchor_pivot_dynamic_enabled(self) -> bool:
+        return os.getenv(_RUNTIME_SINGLE_ANCHOR_PIVOT_DYNAMIC_ENV) == "1"
+
+    def _runtime_single_anchor_chain_low_trust_dynamic_enabled(self) -> bool:
+        return os.getenv("PAL_RUNTIME_SINGLE_ANCHOR_CHAIN_LOW_TRUST_DYNAMIC") == "1"
+
+    def _runtime_preserve_chain_query_shape_on_refresh_enabled(self) -> bool:
+        return os.getenv("PAL_RUNTIME_PRESERVE_CHAIN_QUERY_SHAPE_ON_REFRESH") == "1"
+
+    def _runtime_joined_count_target_boundary_enabled(self) -> bool:
+        return os.getenv(_RUNTIME_JOINED_COUNT_TARGET_ENV) == "1"
+
+    def _runtime_dynamic_probe_fb_filter_enabled(self) -> bool:
+        return os.getenv(_RUNTIME_DYNAMIC_PROBE_FB_FILTER_ENV, "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _runtime_dynamic_probe_allow_base_enabled(self) -> bool:
+        return os.getenv(_RUNTIME_DYNAMIC_PROBE_ALLOW_BASE_ENV, "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _single_anchor_answer_binding_errors(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+    ) -> list[str]:
+        if str(query_plan.get("query_shape") or "").strip() != "single_anchor_lookup":
+            return []
+        relation_paths = [
+            relation_path
+            for relation_path in (query_plan.get("relation_paths") or [])
+            if isinstance(relation_path, Mapping)
+        ]
+        if not relation_paths:
+            return []
+        if len(relation_paths) != 1:
+            return ["family_policy_single_anchor_requires_direct_path"]
+        relation_path = relation_paths[0]
+        from_role = self._normalize_relation_role(relation_path.get("from_role"))
+        to_role = self._normalize_relation_role(relation_path.get("to_role"))
+        if {from_role, to_role} == {"anchor", "answer"}:
+            return []
+        return ["family_policy_single_anchor_requires_direct_path"]
+
+    def _single_anchor_answer_target_semantics_errors(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+        relation_grounding: Sequence[Mapping[str, str]],
+    ) -> list[str]:
+        if str(query_plan.get("query_shape") or "").strip() != "single_anchor_lookup":
+            return []
+        answer_target_phrase = str(query_plan.get("answer_target_phrase") or "").strip()
+        if not answer_target_phrase or not self._count_answer_target_requires_explicit_semantics(
+            answer_target_phrase
+        ):
+            return []
+        relation_paths = [
+            relation_path
+            for relation_path in (query_plan.get("relation_paths") or [])
+            if isinstance(relation_path, Mapping)
+        ]
+        if not relation_paths:
+            return []
+        planned_semantics_preserved = (
+            self._count_answer_target_head_is_encoded_in_relation(
+                answer_target_phrase=answer_target_phrase,
+                relation_candidates=relation_paths,
+            )
+            or self._answer_target_qualifier_is_encoded_in_answer_relation(
+                answer_target_phrase=answer_target_phrase,
+                relation_candidates=relation_paths,
+            )
+            or self._answer_target_is_relation_encoded_type_projection(
+                answer_target_phrase=answer_target_phrase,
+                relation_candidates=relation_paths,
+            )
+        )
+        if planned_semantics_preserved:
+            return []
+        grounded_semantics_available = (
+            self._count_answer_target_head_is_encoded_in_relation(
+                answer_target_phrase=answer_target_phrase,
+                relation_candidates=relation_grounding,
+            )
+            or self._answer_target_qualifier_is_encoded_in_answer_relation(
+                answer_target_phrase=answer_target_phrase,
+                relation_candidates=relation_grounding,
+            )
+            or self._answer_target_is_relation_encoded_type_projection(
+                answer_target_phrase=answer_target_phrase,
+                relation_candidates=relation_grounding,
+            )
+        )
+        if not grounded_semantics_available:
+            return []
+        if any(
+            str(relation_path.get("grounding_source") or "").strip() == "exploratory"
+            for relation_path in relation_paths
+        ):
+            return [
+                "family_policy_single_anchor_exploratory_answer_target_drift:"
+                + answer_target_phrase
+            ]
+        return [
+            "family_policy_single_anchor_answer_target_not_preserved:"
+            + answer_target_phrase
+        ]
+
+    def _single_anchor_low_trust_dynamic_errors(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+    ) -> list[str]:
+        query_shape = str(query_plan.get("query_shape") or "").strip()
+        if query_shape not in {"single_anchor_lookup", "single_anchor_chain_lookup"}:
+            return []
+        if (
+            query_shape == "single_anchor_chain_lookup"
+            and not self._runtime_single_anchor_chain_low_trust_dynamic_enabled()
+        ):
+            return []
+        if (
+            query_shape == "single_anchor_lookup"
+            and not bool(query_plan.get("allow_exploratory_predicates"))
+        ):
+            return []
+        relation_paths = [
+            relation_path
+            for relation_path in (query_plan.get("relation_paths") or [])
+            if isinstance(relation_path, Mapping)
+        ]
+        if len(relation_paths) != 1:
+            return []
+        relation_path = relation_paths[0]
+        if str(relation_path.get("grounding_source") or "").strip() != "dynamic_probe":
+            return []
+        from_role = self._normalize_relation_role(relation_path.get("from_role"))
+        to_role = self._normalize_relation_role(relation_path.get("to_role"))
+        if query_shape == "single_anchor_lookup" and {from_role, to_role} != {"anchor", "answer"}:
+            return []
+        if query_shape == "single_anchor_chain_lookup" and (
+            from_role != "anchor" or to_role != "candidate_set"
+        ):
+            return []
+
+        alias_repaired = any(
+            "live probe repair selected alias"
+            in str(item.get("reason") or "").strip().lower()
+            for item in (query_plan.get("normalized_aliases") or [])
+            if isinstance(item, Mapping)
+        )
+        alias_shifted = any(
+            str(item.get("role") or "").strip() == "anchor"
+            and str(item.get("surface") or "").strip()
+            and str(item.get("chosen_alias") or "").strip()
+            and str(item.get("resolved_entity_id") or "").strip()
+            and str(item.get("surface") or "").strip()
+            != str(item.get("chosen_alias") or "").strip()
+            for item in (query_plan.get("anchored_entities") or [])
+            if isinstance(item, Mapping)
+        )
+        if not (alias_repaired and alias_shifted):
+            return []
+        if query_shape == "single_anchor_chain_lookup":
+            candidate_token = self._normalize_variable_token(
+                query_plan.get("candidate_set_variable")
+            )
+            answer_token = self._normalize_variable_token(
+                query_plan.get("shared_answer_variable")
+            )
+            if not candidate_token or candidate_token == answer_token:
+                return []
+        return ["family_policy_single_anchor_low_trust_dynamic_alias_repair"]
+
+    def _query_plan_has_single_anchor_chain_structure(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+    ) -> bool:
+        relation_paths = [
+            relation_path
+            for relation_path in (query_plan.get("relation_paths") or [])
+            if isinstance(relation_path, Mapping)
+        ]
+        if len(relation_paths) >= 2:
+            return True
+        if len(relation_paths) != 1:
+            return False
+        relation_path = relation_paths[0]
+        from_role = self._normalize_relation_role(relation_path.get("from_role"))
+        to_role = self._normalize_relation_role(relation_path.get("to_role"))
+        candidate_token = self._normalize_variable_token(
+            query_plan.get("candidate_set_variable")
+        )
+        answer_token = self._normalize_variable_token(
+            query_plan.get("shared_answer_variable")
+        )
+        return (
+            from_role == "anchor"
+            and to_role == "candidate_set"
+            and bool(candidate_token)
+            and candidate_token != answer_token
+        )
+
+    def _preserve_chain_query_shape_on_refresh(
+        self,
+        *,
+        previous_query_plan: Mapping[str, Any],
+        refreshed_query_plan: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if not self._runtime_preserve_chain_query_shape_on_refresh_enabled():
+            return refreshed_query_plan
+        previous_shape = str(previous_query_plan.get("query_shape") or "").strip()
+        refreshed_shape = str(refreshed_query_plan.get("query_shape") or "").strip()
+        if previous_shape != "single_anchor_chain_lookup":
+            return refreshed_query_plan
+        if refreshed_shape == "single_anchor_chain_lookup":
+            return refreshed_query_plan
+        if not self._query_plan_has_single_anchor_chain_structure(
+            query_plan=refreshed_query_plan
+        ):
+            return refreshed_query_plan
+        preserved = dict(refreshed_query_plan)
+        preserved["query_shape"] = "single_anchor_chain_lookup"
+        return preserved
+
+    def _joined_count_target_boundary_errors(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+        relation_grounding: Sequence[Mapping[str, str]],
+    ) -> list[str]:
+        if str(query_plan.get("query_shape") or "").strip() != "count_over_joined_set":
+            return []
+        relation_paths = [
+            relation_path
+            for relation_path in (query_plan.get("relation_paths") or [])
+            if isinstance(relation_path, Mapping)
+        ]
+        if not relation_paths:
+            return []
+        count_token = self._normalize_variable_token(query_plan.get("count_set_variable"))
+        candidate_token = self._normalize_variable_token(
+            query_plan.get("candidate_set_variable")
+        )
+        shared_answer_token = self._normalize_variable_token(
+            query_plan.get("shared_answer_variable")
+        )
+        count_bound = False
+        count_connected = candidate_token == count_token and bool(count_token)
+        for relation_path in relation_paths:
+            from_token = self._normalize_variable_token(relation_path.get("from"))
+            to_token = self._normalize_variable_token(relation_path.get("to"))
+            from_role = self._normalize_relation_role(relation_path.get("from_role"))
+            to_role = self._normalize_relation_role(relation_path.get("to_role"))
+            if count_token and (
+                count_token in {from_token, to_token}
+                or "count_set" in {from_role, to_role}
+            ):
+                count_bound = True
+            if count_token and candidate_token and count_token != candidate_token:
+                if (
+                    {count_token, candidate_token} == {from_token, to_token}
+                    or {"count_set", "candidate_set"} == {from_role, to_role}
+                ):
+                    count_connected = True
+            if count_token and shared_answer_token and count_token != shared_answer_token:
+                if (
+                    {count_token, shared_answer_token} == {from_token, to_token}
+                    or {from_role, to_role} & {"count_set"}
+                    and {from_role, to_role} & {"answer", "shared_answer"}
+                ):
+                    count_connected = True
+        errors: list[str] = []
+        if count_token and not count_bound:
+            errors.append(
+                "count_query_counts_wrong_variable:count_set_not_structurally_bound"
+            )
+        if count_token and candidate_token and count_token != candidate_token and not count_connected:
+            errors.append(
+                "count_answer_target_unenforced:count_target_not_connected_to_candidate_boundary"
+            )
+        answer_target_phrase = str(query_plan.get("answer_target_phrase") or "").strip()
+        if (
+            answer_target_phrase
+            and _count_answer_target_requires_explicit_semantics(answer_target_phrase)
+            and not (
+                self._count_answer_target_head_is_encoded_in_relation(
+                    answer_target_phrase=answer_target_phrase,
+                    relation_candidates=relation_grounding,
+                )
+                or self._answer_target_is_relation_encoded_type_projection(
+                    answer_target_phrase=answer_target_phrase,
+                    relation_candidates=relation_grounding,
+                )
+                or self._answer_target_qualifier_is_encoded_in_answer_relation(
+                    answer_target_phrase=answer_target_phrase,
+                    relation_candidates=relation_grounding,
+                )
+            )
+        ):
+            errors.append(
+                "family_policy_count_answer_target_not_preserved:"
+                + answer_target_phrase
+            )
+        return errors
+
+    def _active_family_runtime_policy_errors(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+        relation_grounding: Sequence[Mapping[str, str]] | None = None,
+    ) -> list[str]:
+        errors: list[str] = []
+        locked_family = compare_locked_family_name()
+        query_shape = str(query_plan.get("query_shape") or "").strip()
+        if locked_family and query_shape and query_shape != locked_family:
+            errors.append(
+                "family_compare_locked_query_shape:"
+                + locked_family
+                + ":"
+                + query_shape
+            )
+        active_family_bundle = get_reusable_family_policy_bundle(query_shape)
+        if active_family_bundle is None:
+            return errors
+
+        validator_expectations = set(active_family_bundle.validator_expectations)
+        scaffold_signature = self._build_scaffold_signature(query_plan)
+        if (
+            scaffold_signature
+            and scaffold_signature in set(active_family_bundle.blocked_scaffold_signatures)
+        ):
+            errors.append("family_policy_blocked_scaffold_signature:" + scaffold_signature)
+
+        forbidden_relation_families = set(active_family_bundle.forbidden_relation_families)
+        if forbidden_relation_families:
+            used_relation_names = set(self._relation_names_from_plan(query_plan))
+            for relation_name in sorted(used_relation_names & forbidden_relation_families):
+                errors.append("family_policy_forbidden_relation_family:" + relation_name)
+
+        if (
+            self._runtime_single_anchor_binding_enabled()
+            and validator_expectations
+            & {
+                "require_direct_single_anchor_answer_path",
+                "verify_projected_entity_matches_question_target",
+            }
+        ):
+            errors.extend(self._single_anchor_answer_binding_errors(query_plan=query_plan))
+
+        if (
+            relation_grounding is not None
+            and self._runtime_single_anchor_target_semantics_enabled()
+            and validator_expectations
+            & {
+                "verify_answer_target_semantics_not_just_executability",
+                "tighten_answer_target_semantics",
+            }
+        ):
+            errors.extend(
+                self._single_anchor_answer_target_semantics_errors(
+                    query_plan=query_plan,
+                    relation_grounding=relation_grounding,
+                )
+            )
+
+        if self._runtime_single_anchor_low_trust_dynamic_enabled():
+            errors.extend(
+                self._single_anchor_low_trust_dynamic_errors(query_plan=query_plan)
+            )
+
+        if (
+            relation_grounding is not None
+            and self._runtime_joined_count_target_boundary_enabled()
+            and query_shape == "count_over_joined_set"
+            and validator_expectations
+            & {
+                "require_count_answer_target_preservation",
+                "verify_count_targets_requested_entity_set",
+            }
+        ):
+            errors.extend(
+                self._joined_count_target_boundary_errors(
+                    query_plan=query_plan,
+                    relation_grounding=relation_grounding,
+                )
+            )
+        return errors
+
     def _validate_query_plan_grounding(
         self,
         *,
@@ -6341,32 +6568,13 @@ class PALAgentController(Agent):
             if relation:
                 grounded_by_relation.setdefault(relation, []).append(candidate)
 
-        errors: list[str] = []
-        validation_decisions: list[dict[str, Any]] = []
-        active_family_bundle = get_reusable_family_policy_bundle(
-            str(query_plan.get("query_shape") or "").strip()
-        )
-        if active_family_bundle is not None:
-            scaffold_signature = self._build_scaffold_signature(query_plan)
-            if (
-                scaffold_signature
-                and scaffold_signature
-                in set(active_family_bundle.blocked_scaffold_signatures)
-            ):
-                errors.append(
-                    "family_policy_blocked_scaffold_signature:" + scaffold_signature
-                )
-            forbidden_relation_families = set(
-                active_family_bundle.forbidden_relation_families
+        errors: list[str] = list(
+            self._active_family_runtime_policy_errors(
+                query_plan=query_plan,
+                relation_grounding=relation_grounding,
             )
-            if forbidden_relation_families:
-                used_relation_names = set(self._relation_names_from_plan(query_plan))
-                for relation_name in sorted(
-                    used_relation_names & forbidden_relation_families
-                ):
-                    errors.append(
-                        "family_policy_forbidden_relation_family:" + relation_name
-                    )
+        )
+        validation_decisions: list[dict[str, Any]] = []
         for relation_path in relation_paths:
             relation = str(relation_path.get("relation") or "")
             relation_candidates = grounded_by_relation.get(relation, [])
@@ -7048,68 +7256,67 @@ class PALAgentController(Agent):
             )
         # --- MUSIC ---
         if any(kw in lower_text for kw in ("song", "music", "recording", "track", "release", "album", "musical")):
-            candidates.extend(
-                [
-                    {
-                        "relation": "music.artist.track",
-                        "direction": "forward",
-                        "from": "artist",
-                        "to": "track",
-                        "support": "curated_music_predicate",
-                        "use_when": "find tracks performed/recorded by a music artist",
-                    },
-                    {
-                        "relation": "music.recording.releases",
-                        "direction": "forward",
-                        "from": "recording",
-                        "to": "release",
-                        "support": "curated_music_predicate",
-                        "use_when": "find releases that contain a recording",
-                    },
-                    {
-                        "relation": "music.release.tracks",
-                        "direction": "forward",
-                        "from": "release",
-                        "to": "track",
-                        "support": "curated_music_predicate",
-                        "use_when": "find tracks on a release",
-                    },
-                    {
-                        "relation": "music.release_component.recordings",
-                        "direction": "forward",
-                        "from": "release_component",
-                        "to": "recording",
-                        "support": "curated_music_predicate",
-                        "use_when": "find recordings on a release component",
-                    },
-                    {
-                        "relation": "music.recording.length",
-                        "direction": "forward",
-                        "from": "recording",
-                        "to": "length",
-                        "support": "curated_music_predicate",
-                        "use_when": "get the length/duration of a recording (for argmax/longest queries)",
-                    },
-                    {
-                        "relation": "music.artist.album",
-                        "direction": "forward",
-                        "from": "artist",
-                        "to": "album",
-                        "support": "curated_music_predicate",
-                        "use_when": "find albums by an artist",
-                    },
-                    {
-                        "relation": "music.composer.compositions",
-                        "direction": "reverse",
-                        "from": "composer",
-                        "to": "composition",
-                        "from_role": "anchor",
-                        "to_role": "candidate_set",
-                        "support": "curated_music_predicate",
-                        "use_when": "retrieve compositions written by a composer before chaining to downstream media relations",
-                    },
-                ]
-            )
+            music_candidates = [
+                {
+                    "relation": "music.artist.track",
+                    "direction": "forward",
+                    "from": "artist",
+                    "to": "track",
+                    "support": "curated_music_predicate",
+                    "use_when": "find tracks performed/recorded by a music artist",
+                },
+                {
+                    "relation": "music.recording.releases",
+                    "direction": "forward",
+                    "from": "recording",
+                    "to": "release",
+                    "support": "curated_music_predicate",
+                    "use_when": "find releases that contain a recording",
+                },
+                {
+                    "relation": "music.release.tracks",
+                    "direction": "forward",
+                    "from": "release",
+                    "to": "track",
+                    "support": "curated_music_predicate",
+                    "use_when": "find tracks on a release",
+                },
+                {
+                    "relation": "music.release_component.recordings",
+                    "direction": "forward",
+                    "from": "release_component",
+                    "to": "recording",
+                    "support": "curated_music_predicate",
+                    "use_when": "find recordings on a release component",
+                },
+                {
+                    "relation": "music.recording.length",
+                    "direction": "forward",
+                    "from": "recording",
+                    "to": "length",
+                    "support": "curated_music_predicate",
+                    "use_when": "get the length/duration of a recording (for argmax/longest queries)",
+                },
+                {
+                    "relation": "music.artist.album",
+                    "direction": "forward",
+                    "from": "artist",
+                    "to": "album",
+                    "support": "curated_music_predicate",
+                    "use_when": "find albums by an artist",
+                },
+                {
+                    "relation": "music.composer.compositions",
+                    "direction": "reverse",
+                    "from": "composer",
+                    "to": "composition",
+                    "from_role": "anchor",
+                    "to_role": "candidate_set",
+                    "support": "curated_music_predicate",
+                    "use_when": "retrieve compositions written by a composer before chaining to downstream media relations",
+                },
+            ]
+            candidates.extend(music_candidates)
         # --- VIDEO GAMES / DISTRIBUTION SYSTEMS ---
         if any(
             kw in lower_text
@@ -7756,6 +7963,7 @@ class PALAgentController(Agent):
         task_question: str,
         grounding_card: str,
         query_plan: Mapping[str, Any],
+        relation_grounding: Sequence[Mapping[str, Any]] = (),
         generated_tool_name: str,
         extra_repair_feedback: Sequence[str] = (),
     ) -> tuple[str, dict[str, str]]:
@@ -7781,8 +7989,12 @@ class PALAgentController(Agent):
                 }
             )
             try:
-                generated_output = render_reusable_tool(
+                reusable_query_plan = self._canonicalize_reusable_query_plan_for_render(
                     query_plan=query_plan,
+                    relation_grounding=relation_grounding,
+                )
+                generated_output = render_reusable_tool(
+                    query_plan=reusable_query_plan,
                     selection=reusable_selection,
                 )
                 self._emit_generated_tools_event(
@@ -7984,6 +8196,114 @@ class PALAgentController(Agent):
         raise ValueError(
             f"pal_query_candidate_invalid:{last_error or 'validation_failed'}"
         )
+
+    def _canonicalize_reusable_query_plan_for_render(
+        self,
+        *,
+        query_plan: Mapping[str, Any],
+        relation_grounding: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        if os.getenv(
+            _RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION_ENV,
+            "1",
+        ).strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return copy.deepcopy(dict(query_plan))
+
+        canonicalized_plan = copy.deepcopy(dict(query_plan))
+        relation_paths = [
+            dict(path)
+            for path in (canonicalized_plan.get("relation_paths") or [])
+            if isinstance(path, Mapping)
+        ]
+        if not relation_paths:
+            return canonicalized_plan
+
+        anchored_entities = [
+            dict(item)
+            for item in (canonicalized_plan.get("anchored_entities") or [])
+            if isinstance(item, Mapping)
+        ]
+        anchor_count = len(
+            [
+                item
+                for item in anchored_entities
+                if self._normalize_relation_role(item.get("role"))
+                in {"anchor", "anchor_a", "anchor_b"}
+            ]
+        )
+        rewrite_events: list[dict[str, Any]] = []
+        rewritten_paths: list[dict[str, Any]] = []
+        for relation_path in relation_paths:
+            rewritten_path = dict(relation_path)
+            relation_name = str(rewritten_path.get("relation") or "").strip()
+            grounding_source = str(
+                rewritten_path.get("grounding_source") or ""
+            ).strip().lower()
+            if not relation_name or grounding_source == "exploratory":
+                rewritten_paths.append(rewritten_path)
+                continue
+            candidates = [
+                dict(candidate)
+                for candidate in relation_grounding
+                if isinstance(candidate, Mapping)
+                and str(candidate.get("relation") or "").strip() == relation_name
+            ]
+            if not candidates:
+                rewritten_paths.append(rewritten_path)
+                continue
+            for candidate in candidates:
+                matched, reason = self._relation_contract_match_details(
+                    planned_path=rewritten_path,
+                    grounded_candidate=candidate,
+                    query_shape=str(canonicalized_plan.get("query_shape") or ""),
+                    anchor_count=anchor_count,
+                    anchored_entities=anchored_entities,
+                    query_plan=canonicalized_plan,
+                )
+                if not matched:
+                    continue
+                if reason != "accepted_role_swap_match":
+                    break
+                rewritten_path = {
+                    **rewritten_path,
+                    "from": str(relation_path.get("to") or "").strip(),
+                    "to": str(relation_path.get("from") or "").strip(),
+                    "from_role": str(relation_path.get("to_role") or "").strip(),
+                    "to_role": str(relation_path.get("from_role") or "").strip(),
+                }
+                rewrite_events.append(
+                    {
+                        "relation": relation_name,
+                        "direction": rewritten_path.get("direction"),
+                        "reason": reason,
+                        "original_from": relation_path.get("from"),
+                        "original_to": relation_path.get("to"),
+                        "render_from": rewritten_path.get("from"),
+                        "render_to": rewritten_path.get("to"),
+                        "original_from_role": relation_path.get("from_role"),
+                        "original_to_role": relation_path.get("to_role"),
+                        "render_from_role": rewritten_path.get("from_role"),
+                        "render_to_role": rewritten_path.get("to_role"),
+                    }
+                )
+                break
+            rewritten_paths.append(rewritten_path)
+        canonicalized_plan["relation_paths"] = rewritten_paths
+        if rewrite_events:
+            self._emit_generated_tools_event(
+                {
+                    "event": "pal_reusable_render_path_canonicalized",
+                    "mode": "pal",
+                    "query_shape": canonicalized_plan.get("query_shape"),
+                    "rewrites": rewrite_events,
+                }
+            )
+        return canonicalized_plan
 
     def _rewrite_generated_code_anchor_bindings(
         self,
@@ -8961,6 +9281,7 @@ class PALAgentController(Agent):
                         }
                     )
                 else:
+                    previous_query_plan = copy.deepcopy(working_query_plan)
                     previous_alias_assignments = (
                         self._extract_anchor_alias_assignments(working_query_plan)
                     )
@@ -9012,6 +9333,11 @@ class PALAgentController(Agent):
                         if rewritten_after_alias_refresh is not None:
                             working_query_plan = rewritten_after_alias_refresh
                             _sync_return_query_plan(working_query_plan)
+                        working_query_plan = self._preserve_chain_query_shape_on_refresh(
+                            previous_query_plan=previous_query_plan,
+                            refreshed_query_plan=working_query_plan,
+                        )
+                        _sync_return_query_plan(working_query_plan)
                         if alias_refresh_feedback:
                             cumulative_plan_feedback = self._merge_feedback_items(
                                 cumulative_plan_feedback,
@@ -10309,6 +10635,9 @@ class PALAgentController(Agent):
         ]
         feedback: list[str] = []
         query_shape = str(query_plan.get("query_shape") or "").strip().lower()
+        question_text = self._split_task_question(task_question)[0]
+        answer_target_phrase = self._extract_answer_target_phrase(question_text)
+        domain_hints = self._infer_domain_hints(task_question)
 
         if (
             verdict.verdict == "repairable_grounded_empty_result"
@@ -10381,11 +10710,9 @@ class PALAgentController(Agent):
                 )
             anchor_dynamic_candidates = self._probe_dynamic_relation_candidates_for_anchors(
                 anchored_entities=query_plan.get("anchored_entities") or [],
-                answer_target_phrase=self._extract_answer_target_phrase(
-                    self._split_task_question(task_question)[0]
-                ),
-                domain_hints=self._infer_domain_hints(task_question),
-                question_text=self._split_task_question(task_question)[0],
+                answer_target_phrase=answer_target_phrase,
+                domain_hints=domain_hints,
+                question_text=question_text,
             )
             if anchor_dynamic_candidates:
                 asymmetric_anchor_clues = self._has_asymmetric_anchor_clues(
@@ -10453,11 +10780,9 @@ class PALAgentController(Agent):
             pivot_dynamic_candidates = self._probe_dynamic_relation_candidates_for_live_pivots(
                 query_plan=query_plan,
                 anchor_probe_results=anchor_probe_results,
-                answer_target_phrase=self._extract_answer_target_phrase(
-                    self._split_task_question(task_question)[0]
-                ),
-                domain_hints=self._infer_domain_hints(task_question),
-                question_text=self._split_task_question(task_question)[0],
+                answer_target_phrase=answer_target_phrase,
+                domain_hints=domain_hints,
+                question_text=question_text,
             )
             if pivot_dynamic_candidates:
                 grounding_candidates = self._merge_relation_grounding_candidates(
@@ -10477,6 +10802,40 @@ class PALAgentController(Agent):
                     [
                         "plausibility_feedback:pivot_dynamic_grounding_augmented — a live anchor-side path reached an intermediate pivot node, so second-hop bridge relations from that pivot were added",
                         "repair_hint:prefer_pivot_bridge_completion — when a live anchor-side path ends on a pivot node, prefer a grounded second hop from that pivot to the shared answer set before abandoning the anchor branch",
+                    ]
+                )
+
+        if (
+            self._runtime_single_anchor_pivot_dynamic_enabled()
+            and query_shape == "single_anchor_lookup"
+            and verdict.verdict == "repairable_anchor_path_empty"
+            and "anchor_paths_live_but_projection_empty" in (verdict.reasons or [])
+        ):
+            pivot_dynamic_candidates = self._probe_dynamic_relation_candidates_for_live_pivots(
+                query_plan=query_plan,
+                anchor_probe_results=anchor_probe_results,
+                answer_target_phrase=answer_target_phrase,
+                domain_hints=domain_hints,
+                question_text=question_text,
+            )
+            if pivot_dynamic_candidates:
+                grounding_candidates = self._merge_relation_grounding_candidates(
+                    grounding_candidates,
+                    pivot_dynamic_candidates,
+                    prefer_extra=True,
+                )
+                self._emit_generated_tools_event(
+                    {
+                        "event": "pal_single_anchor_pivot_dynamic_candidates_added",
+                        "mode": "pal",
+                        "query_shape": query_shape,
+                        "added_relation_candidates": pivot_dynamic_candidates,
+                    }
+                )
+                feedback.extend(
+                    [
+                        "plausibility_feedback:single_anchor_pivot_dynamic_grounding_augmented — the anchor-side path is live but the projection hop is empty, so second-hop pivot relations were added for single-anchor repair",
+                        "repair_hint:prefer_live_pivot_projection_relations — when a live anchor hop reaches concrete pivot entities, prefer grounded second-hop relations from those pivots before reusing a semantically weak projection family",
                     ]
                 )
 
@@ -12965,6 +13324,8 @@ class PALAgentController(Agent):
     ) -> str:
         query_shape = str(query_plan.get("query_shape") or "").strip().lower()
         answer_mode = str(query_plan.get("answer_mode") or "entity").strip().lower()
+        if query_shape == "single_anchor_lookup" and answer_mode == "entity":
+            return "answer"
         if answer_mode == "count" or query_shape == "count_over_joined_set":
             return "count_set"
         return "shared_answer"
@@ -13084,6 +13445,7 @@ class PALAgentController(Agent):
     ) -> list[dict[str, str]]:
         query_shape = str(query_plan.get("query_shape") or "").strip().lower()
         if query_shape not in {
+            "single_anchor_lookup",
             "multi_anchor_intersection",
             "shared_type_intersection",
             "count_over_joined_set",
@@ -13581,7 +13943,12 @@ class PALAgentController(Agent):
         query_texts: Sequence[str] | None = None,
         query_plan: Mapping[str, Any],
     ) -> list[str]:
-        errors: list[str] = []
+        errors: list[str] = list(
+            self._active_family_runtime_policy_errors(
+                query_plan=query_plan,
+                relation_grounding=None,
+            )
+        )
         normalized_query_texts: list[str] = []
         for candidate_query in query_texts or ():
             cleaned_query = str(candidate_query or "").strip()
@@ -13675,7 +14042,6 @@ class PALAgentController(Agent):
                 for candidate_query in normalized_query_texts
             ):
                 errors.append("boolean_plan_without_ask")
-
         deduped_errors: list[str] = []
         for error in errors:
             if error not in deduped_errors:
@@ -14793,18 +15159,7 @@ class PALAgentController(Agent):
             question_inputs=interpreted_inputs,
             grounded_relation_candidates=grounded_relation_candidates,
         )
-        family_success_patterns = []
-        if self._tool_evolution_coarse_success_hints_enabled():
-            family_success_patterns = self._format_family_success_archetypes(
-                family_name=query_shape,
-            )
         active_family_policy = self._format_active_family_policy_guidance(
-            family_name=query_shape,
-        )
-        tool_evolution_branch_patterns = self._format_tool_evolution_branch_patterns(
-            family_name=query_shape,
-        )
-        tool_evolution_anchor_patterns = self._format_tool_evolution_anchor_patterns(
             family_name=query_shape,
         )
         lines = [
@@ -14945,22 +15300,10 @@ class PALAgentController(Agent):
             lines.append("- shape_guidance:")
             for guidance_line in shape_guidance:
                 lines.append(f"  - {guidance_line}")
-        if family_success_patterns:
-            lines.append("- family_success_patterns:")
-            for pattern in family_success_patterns:
-                lines.append(f"  - {pattern}")
         if active_family_policy:
             lines.append("- active_family_policy:")
             for policy_line in active_family_policy:
                 lines.append(f"  - {policy_line}")
-        if tool_evolution_branch_patterns:
-            lines.append("- tool_evolution_branch_patterns:")
-            for pattern in tool_evolution_branch_patterns:
-                lines.append(f"  - {pattern}")
-        if tool_evolution_anchor_patterns:
-            lines.append("- tool_evolution_anchor_patterns:")
-            for pattern in tool_evolution_anchor_patterns:
-                lines.append(f"  - {pattern}")
         lines.extend(
             [
                 "- guidance:",
@@ -15055,6 +15398,16 @@ class PALAgentController(Agent):
             return "shared_type_intersection"
         if anchor_like_count > 1:
             return "multi_anchor_intersection"
+        if (
+            anchor_like_count == 1
+            and self._runtime_broader_single_anchor_chain_inference_enabled()
+            and self._looks_like_single_anchor_chain_question(
+                question_text=lower_text,
+                answer_target_phrase=answer_target_phrase,
+                question_inputs=normalized_question_inputs,
+            )
+        ):
+            return "single_anchor_chain_lookup"
         if any(
             phrase in lower_text
             for phrase in (
@@ -15071,6 +15424,54 @@ class PALAgentController(Agent):
         if answer_target_lower:
             return "single_anchor_lookup"
         return "single_anchor_lookup"
+
+    def _runtime_broader_single_anchor_chain_inference_enabled(self) -> bool:
+        return os.getenv("PAL_RUNTIME_BROADER_SINGLE_ANCHOR_CHAIN_INFERENCE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _looks_like_single_anchor_chain_question(
+        self,
+        *,
+        question_text: str,
+        answer_target_phrase: str,
+        question_inputs: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        lower_text = str(question_text or "").strip().lower()
+        answer_target_lower = str(answer_target_phrase or "").strip().lower()
+        if not lower_text:
+            return False
+        if any(
+            phrase in lower_text
+            for phrase in (
+                " similar ",
+                " same as ",
+                "same type as",
+                "same category as",
+            )
+        ):
+            return True
+        if re.search(r"\bdoes\b.+\bhave\b", lower_text):
+            return True
+        if re.search(
+            r"\b(?:that|who|which)\b.+\b("
+            r"performed|composed|released|produced|developed|designed|"
+            r"written|wrote|played|sang|starred"
+            r")\b",
+            lower_text,
+        ):
+            return True
+        has_class_phrase = any(
+            str(item.get("kind") or "").strip() == "class_phrase"
+            for item in question_inputs
+            if isinstance(item, Mapping)
+        )
+        if has_class_phrase and " of " in lower_text and len(answer_target_lower.split()) >= 2:
+            return True
+        return False
 
     def _build_query_shape_guidance(self, query_shape: str) -> list[str]:
         if query_shape == "count_over_direct_relation":
@@ -16280,12 +16681,18 @@ class PALAgentController(Agent):
             label_var="?anchor_label",
             anchor_name=probe_alias,
         )
+        predicate_filter = ""
+        if self._runtime_dynamic_probe_fb_filter_enabled():
+            predicate_filter = (
+                f'  FILTER(STRSTARTS(STR(?p), "{self._FB_NS}"))\n'
+            )
 
         outgoing_sparql = (
             f"PREFIX fb: <http://rdf.freebase.com/ns/>\n"
             f"SELECT DISTINCT ?p WHERE {{\n"
             f"{anchor_match}\n"
             f"  ?anchor ?p ?o .\n"
+            f"{predicate_filter}"
             f"}} LIMIT 40"
         )
         incoming_sparql = (
@@ -16293,6 +16700,7 @@ class PALAgentController(Agent):
             f"SELECT DISTINCT ?p WHERE {{\n"
             f"{anchor_match}\n"
             f"  ?s ?p ?anchor .\n"
+            f"{predicate_filter}"
             f"}} LIMIT 40"
         )
 
@@ -16534,6 +16942,11 @@ class PALAgentController(Agent):
     def _is_noise_predicate(self, iri: str) -> bool:
         """Return True for schema/metadata predicates that should not be offered to the planner."""
         for prefix in self._NOISE_PREDICATE_PREFIXES:
+            if (
+                prefix == "http://rdf.freebase.com/ns/base."
+                and self._runtime_dynamic_probe_allow_base_enabled()
+            ):
+                continue
             if iri.startswith(prefix):
                 return True
         # After stripping the FB namespace, check short-name suffixes.
@@ -17984,6 +18397,19 @@ class PALAgentController(Agent):
         lines.append(
             "Continue manually from the original task. Use the PAL hints only if they help."
         )
+        return " ".join(line.strip() for line in lines if line.strip())
+
+    def _build_pal_plan_failure_advisory(
+        self,
+        *,
+        failure_reason: str,
+    ) -> str:
+        cleaned_reason = str(failure_reason or "pal_query_plan_invalid").strip()
+        lines = [
+            "PAL tool planning produced an invalid family-constrained query plan.",
+            f"Failure reason: {cleaned_reason}.",
+            "Continue manually from the original task. Use the PAL hints only if they help.",
+        ]
         return " ".join(line.strip() for line in lines if line.strip())
 
     def _infer_answer_cardinality_hint(self, task_question: str) -> str:

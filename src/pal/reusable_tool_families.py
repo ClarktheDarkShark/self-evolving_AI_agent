@@ -7,6 +7,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 from src.pal.family_policy_evolution import (
     build_family_policy_store,
+    compare_locked_family_name,
     family_policy_enabled_for,
 )
 from src.pal.policy_contracts import FamilyPolicyBundle
@@ -217,6 +218,9 @@ def select_reusable_tool(
     answer_mode = _normalize_token(query_plan.get("answer_mode"))
     if query_shape not in _SUPPORTED_QUERY_SHAPES:
         return None
+    locked_family = compare_locked_family_name()
+    if locked_family and query_shape != locked_family:
+        return None
 
     relation_paths = [
         path
@@ -300,6 +304,9 @@ def get_reusable_family_policy_bundle(family_name: str) -> Optional[FamilyPolicy
     normalized_family = str(family_name or "").strip()
     baseline_bundle = _FAMILY_POLICY_BUNDLES.get(normalized_family)
     if baseline_bundle is None:
+        return None
+    locked_family = compare_locked_family_name()
+    if locked_family and normalized_family != locked_family:
         return None
     if not family_policy_enabled_for(normalized_family):
         return baseline_bundle

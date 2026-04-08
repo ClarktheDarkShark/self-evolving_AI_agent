@@ -703,6 +703,74 @@ def validate_pal_execution(
                 ],
             )
 
+        # -------------------------------------------------------------- #
+        # Fix A — Curated plan with undeclared SPARQL type filter         #
+        #                                                                  #
+        # A curated plan whose rendered SPARQL injects a type-name filter #
+        # not represented in relation_paths will always see empty results  #
+        # (Freebase type names do not resolve via string-match).  This    #
+        # pattern is a plan/SPARQL mismatch and the zero is untrustworthy.#
+        # -------------------------------------------------------------- #
+        if (
+            answer_mode == "count"
+            and scalar_count == 0
+            and _count_query_has_undeclared_type_filter(qt, relation_paths)
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=[
+                    "count_query_zero_with_undeclared_type_filter",
+                    "count_query_unverified_type_constraint",
+                    "count_scalar_returned:0",
+                    "repair:remove_or_ground_the_type_name_filter_before_accepting_zero_count",
+                ],
+            )
+
+        # -------------------------------------------------------------- #
+        # Fix B1 — COUNT projected over an unbound variable               #
+        #                                                                  #
+        # If the variable named in COUNT(DISTINCT ?X) never appears in    #
+        # the WHERE body, the query structurally guarantees zero — the    #
+        # result is meaningless regardless of KG content.                 #
+        # -------------------------------------------------------------- #
+        if (
+            answer_mode == "count"
+            and scalar_count == 0
+            and _count_projected_variable_unbound_in_where(qt)
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=[
+                    "count_projection_variable_unbound_in_where",
+                    "count_scalar_returned:0",
+                    "repair:ensure_the_counted_variable_is_defined_and_bound_in_the_WHERE_clause",
+                ],
+            )
+
+        # -------------------------------------------------------------- #
+        # Fix B2 — count_over_direct_relation with no anchor-to-count    #
+        #          path in the plan                                        #
+        #                                                                  #
+        # When every relation path has constraint_value on both sides,    #
+        # the anchor entity was never used to navigate to the counted set.#
+        # The plan is structurally invalid and the zero is unjustified.   #
+        # -------------------------------------------------------------- #
+        if (
+            answer_mode == "count"
+            and scalar_count == 0
+            and _direct_count_plan_missing_anchor_to_count_path(
+                query_shape, relation_paths
+            )
+        ):
+            return PlausibilityVerdict(
+                verdict=VERDICT_REPAIRABLE_BAD_COUNT_SET,
+                reasons=[
+                    "count_direct_relation_plan_no_anchor_to_count_path",
+                    "count_scalar_returned:0",
+                    "repair:connect_the_anchor_entity_directly_to_the_counted_variable_before_accepting_zero",
+                ],
+            )
+
         if (
             answer_mode == "count"
             and scalar_count == 0
@@ -2126,6 +2194,88 @@ def _count_query_has_unplanned_dynamic_type_filter(
         re.search(r"\bfb:type\.object\.type\b", query_text)
         or re.search(r"\bfb:type\.type\.instance\b", query_text)
     )
+
+
+def _count_query_has_undeclared_type_filter(
+    query_text: str,
+    relation_paths: Sequence[Any],
+) -> bool:
+    """
+    Returns True when the SPARQL text contains an explicit type-name filter
+    (fb:type.object.type joined with fb:type.object.name + FILTER) but the
+    plan's relation_paths contain no type-constraint relation entry for it.
+
+    This detects plan/SPARQL mismatches where the rendered query injected a
+    type filter that was never declared in the plan — regardless of grounding
+    source.  Curated plans are equally subject to this check.
+
+    Complements _count_query_has_unplanned_dynamic_type_filter which only
+    fires for dynamic/exploratory plans.
+    """
+    normalized_paths = [
+        p for p in relation_paths if isinstance(p, Mapping)
+    ]
+    if not normalized_paths:
+        return False
+    # If the type constraint IS declared in the plan, other checks handle it.
+    if _has_type_constraint_relation(normalized_paths):
+        return False
+    # Type filter present in SPARQL text but absent from plan relation_paths.
+    return _count_query_has_explicit_type_name_filter(query_text)
+
+
+def _count_projected_variable_unbound_in_where(query_text: str) -> bool:
+    """
+    Returns True when the variable projected by COUNT(DISTINCT ?X) does not
+    appear anywhere in the WHERE clause body.
+
+    This detects a plan/SPARQL structural error where the generator named a
+    count projection variable that was never bound in the query body — a
+    pattern that always produces COUNT = 0 regardless of KG content.
+    """
+    m = re.search(
+        r"\bSELECT\s+\(COUNT\s*\(\s*DISTINCT\s+\?(\w+)\s*\)",
+        query_text,
+        re.IGNORECASE,
+    )
+    if not m:
+        return False
+    count_var = m.group(1)
+    where_m = re.search(
+        r"\bWHERE\s*\{(.*)\}",
+        query_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not where_m:
+        return False
+    where_body = where_m.group(1)
+    return not bool(re.search(r"\?" + re.escape(count_var) + r"\b", where_body))
+
+
+def _direct_count_plan_missing_anchor_to_count_path(
+    query_shape: str,
+    relation_paths: Sequence[Any],
+) -> bool:
+    """
+    Returns True when a count_over_direct_relation plan has no relation path
+    that connects an anchor role to a count/candidate target role.
+
+    When every path has constraint_value on both sides, the anchor entity was
+    never used to navigate to the counted set — a structural plan error that
+    makes the count structurally unjustified.
+    """
+    if str(query_shape or "").strip().lower() != "count_over_direct_relation":
+        return False
+    normalized = [p for p in relation_paths if isinstance(p, Mapping)]
+    if not normalized:
+        return False
+    anchor_roles = {"anchor", "anchor_a", "anchor_b"}
+    for path in normalized:
+        from_role = _normalize_contract_role(path.get("from_role"))
+        to_role = _normalize_contract_role(path.get("to_role"))
+        if from_role in anchor_roles or to_role in anchor_roles:
+            return False
+    return True
 
 
 def _count_query_has_explicit_type_name_filter(query_text: str) -> bool:

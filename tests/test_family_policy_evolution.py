@@ -9,11 +9,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.pal.family_policy_evolution import (
+    ENV_DEDUP_SIGNATURE,
     ENV_ENABLE_EVOLUTION,
     ENV_ENABLED_FAMILIES,
     ENV_STORE_PATH,
+    ENV_STRICT_UPDATE_MAPPING,
+    ENV_STRUCTURED_SUCCESS_FEATURES,
+    build_candidate_signature,
     build_family_policy_store,
     build_success_plan_archetype,
+    bundle_from_dict,
     classify_family_failure,
 )
 from src.pal.reusable_tool_families import (
@@ -96,6 +101,338 @@ def test_wrong_trusted_completion_prefers_constructive_count_guidance(tmp_path) 
         "switch_to_joined_count_when_downstream_filter_or_projection_exists"
         in pending[0]["bundle"]["repair_policy"]
     )
+
+
+def test_strict_update_mapping_limits_joined_count_to_validator_constraints(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+
+    candidate = store.create_candidate_update(
+        family_name="count_over_joined_set",
+        scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.temperament",
+        relation_names=["biology.animal_breed.temperament"],
+        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "8"},
+    )
+
+    assert candidate is not None
+    pending = store.get_pending_candidates("count_over_joined_set")
+    assert len(pending) == 1
+    assert pending[0]["fields_changed"] == ["validator_expectations"]
+    assert pending[0]["bundle"]["repair_policy"] == list(
+        get_baseline_reusable_family_policy_bundles()["count_over_joined_set"].repair_policy
+    )
+
+
+def test_candidate_signature_dedup_skips_rejected_duplicate_bundle(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_DEDUP_SIGNATURE, "1")
+    monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+
+    first = store.create_candidate_update(
+        family_name="count_over_joined_set",
+        scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.temperament",
+        relation_names=["biology.animal_breed.temperament"],
+        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "8"},
+    )
+    assert first is not None
+    store.reject_candidate(
+        "count_over_joined_set",
+        candidate_version=first.candidate_version,
+        evaluation_results={"gate": "failed"},
+        rejection_reason="smoke_failed",
+    )
+
+    duplicate = store.create_candidate_update(
+        family_name="count_over_joined_set",
+        scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.country_of_origin",
+        relation_names=["biology.animal_breed.country_of_origin"],
+        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "14"},
+    )
+
+    assert duplicate is None
+    payload = json.loads((tmp_path / "count_over_joined_set.json").read_text())
+    rejected_versions = [
+        version_name
+        for version_name, version_payload in payload["versions"].items()
+        if version_payload["status"] == "rejected"
+    ]
+    assert rejected_versions == [first.candidate_version]
+    signature = payload["versions"][first.candidate_version]["candidate_signature"]
+    assert signature == build_candidate_signature(
+        bundle=store.get_bundle("count_over_joined_set", version=first.candidate_version),
+        fields_changed=["validator_expectations"],
+    )
+
+
+def test_strict_update_mapping_keeps_single_anchor_validator_constraints(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+
+    candidate = store.create_candidate_update(
+        family_name="single_anchor_lookup",
+        scaffold_signature="single_anchor_lookup|answer|royalty.kingdom.monarchs",
+        relation_names=["royalty.kingdom.monarchs"],
+        failure_reasons=[
+            "pal_query_not_accepted:repairable_anchor_not_found",
+            "anchor_not_found:'Saxe-Coburg-Gotha'",
+        ],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "3"},
+    )
+
+    assert candidate is not None
+    pending = store.get_pending_candidates("single_anchor_lookup")
+    assert len(pending) == 1
+    assert pending[0]["fields_changed"] == ["validator_expectations"]
+    assert (
+        "verify_projected_entity_matches_question_target"
+        in pending[0]["bundle"]["validator_expectations"]
+    )
+    assert pending[0]["bundle"]["repair_policy"] == list(
+        get_baseline_reusable_family_policy_bundles()["single_anchor_lookup"].repair_policy
+    )
+
+
+def test_strict_update_mapping_rejects_nonreusable_single_anchor_boundary_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+
+    candidate = store.create_candidate_update(
+        family_name="single_anchor_lookup",
+        scaffold_signature="single_anchor_lookup|answer|people.person.pets",
+        relation_names=["people.person.pets"],
+        failure_reasons=["repairable_grounded_empty_result"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "18"},
+    )
+
+    assert candidate is None
+    assert store.get_pending_candidates("single_anchor_lookup") == []
+
+
+def test_strict_update_mapping_rejects_nonsemantic_single_anchor_validator_miss(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+
+    candidate = store.create_candidate_update(
+        family_name="single_anchor_lookup",
+        scaffold_signature="single_anchor_lookup|answer|people.person.parents",
+        relation_names=["people.person.parents"],
+        failure_reasons=["validator_missing:unrelated_contract_gap"],
+        failure_class="validator_miss",
+        trigger_context={"sample_index": "x1"},
+    )
+
+    assert candidate is None
+    assert store.get_pending_candidates("single_anchor_lookup") == []
+
+
+def test_strict_update_mapping_keeps_single_anchor_validator_miss_for_weak_entity_semantics(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+
+    candidate = store.create_candidate_update(
+        family_name="single_anchor_lookup",
+        scaffold_signature="single_anchor_lookup|answer|digicams.digital_camera.format",
+        relation_names=["digicams.digital_camera.format"],
+        failure_reasons=[
+            "entity_answer_target_unenforced:format?",
+            "dangerous_overreach:weak_entity_semantics",
+        ],
+        failure_class="validator_miss",
+        trigger_context={"sample_index": "19"},
+    )
+
+    assert candidate is not None
+    pending = store.get_pending_candidates("single_anchor_lookup")
+    assert len(pending) == 1
+    assert pending[0]["fields_changed"] == [
+        "validator_expectations",
+        "blocked_scaffold_signatures",
+        "forbidden_overreach_patterns",
+    ]
+    assert (
+        "reject_known_dangerous_overreach_patterns"
+        in pending[0]["bundle"]["validator_expectations"]
+    )
+    assert pending[0]["bundle"]["forbidden_overreach_patterns"] == [
+        "dangerous_overreach:weak_entity_semantics"
+    ]
+
+
+def test_semantic_signature_dedup_skips_wording_only_single_anchor_variant(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_DEDUP_SIGNATURE, "1")
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+
+    first = store.create_candidate_update(
+        family_name="single_anchor_lookup",
+        scaffold_signature="single_anchor_lookup|answer|royalty.kingdom.monarchs",
+        relation_names=["royalty.kingdom.monarchs"],
+        failure_reasons=[
+            "pal_query_not_accepted:repairable_anchor_not_found",
+            "anchor_not_found:'Saxe-Coburg-Gotha'",
+        ],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "3"},
+    )
+
+    assert first is not None
+    store.reject_candidate(
+        "single_anchor_lookup",
+        candidate_version=first.candidate_version,
+        evaluation_results={"gate": "failed"},
+        rejection_reason="smoke_failed",
+    )
+
+    payload_path = tmp_path / "single_anchor_lookup.json"
+    payload = json.loads(payload_path.read_text())
+    version_payload = payload["versions"][first.candidate_version]
+    mutated_bundle = dict(version_payload["bundle"])
+    mutated_bundle["repair_policy"] = list(mutated_bundle.get("repair_policy") or []) + [
+        "wording_only_variant",
+    ]
+    version_payload["bundle"] = mutated_bundle
+    version_payload["candidate_signature"] = build_candidate_signature(
+        bundle=bundle_from_dict(mutated_bundle),
+        fields_changed=version_payload.get("fields_changed") or [],
+    )
+    payload_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+    duplicate = store.create_candidate_update(
+        family_name="single_anchor_lookup",
+        scaffold_signature="single_anchor_lookup|answer|royalty.kingdom.rulers",
+        relation_names=["royalty.kingdom.rulers"],
+        failure_reasons=[
+            "pal_query_not_accepted:repairable_anchor_not_found",
+            "anchor_not_found:'Saxe-Coburg-Gotha'",
+        ],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "3b"},
+    )
+
+    assert duplicate is None
+
+
+def test_exact_duplicate_bundle_is_skipped_even_without_signature_flag(
+    tmp_path,
+) -> None:
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+
+    first = store.create_candidate_update(
+        family_name="count_over_joined_set",
+        scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.temperament",
+        relation_names=["biology.animal_breed.temperament"],
+        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "8"},
+    )
+    assert first is not None
+    store.reject_candidate(
+        "count_over_joined_set",
+        candidate_version=first.candidate_version,
+        evaluation_results={"gate": "failed"},
+        rejection_reason="smoke_failed",
+    )
+
+    duplicate = store.create_candidate_update(
+        family_name="count_over_joined_set",
+        scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.country_of_origin",
+        relation_names=["biology.animal_breed.country_of_origin"],
+        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "14"},
+    )
+
+    assert duplicate is None
+
+
+def test_build_success_plan_archetype_can_emit_structured_success_features(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_STRUCTURED_SUCCESS_FEATURES, "1")
+
+    archetype = build_success_plan_archetype(
+        {
+            "answer_mode": "entity",
+            "query_shape": "single_anchor_lookup",
+            "answer_target_phrase": "parent institution",
+            "anchored_entities": [
+                {
+                    "surface": "National Wine Centre of Australia",
+                    "chosen_alias": "National Wine Centre of Australia",
+                    "resolved_entity_id": "m.03hd1z",
+                    "role": "anchor",
+                }
+            ],
+            "shared_answer_variable": "answer",
+            "relation_paths": [
+                {
+                    "from_role": "anchor",
+                    "to_role": "answer",
+                    "relation": "education.educational_institution.parent_institution",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+        }
+    )
+
+    assert archetype["grounding_sources"] == ["dynamic_probe"]
+    assert archetype["anchor_binding_modes"] == ["resolved_entity_id"]
+    assert archetype["answer_target_present"] is True
+    assert archetype["relation_signatures"] == [
+        "anchor->education.educational_institution.parent_institution->answer->dynamic_probe"
+    ]
 
 
 def test_family_policy_rejection_keeps_baseline_active(tmp_path) -> None:
@@ -355,6 +692,83 @@ def test_harness_synthesizes_candidate_from_wrong_completed_run(tmp_path) -> Non
     assert pending[0]["trigger_context"]["sample_index"] == "2"
 
 
+def test_stage_a_screen_rejects_candidate_before_full_inline_evaluation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    family_name = "count_over_joined_set"
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path,
+    )
+    candidate = store.create_candidate_update(
+        family_name=family_name,
+        scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.temperament",
+        relation_names=["biology.animal_breed.temperament"],
+        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "8"},
+    )
+    assert candidate is not None
+    active_version = store.get_active_version(family_name)
+    store.set_trusted_success_bank(
+        family_name,
+        sample_ids=["21"],
+        source_version=active_version,
+        evaluation_context=family_policy_harness._build_success_bank_context(
+            family_name=family_name,
+            active_version=active_version,
+        ),
+    )
+    monkeypatch.setenv(family_policy_harness.ENV_STAGE_A_SCREEN, "1")
+
+    def _fake_run_sample_with_policy(**kwargs):
+        mode = str(kwargs.get("evaluation_mode") or "")
+        version = str(kwargs.get("override_version") or "")
+        if mode == family_policy_harness.STAGE_A_EVALUATION_MODE:
+            if version == active_version:
+                return {
+                    "sample_index": str(kwargs["sample_index"]),
+                    "sample_status": "completed",
+                    "evaluation_outcome": "correct",
+                    "dangerous_overreach_count": 0,
+                    "evaluation_cache_hit": False,
+                }
+            return {
+                "sample_index": str(kwargs["sample_index"]),
+                "sample_status": "not_completed",
+                "evaluation_outcome": "incorrect",
+                "dangerous_overreach_count": 0,
+                "evaluation_cache_hit": False,
+            }
+        raise AssertionError("full inline evaluation should be skipped after stage_a failure")
+
+    monkeypatch.setattr(
+        family_policy_harness,
+        "_run_sample_with_policy",
+        _fake_run_sample_with_policy,
+    )
+
+    evaluation = family_policy_harness._evaluate_candidate(
+        family_name=family_name,
+        candidate_version=candidate.candidate_version,
+        promote=True,
+        store_path=tmp_path,
+        label_prefix="stage_a_test",
+        trigger_baseline_summary={
+            "sample_index": "8",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "dangerous_overreach_count": 0,
+        },
+        parent_output_dir=None,
+    )
+
+    assert evaluation["gate_stage"] == "stage_a_screen"
+    assert "failed_stage_a_pal_only_screen" in evaluation["promotion_gate"]["reasons"]
+    assert evaluation["evaluation_stats"]["total_evaluation_requests"] == 2
+
+
 def test_harness_synthesizes_candidate_from_matching_sample_decision_only(tmp_path) -> None:
     run_dir = tmp_path / "run"
     (run_dir / "pal_query_artifacts").mkdir(parents=True)
@@ -444,7 +858,283 @@ def test_harness_synthesizes_candidate_from_matching_sample_decision_only(tmp_pa
         in repair_policy
     )
     blocked = tuple(pending[0]["bundle"]["blocked_scaffold_signatures"])
-    assert not blocked
+
+
+def test_harness_synthesizes_candidate_from_nonfinal_decision_with_repair_rejection(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
+    run_dir = tmp_path / "run"
+    (run_dir / "pal_query_artifacts").mkdir(parents=True)
+    (run_dir / "generated_tools.log").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "pal_attempt_decision",
+                        "sample_index": "8",
+                        "selected_family": "count_over_joined_set",
+                        "family_bundle_version": "2026-03-31",
+                        "tool_name": "pal_sparql_query_tool_sample_8",
+                        "dangerous_overreach": False,
+                        "dangerous_overreach_reasons": [],
+                        "materialization_denial_reasons": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "pal_repair_loop_rejected",
+                        "sample_index": "8",
+                        "final_verdict": "no_accepted_candidate",
+                        "last_verdict": "repairable_bad_count_set",
+                        "last_reasons": [
+                            "count_query_zero_with_live_anchor_paths",
+                            "count_scalar_returned:0",
+                        ],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "pal_attempt_decision",
+                        "sample_index": "8",
+                        "selected_family": None,
+                        "family_bundle_version": None,
+                        "tool_name": "pal_sparql_query_tool_sample_8",
+                        "dangerous_overreach": False,
+                        "dangerous_overreach_reasons": [],
+                        "materialization_denial_reasons": [],
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "pal_query_artifacts" / "pal_sparql_query_tool_sample_8.plan.json").write_text(
+        json.dumps(
+            {
+                "query_shape": "count_over_joined_set",
+                "projection_role": "breed_set",
+                "relation_paths": [
+                    {
+                        "relation": "biology.breed_origin.breeds_originating_here",
+                    },
+                    {
+                        "relation": "biology.animal_breed.temperament",
+                    },
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    event = _maybe_create_candidate_from_run_summary(
+        family_name="count_over_joined_set",
+        run_summary={
+            "sample_index": "8",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "run_dir": str(run_dir),
+        },
+        store_path=tmp_path / "store",
+    )
+
+    assert event is not None
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path / "store",
+    )
+    pending = store.get_pending_candidates("count_over_joined_set")
+    assert len(pending) == 1
+    assert pending[0]["fields_changed"] == ["validator_expectations"]
+    assert (
+        "verify_count_targets_requested_entity_set"
+        in pending[0]["bundle"]["validator_expectations"]
+    )
+
+
+def test_harness_skips_single_anchor_candidate_for_low_trust_dynamic_fail_close(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
+    run_dir = tmp_path / "run"
+    (run_dir / "pal_query_artifacts").mkdir(parents=True)
+    (run_dir / "generated_tools.log").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "pal_attempt_decision",
+                        "sample_index": "18",
+                        "selected_family": "single_anchor_lookup",
+                        "family_bundle_version": "2026-03-31__cand0001__cand0001",
+                        "tool_name": "pal_sparql_query_tool_sample_18",
+                        "dangerous_overreach": False,
+                        "dangerous_overreach_reasons": [],
+                        "materialization_denial_reasons": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "pal_query_candidate_rejected",
+                        "sample_index": "18",
+                        "rejection_reasons": [
+                            "family_policy_single_anchor_low_trust_dynamic_alias_repair"
+                        ],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "pal_repair_loop_rejected",
+                        "sample_index": "18",
+                        "final_verdict": "no_accepted_candidate",
+                        "last_verdict": "repairable_anchor_path_empty",
+                        "last_reasons": [
+                            "anchor_path_empty:'J. Paul Reddam':people.person.pets",
+                        ],
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "pal_query_artifacts" / "pal_sparql_query_tool_sample_18.plan.json").write_text(
+        json.dumps(
+            {
+                "query_shape": "single_anchor_lookup",
+                "shared_answer_variable": "answer",
+                "relation_paths": [
+                    {
+                        "relation": "people.person.pets",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    event = _maybe_create_candidate_from_run_summary(
+        family_name="single_anchor_lookup",
+        run_summary={
+            "sample_index": "18",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "run_dir": str(run_dir),
+        },
+        store_path=tmp_path / "store",
+    )
+
+    assert event is None
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path / "store",
+    )
+    assert not store.get_pending_candidates("single_anchor_lookup")
+
+
+def test_harness_skips_single_anchor_chain_candidate_for_low_trust_dynamic_fail_close(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
+    run_dir = tmp_path / "run_chain"
+    (run_dir / "pal_query_artifacts").mkdir(parents=True)
+    (run_dir / "generated_tools.log").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "pal_attempt_decision",
+                        "sample_index": "18",
+                        "selected_family": "single_anchor_chain_lookup",
+                        "family_bundle_version": "2026-03-31__cand0001__cand0001",
+                        "tool_name": "pal_sparql_query_tool_sample_18",
+                        "dangerous_overreach": False,
+                        "dangerous_overreach_reasons": [],
+                        "materialization_denial_reasons": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "pal_query_candidate_rejected",
+                        "sample_index": "18",
+                        "rejection_reasons": [
+                            "family_policy_single_anchor_low_trust_dynamic_alias_repair"
+                        ],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "pal_repair_loop_rejected",
+                        "sample_index": "18",
+                        "final_verdict": "no_accepted_candidate",
+                        "last_verdict": "repairable_anchor_path_empty",
+                        "last_reasons": [
+                            "anchor_path_empty:'J. Paul Reddam':people.person.pets_or_owned_animals",
+                        ],
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (
+        run_dir / "pal_query_artifacts" / "pal_sparql_query_tool_sample_18.plan.json"
+    ).write_text(
+        json.dumps(
+            {
+                "query_shape": "single_anchor_chain_lookup",
+                "shared_answer_variable": "answer",
+                "candidate_set_variable": "owned",
+                "relation_paths": [
+                    {
+                        "relation": "biology.animal_owner.animals_owned",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    event = _maybe_create_candidate_from_run_summary(
+        family_name="single_anchor_chain_lookup",
+        run_summary={
+            "sample_index": "18",
+            "sample_status": "agent_unknown_error",
+            "evaluation_outcome": "incorrect",
+            "run_dir": str(run_dir),
+        },
+        store_path=tmp_path / "store",
+    )
+
+    assert event is None
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path / "store",
+    )
+    assert not store.get_pending_candidates("single_anchor_chain_lookup")
+
+
+def test_harness_scaffold_signature_matches_runtime_single_anchor_signature() -> None:
+    signature = family_policy_harness._build_scaffold_signature(
+        {
+            "query_shape": "single_anchor_lookup",
+            "shared_answer_variable": "format",
+            "candidate_set_variable": "candidate_set",
+            "relation_paths": [
+                {"relation": "digicams.digital_camera.format"},
+            ],
+        }
+    )
+
+    assert signature == "single_anchor_lookup|format|digicams.digital_camera.format"
 
 
 def test_tool_evolution_context_round_trips_patterns(tmp_path) -> None:
@@ -604,6 +1294,79 @@ def test_run_sample_with_policy_reuses_cache_only_for_identical_context(
     )
 
     assert third["evaluation_cache_hit"] is False
+    assert len(calls) == 2
+
+
+def test_run_sample_with_policy_bypasses_nonterminal_cached_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(family_policy_harness, "_policy_fingerprint", lambda: "policy-a")
+    monkeypatch.setattr(
+        family_policy_harness,
+        "_execution_environment_fingerprint",
+        lambda: "exec-a",
+    )
+
+    def fake_run_sample(
+        *,
+        sample_index: str,
+        label: str,
+        parent_output_dir=None,
+    ) -> dict[str, str]:
+        calls.append((sample_index, label))
+        run_dir = tmp_path / f"run_{len(calls)}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if len(calls) == 1:
+            return {
+                "sample_index": sample_index,
+                "sample_status": "running",
+                "evaluation_outcome": "",
+                "run_dir": str(run_dir),
+                "returncode": -15,
+            }
+        return {
+            "sample_index": sample_index,
+            "sample_status": "completed",
+            "evaluation_outcome": "correct",
+            "run_dir": str(run_dir),
+            "returncode": 0,
+        }
+
+    monkeypatch.setattr(family_policy_harness, "run_sample", fake_run_sample)
+
+    first = family_policy_harness._run_sample_with_policy(
+        sample_index="18",
+        label="cache_probe_running",
+        family_name="single_anchor_lookup",
+        store_path=tmp_path / "store",
+        promotion_enabled=False,
+        override_version="2026-03-31",
+    )
+    second = family_policy_harness._run_sample_with_policy(
+        sample_index="18",
+        label="cache_probe_running",
+        family_name="single_anchor_lookup",
+        store_path=tmp_path / "store",
+        promotion_enabled=False,
+        override_version="2026-03-31",
+    )
+    third = family_policy_harness._run_sample_with_policy(
+        sample_index="18",
+        label="cache_probe_running",
+        family_name="single_anchor_lookup",
+        store_path=tmp_path / "store",
+        promotion_enabled=False,
+        override_version="2026-03-31",
+    )
+
+    assert first["evaluation_cache_hit"] is False
+    assert first["sample_status"] == "running"
+    assert second["evaluation_cache_hit"] is False
+    assert second["sample_status"] == "completed"
+    assert third["evaluation_cache_hit"] is True
     assert len(calls) == 2
 
 
@@ -1334,4 +2097,3 @@ def test_candidate_update_can_tighten_validator_and_repair_policy(tmp_path) -> N
     assert candidate is not None
     pending = store.get_pending_candidates("multi_anchor_intersection")
     assert "repair_policy" in pending[0]["fields_changed"]
-

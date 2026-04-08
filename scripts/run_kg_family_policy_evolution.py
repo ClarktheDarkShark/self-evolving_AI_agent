@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.pal_kg_batch_runner import PROJECT_ROOT, run_sample
 from src.pal.family_policy_evolution import (
+    ENV_COMPARE_LOCK_FAMILY,
     ENV_ENABLE_EVOLUTION,
     ENV_ENABLE_PROMOTION,
     ENV_ENABLED_FAMILIES,
@@ -33,6 +34,9 @@ PROMOTION_EVALUATION_MODE = "family_inline_promotion_gate"
 PROMOTION_EVALUATION_CONTRACT_VERSION = "2026-03-31__family_inline_promotion_gate_v1"
 MAX_PRIOR_SUCCESS_SAMPLES = 1
 ENV_PROMOTION_GATE_MODE = "PAL_FAMILY_POLICY_PROMOTION_GATE_MODE"
+ENV_STAGE_A_SCREEN = "PAL_INLINE_FAMILY_STAGE_A_SCREEN"
+PAL_ONLY_BYPASS_ENV = "PAL_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK"
+STAGE_A_EVALUATION_MODE = "family_inline_stage_a_pal_only"
 POLICY_FINGERPRINT_FILES = (
     PROJECT_ROOT / "src" / "agents" / "instance" / "pal_agent_controller.py",
     PROJECT_ROOT / "src" / "pal" / "family_policy_evolution.py",
@@ -109,12 +113,18 @@ def _build_evaluation_cache_context(
     bundle_version: str,
     sample_index: str,
     evaluation_mode: str = PROMOTION_EVALUATION_MODE,
+    extra_env: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "family_name": str(family_name or "").strip(),
         "bundle_version": str(bundle_version or "").strip(),
         "sample_index": str(sample_index or "").strip(),
         "evaluation_mode": str(evaluation_mode or "").strip(),
+        "extra_env": {
+            str(key or "").strip(): str(value or "").strip()
+            for key, value in sorted((extra_env or {}).items())
+            if str(key or "").strip()
+        },
         "promotion_evaluation_contract_version": PROMOTION_EVALUATION_CONTRACT_VERSION,
         "policy_fingerprint": _policy_fingerprint(),
         "execution_environment_fingerprint": _execution_environment_fingerprint(),
@@ -143,8 +153,21 @@ def _promotion_gate_mode() -> str:
     return "trigger_first"
 
 
+def _stage_a_screen_enabled() -> bool:
+    return str(os.environ.get(ENV_STAGE_A_SCREEN) or "").strip() == "1"
+
+
 def _contexts_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     return dict(left) == dict(right)
+
+
+def _cached_result_is_reusable(result: Mapping[str, Any]) -> bool:
+    sample_status = str(result.get("sample_status") or "").strip().lower()
+    if not sample_status:
+        return False
+    if sample_status in {"initial", "running"}:
+        return False
+    return True
 
 
 def _context_contains(expected: Mapping[str, Any], observed: Mapping[str, Any]) -> bool:
@@ -205,14 +228,52 @@ def _load_json_lines(path: Path) -> list[dict[str, Any]]:
 
 def _latest_attempt_decision(run_dir: Path, *, sample_index: str) -> dict[str, Any]:
     generated_tools_path = run_dir / "generated_tools.log"
-    latest: dict[str, Any] = {}
+    latest_finalized: dict[str, Any] = {}
+    latest_attempt: dict[str, Any] = {}
+    latest_attempt_with_family: dict[str, Any] = {}
     target_sample = str(sample_index or "").strip()
     for payload in _load_json_lines(generated_tools_path):
         if str(payload.get("sample_index") or "").strip() != target_sample:
             continue
         if payload.get("event") == "pal_attempt_decision_finalized":
+            latest_finalized = payload
+        elif payload.get("event") == "pal_attempt_decision":
+            latest_attempt = payload
+            if str(payload.get("selected_family") or "").strip():
+                latest_attempt_with_family = payload
+    return latest_finalized or latest_attempt_with_family or latest_attempt
+
+
+def _latest_repair_loop_rejected(run_dir: Path, *, sample_index: str) -> dict[str, Any]:
+    generated_tools_path = run_dir / "generated_tools.log"
+    latest: dict[str, Any] = {}
+    target_sample = str(sample_index or "").strip()
+    for payload in _load_json_lines(generated_tools_path):
+        if str(payload.get("sample_index") or "").strip() != target_sample:
+            continue
+        if payload.get("event") == "pal_repair_loop_rejected":
             latest = payload
     return latest
+
+
+def _latest_query_candidate_rejection_reasons(
+    run_dir: Path,
+    *,
+    sample_index: str,
+) -> list[str]:
+    generated_tools_path = run_dir / "generated_tools.log"
+    reasons: list[str] = []
+    target_sample = str(sample_index or "").strip()
+    for payload in _load_json_lines(generated_tools_path):
+        if str(payload.get("sample_index") or "").strip() != target_sample:
+            continue
+        if payload.get("event") != "pal_query_candidate_rejected":
+            continue
+        for raw_value in payload.get("rejection_reasons") or []:
+            cleaned = str(raw_value or "").strip()
+            if cleaned and cleaned not in reasons:
+                reasons.append(cleaned)
+    return reasons
 
 
 def _load_query_plan_for_tool(run_dir: Path, tool_name: str) -> dict[str, Any]:
@@ -246,16 +307,17 @@ def _relation_names_from_query_plan(query_plan: Mapping[str, Any]) -> list[str]:
 
 
 def _build_scaffold_signature(query_plan: Mapping[str, Any]) -> str:
-    query_shape = str(query_plan.get("query_shape") or "n/a").strip() or "n/a"
+    query_shape = str(query_plan.get("query_shape") or "").strip().lower() or "other"
     answer_role = str(
-        query_plan.get("projection_role")
-        or query_plan.get("projection_var_role")
-        or query_plan.get("answer_role")
-        or "n/a"
-    ).strip() or "n/a"
+        query_plan.get("shared_answer_variable")
+        or query_plan.get("candidate_set_variable")
+        or query_plan.get("count_set_variable")
+        or ""
+    ).strip() or "unknown"
     relation_names = _relation_names_from_query_plan(query_plan)
-    relation_part = "|".join(relation_names[:3]) if relation_names else "n/a"
-    return f"{query_shape}|{answer_role}|{relation_part}"
+    if not relation_names:
+        return ""
+    return "|".join([query_shape, answer_role, *sorted(relation_names)])
 
 
 def _has_pending_candidate_for_sample(
@@ -300,6 +362,26 @@ def _derive_failure_reasons(
     return reasons
 
 
+def _repair_loop_failure_reasons(repair_payload: Mapping[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    for raw_value in (
+        repair_payload.get("final_verdict"),
+        repair_payload.get("last_verdict"),
+    ):
+        cleaned = str(raw_value or "").strip()
+        if cleaned:
+            reasons.append(cleaned)
+    for raw_value in repair_payload.get("last_reasons") or []:
+        cleaned = str(raw_value or "").strip()
+        if cleaned:
+            reasons.append(cleaned)
+    deduped: list[str] = []
+    for reason in reasons:
+        if reason not in deduped:
+            deduped.append(reason)
+    return deduped
+
+
 def _maybe_create_candidate_from_run_summary(
     *,
     family_name: str,
@@ -325,6 +407,10 @@ def _maybe_create_candidate_from_run_summary(
     decision_payload = _latest_attempt_decision(run_dir, sample_index=sample_index)
     if str(decision_payload.get("selected_family") or "").strip() != str(family_name or "").strip():
         return None
+    repair_rejected_payload = _latest_repair_loop_rejected(
+        run_dir,
+        sample_index=sample_index,
+    )
 
     query_plan = _load_query_plan_for_tool(
         run_dir, str(decision_payload.get("tool_name") or "").strip()
@@ -341,6 +427,24 @@ def _maybe_create_candidate_from_run_summary(
         evaluation_outcome=evaluation_outcome,
         decision_payload=decision_payload,
     )
+    for reason in _repair_loop_failure_reasons(repair_rejected_payload):
+        if reason not in failure_reasons:
+            failure_reasons.append(reason)
+    for reason in _latest_query_candidate_rejection_reasons(
+        run_dir,
+        sample_index=sample_index,
+    ):
+        if reason not in failure_reasons:
+            failure_reasons.append(reason)
+    if (
+        str(family_name or "").strip()
+        in {"single_anchor_lookup", "single_anchor_chain_lookup"}
+        and any(
+            "family_policy_single_anchor_low_trust_dynamic_alias_repair" in reason
+            for reason in failure_reasons
+        )
+    ):
+        return None
     failure_class = classify_family_failure(
         family_name=family_name,
         sample_status=sample_status,
@@ -396,6 +500,7 @@ def _run_sample_with_policy(
     override_version: str | None = None,
     evaluation_mode: str = PROMOTION_EVALUATION_MODE,
     parent_output_dir: Path | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     store = build_family_policy_store(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),
@@ -409,6 +514,7 @@ def _run_sample_with_policy(
         bundle_version=bundle_version,
         sample_index=sample_index,
         evaluation_mode=evaluation_mode,
+        extra_env=extra_env,
     )
     cache_key = _hash_payload(cache_context)
     cached = store.get_cached_evaluation(family_name, cache_key=cache_key)
@@ -417,20 +523,26 @@ def _run_sample_with_policy(
         cache_context,
     ):
         cached_result = dict(cached.get("result") or {})
-        cached_result.update(
-            {
-                "evaluation_cache_hit": True,
-                "evaluation_cache_key": cache_key,
-                "evaluation_context": cache_context,
-                "evaluation_bundle_version": bundle_version,
-            }
-        )
+        if _cached_result_is_reusable(cached_result):
+            cached_result.update(
+                {
+                    "evaluation_cache_hit": True,
+                    "evaluation_cache_key": cache_key,
+                    "evaluation_context": cache_context,
+                    "evaluation_bundle_version": bundle_version,
+                }
+            )
+            print(
+                "[family_policy_cache] hit "
+                f"family={family_name} version={bundle_version} sample={sample_index} "
+                f"mode={evaluation_mode}"
+            )
+            return cached_result
         print(
-            "[family_policy_cache] hit "
+            "[family_policy_cache] bypass_nonterminal "
             f"family={family_name} version={bundle_version} sample={sample_index} "
-            f"mode={evaluation_mode}"
+            f"mode={evaluation_mode} status={cached_result.get('sample_status')}"
         )
-        return cached_result
 
     env_updates = {
         ENV_ENABLE_EVOLUTION: "1",
@@ -438,6 +550,12 @@ def _run_sample_with_policy(
         ENV_ENABLED_FAMILIES: family_name,
         ENV_STORE_PATH: str(store_path),
     }
+    if extra_env:
+        for key, value in extra_env.items():
+            cleaned_key = str(key or "").strip()
+            if not cleaned_key:
+                continue
+            env_updates[cleaned_key] = str(value or "")
     if override_version:
         env_updates[ENV_OVERRIDE_VERSIONS] = json.dumps({family_name: override_version})
     else:
@@ -626,6 +744,7 @@ def _evaluate_candidate(
     prior_success_candidate: list[dict[str, Any]] = []
     prior_success_samples: list[str] = []
     prior_success_baseline_reused = False
+    stage_a_screen: dict[str, Any] | None = None
     success_bank = store.get_trusted_success_bank(family_name)
     bank_metadata = store.get_trusted_success_bank_metadata(family_name)
     expected_bank_context = _build_success_bank_context(
@@ -710,6 +829,105 @@ def _evaluate_candidate(
             evaluation_results=evaluation_payload,
         )
         return evaluation_payload
+
+    if _stage_a_screen_enabled():
+        stage_a_env = {
+            ENV_COMPARE_LOCK_FAMILY: family_name,
+            PAL_ONLY_BYPASS_ENV: "1",
+        }
+        stage_a_baseline = _run_sample_with_policy(
+            sample_index=trigger_sample,
+            label=f"{label_prefix}_stage_a_baseline",
+            family_name=family_name,
+            store_path=store_path,
+            promotion_enabled=False,
+            override_version=active_version,
+            evaluation_mode=STAGE_A_EVALUATION_MODE,
+            parent_output_dir=parent_output_dir,
+            extra_env=stage_a_env,
+        )
+        stage_a_candidate = _run_sample_with_policy(
+            sample_index=trigger_sample,
+            label=f"{label_prefix}_stage_a_candidate",
+            family_name=family_name,
+            store_path=store_path,
+            promotion_enabled=False,
+            override_version=candidate_version,
+            evaluation_mode=STAGE_A_EVALUATION_MODE,
+            parent_output_dir=parent_output_dir,
+            extra_env=stage_a_env,
+        )
+        stage_a_gate = _evaluate_inline_promotion_gate(
+            trigger_baseline=stage_a_baseline,
+            trigger_candidate=stage_a_candidate,
+            prior_success_baseline=[],
+            prior_success_candidate=[],
+        )
+        stage_a_screen = {
+            "baseline": stage_a_baseline,
+            "candidate": stage_a_candidate,
+            "promotion_gate": stage_a_gate,
+        }
+        if not stage_a_gate["gate_checks"]["trigger_gate_passed"]:
+            evaluation_payload = {
+                "family_name": family_name,
+                "active_version": active_version,
+                "candidate_version": candidate_version,
+                "evaluation_mode": PROMOTION_EVALUATION_MODE,
+                "promotion_evaluation_contract_version": PROMOTION_EVALUATION_CONTRACT_VERSION,
+                "gate_stage": "stage_a_screen",
+                "stage_a_screen": stage_a_screen,
+                "trigger": {
+                    "baseline": trigger_baseline,
+                    "candidate": {},
+                },
+                "prior_success": {
+                    "sample_ids": [],
+                    "baseline": [],
+                    "candidate": [],
+                    "trusted_success_bank_reused": False,
+                    "baseline_reused_from_bank_metadata": False,
+                },
+                "evaluation_stats": {
+                    "cache_hits": int(bool(stage_a_baseline.get("evaluation_cache_hit")))
+                    + int(bool(stage_a_candidate.get("evaluation_cache_hit"))),
+                    "cache_misses": int(not bool(stage_a_baseline.get("evaluation_cache_hit")))
+                    + int(not bool(stage_a_candidate.get("evaluation_cache_hit"))),
+                    "executed_runs": int(not bool(stage_a_baseline.get("evaluation_cache_hit")))
+                    + int(not bool(stage_a_candidate.get("evaluation_cache_hit"))),
+                    "total_evaluation_requests": 2,
+                    "potential_max_requests": 5,
+                    "prior_success_evaluated": 0,
+                    "prior_success_skipped": MAX_PRIOR_SUCCESS_SAMPLES,
+                    "regression_guard_available": False,
+                    "prior_success_baseline_reused": False,
+                    "stage_reached": "stage_a_screen_rejected",
+                },
+                "promotion_gate": {
+                    **dict(stage_a_gate),
+                    "reasons": [
+                        *[
+                            reason
+                            for reason in (stage_a_gate.get("reasons") or [])
+                            if reason != "awaiting_prior_trusted_success"
+                        ],
+                        "failed_stage_a_pal_only_screen",
+                    ],
+                },
+            }
+            store.update_candidate_evaluation(
+                family_name,
+                candidate_version=candidate_version,
+                evaluation_results=evaluation_payload,
+            )
+            if promote:
+                store.reject_candidate(
+                    family_name,
+                    candidate_version=candidate_version,
+                    evaluation_results=evaluation_payload,
+                    rejection_reason="failed_stage_a_pal_only_screen",
+                )
+            return evaluation_payload
 
     trigger_candidate = _run_sample_with_policy(
         sample_index=trigger_sample,
@@ -814,6 +1032,7 @@ def _evaluate_candidate(
     evaluation_payload = {
         **evaluation_results,
         "gate_stage": "inline",
+        "stage_a_screen": stage_a_screen or {},
         "evaluation_stats": {
             "cache_hits": cache_hits,
             "cache_misses": cache_misses,

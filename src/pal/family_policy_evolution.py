@@ -16,6 +16,10 @@ ENV_ENABLE_PROMOTION = "PAL_ENABLE_FAMILY_POLICY_PROMOTION"
 ENV_ENABLED_FAMILIES = "PAL_FAMILY_POLICY_EVOLUTION_FAMILIES"
 ENV_STORE_PATH = "PAL_FAMILY_POLICY_STORE_PATH"
 ENV_OVERRIDE_VERSIONS = "PAL_FAMILY_POLICY_OVERRIDE_VERSIONS"
+ENV_COMPARE_LOCK_FAMILY = "PAL_FAMILY_POLICY_COMPARE_LOCK_FAMILY"
+ENV_STRICT_UPDATE_MAPPING = "PAL_FAMILY_POLICY_STRICT_UPDATE_MAPPING"
+ENV_DEDUP_SIGNATURE = "PAL_FAMILY_POLICY_DEDUP_SIGNATURE"
+ENV_STRUCTURED_SUCCESS_FEATURES = "PAL_FAMILY_POLICY_STRUCTURED_SUCCESS_FEATURES"
 
 
 @dataclass(frozen=True)
@@ -94,7 +98,9 @@ def classify_family_failure(
     if cleaned_family == "single_anchor_lookup" and _has_reason_fragment(
         "repairable_weak_grounding",
         "repairable_anchor_path_empty",
+        "repairable_anchor_not_found",
         "anchor_path_empty",
+        "anchor_not_found",
     ):
         return "bad_routing"
     if any(reason.startswith("sample_status:agent_unknown_error") for reason in cleaned_reasons):
@@ -161,6 +167,22 @@ def parse_override_versions() -> dict[str, str]:
     }
 
 
+def compare_locked_family_name() -> str:
+    return str(os.environ.get(ENV_COMPARE_LOCK_FAMILY) or "").strip()
+
+
+def strict_update_mapping_enabled() -> bool:
+    return os.environ.get(ENV_STRICT_UPDATE_MAPPING) == "1"
+
+
+def candidate_signature_dedup_enabled() -> bool:
+    return os.environ.get(ENV_DEDUP_SIGNATURE) == "1"
+
+
+def structured_success_features_enabled() -> bool:
+    return os.environ.get(ENV_STRUCTURED_SUCCESS_FEATURES) == "1"
+
+
 def bundle_from_dict(payload: Mapping[str, Any]) -> FamilyPolicyBundle:
     return FamilyPolicyBundle(
         family_name=str(payload.get("family_name") or "").strip(),
@@ -185,6 +207,18 @@ def _dedupe_strings(items: Sequence[str]) -> tuple[str, ...]:
     return tuple(deduped)
 
 
+def _reason_contains_any(
+    failure_reasons: Sequence[str],
+    *fragments: str,
+) -> bool:
+    lowered_reasons = [str(item or "").strip().lower() for item in failure_reasons]
+    for fragment in fragments:
+        cleaned_fragment = str(fragment or "").strip().lower()
+        if cleaned_fragment and any(cleaned_fragment in reason for reason in lowered_reasons):
+            return True
+    return False
+
+
 def version_reuse_compatible(source_version: str, active_version: str) -> bool:
     cleaned_source = str(source_version or "").strip()
     cleaned_active = str(active_version or "").strip()
@@ -199,6 +233,7 @@ def _constructive_policy_updates(
     *,
     family_name: str,
     failure_class: str,
+    failure_reasons: Sequence[str] = (),
 ) -> dict[str, tuple[str, ...]]:
     applicability_conditions: list[str] = []
     validator_expectations: list[str] = []
@@ -240,9 +275,21 @@ def _constructive_policy_updates(
             )
             repair_policy.append("preserve_joined_count_target_semantics_during_repairs")
     elif family_name in {"single_anchor_lookup", "single_anchor_chain_lookup"}:
+        if failure_class in {"weak_applicability_boundary", "bad_routing"}:
+            validator_expectations.append(
+                "verify_answer_target_semantics_not_just_executability"
+            )
         if failure_class == "weak_applicability_boundary":
             validator_expectations.append(
                 "verify_projected_entity_matches_question_target"
+            )
+        if _reason_contains_any(
+            failure_reasons,
+            "repairable_anchor_path_empty",
+            "anchor_path_empty",
+        ):
+            validator_expectations.append(
+                "require_direct_single_anchor_answer_path"
             )
     elif family_name == "superlative_chain":
         if failure_class in {"weak_applicability_boundary", "bad_routing"}:
@@ -255,6 +302,15 @@ def _constructive_policy_updates(
             validator_expectations.append(
                 "preserve_all_anchor_constraints_on_same_answer_variable"
             )
+    if family_name == "count_over_joined_set" and _reason_contains_any(
+        failure_reasons,
+        "count_answer_target_unenforced",
+        "count_query_counts_wrong_variable",
+        "count_repair_dropped_preserved_relation_family",
+        "repair:preserve_live_count_target_family_after_pivot",
+        "dangerous_overreach:weak_count_semantics",
+    ):
+        validator_expectations.append("require_count_answer_target_preservation")
 
     return {
         "applicability_conditions": _dedupe_strings(applicability_conditions),
@@ -265,6 +321,189 @@ def _constructive_policy_updates(
 
 def _normalize_role_token(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _allowed_update_fields_for_failure(
+    *,
+    family_name: str,
+    failure_class: str,
+    failure_reasons: Sequence[str] = (),
+) -> frozenset[str]:
+    cleaned_family = str(family_name or "").strip()
+    cleaned_failure = str(failure_class or "").strip()
+    if cleaned_failure == "bad_routing":
+        if cleaned_family in {"single_anchor_lookup", "single_anchor_chain_lookup"}:
+            if not _reason_contains_any(
+                failure_reasons,
+                "repairable_anchor_path_empty",
+                "anchor_path_empty",
+                "anchor_paths_live_but_projection_empty",
+                "query_shape:single_anchor_lookup",
+                "family_compare_locked_query_shape",
+                "single_anchor_chain_lookup",
+            ):
+                return frozenset()
+            return frozenset({"validator_expectations", "blocked_scaffold_signatures"})
+        return frozenset({"repair_policy", "blocked_scaffold_signatures"})
+    if cleaned_failure == "bad_fallback_ordering":
+        return frozenset({"repair_policy"})
+    if cleaned_failure in {"validator_miss", "forbidden_relation_family_miss"}:
+        if cleaned_family in {"single_anchor_lookup", "single_anchor_chain_lookup"}:
+            if cleaned_failure == "validator_miss":
+                if not _reason_contains_any(
+                    failure_reasons,
+                    "entity_answer_target_unenforced",
+                    "dangerous_overreach:weak_entity_semantics",
+                    "generic_type_result_overbroad_for_answer_target",
+                ):
+                    return frozenset()
+                return frozenset(
+                    {
+                        "validator_expectations",
+                        "blocked_scaffold_signatures",
+                        "forbidden_overreach_patterns",
+                    }
+                )
+            return frozenset({"forbidden_relation_families"})
+        return frozenset(
+            {
+                "validator_expectations",
+                "blocked_scaffold_signatures",
+                "forbidden_overreach_patterns",
+                "forbidden_relation_families",
+            }
+        )
+    if cleaned_failure == "weak_applicability_boundary":
+        if cleaned_family in {
+            "count_over_direct_relation",
+            "count_over_joined_set",
+            "multi_anchor_intersection",
+            "shared_type_intersection",
+        }:
+            return frozenset({"validator_expectations"})
+        if cleaned_family in {"single_anchor_lookup", "single_anchor_chain_lookup"}:
+            if not _reason_contains_any(
+                failure_reasons,
+                "repairable_anchor_path_empty",
+                "anchor_path_empty",
+                "anchor_paths_live_but_projection_empty",
+                "repairable_weak_grounding",
+                "entity_answer_target_unenforced",
+                "dangerous_overreach:weak_entity_semantics",
+                "grounded_single_anchor_empty_result",
+                "anchor_not_found",
+            ):
+                return frozenset()
+            return frozenset({"validator_expectations"})
+        return frozenset({"applicability_conditions", "validator_expectations"})
+    return frozenset()
+
+
+def build_candidate_signature(
+    *,
+    bundle: FamilyPolicyBundle,
+    fields_changed: Sequence[str],
+) -> dict[str, Any]:
+    field_names = (
+        "applicability_conditions",
+        "validator_expectations",
+        "repair_policy",
+        "blocked_scaffold_signatures",
+        "forbidden_overreach_patterns",
+        "forbidden_relation_families",
+    )
+    cleaned_validators = {
+        str(item or "").strip()
+        for item in bundle.validator_expectations
+        if str(item or "").strip()
+    }
+    validator_groups = (
+        (
+            "single_anchor_direct_path",
+            {
+                "require_direct_single_anchor_answer_path",
+                "verify_projected_entity_matches_question_target",
+            },
+        ),
+        (
+            "answer_target_semantics",
+            {
+                "verify_answer_target_semantics_not_just_executability",
+                "tighten_answer_target_semantics",
+            },
+        ),
+        (
+            "count_answer_target_preservation",
+            {
+                "verify_count_targets_requested_entity_set",
+                "require_count_answer_target_preservation",
+            },
+        ),
+        (
+            "dangerous_overreach_rejection",
+            {"reject_known_dangerous_overreach_patterns"},
+        ),
+    )
+    validator_tags: list[str] = []
+    covered_validators: set[str] = set()
+    for tag, members in validator_groups:
+        if cleaned_validators & members:
+            validator_tags.append(tag)
+            covered_validators.update(members)
+    for item in sorted(cleaned_validators - covered_validators):
+        validator_tags.append(f"validator:{item}")
+
+    blocked_scaffold_tags: list[str] = []
+    for raw_value in bundle.blocked_scaffold_signatures:
+        cleaned = str(raw_value or "").strip()
+        if not cleaned:
+            continue
+        parts = [part for part in cleaned.split("|") if part]
+        family_name = parts[0] if parts else cleaned
+        relation_parts = [part for part in parts[1:] if "." in part]
+        normalized = (
+            "|".join([family_name, *relation_parts])
+            if relation_parts
+            else cleaned
+        )
+        if normalized not in blocked_scaffold_tags:
+            blocked_scaffold_tags.append(normalized)
+
+    return {
+        "family_name": str(bundle.family_name or "").strip(),
+        "renderer_name": str(bundle.renderer_name or "").strip(),
+        "fields_changed": [
+            str(field_name or "").strip()
+            for field_name in fields_changed
+            if str(field_name or "").strip()
+        ],
+        "field_payloads": {
+            field_name: [
+                str(item or "").strip()
+                for item in getattr(bundle, field_name)
+                if str(item or "").strip()
+            ]
+            for field_name in field_names
+        },
+        "effective_constraint_signature": {
+            "validator_tags": validator_tags,
+            "blocked_scaffold_tags": blocked_scaffold_tags,
+            "forbidden_relation_families": sorted(
+                {
+                    str(item or "").strip()
+                    for item in bundle.forbidden_relation_families
+                    if str(item or "").strip()
+                }
+            ),
+            "forbidden_overreach_patterns": sorted(
+                {
+                    str(item or "").strip()
+                    for item in bundle.forbidden_overreach_patterns
+                    if str(item or "").strip()
+                }
+            ),
+        },
+    }
 
 
 def build_success_plan_archetype(
@@ -345,9 +584,11 @@ def build_success_plan_archetype(
     ]
     pattern_signature = "|".join(part for part in pattern_signature_parts if part)
 
-    return {
+    payload = {
         "query_shape": query_shape,
         "answer_mode": answer_mode,
+        "anchor_count": len(anchor_roles),
+        "relation_depth": len(relation_role_skeleton),
         "join_type": join_type,
         "anchor_roles": anchor_roles,
         "anchor_constraints": anchor_constraints,
@@ -358,6 +599,52 @@ def build_success_plan_archetype(
         "structural_notes": structural_notes,
         "pattern_signature": pattern_signature,
     }
+    if structured_success_features_enabled():
+        grounding_sources = sorted(
+            {
+                str(relation_path.get("grounding_source") or "").strip().lower()
+                for relation_path in query_plan.get("relation_paths") or []
+                if isinstance(relation_path, Mapping)
+                and str(relation_path.get("grounding_source") or "").strip()
+            }
+        )
+        relation_signatures = [
+            "->".join(
+                part
+                for part in (
+                    _normalize_role_token(relation_path.get("from_role")),
+                    str(relation_path.get("relation") or "").strip(),
+                    _normalize_role_token(relation_path.get("to_role")),
+                    str(relation_path.get("grounding_source") or "").strip().lower(),
+                )
+                if part
+            )
+            for relation_path in query_plan.get("relation_paths") or []
+            if isinstance(relation_path, Mapping)
+        ]
+        anchor_binding_modes: list[str] = []
+        for item in query_plan.get("anchored_entities") or []:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("resolved_entity_id") or "").strip():
+                anchor_binding_modes.append("resolved_entity_id")
+            chosen_alias = str(item.get("chosen_alias") or "").strip()
+            surface = str(item.get("surface") or "").strip()
+            if chosen_alias and chosen_alias.startswith("m."):
+                anchor_binding_modes.append("freebase_mid_anchor")
+            elif chosen_alias and surface and chosen_alias.lower() != surface.lower():
+                anchor_binding_modes.append("surface_alias_anchor")
+        payload.update(
+            {
+                "grounding_sources": grounding_sources,
+                "relation_signatures": relation_signatures[:4],
+                "anchor_binding_modes": list(_dedupe_strings(anchor_binding_modes)),
+                "answer_target_present": bool(
+                    str(query_plan.get("answer_target_phrase") or "").strip()
+                ),
+            }
+        )
+    return payload
 
 def merge_success_plan_archetypes(
     existing_archetypes: Sequence[Mapping[str, Any]],
@@ -646,6 +933,7 @@ class FamilyPolicyStore:
         constructive_updates = _constructive_policy_updates(
             family_name=family_name,
             failure_class=cleaned_failure_class,
+            failure_reasons=failure_reasons,
         )
         applicability_conditions.extend(
             constructive_updates["applicability_conditions"]
@@ -672,6 +960,31 @@ class FamilyPolicyStore:
             retry_guard = "deprioritize_failed_scaffold_before_family_switch"
             if retry_guard not in repair_policy:
                 repair_policy.append(retry_guard)
+
+        if strict_update_mapping_enabled():
+            allowed_fields = _allowed_update_fields_for_failure(
+                family_name=family_name,
+                failure_class=cleaned_failure_class,
+                failure_reasons=failure_reasons,
+            )
+            if not allowed_fields:
+                return None
+            if "applicability_conditions" not in allowed_fields:
+                applicability_conditions = list(active_bundle.applicability_conditions)
+            if "validator_expectations" not in allowed_fields:
+                validator_expectations = list(active_bundle.validator_expectations)
+            if "repair_policy" not in allowed_fields:
+                repair_policy = list(active_bundle.repair_policy)
+            if "blocked_scaffold_signatures" not in allowed_fields:
+                blocked_scaffolds = list(active_bundle.blocked_scaffold_signatures)
+            if "forbidden_overreach_patterns" not in allowed_fields:
+                forbidden_overreach_patterns = list(
+                    active_bundle.forbidden_overreach_patterns
+                )
+            if "forbidden_relation_families" not in allowed_fields:
+                forbidden_relation_families = list(
+                    active_bundle.forbidden_relation_families
+                )
 
         updated_bundle = FamilyPolicyBundle(
             family_name=active_bundle.family_name,
@@ -700,12 +1013,68 @@ class FamilyPolicyStore:
         if not fields_changed:
             return None
 
+        candidate_signature = build_candidate_signature(
+            bundle=updated_bundle,
+            fields_changed=fields_changed,
+        )
+
         existing_versions = payload.get("versions") or {}
         updated_bundle_payload = updated_bundle.as_dict()
         for version_name, version_payload in existing_versions.items():
             if not isinstance(version_payload, Mapping):
                 continue
-            if (version_payload.get("bundle") or {}) == updated_bundle_payload:
+            existing_signature = version_payload.get("candidate_signature")
+            if not isinstance(existing_signature, Mapping):
+                existing_bundle_payload = version_payload.get("bundle")
+                if isinstance(existing_bundle_payload, Mapping):
+                    try:
+                        existing_signature = build_candidate_signature(
+                            bundle=bundle_from_dict(existing_bundle_payload),
+                            fields_changed=version_payload.get("fields_changed") or [],
+                        )
+                    except Exception:
+                        existing_signature = None
+            existing_effective_signature = (
+                dict(existing_signature.get("effective_constraint_signature") or {})
+                if isinstance(existing_signature, Mapping)
+                else {}
+            )
+            candidate_effective_signature = dict(
+                candidate_signature.get("effective_constraint_signature") or {}
+            )
+            if (
+                candidate_signature_dedup_enabled()
+                and isinstance(existing_signature, Mapping)
+                and (
+                    dict(existing_signature) == candidate_signature
+                    or (
+                        existing_effective_signature
+                        and existing_effective_signature
+                        == candidate_effective_signature
+                    )
+                )
+            ):
+                if str(version_payload.get("status") or "").strip() == "candidate":
+                    return FamilyPolicyCandidateUpdate(
+                        family_name=family_name,
+                        base_version=active_version,
+                        candidate_version=str(version_name),
+                        bundle=bundle_from_dict(updated_bundle_payload),
+                        fields_changed=tuple(fields_changed),
+                        reason_for_change=str(
+                            version_payload.get("reason_for_change")
+                            or "duplicate_candidate"
+                        ).strip(),
+                        trigger_context=dict(trigger_context),
+                    )
+                return None
+            existing_bundle_payload = version_payload.get("bundle") or {}
+            if isinstance(existing_bundle_payload, Mapping):
+                existing_bundle_payload = dict(existing_bundle_payload)
+                existing_bundle_payload.pop("version", None)
+            updated_bundle_payload_no_version = dict(updated_bundle_payload)
+            updated_bundle_payload_no_version.pop("version", None)
+            if existing_bundle_payload == updated_bundle_payload_no_version:
                 if str(version_payload.get("status") or "").strip() == "candidate":
                     return FamilyPolicyCandidateUpdate(
                         family_name=family_name,
@@ -718,6 +1087,7 @@ class FamilyPolicyStore:
                         ).strip(),
                         trigger_context=dict(trigger_context),
                     )
+                return None
 
         suffix = 1
         while True:
@@ -772,6 +1142,7 @@ class FamilyPolicyStore:
                 **dict(trigger_context),
                 "failure_class": cleaned_failure_class,
             },
+            "candidate_signature": candidate_signature,
         }
         payload["versions"] = existing_versions
         self._save_family_payload(family_name, payload)
@@ -923,19 +1294,26 @@ def summarize_sample_metrics(sample_result: Mapping[str, Any]) -> dict[str, Any]
 
 
 __all__ = [
+    "ENV_DEDUP_SIGNATURE",
+    "ENV_COMPARE_LOCK_FAMILY",
     "ENV_ENABLE_EVOLUTION",
     "ENV_ENABLE_PROMOTION",
     "ENV_ENABLED_FAMILIES",
     "ENV_OVERRIDE_VERSIONS",
+    "ENV_STRICT_UPDATE_MAPPING",
     "ENV_STORE_PATH",
     "FamilyPolicyCandidateUpdate",
     "FamilyPolicyStore",
+    "build_candidate_signature",
     "build_family_policy_store",
     "bundle_from_dict",
+    "candidate_signature_dedup_enabled",
+    "compare_locked_family_name",
     "family_policy_enabled_for",
     "family_policy_evolution_enabled",
     "family_policy_promotion_enabled",
     "parse_override_versions",
     "resolve_family_policy_store_path",
+    "strict_update_mapping_enabled",
     "summarize_sample_metrics",
 ]
