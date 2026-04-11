@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+from src.pal.family_contracts import get_family_contract
 from src.pal.policy_contracts import FamilyPolicyBundle
 
 
@@ -670,6 +671,32 @@ def merge_success_plan_archetypes(
     return merged[-max_items:]
 
 
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, bytearray):
+        return bytes(value).decode("utf-8", errors="replace")
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, set):
+        return [
+            _json_safe_value(item)
+            for item in sorted(value, key=lambda item: str(item))
+        ]
+    try:
+        json.dumps(value)
+    except TypeError:
+        return str(value)
+    return value
+
+
 class FamilyPolicyStore:
     def __init__(
         self,
@@ -691,7 +718,13 @@ class FamilyPolicyStore:
     def _write_json(self, path: Path, payload: Mapping[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            json.dumps(
+                _json_safe_value(payload),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
             encoding="utf-8",
         )
 
@@ -982,6 +1015,40 @@ class FamilyPolicyStore:
                     active_bundle.forbidden_overreach_patterns
                 )
             if "forbidden_relation_families" not in allowed_fields:
+                forbidden_relation_families = list(
+                    active_bundle.forbidden_relation_families
+                )
+
+        family_contract = get_family_contract(family_name)
+        runtime_consumable_fields = set(
+            family_contract.runtime_consumable_fields if family_contract is not None else ()
+        )
+        if runtime_consumable_fields:
+            if "applicability_conditions" not in runtime_consumable_fields:
+                applicability_conditions = list(active_bundle.applicability_conditions)
+            if "validator_expectations" in runtime_consumable_fields:
+                runtime_validator_expectations = set(
+                    family_contract.runtime_validator_expectations
+                    if family_contract is not None
+                    else ()
+                )
+                validator_expectations = list(active_bundle.validator_expectations) + [
+                    expectation
+                    for expectation in validator_expectations
+                    if expectation not in active_bundle.validator_expectations
+                    and expectation in runtime_validator_expectations
+                ]
+            else:
+                validator_expectations = list(active_bundle.validator_expectations)
+            if "repair_policy" not in runtime_consumable_fields:
+                repair_policy = list(active_bundle.repair_policy)
+            if "blocked_scaffold_signatures" not in runtime_consumable_fields:
+                blocked_scaffolds = list(active_bundle.blocked_scaffold_signatures)
+            if "forbidden_overreach_patterns" not in runtime_consumable_fields:
+                forbidden_overreach_patterns = list(
+                    active_bundle.forbidden_overreach_patterns
+                )
+            if "forbidden_relation_families" not in runtime_consumable_fields:
                 forbidden_relation_families = list(
                     active_bundle.forbidden_relation_families
                 )

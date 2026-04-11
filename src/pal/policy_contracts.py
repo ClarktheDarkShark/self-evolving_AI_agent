@@ -70,6 +70,7 @@ class AttemptDecisionRecord:
     materialization_denial_reasons: tuple[str, ...] = ()
     dangerous_overreach: bool = False
     dangerous_overreach_reasons: tuple[str, ...] = ()
+    family_contract: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -85,6 +86,7 @@ class AttemptDecisionRecord:
             "materialization_denial_reasons": list(self.materialization_denial_reasons),
             "dangerous_overreach": self.dangerous_overreach,
             "dangerous_overreach_reasons": list(self.dangerous_overreach_reasons),
+            "family_contract": dict(self.family_contract),
         }
 
 

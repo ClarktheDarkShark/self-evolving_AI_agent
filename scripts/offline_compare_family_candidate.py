@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import scripts.run_kg_family_policy_evolution as family_policy_harness
 from src.pal.candidate_compare import (
     aggregate_stage_metrics,
+    baseline_satisfies_locked_family,
     compare_aggregate_metrics,
     load_archived_baseline_record,
     stage_definitively_lost,
@@ -132,6 +133,7 @@ def compare_family_candidate(
     baseline_archive_root: Path | None = None,
     parent_output_dir: Path | None = None,
     pal_only_screen: bool = False,
+    screen_unsatisfied_baseline: bool = False,
     stop_on_definitive_loss: bool = True,
     label: str = "",
     extra_env: Mapping[str, str] | None = None,
@@ -179,6 +181,7 @@ def compare_family_candidate(
     candidate_rows: list[dict[str, Any]] = []
     per_sample_rows: list[dict[str, Any]] = []
     baseline_reuse_count = 0
+    screened_out_samples: list[dict[str, Any]] = []
     stopped_early = False
 
     cleaned_label = str(label or "").strip() or f"{cleaned_family}_{evaluation_mode}"
@@ -223,6 +226,33 @@ def compare_family_candidate(
                 run_summary=baseline_run_summary,
                 semantic_metrics=baseline_semantic_metrics,
             )
+
+        if screen_unsatisfied_baseline and not baseline_satisfies_locked_family(
+            baseline_semantic_metrics
+        ) or (
+            screen_unsatisfied_baseline
+            and str(baseline_run_summary.get("finish_reason") or "").strip().startswith(
+                "pal_query_plan_invalid:family_compare_locked_query_shape:"
+            )
+        ):
+            screened_out_samples.append(
+                {
+                    "sample_index": sample_index,
+                    "reason": "baseline_locked_family_unsatisfied",
+                    "baseline_run_summary": dict(baseline_run_summary),
+                    "baseline_semantic_metrics": dict(baseline_semantic_metrics),
+                }
+            )
+            per_sample_rows.append(
+                {
+                    "sample_index": sample_index,
+                    "screened_out": True,
+                    "screen_reason": "baseline_locked_family_unsatisfied",
+                    "baseline_run_summary": baseline_run_summary,
+                    "baseline_semantic_metrics": baseline_semantic_metrics,
+                }
+            )
+            continue
 
         candidate_run_summary, candidate_semantic_metrics = _run_and_summarize(
             sample_index=sample_index,
@@ -276,6 +306,9 @@ def compare_family_candidate(
         "store_path": str(store_path),
         "baseline_archive_root": str(baseline_root),
         "baseline_reuse_count": baseline_reuse_count,
+        "screen_unsatisfied_baseline": bool(screen_unsatisfied_baseline),
+        "screened_out_sample_count": len(screened_out_samples),
+        "screened_out_samples": screened_out_samples,
         "stopped_early": stopped_early,
         "family_lock_pure": bool(
             int(baseline_aggregate.get("family_lock_violation_count") or 0) == 0
@@ -306,6 +339,7 @@ def main() -> int:
     parser.add_argument("--parent-output-dir", default="")
     parser.add_argument("--label", default="")
     parser.add_argument("--pal-only-screen", action="store_true")
+    parser.add_argument("--screen-unsatisfied-baseline", action="store_true")
     parser.add_argument("--no-early-stop", action="store_true")
     parser.add_argument("--config-path", default="")
     parser.add_argument("--samples", nargs="*")
@@ -336,6 +370,7 @@ def main() -> int:
             _resolve_path(args.parent_output_dir) if args.parent_output_dir else None
         ),
         pal_only_screen=bool(args.pal_only_screen),
+        screen_unsatisfied_baseline=bool(args.screen_unsatisfied_baseline),
         stop_on_definitive_loss=not bool(args.no_early_stop),
         label=args.label,
         extra_env=_parse_extra_env(args.extra_env),

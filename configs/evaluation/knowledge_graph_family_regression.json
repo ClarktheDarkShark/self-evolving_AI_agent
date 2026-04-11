@@ -7,9 +7,17 @@
       "tuning": ["11", "20", "241"],
       "held_out": ["15", "257"]
     },
+    "count_over_joined_set": {
+      "tuning": ["21", "102"],
+      "held_out": ["203", "316"]
+    },
     "single_anchor_lookup": {
       "tuning": ["10", "22"],
       "held_out": ["33", "386"]
+    },
+    "single_anchor_chain_lookup": {
+      "tuning": ["22", "68"],
+      "held_out": ["214", "274"]
     },
     "multi_anchor_intersection": {
       "tuning": ["0", "2", "6"],
@@ -18,6 +26,10 @@
     "shared_type_intersection": {
       "tuning": ["7", "158"],
       "held_out": ["28", "30"]
+    },
+    "containment_or_ownership_lookup": {
+      "tuning": [],
+      "held_out": []
     },
     "superlative_chain": {
       "tuning": ["12", "13"],

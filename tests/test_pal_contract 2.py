@@ -2026,6 +2026,34 @@ def test_answer_target_relative_clause_is_not_split_as_class_phrase() -> None:
     assert target_head == "infectious diseases that can be transmitted by aedes aegypti"
 
 
+def test_answer_target_compound_phrase_prefers_leading_head_before_relation_marker() -> None:
+    controller = _make_controller()
+
+    qualifier, head = controller._split_answer_target_compound_phrase(
+        "artists recorded the contribution by lso"
+    )
+    assert qualifier == "recorded the contribution by lso"
+    assert head == "artists"
+
+    qualifier, head = controller._split_answer_target_compound_phrase(
+        "infectious diseases can a flea transmit"
+    )
+    assert qualifier == "can a flea transmit"
+    assert head == "infectious diseases"
+
+    qualifier, head = controller._split_answer_target_compound_phrase(
+        "contents about higher education"
+    )
+    assert qualifier == "about higher education"
+    assert head == "contents"
+
+    qualifier, head = controller._split_answer_target_compound_phrase(
+        "game expansions"
+    )
+    assert qualifier == ""
+    assert head == "game expansions"
+
+
 def test_extract_answer_target_phrase_handles_name_of_relative_clause() -> None:
     controller = _make_controller()
 
@@ -4640,6 +4668,689 @@ def test_grounded_relation_sort_prefers_publisher_relations_for_has_released_gam
     assert ranked[0]["relation"] == "cvg.cvg_publisher.games_published"
 
 
+def test_count_answer_target_head_match_requires_full_semantic_head() -> None:
+    controller = _make_controller()
+
+    assert not controller._count_answer_target_head_is_encoded_in_relation(
+        answer_target_phrase="game expansions",
+        relation_candidates=[
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve game versions published or released by a known publisher",
+            }
+        ],
+    )
+    assert controller._count_answer_target_head_is_encoded_in_relation(
+        answer_target_phrase="infectious diseases",
+        relation_candidates=[
+            {
+                "relation": "medicine.infectious_disease.vector",
+                "direction": "reverse",
+                "from": "disease",
+                "to": "anchor",
+                "from_role": "count_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+    )
+    assert not controller._count_answer_target_head_is_encoded_in_relation(
+        answer_target_phrase="artists recorded the contribution by lso",
+        relation_candidates=[
+            {
+                "relation": "music.recording_contribution.contributor",
+                "direction": "reverse",
+                "from": "contribution",
+                "to": "anchor",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+    )
+    assert controller._count_answer_target_head_is_encoded_in_relation(
+        answer_target_phrase="artists recorded the contribution by lso",
+        relation_candidates=[
+            {
+                "relation": "music.recording.featured_artists",
+                "direction": "reverse",
+                "from": "recording",
+                "to": "anchor",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+            }
+        ],
+    )
+
+
+def test_class_filtered_count_repair_plan_adds_explicit_constraint_for_game_expansions() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_joined_set",
+        "strategy": "Count distinct game-version entities reached from the publisher anchor and filter them to game expansions.",
+        "anchored_entities": [
+            {
+                "surface": "valve corp",
+                "chosen_alias": "m.0dwl2",
+                "role": "anchor",
+            }
+        ],
+        "relation_paths": [
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "support": "curated_cvg_predicate",
+                "use_when": "retrieve game versions published or released by a known publisher",
+            },
+            {
+                "relation": "type.object.type",
+                "direction": "forward",
+                "from": "candidate_set",
+                "to": "type_set",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "exploratory",
+                "reason": "apply a type/category filter to restrict the candidate game versions to those whose type matches game expansion",
+            },
+        ],
+        "shared_answer_variable": "candidate_set",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "candidate_set",
+        "join_structure": {
+            "type": "single_path",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "candidate_set",
+                    "notes": "Use the publisher->game-version relation to produce the candidate set of game versions published by the anchor publisher",
+                }
+            ],
+        },
+        "projection": ["count"],
+        "plan_rationale": [],
+    }
+
+    rewritten = controller._build_class_filtered_count_repair_plan(
+        task_question=(
+            "Question: how many game expansions has valve corp released?, "
+            "Entities: ['valve corp']"
+        ),
+        query_plan=query_plan,
+        relation_grounding=query_plan["relation_paths"],
+    )
+
+    assert rewritten is not None
+    assert len(rewritten["anchored_entities"]) == 2
+    assert {
+        str(path.get("relation") or "").strip() for path in rewritten["relation_paths"]
+    } == {
+        "cvg.cvg_publisher.game_versions_published",
+        "type.object.type",
+    }
+    assert any(
+        str(item.get("role") or "").strip() in {"constraint_value", "type_set", "shared_type"}
+        and str(item.get("chosen_alias") or "").strip() == "game expansion"
+        for item in rewritten["anchored_entities"]
+    )
+    assert any(
+        str(item.get("anchor_role") or "").strip() in {"constraint_value", "type_set", "shared_type"}
+        for item in rewritten["join_structure"]["anchor_constraints"]
+    )
+    assert "answer-class or answer-constraint filter" in " ".join(
+        str(item.get("notes") or "").strip()
+        for item in rewritten["join_structure"]["anchor_constraints"]
+        if isinstance(item, dict)
+    ).lower()
+
+
+def test_select_class_filtered_count_candidate_prefers_type_like_relation_with_answer_target_overlap() -> None:
+    controller = _make_controller()
+
+    selected = controller._select_class_filtered_count_candidate(
+        relation_grounding=[
+            {
+                "relation": "music.recording.length",
+                "direction": "forward",
+                "from": "shared_answer",
+                "to": "constraint_value",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+                "reason": "unrelated attribute constraint",
+            },
+            {
+                "relation": "type.object.type",
+                "direction": "forward",
+                "from": "shared_answer",
+                "to": "constraint_value",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "exploratory",
+                "reason": "restrict to the game expansion type",
+            },
+        ],
+        preferred_relation_root="cvg",
+        answer_target_phrase="game expansions",
+    )
+
+    assert selected is not None
+    assert selected["relation"] == "type.object.type"
+
+
+def test_class_filtered_count_repair_requires_anchor_touched_count_path() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "Count songwriters who work in the percussionist profession.",
+        "anchored_entities": [
+            {
+                "surface": "Percussionist",
+                "chosen_alias": "m.02h66l4",
+                "role": "anchor",
+            }
+        ],
+        "relation_paths": [
+            {
+                "relation": "people.profession.people_with_this_profession",
+                "direction": "forward",
+                "from": "profession",
+                "to": "person",
+                "from_role": "constraint_value",
+                "to_role": "count_set",
+                "grounding_source": "curated",
+            }
+        ],
+        "shared_answer_variable": "candidate_set",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "candidate_set",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "candidate_set",
+                    "notes": (
+                        "The primary anchor constrains the shared counted entity set "
+                        "via people.profession.people_with_this_profession."
+                    ),
+                }
+            ],
+        },
+        "projection": ["count"],
+        "plan_rationale": [],
+    }
+
+    rewritten = controller._build_class_filtered_count_repair_plan(
+        task_question=(
+            "Question: how many songwriters work in the percussionist profession?, "
+            "Entities: ['Percussionist']"
+        ),
+        query_plan=query_plan,
+        relation_grounding=[
+            {
+                "relation": "people.person.profession",
+                "direction": "forward",
+                "from": "person",
+                "to": "profession",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "curated",
+                "reason": "find the profession(s) of a person",
+            }
+        ],
+    )
+
+    assert rewritten is None
+
+
+def test_relation_selected_direct_count_repair_prefers_top_grounded_anchor_family() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_joined_set",
+        "strategy": "Count game versions and filter them to game expansions.",
+        "anchored_entities": [
+            {
+                "surface": "valve corp",
+                "chosen_alias": "m.0dwl2",
+                "role": "anchor",
+            }
+        ],
+        "relation_paths": [
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "cvg.game_version.version_type",
+                "direction": "forward",
+                "from": "candidate_set",
+                "to": "version_type",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "exploratory",
+            },
+        ],
+        "shared_answer_variable": "candidate_set",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "candidate_set",
+        "join_structure": {
+            "type": "intersection",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "candidate_set",
+                    "notes": "publisher count path",
+                }
+            ],
+        },
+        "projection": ["count"],
+        "plan_rationale": [],
+    }
+
+    rewritten = controller._build_relation_selected_direct_count_repair_plan(
+        task_question=(
+            "Question: how many game expansions has valve corp released?, "
+            "Entities: ['valve corp']"
+        ),
+        query_plan=query_plan,
+        relation_grounding=[
+            {
+                "relation": "cvg.cvg_publisher.games_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve games published or released by a known publisher",
+            },
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve game versions published or released by a known publisher",
+            },
+        ],
+    )
+
+    assert rewritten is not None
+    assert rewritten["query_shape"] == "count_over_direct_relation"
+    assert [path["relation"] for path in rewritten["relation_paths"]] == [
+        "cvg.cvg_publisher.games_published"
+    ]
+    assert rewritten["allow_exploratory_predicates"] is False
+    assert "relation-selection hint" in rewritten["strategy"]
+
+
+def test_relation_selected_direct_count_repair_can_rewrite_initial_direct_count_family() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "Count game versions published by the anchor.",
+        "anchored_entities": [
+            {
+                "surface": "valve corp",
+                "chosen_alias": "m.0dwl2",
+                "role": "anchor",
+            }
+        ],
+        "relation_paths": [
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            }
+        ],
+        "shared_answer_variable": "candidate_set",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "candidate_set",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "candidate_set",
+                    "notes": "publisher count path",
+                }
+            ],
+        },
+        "projection": ["count"],
+        "plan_rationale": [],
+    }
+
+    rewritten = controller._build_relation_selected_direct_count_repair_plan(
+        task_question=(
+            "Question: how many game expansions has valve corp released?, "
+            "Entities: ['valve corp']"
+        ),
+        query_plan=query_plan,
+        relation_grounding=[
+            {
+                "relation": "cvg.cvg_publisher.games_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve games published or released by a known publisher",
+            },
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve game versions published or released by a known publisher",
+            },
+        ],
+    )
+
+    assert rewritten is not None
+    assert rewritten["query_shape"] == "count_over_direct_relation"
+    assert [path["relation"] for path in rewritten["relation_paths"]] == [
+        "cvg.cvg_publisher.games_published"
+    ]
+    assert "under-encodes the answer target" in " ".join(rewritten["plan_rationale"]).lower()
+
+
+def test_relation_selected_direct_count_repair_uses_subject_probe_to_normalize_direction() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "Count game versions published by the anchor.",
+        "anchored_entities": [
+            {
+                "surface": "valve corp",
+                "chosen_alias": "m.0dwl2",
+                "role": "anchor",
+            }
+        ],
+        "relation_paths": [
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            }
+        ],
+        "shared_answer_variable": "candidate_set",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "candidate_set",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "candidate_set",
+                    "notes": "publisher count path",
+                }
+            ],
+        },
+        "projection": ["count"],
+        "plan_rationale": [],
+    }
+
+    rewritten = controller._build_relation_selected_direct_count_repair_plan(
+        task_question=(
+            "Question: how many game expansions has valve corp released?, "
+            "Entities: ['valve corp']"
+        ),
+        query_plan=query_plan,
+        relation_grounding=[
+            {
+                "relation": "cvg.cvg_publisher.games_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve games published or released by a known publisher",
+            },
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve game versions published or released by a known publisher",
+            },
+        ],
+        anchor_probe_results=[
+            {
+                "anchor_name": "valve corp",
+                "entity_count": 1,
+                "found": True,
+                "path_count": 80,
+                "relation_probed": "cvg.cvg_publisher.games_published",
+                "anchor_position": "subject",
+                "resolved_entity_id": "m.0dwl2",
+            }
+        ],
+    )
+
+    assert rewritten is not None
+    assert rewritten["relation_paths"][0]["relation"] == "cvg.cvg_publisher.games_published"
+    assert rewritten["relation_paths"][0]["direction"] == "forward"
+
+
+def test_relation_selected_direct_count_repair_uses_current_subject_probe_for_sibling_relation() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "Count game versions published by the anchor.",
+        "anchored_entities": [
+            {
+                "surface": "valve corp",
+                "chosen_alias": "m.0dwl2",
+                "role": "anchor",
+            }
+        ],
+        "relation_paths": [
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            }
+        ],
+        "shared_answer_variable": "candidate_set",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "candidate_set",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "candidate_set",
+                    "notes": "publisher count path",
+                }
+            ],
+        },
+        "projection": ["count"],
+        "plan_rationale": [],
+    }
+
+    rewritten = controller._build_relation_selected_direct_count_repair_plan(
+        task_question=(
+            "Question: how many game expansions has valve corp released?, "
+            "Entities: ['valve corp']"
+        ),
+        query_plan=query_plan,
+        relation_grounding=[
+            {
+                "relation": "cvg.cvg_publisher.games_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve games published or released by a known publisher",
+            },
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve game versions published or released by a known publisher",
+            },
+        ],
+        anchor_probe_results=[
+            {
+                "anchor_name": "valve corp",
+                "entity_count": 1,
+                "found": True,
+                "path_count": 35,
+                "relation_probed": "cvg.cvg_publisher.game_versions_published",
+                "anchor_position": "subject",
+                "resolved_entity_id": "m.0dwl2",
+            }
+        ],
+    )
+
+    assert rewritten is not None
+    assert rewritten["relation_paths"][0]["relation"] == "cvg.cvg_publisher.games_published"
+    assert rewritten["relation_paths"][0]["direction"] == "forward"
+
+
+def test_relation_selected_direct_count_repair_accepts_anchor_probe_objects() -> None:
+    controller = _make_controller()
+    query_plan = {
+        "answer_mode": "count",
+        "answer_type": "count",
+        "query_shape": "count_over_direct_relation",
+        "strategy": "Count game versions published by the anchor.",
+        "anchored_entities": [
+            {
+                "surface": "valve corp",
+                "chosen_alias": "m.0dwl2",
+                "role": "anchor",
+            }
+        ],
+        "relation_paths": [
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            }
+        ],
+        "shared_answer_variable": "candidate_set",
+        "candidate_set_variable": "candidate_set",
+        "count_set_variable": "candidate_set",
+        "join_structure": {
+            "type": "count",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "candidate_set",
+                    "notes": "publisher count path",
+                }
+            ],
+        },
+        "projection": ["count"],
+        "plan_rationale": [],
+    }
+
+    rewritten = controller._build_relation_selected_direct_count_repair_plan(
+        task_question=(
+            "Question: how many game expansions has valve corp released?, "
+            "Entities: ['valve corp']"
+        ),
+        query_plan=query_plan,
+        relation_grounding=[
+            {
+                "relation": "cvg.cvg_publisher.games_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve games published or released by a known publisher",
+            },
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "candidate_set",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+                "use_when": "retrieve game versions published or released by a known publisher",
+            },
+        ],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="valve corp",
+                entity_count=1,
+                path_count=35,
+                relation_probed="cvg.cvg_publisher.game_versions_published",
+                anchor_position="subject",
+                resolved_entity_id="m.0dwl2",
+            )
+        ],
+    )
+
+    assert rewritten is not None
+    assert rewritten["relation_paths"][0]["direction"] == "forward"
+
+
 def test_single_anchor_answer_target_count_rewrite_keeps_surface_anchor_semantics() -> None:
     controller = _make_controller()
     query_plan = {
@@ -6569,7 +7280,7 @@ def test_grounding_validation_relaxes_shape_for_dynamic_probe_only_relations() -
 
 def test_repair_loop_rejection_is_fail_closed() -> None:
     controller = _make_controller()
-    assert (
+    with pytest.raises(AgentUnknownException, match="pal_query_not_accepted:repairable_bad_count_set"):
         controller._ensure_repair_loop_accepted(
             generated_tool_name="pal_sparql_query_tool_test",
             repair_loop_log={
@@ -6580,64 +7291,6 @@ def test_repair_loop_rejection_is_fail_closed() -> None:
                 "last_reasons": ["count_set_path_empty"],
             },
         )
-        == "pal_query_not_accepted:repairable_bad_count_set"
-    )
-
-
-def test_repair_loop_rejection_emits_typed_finalized_failure() -> None:
-    controller = _make_controller()
-    emitted_events: list[dict[str, object]] = []
-    controller._emit_generated_tools_event = lambda payload: emitted_events.append(
-        dict(payload)
-    )
-
-    controller._emit_repair_loop_rejection_finalization(
-        generated_tool_name="pal_sparql_query_tool_test",
-        query_plan={
-            "query_shape": "count_over_direct_relation",
-            "answer_mode": "count",
-        },
-        repair_loop_log={
-            "total_attempts": 4,
-            "repair_used": True,
-            "final_verdict": "no_accepted_candidate",
-            "last_verdict": "repairable_anchor_path_empty",
-            "last_reasons": ["anchor_path_empty:example"],
-        },
-        repair_failure_reason="pal_query_not_accepted:repairable_anchor_path_empty",
-    )
-
-    assert emitted_events[-1]["event"] == "pal_attempt_decision_finalized"
-    typed_outcome = emitted_events[-1]["typed_outcome"]
-    assert typed_outcome["stop_reason"] == "grounding_miss"
-    assert typed_outcome["primary_failure_kind"] == "grounding_miss"
-    assert typed_outcome["completion_state"] == "rejected"
-
-
-def test_run_text_prompt_threads_request_timeout_override() -> None:
-    captured: dict[str, object] = {}
-
-    class _FakeResponse:
-        content = "ok"
-
-    class _FakeLanguageModel:
-        def inference(self, histories, inference_config, system_prompt):
-            captured["histories"] = histories
-            captured["inference_config"] = dict(inference_config)
-            captured["system_prompt"] = system_prompt
-            return [_FakeResponse()]
-
-    controller = _make_controller()
-    controller._language_model = _FakeLanguageModel()
-    controller._inference_config_dict = {"temperature": 0.1}
-
-    response = controller._run_text_prompt(
-        system_prompt="system",
-        user_prompt="user",
-    )
-
-    assert response == "ok"
-    assert captured["inference_config"]["temperature"] == 0.1
 
 
 def test_repair_loop_stagnation_cuts_off_repeated_state() -> None:
@@ -8095,48 +8748,6 @@ def test_trusted_macro_result_uses_solver_review_before_finalizing() -> None:
     assert controller._tool_invoked_in_last_inference == "manual_solver"
 
 
-def test_trusted_macro_result_bypasses_manual_solver_in_pal_only_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    controller = _make_controller()
-    controller._log_macro_result = lambda content: None
-    controller._get_run_id = lambda: "knowledge_graph_7"
-    monkeypatch.setenv("PAL_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK", "1")
-
-    class _FallbackAgent:
-        _tool_invoked_in_last_inference = "manual_solver"
-
-        def _inference(self, chat_history):
-            raise AssertionError("manual solver should be bypassed for trusted macros")
-
-    controller._manual_fallback_agent = _FallbackAgent()
-
-    chat_history = ChatHistory()
-    chat_history.inject(
-        ChatHistoryItem(
-            role=Role.USER,
-            content=(
-                "Macro result: pal_benchmark_bridge_macro -> SUCCESS.\n"
-                "Final variable: #3\n"
-                "Semantic: count result returned by the PAL query\n"
-                "Artifact type: count_scalar\n"
-                "Projected query variable: count\n"
-                "Raw binding count: 1\n"
-                "Unique value count: 1\n"
-                "Row preview: count=4\n"
-                "Solves task: yes\n"
-                "Trusted final: yes"
-            ),
-        )
-    )
-
-    response = controller._inference(chat_history)
-
-    assert response.content == "Final Answer: #3"
-    assert "knowledge_graph_7" not in controller._manual_fallback_active_runs
-    assert controller._tool_invoked_in_last_inference == "pal_trusted_macro_bypass"
-
-
 def test_default_manual_fallback_agent_is_plain_solver() -> None:
     controller = _make_controller()
     controller._language_model = type("LM", (), {"role_dict": {Role.USER: "user", Role.AGENT: "assistant"}})()
@@ -8468,47 +9079,6 @@ def test_classify_execution_artifact_rejects_missing_selected_head_var() -> None
 
     assert artifact.artifact_type == "unresolved"
     assert artifact.diagnostics["reason"] == "selected_head_var_missing_from_bindings"
-
-
-def test_should_skip_pal_solver_for_structured_raw_artifacts() -> None:
-    controller = _make_controller()
-
-    entity_artifact = classify_execution_artifact(
-        {
-            "head": {"vars": ["answer"]},
-            "results": {
-                "bindings": [
-                    {
-                        "answer": {
-                            "type": "uri",
-                            "value": "http://rdf.freebase.com/ns/m.01vq3",
-                        }
-                    }
-                ]
-            },
-        }
-    )
-    unresolved_artifact = classify_execution_artifact(
-        {
-            "head": {"vars": ["answer"]},
-            "results": {
-                "bindings": [
-                    {
-                        "other": {
-                            "type": "literal",
-                            "value": "x",
-                        }
-                    }
-                ]
-            },
-        }
-    )
-
-    assert controller._should_skip_pal_solver_for_raw_artifact(entity_artifact) is True
-    assert (
-        controller._should_skip_pal_solver_for_raw_artifact(unresolved_artifact)
-        is False
-    )
 
 
 def test_should_accept_best_executing_candidate_rejects_positive_low_support_count_result() -> None:
@@ -9429,82 +9999,6 @@ def test_probe_guided_alias_repair_can_use_high_confidence_token_search_fallback
     assert "anchor_alias_override:google play store=>Google Play" in feedback
 
 
-def test_probe_guided_alias_repair_accepts_close_spelling_token_search_alias() -> None:
-    controller = _make_controller()
-    entity_counts = {"Rob Corddry": 11}
-    controller._probe_entity_name_count = (
-        lambda alias, timeout_s=1.5: entity_counts.get(alias, 0)
-    )
-    controller._probe_anchor_path_count = (
-        lambda alias, relation, anchor_position="subject", timeout_s=1.5: 0
-    )
-    controller._probe_entity_name_candidates_by_token_search = (
-        lambda entity, timeout_s=2.0, limit=8: ["Rob Corddry"]
-    )
-
-    repaired_plan, _repaired_grounding_card, feedback = controller._apply_probe_guided_alias_repairs(
-        task_question=(
-            "Question: what tv episode segment did rob cordry direct?, "
-            "Entities: ['rob cordry']"
-        ),
-        query_plan={
-            "anchored_entities": [
-                {
-                    "surface": "rob cordry",
-                    "chosen_alias": "rob cordry",
-                    "role": "anchor",
-                },
-            ],
-            "normalized_aliases": [],
-            "relation_paths": [
-                {
-                    "relation": "tv.tv_episode_segment.directors",
-                    "direction": "reverse",
-                    "from_role": "candidate_set",
-                    "to_role": "anchor",
-                    "from": "answer",
-                    "to": "anchor",
-                    "grounding_source": "exploratory",
-                }
-            ],
-        },
-        grounding_card="PAL grounding hints:",
-        relation_grounding=[],
-        anchor_probe_results=[
-            type(
-                "Probe",
-                (),
-                {
-                    "entity_count": 0,
-                    "path_count": 0,
-                    "relation_probed": "tv.tv_episode_segment.directors",
-                    "anchor_position": "object",
-                },
-            )(),
-        ],
-    )
-
-    assert repaired_plan["anchored_entities"][0]["chosen_alias"] == "Rob Corddry"
-    assert "anchor_alias_override:rob cordry=>Rob Corddry" in feedback
-
-
-def test_select_high_confidence_token_search_alias_accepts_singularized_surface() -> None:
-    controller = _make_controller()
-
-    selected = controller._select_high_confidence_token_search_alias(
-        surface="concertos",
-        candidate_counts=[
-            {
-                "candidate_alias": "Concerto",
-                "entity_count": 6,
-                "candidate_source": "token_search",
-            }
-        ],
-    )
-
-    assert selected == "Concerto"
-
-
 def test_probe_guided_alias_repair_skips_semantically_weak_token_search_alias() -> None:
     controller = _make_controller()
     entity_counts = {"Radiolab": 1}
@@ -9814,106 +10308,6 @@ def test_normalize_pal_query_plan_retags_single_anchor_direct_candidate_set_as_a
     assert normalized["relation_paths"][0]["to_role"] == "answer"
 
 
-def test_normalize_pal_query_plan_projects_structural_candidate_set_when_single_anchor_type_filter_lacks_answer_path() -> None:
-    controller = _make_controller()
-
-    normalized = controller._normalize_pal_query_plan(
-        {
-            "answer_mode": "entity",
-            "answer_type": "entity",
-            "query_shape": "single_anchor_lookup",
-            "anchored_entities": [
-                {"surface": "Scout X-1", "chosen_alias": "Scout X-1", "role": "anchor"}
-            ],
-            "shared_answer_variable": "answer",
-            "candidate_set_variable": "launched",
-            "relation_paths": [
-                {
-                    "relation": "spaceflight.rocket.satellites_launched",
-                    "direction": "forward",
-                    "from": "anchor",
-                    "to": "launched",
-                    "from_role": "anchor",
-                    "to_role": "candidate_set",
-                    "grounding_source": "dynamic_probe",
-                },
-                {
-                    "relation": "type.object.type",
-                    "direction": "forward",
-                    "from": "launched",
-                    "to": "type",
-                    "from_role": "candidate_set",
-                    "to_role": "type_set",
-                    "grounding_source": "curated",
-                },
-            ],
-            "projection": ["answer", "answer_name"],
-        }
-    )
-
-    assert normalized["shared_answer_variable"] == "launched"
-    assert normalized["projection"] == ["launched"]
-def test_normalize_pal_query_plan_projects_structural_candidate_set_for_multi_anchor_intersection_without_shared_answer_path() -> None:
-    controller = _make_controller()
-
-    normalized = controller._normalize_pal_query_plan(
-        {
-            "answer_mode": "entity",
-            "answer_type": "entity",
-            "query_shape": "multi_anchor_intersection",
-            "anchored_entities": [
-                {"surface": "January 6", "chosen_alias": "January 6", "role": "anchor_a"},
-                {
-                    "surface": "christmas holiday season",
-                    "chosen_alias": "christmas holiday season",
-                    "role": "anchor_b",
-                },
-            ],
-            "shared_answer_variable": "shared_answer",
-            "candidate_set_variable": "candidate_set",
-            "join_structure": {
-                "type": "intersection",
-                "anchor_constraints": [
-                    {"anchor_role": "anchor_a", "constrains_variable": "candidate_set"},
-                    {"anchor_role": "anchor_b", "constrains_variable": "candidate_set"},
-                ],
-            },
-            "relation_paths": [
-                {
-                    "relation": "type.type.instance",
-                    "direction": "forward",
-                    "from": "holiday",
-                    "to": "candidate_set",
-                    "from_role": "type_set",
-                    "to_role": "candidate_set",
-                    "grounding_source": "dynamic_probe",
-                },
-                {
-                    "relation": "time.holiday.day_of_year",
-                    "direction": "reverse",
-                    "from": "candidate_set",
-                    "to": "January 6",
-                    "from_role": "candidate_set",
-                    "to_role": "anchor_a",
-                    "grounding_source": "dynamic_probe",
-                },
-                {
-                    "relation": "time.holiday.season",
-                    "direction": "reverse",
-                    "from": "candidate_set",
-                    "to": "christmas holiday season",
-                    "from_role": "candidate_set",
-                    "to_role": "anchor_b",
-                    "grounding_source": "exploratory",
-                },
-            ],
-            "projection": ["shared_answer", "shared_answer_name"],
-        }
-    )
-
-    assert normalized["shared_answer_variable"] == "candidate_set"
-    assert normalized["projection"] == ["candidate_set"]
-
 def test_superlative_dynamic_anchor_repair_plan_rewrites_dead_anchor_family() -> None:
     controller = _make_controller()
 
@@ -10090,6 +10484,7 @@ def test_superlative_dynamic_anchor_repair_plan_collapses_redundant_projection_h
     assert repaired_plan["relation_paths"][0]["from"] == "anchor"
     assert repaired_plan["relation_paths"][0]["to"] == "release"
     assert repaired_plan["relation_paths"][1]["relation"] == "music.release.release_date"
+
 
 def test_superlative_dynamic_anchor_repair_plan_handles_live_style_anchor_recording_chain() -> None:
     controller = _make_controller()
@@ -10923,7 +11318,7 @@ def test_grounding_validation_rejects_wrong_multi_anchor_surface_reuse() -> None
 
 def test_generate_plan_rejects_reused_dead_scaffold_signature() -> None:
     controller = _make_controller()
-    controller._run_text_prompt = lambda system_prompt, user_prompt, **kwargs: """
+    controller._run_text_prompt = lambda system_prompt, user_prompt: """
     {
       "answer_type": "entity",
       "answer_mode": "entity",
@@ -12650,126 +13045,6 @@ def test_query_candidate_rejects_single_use_helper_join_variable() -> None:
     )
 
     assert "single_use_helper_variable:producer" in errors
-
-
-def test_query_candidate_allows_terminal_leaf_on_primary_counted_set() -> None:
-    controller = _make_controller()
-    query_text = (
-        "PREFIX fb: <http://rdf.freebase.com/ns/> "
-        "SELECT (COUNT(DISTINCT ?recording) AS ?count) WHERE { "
-        "fb:m.01vv6y3 fb:music.recording.artist ?recording . "
-        "?recording fb:music.recording.releases ?release . "
-        "} LIMIT 50"
-    )
-    errors = controller._validate_pal_query_candidate(
-        raw_output="",
-        generated_code="def solve(endpoint_url):\n    pass\n",
-        query_text=query_text,
-        query_plan={
-            "answer_mode": "count",
-            "query_shape": "count_over_direct_relation",
-            "candidate_set_variable": "recording",
-            "shared_answer_variable": "recording",
-            "count_set_variable": "recording",
-            "relation_paths": [
-                {
-                    "relation": "music.recording.artist",
-                    "direction": "reverse",
-                    "from_role": "candidate_set",
-                    "to_role": "anchor",
-                }
-            ],
-            "ordering_attribute": {},
-            "allow_exploratory_predicates": False,
-        },
-    )
-
-    assert "single_use_helper_variable:release" not in errors
-def test_query_candidate_allows_terminal_leaf_on_primary_entity_set() -> None:
-    controller = _make_controller()
-    query_text = (
-        "PREFIX fb: <http://rdf.freebase.com/ns/> "
-        "SELECT DISTINCT ?candidate_set ?candidate_set_name WHERE { "
-        "?candidate_set fb:tv.tv_song.episode_segments ?song_candidate_set . "
-        "?candidate_set fb:tv.tv_segment_relationship.episode ?episode . "
-        "?episode fb:tv.tv_episode.air_date ?air_date . "
-        "OPTIONAL { ?candidate_set fb:type.object.name ?candidate_set_name . } "
-        "} ORDER BY DESC(?air_date) LIMIT 1"
-    )
-    errors = controller._validate_pal_query_candidate(
-        raw_output="",
-        generated_code="def solve(endpoint_url):\n    pass\n",
-        query_text=query_text,
-        query_plan={
-            "answer_mode": "entity",
-            "query_shape": "superlative_chain",
-            "candidate_set_variable": "candidate_set",
-            "shared_answer_variable": "candidate_set",
-            "count_set_variable": "",
-            "relation_paths": [
-                {
-                    "relation": "tv.tv_song.episode_segments",
-                    "direction": "forward",
-                    "from_role": "candidate_set",
-                    "to_role": "candidate_set",
-                },
-                {
-                    "relation": "tv.tv_segment_relationship.episode",
-                    "direction": "forward",
-                    "from_role": "candidate_set",
-                    "to_role": "candidate_set",
-                },
-                {
-                    "relation": "tv.tv_episode.air_date",
-                    "direction": "forward",
-                    "from_role": "candidate_set",
-                    "to_role": "ordering_attribute",
-                },
-            ],
-            "ordering_attribute": {"relation": "tv.tv_episode.air_date"},
-            "allow_exploratory_predicates": True,
-        },
-    )
-
-    assert "single_use_helper_variable:song_candidate_set" not in errors
-
-
-def test_query_candidate_rejects_terminal_leaf_when_relaxation_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("PAL_RUNTIME_TERMINAL_LEAF_RELAXATION", "0")
-    controller = _make_controller()
-    query_text = (
-        "PREFIX fb: <http://rdf.freebase.com/ns/> "
-        "SELECT (COUNT(DISTINCT ?recording) AS ?count) WHERE { "
-        "fb:m.01vv6y3 fb:music.recording.artist ?recording . "
-        "?recording fb:music.recording.releases ?release . "
-        "} LIMIT 50"
-    )
-    errors = controller._validate_pal_query_candidate(
-        raw_output="",
-        generated_code="def solve(endpoint_url):\n    pass\n",
-        query_text=query_text,
-        query_plan={
-            "answer_mode": "count",
-            "query_shape": "count_over_direct_relation",
-            "candidate_set_variable": "recording",
-            "shared_answer_variable": "recording",
-            "count_set_variable": "recording",
-            "relation_paths": [
-                {
-                    "relation": "music.recording.artist",
-                    "direction": "reverse",
-                    "from_role": "candidate_set",
-                    "to_role": "anchor",
-                }
-            ],
-            "ordering_attribute": {},
-            "allow_exploratory_predicates": False,
-        },
-    )
-
-    assert "single_use_helper_variable:release" in errors
 
 
 def test_extract_sparql_query_texts_tracks_setquery_assignments() -> None:

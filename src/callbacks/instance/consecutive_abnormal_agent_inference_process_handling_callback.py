@@ -27,12 +27,22 @@ class ConsecutiveAbnormalAgentInferenceProcessHandlingCallback(Callback):
             consecutive_abnormality_count_state_path,
             consecutive_abnormality_count_state_key,
         ) = self._get_consecutive_abnormality_count_state_info()
-        self.consecutive_abnormality_count = json.load(
-            open(consecutive_abnormality_count_state_path, "r")
-        )[consecutive_abnormality_count_state_key]
-        self.aborted_sample_index_list = json.load(
-            open(self._get_aborted_sample_index_list_state_path(), "r")
+        if os.path.exists(consecutive_abnormality_count_state_path):
+            self.consecutive_abnormality_count = json.load(
+                open(consecutive_abnormality_count_state_path, "r")
+            ).get(consecutive_abnormality_count_state_key, 0)
+        else:
+            self.consecutive_abnormality_count = 0
+
+        aborted_sample_index_list_state_path = (
+            self._get_aborted_sample_index_list_state_path()
         )
+        if os.path.exists(aborted_sample_index_list_state_path):
+            self.aborted_sample_index_list = json.load(
+                open(aborted_sample_index_list_state_path, "r")
+            )
+        else:
+            self.aborted_sample_index_list = []
 
     def on_session_create(self, callback_args: CallbackArguments) -> None:
         if self.consecutive_abnormality_count != self.tolerance_count:

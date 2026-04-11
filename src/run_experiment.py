@@ -58,6 +58,49 @@ PAL_AGENT_COMPONENT_CONFIG_PATH = os.path.join(
 # ---------------------------------------------------------------------------
 _HTML_TRACE_TEMPLATE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Trace Viewer</title>
+<script>
+/* Live Server smart-reload intercept — patches window.WebSocket before livereload.js runs */
+(function(){
+  var _WS=window.WebSocket;
+  var _timer=null;
+  function _smartReload(){
+    clearTimeout(_timer);
+    _timer=setTimeout(function(){
+      var base=location.href.replace(/\\?.*$/,'').replace(/\\/[^\\/]*$/,'/');
+      fetch(base+'sessions.json?_t='+Date.now())
+        .then(function(r){return r.json();})
+        .then(function(nd){
+          if(!Array.isArray(nd))return;
+          if(nd.length<=(window._liveData||[]).length)return;
+          window._liveData=nd;
+          window._liveRefresh&&window._liveRefresh(nd);
+        })
+        .catch(function(){});
+    },250);
+  }
+  function wrapMsg(fn,ws){
+    return function(evt){
+      try{var d=JSON.parse(evt.data);if(d&&d.command==='reload'){_smartReload();return;}}catch(e){}
+      fn&&fn.call(ws,evt);
+    };
+  }
+  function PatchedWS(url,proto){
+    var ws=proto!==undefined?new _WS(url,proto):new _WS(url);
+    if(!/35729|livereload/i.test(String(url)))return ws;
+    var _omcb=null;
+    Object.defineProperty(ws,'onmessage',{configurable:true,
+      get:function(){return _omcb;},
+      set:function(fn){if(_omcb)ws.removeEventListener('message',_omcb);_omcb=wrapMsg(fn,ws);ws.addEventListener('message',_omcb);}
+    });
+    var _ael=ws.addEventListener.bind(ws);
+    ws.addEventListener=function(type,fn,opts){_ael(type,type==='message'?wrapMsg(fn,ws):fn,opts);};
+    return ws;
+  }
+  PatchedWS.prototype=_WS.prototype;
+  try{Object.keys(_WS).forEach(function(k){PatchedWS[k]=_WS[k];});}catch(e){}
+  window.WebSocket=PatchedWS;
+})();
+</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',system-ui,sans-serif;display:flex;height:100vh;overflow:hidden;background:#12121f;color:#dde1f0}
@@ -247,7 +290,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;display:flex;height:100vh;overf
 </div>
 <div id="main"><div id="empty">← Select a session</div></div>
 <script>
-const logData=/*LOG_DATA_PLACEHOLDER*/;
+let logData=window._liveData=/*LOG_DATA_PLACEHOLDER*/;
 const STATE_KEY='traceViewerState:'+location.pathname;
 const KG_PROMPT_PFX="You are an intelligent agent tasked with answering questions by querying a knowledge base.";
 
@@ -832,6 +875,22 @@ document.getElementById('sb-search').addEventListener('input',e=>{
   _search=e.target.value.trim();
   renderSidebarList();
 });
+// ── Live-reload patch handler ───────────────────────────────────────────────
+window._liveRefresh=function(newData){
+  var st=readState();
+  var sbEl=document.getElementById('sidebar');
+  var prevSbTop=sbEl?sbEl.scrollTop:0;
+  var prevSI=st.si;
+  logData=window._liveData=newData;
+  buildSidebar();
+  if(sbEl)sbEl.scrollTop=prevSbTop;
+  var curIdx=prevSI!=null?findIdx(prevSI):-1;
+  if(curIdx>=0){
+    document.querySelectorAll('.si').forEach(function(e){e.classList.remove('active');});
+    var el=document.getElementById('i'+curIdx);
+    if(el)el.classList.add('active');
+  }
+};
 buildSidebar();
 function initialIdx(){
   const hi=findIdx(readHashSI());if(hi>=0)return hi;
@@ -857,6 +916,9 @@ def _export_html_trace(run_dir: str, session_list_data: list) -> None:
     out_path = os.path.join(html_dir, "trace_viewer.html")
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(html)
+    sessions_path = os.path.join(html_dir, "sessions.json")
+    with open(sessions_path, "w", encoding="utf-8") as sfh:
+        sfh.write(payload)
 
 
 class ConfigUtilityCaller(StrEnum):

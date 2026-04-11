@@ -44,6 +44,8 @@ class BenchmarkAdapterContext:
     run_id: str
     state_dir: str
     bridge_tool_name: str = PAL_BENCHMARK_BRIDGE_TOOL_NAME
+    family_name: str = ""
+    query_shape: str = ""
 
 
 @dataclass(frozen=True)
@@ -298,6 +300,12 @@ def materialize_benchmark_artifact(
         "artifact_type": artifact.artifact_type,
         "artifact_source": artifact.source,
     }
+    family_name = str(context.family_name or "").strip()
+    if family_name:
+        materialization_diagnostics["family_name"] = family_name
+    query_shape = str(context.query_shape or "").strip()
+    if query_shape:
+        materialization_diagnostics["query_shape"] = query_shape
     selected_query_variable = str(
         artifact.diagnostics.get("selected_var") or ""
     ).strip()
@@ -356,6 +364,8 @@ def materialize_benchmark_artifact(
         "pal_artifact_value": artifact.value,
         "pal_artifact_source": artifact.source,
         "pal_artifact_diagnostics": dict(artifact.diagnostics),
+        "pal_family_name": family_name,
+        "pal_query_shape": query_shape,
         "run_id": context.run_id,
         "state_dir": context.state_dir,
     }
@@ -889,8 +899,6 @@ def _normalize_entity_id(raw_value: str) -> Optional[str]:
     if _MID_PATTERN.fullmatch(value):
         return value
     return None
-
-
 def _looks_numeric(raw_value: str, datatype: str) -> bool:
     datatype_lower = datatype.lower()
     if any(

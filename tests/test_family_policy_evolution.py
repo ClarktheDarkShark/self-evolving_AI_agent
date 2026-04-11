@@ -65,11 +65,10 @@ def test_family_policy_candidate_creation_preserves_active_version(tmp_path) -> 
     pending = store.get_pending_candidates("count_over_direct_relation")
     assert len(pending) == 1
     assert pending[0]["candidate_version"] == candidate.candidate_version
-    assert "repair_policy" in pending[0]["fields_changed"]
-    assert (
-        "switch_to_joined_count_when_downstream_filter_or_projection_exists"
-        in pending[0]["bundle"]["repair_policy"]
-    )
+    assert pending[0]["fields_changed"] == ["validator_expectations"]
+    assert pending[0]["bundle"]["repair_policy"] == [
+        "repair direct count relation family before escalating to joined-count family"
+    ]
     assert not pending[0]["bundle"]["blocked_scaffold_signatures"]
 
 
@@ -91,16 +90,14 @@ def test_wrong_trusted_completion_prefers_constructive_count_guidance(tmp_path) 
     assert candidate is not None
     pending = store.get_pending_candidates("count_over_direct_relation")
     assert len(pending) == 1
-    assert "validator_expectations" in pending[0]["fields_changed"]
-    assert "repair_policy" in pending[0]["fields_changed"]
+    assert pending[0]["fields_changed"] == ["validator_expectations"]
     assert (
         "verify_count_targets_requested_entity_set"
         in pending[0]["bundle"]["validator_expectations"]
     )
-    assert (
-        "switch_to_joined_count_when_downstream_filter_or_projection_exists"
-        in pending[0]["bundle"]["repair_policy"]
-    )
+    assert pending[0]["bundle"]["repair_policy"] == [
+        "repair direct count relation family before escalating to joined-count family"
+    ]
 
 
 def test_strict_update_mapping_limits_joined_count_to_validator_constraints(
@@ -288,18 +285,12 @@ def test_strict_update_mapping_keeps_single_anchor_validator_miss_for_weak_entit
     assert candidate is not None
     pending = store.get_pending_candidates("single_anchor_lookup")
     assert len(pending) == 1
-    assert pending[0]["fields_changed"] == [
-        "validator_expectations",
-        "blocked_scaffold_signatures",
-        "forbidden_overreach_patterns",
-    ]
+    assert pending[0]["fields_changed"] == ["blocked_scaffold_signatures"]
     assert (
         "reject_known_dangerous_overreach_patterns"
-        in pending[0]["bundle"]["validator_expectations"]
+        not in pending[0]["bundle"]["validator_expectations"]
     )
-    assert pending[0]["bundle"]["forbidden_overreach_patterns"] == [
-        "dangerous_overreach:weak_entity_semantics"
-    ]
+    assert pending[0]["bundle"]["forbidden_overreach_patterns"] == []
 
 
 def test_semantic_signature_dedup_skips_wording_only_single_anchor_variant(
@@ -496,8 +487,8 @@ def test_family_policy_promotion_switches_active_version(tmp_path, monkeypatch) 
     assert active_bundle is not None
     assert active_bundle.version == candidate.candidate_version
     assert (
-        "dangerous_overreach:broad_type_expansion"
-        in active_bundle.forbidden_overreach_patterns
+        "preserve_all_anchor_constraints_on_same_answer_variable"
+        in active_bundle.validator_expectations
     )
 
 
@@ -852,10 +843,10 @@ def test_harness_synthesizes_candidate_from_matching_sample_decision_only(tmp_pa
     )
     pending = store.get_pending_candidates("count_over_direct_relation")
     assert len(pending) == 1
+    assert pending[0]["fields_changed"] == ["validator_expectations"]
     repair_policy = tuple(pending[0]["bundle"]["repair_policy"])
-    assert (
-        "switch_to_joined_count_when_downstream_filter_or_projection_exists"
-        in repair_policy
+    assert repair_policy == (
+        "repair direct count relation family before escalating to joined-count family",
     )
     blocked = tuple(pending[0]["bundle"]["blocked_scaffold_signatures"])
 
@@ -1376,33 +1367,38 @@ def test_batch_runner_places_child_run_under_parent_output_dir(
 ) -> None:
     commands: list[list[str]] = []
 
-    class DummyCompleted:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+    class DummyPopen:
+        def __init__(self, command, **kwargs):
+            del kwargs
+            commands.append(list(command))
+            run_dir = tmp_path / "parent" / "pal_batch_demo_2"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "task_outcomes.json").write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "sample_index": "2",
+                                "completed": False,
+                                "correct": False,
+                                "outcome": "incorrect",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.returncode = 0
+            self.pid = 12345
 
-    def fake_subprocess_run(command, **kwargs):
-        commands.append(list(command))
-        run_dir = tmp_path / "parent" / "pal_batch_demo_2"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "task_outcomes.json").write_text(
-            json.dumps(
-                {
-                    "results": [
-                        {
-                            "sample_index": "2",
-                            "completed": False,
-                            "correct": False,
-                            "outcome": "incorrect",
-                        }
-                    ]
-                }
-            ),
-            encoding="utf-8",
-        )
-        return DummyCompleted()
+        def communicate(self, timeout=None):
+            del timeout
+            return "", ""
 
-    monkeypatch.setattr(kg_batch_runner.subprocess, "run", fake_subprocess_run)
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(kg_batch_runner.subprocess, "Popen", DummyPopen)
 
     summary = kg_batch_runner.run_sample(
         sample_index="2",
@@ -1414,6 +1410,108 @@ def test_batch_runner_places_child_run_under_parent_output_dir(
     assert "m._run_one(" in commands[0][2]
     assert str((tmp_path / "parent").resolve()) in commands[0][2]
     assert summary["run_dir"] == str(tmp_path / "parent" / "pal_batch_demo_2")
+
+
+def test_batch_runner_timeout_cleans_up_orphans(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+    killed_groups: list[tuple[int, int]] = []
+    killed_pids: list[int] = []
+
+    def fake_subprocess_run(command, **kwargs):
+        command_list = list(command)
+        commands.append(command_list)
+        if command_list[:2] == ["pkill", "-f"]:
+            return type(
+                "Completed",
+                (),
+                {"returncode": 0, "stdout": "", "stderr": ""},
+            )()
+        if command_list and command_list[0] == "lsof":
+            return type(
+                "Completed",
+                (),
+                {"returncode": 0, "stdout": "8000\n8001\n", "stderr": ""},
+            )()
+        raise AssertionError(f"unexpected subprocess.run call: {command_list}")
+
+    class TimeoutPopen:
+        def __init__(self, command, **kwargs):
+            del command, kwargs
+            self.pid = 4242
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            raise kg_batch_runner.subprocess.TimeoutExpired(
+                cmd=["python"],
+                timeout=timeout or 1,
+                output=b"partial stdout",
+                stderr=b"partial stderr",
+            )
+
+        def poll(self):
+            return None
+
+    def fake_kill(pid: int, sig: int) -> None:
+        del sig
+        killed_pids.append(pid)
+
+    def fake_killpg(pid: int, sig: int) -> None:
+        killed_groups.append((pid, sig))
+
+    monkeypatch.setattr(kg_batch_runner.subprocess, "Popen", TimeoutPopen)
+    monkeypatch.setattr(kg_batch_runner.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(kg_batch_runner.os, "kill", fake_kill)
+    monkeypatch.setattr(kg_batch_runner.os, "killpg", fake_killpg)
+    monkeypatch.setattr(kg_batch_runner.time, "sleep", lambda _: None)
+
+    summary = kg_batch_runner.run_sample(
+        sample_index="9",
+        label="timeout_probe",
+        parent_output_dir=tmp_path / "parent",
+    )
+
+    assert summary["returncode"] == 124
+    assert summary["sample_status"] == "timeout"
+    assert summary["finish_reason"] == "timed_out"
+    assert summary["timed_out"] is True
+    assert "partial stdout" in summary["stdout_tail"]
+    assert "partial stderr" in summary["stderr_tail"]
+    assert any(command[:2] == ["pkill", "-f"] for command in commands)
+    assert killed_groups == [
+        (4242, kg_batch_runner.signal.SIGTERM),
+        (4242, kg_batch_runner.signal.SIGKILL),
+    ]
+    assert killed_pids == [8000, 8001]
+
+
+def test_family_policy_store_serializes_cached_evaluation_bytes(tmp_path) -> None:
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path / "store",
+    )
+
+    store.set_cached_evaluation(
+        "count_over_direct_relation",
+        cache_key="bytes-cache",
+        context={"sample_index": "240"},
+        result={
+            "sample_status": "timeout",
+            "stdout_tail": b"partial stdout",
+            "stderr_tail": b"partial stderr",
+        },
+    )
+
+    cached = store.get_cached_evaluation(
+        "count_over_direct_relation",
+        cache_key="bytes-cache",
+    )
+
+    assert cached is not None
+    assert cached["result"]["stdout_tail"] == "partial stdout"
+    assert cached["result"]["stderr_tail"] == "partial stderr"
 
 
 def test_evaluate_candidate_fails_fast_when_trigger_not_improved(
@@ -2072,10 +2170,9 @@ def test_candidate_update_does_not_ban_non_type_relation_for_semantic_validator_
     pending = store.get_pending_candidates("count_over_joined_set")
     assert pending
     bundle = pending[0]["bundle"]
-    assert (
-        "dangerous_overreach:weak_count_semantics"
-        in bundle["forbidden_overreach_patterns"]
-    )
+    assert bundle["forbidden_overreach_patterns"] == []
+    assert "validator_expectations" in pending[0]["fields_changed"]
+    assert "require_count_answer_target_preservation" in bundle["validator_expectations"]
     assert bundle["forbidden_relation_families"] == []
 
 
@@ -2096,4 +2193,4 @@ def test_candidate_update_can_tighten_validator_and_repair_policy(tmp_path) -> N
 
     assert candidate is not None
     pending = store.get_pending_candidates("multi_anchor_intersection")
-    assert "repair_policy" in pending[0]["fields_changed"]
+    assert pending[0]["fields_changed"] == ["blocked_scaffold_signatures"]

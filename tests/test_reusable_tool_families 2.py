@@ -12,7 +12,6 @@ import src.agents.instance.pal_agent_controller as pal_agent_controller_module
 from src.agents.instance.pal_agent_controller import PALAgentController
 from src.pal.parser import extract_and_validate_code
 from src.pal.reusable_tool_families import (
-    get_reusable_family_contract,
     get_reusable_family_policy_bundle,
     render_reusable_tool,
     select_reusable_tool,
@@ -279,76 +278,7 @@ def test_reusable_render_does_not_rewrite_canonical_reverse_anchor_path(
         relation_grounding=relation_grounding,
     )
 
-    assert canonicalized["relation_paths"][0]["relation"] == "music.recording.releases"
-    assert canonicalized["relation_paths"][0]["direction"] == "reverse"
-    assert canonicalized["relation_paths"][0]["from"] == "answer"
-    assert canonicalized["relation_paths"][0]["to"] == "m.03_9dcv"
-    assert canonicalized["relation_paths"][0]["from_role"] == "answer"
-    assert canonicalized["relation_paths"][0]["to_role"] == "anchor"
-
-
-def test_reusable_render_canonicalization_normalizes_unbound_answer_projection_to_structural_candidate_set(
-    monkeypatch,
-) -> None:
-    controller = _make_controller()
-    monkeypatch.setenv("PAL_RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION", "1")
-
-    query_plan = {
-        "answer_mode": "entity",
-        "answer_type": "entity",
-        "query_shape": "single_anchor_lookup",
-        "anchored_entities": [
-            {
-                "surface": "Scout X-1",
-                "chosen_alias": "Scout X-1",
-                "role": "anchor",
-            }
-        ],
-        "shared_answer_variable": "answer",
-        "candidate_set_variable": "launched",
-        "relation_paths": [
-            {
-                "relation": "spaceflight.rocket.satellites_launched",
-                "direction": "forward",
-                "from": "anchor",
-                "to": "launched",
-                "from_role": "anchor",
-                "to_role": "candidate_set",
-                "grounding_source": "dynamic_probe",
-            },
-            {
-                "relation": "type.object.type",
-                "direction": "forward",
-                "from": "launched",
-                "to": "type",
-                "from_role": "candidate_set",
-                "to_role": "type_set",
-                "grounding_source": "curated",
-            },
-        ],
-        "projection": ["answer", "answer_name"],
-        "ordering_attribute": {},
-        "allow_exploratory_predicates": False,
-    }
-
-    canonicalized = controller._canonicalize_reusable_query_plan_for_render(
-        query_plan=query_plan,
-        relation_grounding=[],
-    )
-
-    assert canonicalized["shared_answer_variable"] == "launched"
-    assert canonicalized["projection"] == ["launched"]
-
-    selection = select_reusable_tool(canonicalized)
-    assert selection is not None
-    generated_output = render_reusable_tool(
-        query_plan=canonicalized,
-        selection=selection,
-    )
-    generated_code = extract_and_validate_code(generated_output)
-
-    assert "SELECT DISTINCT ?launched ?launched_name WHERE" in generated_code
-    assert "?anchor fb:spaceflight.rocket.satellites_launched ?launched ." in generated_code
+    assert canonicalized["relation_paths"][0] == query_plan["relation_paths"][0]
 
 
 def test_direct_count_renderer_counts_terminal_count_set_leaf_in_pivot_chain() -> None:
@@ -859,7 +789,7 @@ def test_superlative_renderer_uses_subquery_for_post_selection_answer_projection
 
 def test_generate_validated_pal_candidate_prefers_reusable_tool_before_llm() -> None:
     controller = _make_controller()
-    controller._run_text_prompt = lambda system_prompt, user_prompt, **kwargs: pytest.fail(
+    controller._run_text_prompt = lambda system_prompt, user_prompt: pytest.fail(
         "LLM generator should not be called for reusable direct-count plan"
     )
 
@@ -907,7 +837,7 @@ def test_generate_validated_pal_candidate_falls_back_to_llm_when_reusable_query_
     controller = _make_controller()
     llm_calls: list[str] = []
 
-    controller._run_text_prompt = lambda system_prompt, user_prompt, **kwargs: (
+    controller._run_text_prompt = lambda system_prompt, user_prompt: (
         llm_calls.append(user_prompt)
         or """
 ###QUERY_START
@@ -1258,6 +1188,81 @@ def test_joined_count_renderer_preserves_explicit_constraint_value_entity() -> N
     assert 'FILTER(LCASE(STR(?constraint_value_label)) = "songwriter")' in generated_code
     assert "?shared_answer fb:people.person.profession ?constraint_value ." in generated_code
     assert "?count fb:biology.animal_breed.temperament" not in generated_code
+
+
+def test_joined_count_renderer_uses_single_anchor_entity_when_plan_role_mismatches() -> None:
+    query_plan = {
+        "answer_mode": "count",
+        "query_shape": "count_over_joined_set",
+        "anchored_entities": [
+            {
+                "surface": "valve corp",
+                "chosen_alias": "m.0dwl2",
+                "resolved_entity_id": "m.0dwl2",
+                "role": "anchor_a",
+            },
+            {
+                "surface": "game expansions",
+                "chosen_alias": "game expansion",
+                "role": "constraint_value",
+            },
+        ],
+        "shared_answer_variable": "shared_answer",
+        "candidate_set_variable": "shared_answer",
+        "count_set_variable": "shared_answer",
+        "join_structure": {
+            "type": "intersection",
+            "anchor_constraints": [
+                {
+                    "anchor_role": "anchor",
+                    "constrains_variable": "shared_answer",
+                    "notes": "The primary anchor constrains the shared counted entity set via cvg.cvg_publisher.game_versions_published.",
+                },
+                {
+                    "anchor_role": "constraint_value",
+                    "constrains_variable": "shared_answer",
+                    "notes": "The answer target phrase is treated as an explicit answer-class or answer-constraint filter on the same counted set via type.object.type with value 'game expansion'.",
+                },
+            ],
+        },
+        "relation_paths": [
+            {
+                "relation": "cvg.cvg_publisher.game_versions_published",
+                "direction": "reverse",
+                "from": "publisher",
+                "to": "shared_answer",
+                "from_role": "anchor",
+                "to_role": "candidate_set",
+                "grounding_source": "curated",
+            },
+            {
+                "relation": "type.object.type",
+                "direction": "forward",
+                "from": "shared_answer",
+                "to": "constraint_value",
+                "from_role": "candidate_set",
+                "to_role": "constraint_value",
+                "grounding_source": "exploratory",
+            },
+        ],
+        "projection": ["count"],
+        "ordering_attribute": {},
+        "allow_exploratory_predicates": False,
+    }
+
+    selection = select_reusable_tool(query_plan)
+    assert selection is not None
+
+    generated_output = render_reusable_tool(
+        query_plan=query_plan,
+        selection=selection,
+    )
+    generated_code = extract_and_validate_code(generated_output)
+
+    assert "fb:m.0dwl2 fb:cvg.cvg_publisher.game_versions_published ?shared_answer ." in generated_code
+    assert 'FILTER(LCASE(STR(?anchor_label)) = "publisher")' not in generated_code
+    assert 'FILTER(LCASE(STR(?constraint_value_label)) = "game expansion")' in generated_code
+
 
 def test_joined_count_renderer_keeps_relation_hinted_anchor_binding_even_with_repeated_constraint_endpoint() -> None:
     query_plan = {
@@ -2617,27 +2622,3 @@ def test_shared_type_intersection_renderer_projects_shared_answer_variable() -> 
     assert "?type_a fb:type.type.instance ?shared_answer ." in generated_code
     assert "?type_b fb:type.type.instance ?shared_answer ." in generated_code
     assert "?candidate_set " not in generated_code
-
-
-def test_all_supported_reusable_families_have_explicit_contracts() -> None:
-    expected_families = {
-        "single_anchor_lookup",
-        "single_anchor_chain_lookup",
-        "multi_anchor_intersection",
-        "shared_type_intersection",
-        "containment_or_ownership_lookup",
-        "count_over_direct_relation",
-        "count_over_joined_set",
-        "superlative_chain",
-    }
-
-    for family_name in expected_families:
-        bundle = get_reusable_family_policy_bundle(family_name)
-        contract = get_reusable_family_contract(family_name)
-        assert bundle is not None
-        assert contract is not None
-        assert contract.family_name == family_name
-        assert contract.required_slots
-        assert contract.invariants
-        assert contract.allowed_exhaustion_states
-        assert contract.handoff_expectations

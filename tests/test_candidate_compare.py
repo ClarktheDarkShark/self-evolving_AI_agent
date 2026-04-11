@@ -12,7 +12,9 @@ import src.agents.instance.pal_agent_controller as pal_agent_controller_module
 from src.agents.exceptions import AgentUnknownException
 from src.agents.instance.pal_agent_controller import PALAgentController
 from src.pal.candidate_compare import (
+    baseline_satisfies_locked_family,
     load_archived_baseline_record,
+    summarize_sample_semantic_metrics,
     write_archived_baseline_record,
 )
 from src.pal.family_policy_evolution import ENV_COMPARE_LOCK_FAMILY
@@ -255,6 +257,106 @@ def test_compare_family_candidate_passes_extra_env(tmp_path, monkeypatch) -> Non
             "PAL_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING": "1",
         },
     ]
+
+
+def test_summarize_sample_semantic_metrics_falls_back_to_summary_typed_fields() -> None:
+    metrics = summarize_sample_semantic_metrics(
+        {
+            "sample_index": "15",
+            "sample_status": "timeout",
+            "evaluation_outcome": "",
+            "finish_reason": "timed_out",
+            "pal_primary_failure_kind": "timeout",
+            "pal_stop_reason": "runner_timeout",
+            "pal_completion_state": "fail_closed",
+            "pal_repair_attempt_count": 0,
+        }
+    )
+
+    assert metrics["timeout_count"] == 1
+    assert metrics["primary_failure_kind"] == "timeout"
+    assert metrics["stop_reason"] == "runner_timeout"
+    assert metrics["repair_attempt_count"] == 0
+
+
+def test_summarize_sample_semantic_metrics_infers_timeout_without_typed_failure() -> None:
+    metrics = summarize_sample_semantic_metrics(
+        {
+            "sample_index": "21",
+            "sample_status": "timeout",
+            "evaluation_outcome": "",
+            "finish_reason": "timed_out",
+            "timed_out": True,
+        }
+    )
+
+    assert metrics["timeout_count"] == 1
+    assert metrics["primary_failure_kind"] == "timeout"
+    assert metrics["stop_reason"] == "runner_timeout"
+
+
+def test_baseline_satisfies_locked_family_rejects_shape_mismatch() -> None:
+    assert not baseline_satisfies_locked_family(
+        {
+            "family_lock_violation_count": 0,
+            "semantic_failure_labels": [
+                "pal_query_plan_invalid:family_compare_locked_query_shape:count_over_joined_set:count_over_direct_relation"
+            ],
+        }
+    )
+    assert baseline_satisfies_locked_family(
+        {
+            "family_lock_violation_count": 0,
+            "semantic_failure_labels": ["accepted_completion"],
+        }
+    )
+
+
+def test_compare_family_candidate_screens_unsatisfied_baseline(tmp_path, monkeypatch) -> None:
+    call_log: list[tuple[str, str]] = []
+
+    def _fake_run_sample_with_policy(**kwargs):
+        sample_index = str(kwargs["sample_index"])
+        version = str(kwargs.get("override_version") or "")
+        call_log.append((sample_index, version))
+        if version == "2026-03-31" and sample_index == "20":
+            return {
+                "sample_index": sample_index,
+                "sample_status": "not_completed",
+                "evaluation_outcome": "incorrect",
+                "finish_reason": "pal_query_plan_invalid:family_compare_locked_query_shape:count_over_joined_set:count_over_direct_relation",
+                "run_dir": str(tmp_path / f"run_{version}_{sample_index}"),
+                "dangerous_overreach_count": 0,
+            }
+        return {
+            "sample_index": sample_index,
+            "sample_status": "completed",
+            "evaluation_outcome": "correct",
+            "finish_reason": "done",
+            "run_dir": str(tmp_path / f"run_{version}_{sample_index}"),
+            "dangerous_overreach_count": 0,
+        }
+
+    monkeypatch.setattr(
+        offline_compare.family_policy_harness,
+        "_run_sample_with_policy",
+        _fake_run_sample_with_policy,
+    )
+
+    summary = offline_compare.compare_family_candidate(
+        family_name="count_over_joined_set",
+        sample_indices=["20", "21"],
+        store_path=tmp_path / "store",
+        candidate_version="2026-03-31__cand0001",
+        baseline_version="2026-03-31",
+        screen_unsatisfied_baseline=True,
+    )
+
+    assert summary["screened_out_sample_count"] == 1
+    assert summary["screened_out_samples"][0]["sample_index"] == "20"
+    assert summary["baseline"]["sample_count"] == 1
+    assert summary["candidate"]["sample_count"] == 1
+    assert ("20", "2026-03-31__cand0001") not in call_log
 
 
 def test_inference_routes_pal_query_plan_invalid_to_manual_fallback() -> None:

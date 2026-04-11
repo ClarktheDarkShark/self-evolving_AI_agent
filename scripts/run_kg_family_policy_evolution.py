@@ -359,6 +359,15 @@ def _derive_failure_reasons(
         cleaned = str(denial_reason or "").strip()
         if cleaned:
             reasons.append(cleaned)
+    typed_outcome = decision_payload.get("typed_outcome") or {}
+    if isinstance(typed_outcome, Mapping):
+        for raw_value in (
+            typed_outcome.get("primary_failure_kind"),
+            typed_outcome.get("stop_reason"),
+        ):
+            cleaned = str(raw_value or "").strip()
+            if cleaned:
+                reasons.append(cleaned)
     return reasons
 
 
@@ -367,6 +376,7 @@ def _repair_loop_failure_reasons(repair_payload: Mapping[str, Any]) -> list[str]
     for raw_value in (
         repair_payload.get("final_verdict"),
         repair_payload.get("last_verdict"),
+        repair_payload.get("stop_reason"),
     ):
         cleaned = str(raw_value or "").strip()
         if cleaned:
@@ -467,6 +477,7 @@ def _maybe_create_candidate_from_run_summary(
             "family_bundle_version": str(
                 decision_payload.get("family_bundle_version") or ""
             ).strip(),
+            "typed_outcome": dict(decision_payload.get("typed_outcome") or {}),
             "tool_name": str(decision_payload.get("tool_name") or "").strip(),
             "scaffold_signature": scaffold_signature,
             "relation_names": relation_names,

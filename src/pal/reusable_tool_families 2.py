@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from src.pal.family_contracts import FamilyContract, get_family_contract
 from src.pal.family_policy_evolution import (
     build_family_policy_store,
     compare_locked_family_name,
@@ -316,10 +315,6 @@ def get_reusable_family_policy_bundle(family_name: str) -> Optional[FamilyPolicy
         return store.get_active_bundle(normalized_family) or baseline_bundle
     except Exception:
         return baseline_bundle
-
-
-def get_reusable_family_contract(family_name: str) -> Optional[FamilyContract]:
-    return get_family_contract(family_name)
 
 
 def iter_reusable_family_policy_bundles() -> tuple[FamilyPolicyBundle, ...]:
@@ -1430,6 +1425,14 @@ def _build_node_spec(
 
     if specific_anchor_role in _ANCHOR_ROLES:
         anchor_entity = anchor_entities_by_role.get(specific_anchor_role)
+        if anchor_entity is None:
+            single_anchor_entities = [
+                entity
+                for entity_role, entity in anchor_entities_by_role.items()
+                if entity_role in _ANCHOR_ROLES and isinstance(entity, Mapping)
+            ]
+            if len(single_anchor_entities) == 1:
+                anchor_entity = dict(single_anchor_entities[0])
         if anchor_entity is not None:
             resolved_mid = str(
                 anchor_entity.get("resolved_entity_id")
@@ -1627,11 +1630,9 @@ def _resolve_variable_name(
             return endpoint_token
         return attribute_token or endpoint_token or "ordering_attribute"
     if role_token == "type_set":
-        endpoint_token = _normalize_token(endpoint_text)
-        return endpoint_token or "type_set"
+        return _normalize_token(endpoint_text) or "type_set"
     if role_token == "shared_type":
-        endpoint_token = _normalize_token(endpoint_text)
-        return endpoint_token or "shared_type"
+        return _normalize_token(endpoint_text) or "shared_type"
     if role_token == "constraint_value":
         return _normalize_token(endpoint_text) or "constraint_value"
     if role_token == "anchor_value":
