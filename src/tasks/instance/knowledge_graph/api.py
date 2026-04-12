@@ -332,7 +332,7 @@ class KnowledgeGraphAPI:
 
     @classmethod
     def _variable_relation_probe_too_complex(cls, variable: Variable) -> bool:
-        if str(getattr(variable, "type", "") or "").startswith("pal."):
+        if str(getattr(variable, "type", "") or "").startswith("sage."):
             return False
         try:
             expression = SemanticParserUtil.lisp_to_nested_expression(variable.program)
@@ -365,20 +365,20 @@ class KnowledgeGraphAPI:
         return self.sparql_executor.execute_query(sparql_query)
 
     @staticmethod
-    def _normalize_pal_scalar(value: Any) -> str:
+    def _normalize_sage_scalar(value: Any) -> str:
         if isinstance(value, bool):
             return str(value).lower()
         return str(value)
 
-    def _execute_pal_synthetic(self, variable: Variable) -> list[str]:
+    def _execute_sage_synthetic(self, variable: Variable) -> list[str]:
         try:
             payload = json.loads(variable.program)
         except Exception as exc:
             raise KnowledgeGraphAPIException(
-                f"pal_synthetic_decode_failed:{exc}"
+                f"sage_synthetic_decode_failed:{exc}"
             ) from exc
         if not isinstance(payload, Mapping):
-            raise KnowledgeGraphAPIException("pal_synthetic_payload_not_mapping")
+            raise KnowledgeGraphAPIException("sage_synthetic_payload_not_mapping")
 
         kind = str(payload.get("kind") or "").strip()
         value = payload.get("value")
@@ -389,15 +389,15 @@ class KnowledgeGraphAPI:
             return self._normalize_entity_list(values)
         if kind in {"count_scalar", "scalar_literal", "text_literal"}:
             if isinstance(value, Sequence) and not isinstance(value, str):
-                return [self._normalize_pal_scalar(item) for item in value]
+                return [self._normalize_sage_scalar(item) for item in value]
             if value is None:
                 return []
-            return [self._normalize_pal_scalar(value)]
+            return [self._normalize_sage_scalar(value)]
         if kind == "boolean":
-            return [self._normalize_pal_scalar(bool(value))]
+            return [self._normalize_sage_scalar(bool(value))]
         if kind == "empty":
             return []
-        raise KnowledgeGraphAPIException(f"pal_synthetic_kind_unsupported:{kind}")
+        raise KnowledgeGraphAPIException(f"sage_synthetic_kind_unsupported:{kind}")
 
     def _query_relations_for_entities(self, entity_ids: Sequence[Any]) -> list[str]:
         mids = self._normalize_entity_list(entity_ids)
@@ -508,8 +508,8 @@ class KnowledgeGraphAPI:
         return self._execute_plain_lisp(lisp_program)
 
     def final_execute(self, variable: Variable) -> list[str]:
-        if variable.type.startswith("pal."):
-            return self._execute_pal_synthetic(variable)
+        if variable.type.startswith("sage."):
+            return self._execute_sage_synthetic(variable)
         program = variable.program
         try:
             expression = SemanticParserUtil.lisp_to_nested_expression(program)

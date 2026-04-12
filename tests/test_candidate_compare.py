@@ -8,40 +8,40 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import scripts.offline_compare_family_candidate as offline_compare
-import src.agents.instance.pal_agent_controller as pal_agent_controller_module
+import src.agents.instance.sage_agent_controller as sage_agent_controller_module
 from src.agents.exceptions import AgentUnknownException
-from src.agents.instance.pal_agent_controller import PALAgentController
-from src.pal.candidate_compare import (
+from src.agents.instance.sage_agent_controller import SAGEAgentController
+from src.sage.candidate_compare import (
     baseline_satisfies_locked_family,
     load_archived_baseline_record,
     summarize_sample_semantic_metrics,
     write_archived_baseline_record,
 )
-from src.pal.family_policy_evolution import ENV_COMPARE_LOCK_FAMILY
-from src.pal.policy_contracts import FamilyPolicyBundle
+from src.sage.family_policy_evolution import ENV_COMPARE_LOCK_FAMILY
+from src.sage.policy_contracts import FamilyPolicyBundle
 from src.typings import ChatHistory, ChatHistoryItem, Role
 
 
-RUNTIME_SINGLE_ANCHOR_BINDING_ENV = "PAL_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING"
-RUNTIME_SINGLE_ANCHOR_TARGET_ENV = "PAL_RUNTIME_SINGLE_ANCHOR_TARGET_SEMANTICS"
-RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC_ENV = "PAL_RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC"
+RUNTIME_SINGLE_ANCHOR_BINDING_ENV = "SAGE_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING"
+RUNTIME_SINGLE_ANCHOR_TARGET_ENV = "SAGE_RUNTIME_SINGLE_ANCHOR_TARGET_SEMANTICS"
+RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC_ENV = "SAGE_RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC"
 RUNTIME_SINGLE_ANCHOR_CHAIN_LOW_TRUST_DYNAMIC_ENV = (
-    "PAL_RUNTIME_SINGLE_ANCHOR_CHAIN_LOW_TRUST_DYNAMIC"
+    "SAGE_RUNTIME_SINGLE_ANCHOR_CHAIN_LOW_TRUST_DYNAMIC"
 )
 RUNTIME_PRESERVE_CHAIN_QUERY_SHAPE_ON_REFRESH_ENV = (
-    "PAL_RUNTIME_PRESERVE_CHAIN_QUERY_SHAPE_ON_REFRESH"
+    "SAGE_RUNTIME_PRESERVE_CHAIN_QUERY_SHAPE_ON_REFRESH"
 )
-RUNTIME_JOINED_COUNT_TARGET_ENV = "PAL_RUNTIME_JOINED_COUNT_TARGET_BOUNDARY"
-from src.pal.reusable_tool_families import select_reusable_tool
+RUNTIME_JOINED_COUNT_TARGET_ENV = "SAGE_RUNTIME_JOINED_COUNT_TARGET_BOUNDARY"
+from src.sage.reusable_tool_families import select_reusable_tool
 
 
-def _make_controller() -> PALAgentController:
-    controller = object.__new__(PALAgentController)
+def _make_controller() -> SAGEAgentController:
+    controller = object.__new__(SAGEAgentController)
     controller._emit_generated_tools_event = lambda payload: None
     return controller
 
 
-def _make_inference_ready_controller() -> PALAgentController:
+def _make_inference_ready_controller() -> SAGEAgentController:
     controller = _make_controller()
     controller._manual_fallback_active_runs = set()
     controller._manual_fallback_agent = None
@@ -49,7 +49,7 @@ def _make_inference_ready_controller() -> PALAgentController:
     controller._language_model = type("DummyLM", (), {"role_dict": {}})()
     controller._inference_config_dict = {}
     controller._kwargs = {}
-    controller._build_query_tool_name = lambda task_question: "pal_test_tool"
+    controller._build_query_tool_name = lambda task_question: "sage_test_tool"
     controller._split_task_question = lambda task_question: (task_question, [])
     controller._extract_answer_target_phrase = lambda question_text: ""
     controller._build_question_interpretation = lambda **kwargs: {
@@ -66,7 +66,7 @@ def _make_inference_ready_controller() -> PALAgentController:
     controller._refine_question_interpretation_with_grounding = (
         lambda **kwargs: kwargs["question_interpretation"]
     )
-    controller._build_pal_grounding_card = lambda *args, **kwargs: ""
+    controller._build_sage_grounding_card = lambda *args, **kwargs: ""
     controller._run_text_prompt = lambda **kwargs: "generate_tool"
     controller._parse_orchestrator_action = lambda raw_output: "generate_tool"
     return controller
@@ -240,21 +240,21 @@ def test_compare_family_candidate_passes_extra_env(tmp_path, monkeypatch) -> Non
         store_path=tmp_path / "store",
         candidate_version="2026-03-31__cand0001",
         baseline_version="2026-03-31",
-        extra_env={"PAL_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING": "1"},
+        extra_env={"SAGE_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING": "1"},
     )
 
     assert summary["extra_env"] == {
         ENV_COMPARE_LOCK_FAMILY: "single_anchor_lookup",
-        "PAL_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING": "1",
+        "SAGE_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING": "1",
     }
     assert observed_contexts == [
         {
             ENV_COMPARE_LOCK_FAMILY: "single_anchor_lookup",
-            "PAL_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING": "1",
+            "SAGE_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING": "1",
         },
         {
             ENV_COMPARE_LOCK_FAMILY: "single_anchor_lookup",
-            "PAL_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING": "1",
+            "SAGE_RUNTIME_SINGLE_ANCHOR_ANSWER_BINDING": "1",
         },
     ]
 
@@ -266,10 +266,10 @@ def test_summarize_sample_semantic_metrics_falls_back_to_summary_typed_fields() 
             "sample_status": "timeout",
             "evaluation_outcome": "",
             "finish_reason": "timed_out",
-            "pal_primary_failure_kind": "timeout",
-            "pal_stop_reason": "runner_timeout",
-            "pal_completion_state": "fail_closed",
-            "pal_repair_attempt_count": 0,
+            "sage_primary_failure_kind": "timeout",
+            "sage_stop_reason": "runner_timeout",
+            "sage_completion_state": "fail_closed",
+            "sage_repair_attempt_count": 0,
         }
     )
 
@@ -300,7 +300,7 @@ def test_baseline_satisfies_locked_family_rejects_shape_mismatch() -> None:
         {
             "family_lock_violation_count": 0,
             "semantic_failure_labels": [
-                "pal_query_plan_invalid:family_compare_locked_query_shape:count_over_joined_set:count_over_direct_relation"
+                "sage_query_plan_invalid:family_compare_locked_query_shape:count_over_joined_set:count_over_direct_relation"
             ],
         }
     )
@@ -324,7 +324,7 @@ def test_compare_family_candidate_screens_unsatisfied_baseline(tmp_path, monkeyp
                 "sample_index": sample_index,
                 "sample_status": "not_completed",
                 "evaluation_outcome": "incorrect",
-                "finish_reason": "pal_query_plan_invalid:family_compare_locked_query_shape:count_over_joined_set:count_over_direct_relation",
+                "finish_reason": "sage_query_plan_invalid:family_compare_locked_query_shape:count_over_joined_set:count_over_direct_relation",
                 "run_dir": str(tmp_path / f"run_{version}_{sample_index}"),
                 "dangerous_overreach_count": 0,
             }
@@ -359,10 +359,10 @@ def test_compare_family_candidate_screens_unsatisfied_baseline(tmp_path, monkeyp
     assert ("20", "2026-03-31__cand0001") not in call_log
 
 
-def test_inference_routes_pal_query_plan_invalid_to_manual_fallback() -> None:
+def test_inference_routes_sage_query_plan_invalid_to_manual_fallback() -> None:
     controller = _make_inference_ready_controller()
-    controller._generate_pal_query_plan = lambda **kwargs: (_ for _ in ()).throw(
-        ValueError("pal_query_plan_invalid:family_policy_single_anchor_requires_direct_path")
+    controller._generate_sage_query_plan = lambda **kwargs: (_ for _ in ()).throw(
+        ValueError("sage_query_plan_invalid:family_policy_single_anchor_requires_direct_path")
     )
     controller._tool_evolution_skip_manual_fallback_enabled = lambda: False
     controller._delegate_to_manual_solver = lambda **kwargs: ChatHistoryItem(
@@ -379,14 +379,14 @@ def test_inference_routes_pal_query_plan_invalid_to_manual_fallback() -> None:
     assert response.content == "manual fallback answer"
     assert controller._manual_fallback_active_for_current_run()
     updated_user_turn = chat_history.get_item_deep_copy(-1).content or ""
-    assert "PAL tool advisory" in updated_user_turn
-    assert "pal_query_plan_invalid:family_policy_single_anchor_requires_direct_path" in updated_user_turn
+    assert "SAGE tool advisory" in updated_user_turn
+    assert "sage_query_plan_invalid:family_policy_single_anchor_requires_direct_path" in updated_user_turn
 
 
 def test_inference_bypasses_manual_fallback_for_plan_invalid_when_skip_enabled() -> None:
     controller = _make_inference_ready_controller()
-    controller._generate_pal_query_plan = lambda **kwargs: (_ for _ in ()).throw(
-        ValueError("pal_query_plan_invalid:family_policy_single_anchor_requires_direct_path")
+    controller._generate_sage_query_plan = lambda **kwargs: (_ for _ in ()).throw(
+        ValueError("sage_query_plan_invalid:family_policy_single_anchor_requires_direct_path")
     )
     controller._tool_evolution_skip_manual_fallback_enabled = lambda: True
 
@@ -399,7 +399,7 @@ def test_inference_bypasses_manual_fallback_for_plan_invalid_when_skip_enabled()
         raise AssertionError("Expected AgentUnknownException")
     except AgentUnknownException as exc:
         assert (
-            "pal_tool_failure_bypassed:pal_query_plan_invalid:family_policy_single_anchor_requires_direct_path"
+            "sage_tool_failure_bypassed:sage_query_plan_invalid:family_policy_single_anchor_requires_direct_path"
             in str(exc)
         )
     assert not controller._manual_fallback_active_for_current_run()
@@ -411,7 +411,7 @@ def test_validate_query_plan_grounding_rejects_single_anchor_without_answer_bind
     controller = _make_controller()
     monkeypatch.setenv(RUNTIME_SINGLE_ANCHOR_BINDING_ENV, "1")
     monkeypatch.setattr(
-        pal_agent_controller_module,
+        sage_agent_controller_module,
         "get_reusable_family_policy_bundle",
         lambda family_name: FamilyPolicyBundle(
             family_name="single_anchor_lookup",
@@ -472,7 +472,7 @@ def test_validate_query_plan_grounding_rejects_single_anchor_exploratory_target_
     controller = _make_controller()
     monkeypatch.setenv(RUNTIME_SINGLE_ANCHOR_TARGET_ENV, "1")
     monkeypatch.setattr(
-        pal_agent_controller_module,
+        sage_agent_controller_module,
         "get_reusable_family_policy_bundle",
         lambda family_name: FamilyPolicyBundle(
             family_name="single_anchor_lookup",
@@ -534,7 +534,7 @@ def test_validate_query_plan_grounding_rejects_low_trust_dynamic_single_anchor_a
     controller = _make_controller()
     monkeypatch.setenv(RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC_ENV, "1")
     monkeypatch.setattr(
-        pal_agent_controller_module,
+        sage_agent_controller_module,
         "get_reusable_family_policy_bundle",
         lambda family_name: FamilyPolicyBundle(
             family_name="single_anchor_lookup",
@@ -602,7 +602,7 @@ def test_validate_query_plan_grounding_rejects_low_trust_dynamic_without_bundle_
     controller = _make_controller()
     monkeypatch.setenv(RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC_ENV, "1")
     monkeypatch.setattr(
-        pal_agent_controller_module,
+        sage_agent_controller_module,
         "get_reusable_family_policy_bundle",
         lambda family_name: FamilyPolicyBundle(
             family_name="single_anchor_lookup",
@@ -671,7 +671,7 @@ def test_validate_query_plan_grounding_rejects_low_trust_dynamic_single_anchor_c
     monkeypatch.setenv(RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC_ENV, "1")
     monkeypatch.setenv(RUNTIME_SINGLE_ANCHOR_CHAIN_LOW_TRUST_DYNAMIC_ENV, "1")
     monkeypatch.setattr(
-        pal_agent_controller_module,
+        sage_agent_controller_module,
         "get_reusable_family_policy_bundle",
         lambda family_name: FamilyPolicyBundle(
             family_name="single_anchor_chain_lookup",
@@ -741,7 +741,7 @@ def test_validate_query_plan_grounding_allows_dynamic_single_anchor_without_alia
     controller = _make_controller()
     monkeypatch.setenv(RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC_ENV, "1")
     monkeypatch.setattr(
-        pal_agent_controller_module,
+        sage_agent_controller_module,
         "get_reusable_family_policy_bundle",
         lambda family_name: FamilyPolicyBundle(
             family_name="single_anchor_lookup",
@@ -803,13 +803,13 @@ def test_validate_query_plan_grounding_allows_dynamic_single_anchor_without_alia
     assert "family_policy_single_anchor_low_trust_dynamic_alias_repair" not in errors
 
 
-def test_validate_pal_query_candidate_rejects_repaired_low_trust_dynamic_single_anchor(
+def test_validate_sage_query_candidate_rejects_repaired_low_trust_dynamic_single_anchor(
     monkeypatch,
 ) -> None:
     controller = _make_controller()
     monkeypatch.setenv(RUNTIME_SINGLE_ANCHOR_LOW_TRUST_DYNAMIC_ENV, "1")
     monkeypatch.setattr(
-        pal_agent_controller_module,
+        sage_agent_controller_module,
         "get_reusable_family_policy_bundle",
         lambda family_name: FamilyPolicyBundle(
             family_name="single_anchor_lookup",
@@ -831,7 +831,7 @@ def test_validate_pal_query_candidate_rejects_repaired_low_trust_dynamic_single_
     }
     """
 
-    errors = controller._validate_pal_query_candidate(
+    errors = controller._validate_sage_query_candidate(
         raw_output=query_text,
         generated_code=f"""
 query = '''{query_text}'''
@@ -926,7 +926,7 @@ def test_validate_query_plan_grounding_rejects_joined_count_missing_target_bound
     controller = _make_controller()
     monkeypatch.setenv(RUNTIME_JOINED_COUNT_TARGET_ENV, "1")
     monkeypatch.setattr(
-        pal_agent_controller_module,
+        sage_agent_controller_module,
         "get_reusable_family_policy_bundle",
         lambda family_name: FamilyPolicyBundle(
             family_name="count_over_joined_set",

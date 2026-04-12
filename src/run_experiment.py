@@ -41,16 +41,16 @@ from src.callbacks import (
 # task is skipped.  The mid-run Orchestrator escape-hatch
 # (request_new_tool) remains fully operational regardless of this flag.
 ENABLE_POST_TASK_REFLECTION = False
-ENABLE_PAL_AGENT = os.environ.get("ENABLE_PAL_AGENT") == "1"
-PAL_AGENT_NAME = "pal_agent_controller"
-PAL_AGENT_MAX_COMPLETION_TOKENS_ENV = "PAL_AGENT_MAX_COMPLETION_TOKENS"
-PAL_AGENT_REASONING_EFFORT_ENV = "PAL_AGENT_REASONING_EFFORT"
-PAL_AGENT_COMPONENT_CONFIG_PATH = os.path.join(
+ENABLE_SAGE_AGENT = os.environ.get("ENABLE_SAGE_AGENT") == "1"
+SAGE_AGENT_NAME = "sage_agent_controller"
+SAGE_AGENT_MAX_COMPLETION_TOKENS_ENV = "SAGE_AGENT_MAX_COMPLETION_TOKENS"
+SAGE_AGENT_REASONING_EFFORT_ENV = "SAGE_AGENT_REASONING_EFFORT"
+SAGE_AGENT_COMPONENT_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "configs",
     "components",
     "agents",
-    "pal_agent_controller.yaml",
+    "sage_agent_controller.yaml",
 )
 
 # ---------------------------------------------------------------------------
@@ -129,7 +129,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;display:flex;height:100vh;overf
 .si-badges{display:flex;gap:4px;align-items:center}
 .si-oc{font-size:11px;font-weight:700}
 .oc-correct{color:#6fcf7c}.oc-incorrect{color:#f07070}.oc-unset{color:#8890a8}
-.si-pal{font-size:9px;background:#0d1e30;color:#5ba8ff;border:1px solid #1d4060;border-radius:3px;padding:1px 5px;letter-spacing:.5px}
+.si-sage{font-size:9px;background:#0d1e30;color:#5ba8ff;border:1px solid #1d4060;border-radius:3px;padding:1px 5px;letter-spacing:.5px}
 .si-q{font-size:11px;color:#6878a0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ── Main panel ── */
@@ -172,16 +172,16 @@ body{font-family:'Segoe UI',system-ui,sans-serif;display:flex;height:100vh;overf
 .stage-det{font-size:9px;color:#5ba8ff;text-align:center;margin-top:2px;line-height:1.3}
 .stage-det.s-warn{color:#f0a030}
 
-/* ── PAL execution summary ── */
-.pal-card{background:#0a1828;border:1px solid #1d3050;border-radius:8px;padding:14px 16px;margin-bottom:20px}
-.pal-card-title{font-size:10px;color:#5ba8ff;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:12px;display:flex;align-items:center;gap:6px}
-.pal-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.pal-stat{background:#0a1220;border-radius:6px;padding:9px 11px;border:1px solid #152030}
-.pal-stat-k{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:#3a5070;margin-bottom:4px}
-.pal-stat-v{font-size:13px;font-weight:600;color:#c8d8f0}
-.pal-stat-v.pv-good{color:#6fcf7c}
-.pal-stat-v.pv-empty{color:#f0a030}
-.pal-stat-v.pv-mono{font-family:monospace;font-size:12px}
+/* ── SAGE execution summary ── */
+.sage-card{background:#0a1828;border:1px solid #1d3050;border-radius:8px;padding:14px 16px;margin-bottom:20px}
+.sage-card-title{font-size:10px;color:#5ba8ff;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:12px;display:flex;align-items:center;gap:6px}
+.sage-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.sage-stat{background:#0a1220;border-radius:6px;padding:9px 11px;border:1px solid #152030}
+.sage-stat-k{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:#3a5070;margin-bottom:4px}
+.sage-stat-v{font-size:13px;font-weight:600;color:#c8d8f0}
+.sage-stat-v.pv-good{color:#6fcf7c}
+.sage-stat-v.pv-empty{color:#f0a030}
+.sage-stat-v.pv-mono{font-family:monospace;font-size:12px}
 
 /* ── Conversation ── */
 .sec{margin-bottom:22px}
@@ -283,7 +283,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;display:flex;height:100vh;overf
       <button class="flt active" data-f="all">All</button>
       <button class="flt" data-f="correct">✅ Correct</button>
       <button class="flt" data-f="incorrect">❌ Incorrect</button>
-      <button class="flt" data-f="pal">🌉 PAL</button>
+      <button class="flt" data-f="sage">🌉 SAGE</button>
     </div>
   </div>
   <div id="sl"></div>
@@ -306,7 +306,7 @@ function persistScroll(){writeState({sTop:document.getElementById('sidebar')?.sc
 function restoreScroll(){const st=readState();const sb=document.getElementById('sidebar');const m=document.getElementById('main');if(sb&&st.sTop!=null)sb.scrollTop=st.sTop;if(m&&st.mTop!=null)m.scrollTop=st.mTop;}
 
 // ── Data helpers ───────────────────────────────────────────────────────────
-function hasBridge(s){return(s.chat_history?.value||[]).some(t=>(t.content||'').includes('pal_benchmark_bridge_macro'));}
+function hasBridge(s){return(s.chat_history?.value||[]).some(t=>(t.content||'').includes('sage_benchmark_bridge_macro'));}
 function extractQuestion(turns){
   for(const t of turns){
     if(t.role!=='user')continue;
@@ -318,7 +318,7 @@ function extractQuestion(turns){
 function parseBridgePayload(turns){
   for(const t of turns){
     const c=t.content||'';
-    if(!c.includes('pal_benchmark_bridge_macro'))continue;
+    if(!c.includes('sage_benchmark_bridge_macro'))continue;
     const m=c.match(/execute_macro\\([^,]+,\\s*(\\{[\\s\\S]*\\})\\)/);
     if(m){try{return JSON.parse(m[1]);}catch{}}
     break;
@@ -347,7 +347,7 @@ function artifactMeta(type){
 }
 
 function sourceLabel(source){
-  const map={raw_execution:'Direct PAL query result'};
+  const map={raw_execution:'Direct SAGE query result'};
   return map[source]||humanizeToken(source||'result source');
 }
 
@@ -430,37 +430,37 @@ function normalizeFlag(value){
 }
 
 function buildBridgeInfoFromPayload(payload){
-  const diag=payload?.pal_artifact_diagnostics||{};
+  const diag=payload?.sage_artifact_diagnostics||{};
   return{
-    artifactType:payload?.pal_artifact_type||'',
-    primaryValue:payload?.pal_artifact_value,
-    source:payload?.pal_artifact_source||'',
-    semantic:payload?.pal_semantic_description||'',
-    selectionBasis:payload?.pal_selection_basis||'',
-    relationSummary:payload?.pal_relation_summary||[],
-    projectedVar:payload?.pal_selected_query_variable||diag.selected_var||'',
-    bindingCount:payload?.pal_binding_count??diag.binding_count,
-    uniqueValueCount:payload?.pal_unique_value_count??diag.normalized_value_count,
-    valuePreview:payload?.pal_value_preview??diag.value_preview,
-    rowPreview:payload?.pal_row_preview??diag.row_preview,
-    resolvedValuePreview:payload?.pal_resolved_value_preview||'',
-    answerCardinality:payload?.pal_answer_cardinality_hint||'',
-    completenessHint:payload?.pal_completeness_hint||'',
-    proofHint:payload?.pal_proof_hint||'',
-    repairCaveat:payload?.pal_repair_caveat||'',
-    failureReason:payload?.pal_failure_reason||'',
-    trustedFinal:normalizeFlag(payload?.pal_trusted_for_materialization),
-    solvesTask:normalizeFlag(payload?.pal_solves_task),
-    confidence:payload?.pal_confidence,
+    artifactType:payload?.sage_artifact_type||'',
+    primaryValue:payload?.sage_artifact_value,
+    source:payload?.sage_artifact_source||'',
+    semantic:payload?.sage_semantic_description||'',
+    selectionBasis:payload?.sage_selection_basis||'',
+    relationSummary:payload?.sage_relation_summary||[],
+    projectedVar:payload?.sage_selected_query_variable||diag.selected_var||'',
+    bindingCount:payload?.sage_binding_count??diag.binding_count,
+    uniqueValueCount:payload?.sage_unique_value_count??diag.normalized_value_count,
+    valuePreview:payload?.sage_value_preview??diag.value_preview,
+    rowPreview:payload?.sage_row_preview??diag.row_preview,
+    resolvedValuePreview:payload?.sage_resolved_value_preview||'',
+    answerCardinality:payload?.sage_answer_cardinality_hint||'',
+    completenessHint:payload?.sage_completeness_hint||'',
+    proofHint:payload?.sage_proof_hint||'',
+    repairCaveat:payload?.sage_repair_caveat||'',
+    failureReason:payload?.sage_failure_reason||'',
+    trustedFinal:normalizeFlag(payload?.sage_trusted_for_materialization),
+    solvesTask:normalizeFlag(payload?.sage_solves_task),
+    confidence:payload?.sage_confidence,
     finalVariable:'',
-    status:String(payload?.pal_tool_status||'success'),
+    status:String(payload?.sage_tool_status||'success'),
     observation:'',
   };
 }
 
 function buildBridgeInfoFromMacroText(text){
   const parsed=parseMacroResultText(text);
-  if(!parsed||parsed.macroName!=='pal_benchmark_bridge_macro')return null;
+  if(!parsed||parsed.macroName!=='sage_benchmark_bridge_macro')return null;
   const f=parsed.fields;
   return{
     artifactType:f['Artifact type']||'',
@@ -516,10 +516,10 @@ function renderBridgeInfoCard(info,mode){
   const solves=info.solvesTask==='yes';
   const variant=ok?(trusted?'bridge-ok':'bridge-warn'):'bridge-fail';
   const title=mode==='action'
-    ? `PAL produced a ${meta.label.toLowerCase()}`
+    ? `SAGE produced a ${meta.label.toLowerCase()}`
     : ok
-      ? 'Bridge recorded the PAL result'
-      : 'Bridge reported a PAL failure';
+      ? 'Bridge recorded the SAGE result'
+      : 'Bridge reported a SAGE failure';
   const subtitle=mode==='action'
     ? sourceLabel(info.source)
     : trusted
@@ -554,7 +554,7 @@ function renderBridgeInfoCard(info,mode){
     </div>
     <div class="bridge-body">
       ${info.semantic?`<div class="bridge-note"><span class="bridge-note-k">Interpreted as</span><span class="bridge-note-v">${esc(info.semantic)}</span></div>`:''}
-      ${info.selectionBasis?`<div class="bridge-note"><span class="bridge-note-k">Why PAL chose it</span><span class="bridge-note-v">${esc(info.selectionBasis)}</span></div>`:''}
+      ${info.selectionBasis?`<div class="bridge-note"><span class="bridge-note-k">Why SAGE chose it</span><span class="bridge-note-v">${esc(info.selectionBasis)}</span></div>`:''}
       ${relations.length?`<div class="bridge-note"><span class="bridge-note-k">Query path</span><div class="bridge-paths">${relations.map(path=>`<div class="bridge-path">${esc(path.replace(/\s*->\s*/g,' → '))}</div>`).join('')}</div></div>`:''}
       <div class="bridge-grid">
         <div class="bridge-stat"><div class="bridge-stat-k">Result type</div><div class="bridge-stat-v">${esc(meta.label)}</div></div>
@@ -582,15 +582,15 @@ function renderBridgeInfoCard(info,mode){
 function buildStages(s){
   const turns=s.chat_history?.value||[];
   const outcome=s.evaluation_record?.outcome||'unset';
-  const pal=hasBridge(s);
+  const sage=hasBridge(s);
   const ansIcon=outcome==='correct'?'\\u2705':outcome==='incorrect'?'\\u274c':'\\u2014';
   const ansStatus=outcome==='correct'?'s-done':outcome==='incorrect'?'s-fail':'s-neutral';
   const ansStage={label:'Answer',icon:ansIcon,status:ansStatus};
-  if(pal){
+  if(sage){
     const p=parseBridgePayload(turns);
-    const diag=p?.pal_artifact_diagnostics||{};
+    const diag=p?.sage_artifact_diagnostics||{};
     const bcount=diag.binding_count??null;
-    const atype=p?.pal_artifact_type||'';
+    const atype=p?.sage_artifact_type||'';
     const execOk=bcount==null||bcount>0;
     return[
       {label:'Task Received',icon:'📥',status:'s-done'},
@@ -667,7 +667,7 @@ function renderAnswerCard(s){
   </div>`;
 }
 
-// ── 4. PAL execution summary (repair loop details) ─────────────────────────
+// ── 4. SAGE execution summary (repair loop details) ─────────────────────────
 function renderPalDetails(s){
   const turns=s.chat_history?.value||[];
   const p=parseBridgePayload(turns);
@@ -676,16 +676,16 @@ function renderPalDetails(s){
   const meta=artifactMeta(info.artifactType);
   const rawValue=formatPreviewValue(info.primaryValue);
   const rowPreview=Array.isArray(info.rowPreview)?formatRowPreview(info.rowPreview):String(info.rowPreview||'');
-  return`<div class="pal-card">
-    <div class="pal-card-title">🌉 PAL Result Snapshot</div>
+  return`<div class="sage-card">
+    <div class="sage-card-title">🌉 SAGE Result Snapshot</div>
     ${info.selectionBasis?`<div style="font-size:12px;color:#d8e4f8;line-height:1.55;margin-bottom:10px">${esc(info.selectionBasis)}</div>`:''}
-    <div class="pal-grid">
-      <div class="pal-stat"><div class="pal-stat-k">Result Type</div><div class="pal-stat-v">${esc(meta.label)}</div></div>
-      <div class="pal-stat"><div class="pal-stat-k">Query Rows</div><div class="pal-stat-v ${(Number(info.bindingCount)||0)>0?'pv-good':'pv-empty'}">${esc(String(info.bindingCount??'—'))}</div></div>
-      <div class="pal-stat"><div class="pal-stat-k">Query Column</div><div class="pal-stat-v pv-mono">${esc(info.projectedVar||'—')}</div></div>
-      <div class="pal-stat"><div class="pal-stat-k">Unique Values</div><div class="pal-stat-v">${esc(String(info.uniqueValueCount??'—'))}</div></div>
-      <div class="pal-stat" style="grid-column:span 2"><div class="pal-stat-k">Raw Value</div><div class="pal-stat-v pv-mono" style="font-size:11px">${esc(rawValue)}</div></div>
-      ${rowPreview?`<div class="pal-stat" style="grid-column:span 3"><div class="pal-stat-k">Sample Rows</div><div class="pal-stat-v pv-mono" style="font-size:11px;line-height:1.5">${esc(rowPreview)}</div></div>`:''}
+    <div class="sage-grid">
+      <div class="sage-stat"><div class="sage-stat-k">Result Type</div><div class="sage-stat-v">${esc(meta.label)}</div></div>
+      <div class="sage-stat"><div class="sage-stat-k">Query Rows</div><div class="sage-stat-v ${(Number(info.bindingCount)||0)>0?'pv-good':'pv-empty'}">${esc(String(info.bindingCount??'—'))}</div></div>
+      <div class="sage-stat"><div class="sage-stat-k">Query Column</div><div class="sage-stat-v pv-mono">${esc(info.projectedVar||'—')}</div></div>
+      <div class="sage-stat"><div class="sage-stat-k">Unique Values</div><div class="sage-stat-v">${esc(String(info.uniqueValueCount??'—'))}</div></div>
+      <div class="sage-stat" style="grid-column:span 2"><div class="sage-stat-k">Raw Value</div><div class="sage-stat-v pv-mono" style="font-size:11px">${esc(rawValue)}</div></div>
+      ${rowPreview?`<div class="sage-stat" style="grid-column:span 3"><div class="sage-stat-k">Sample Rows</div><div class="sage-stat-v pv-mono" style="font-size:11px;line-height:1.5">${esc(rowPreview)}</div></div>`:''}
     </div>
   </div>`;
 }
@@ -721,8 +721,8 @@ function renderTurnContent(t,ti){
     }
   }
 
-  // PAL bridge macro call
-  if(c.includes('pal_benchmark_bridge_macro')){
+  // SAGE bridge macro call
+  if(c.includes('sage_benchmark_bridge_macro')){
     const pm=c.match(/execute_macro\\([^,]+,\\s*(\\{[\\s\\S]*\\})\\)/);
     if(pm){
       try{return renderBridgeInfoCard(buildBridgeInfoFromPayload(JSON.parse(pm[1])),'action');}catch{}
@@ -787,7 +787,7 @@ let _search='';
 function matchFilter(s){
   if(_filter==='correct') return(s.evaluation_record?.outcome||'')==='correct';
   if(_filter==='incorrect') return(s.evaluation_record?.outcome||'')==='incorrect';
-  if(_filter==='pal') return hasBridge(s);
+  if(_filter==='sage') return hasBridge(s);
   return true;
 }
 function matchSearch(s){
@@ -814,7 +814,7 @@ function renderSidebarList(){
   const visible=logData.map((s,i)=>({s,i})).filter(({s})=>matchFilter(s)&&matchSearch(s));
   document.getElementById('sl').innerHTML=visible.map(({s,i})=>{
     const o=s.evaluation_record?.outcome||'unset';
-    const pal=hasBridge(s);
+    const sage=hasBridge(s);
     const turns=s.chat_history?.value||[];
     const q=extractQuestion(turns)||'';
     const qShort=q.length>48?q.slice(0,45)+'\\u2026':q;
@@ -822,7 +822,7 @@ function renderSidebarList(){
       <div class="si-row1">
         <span class="si-idx">Sample #${esc(s.sample_index)}</span>
         <span class="si-badges">
-          ${pal?'<span class="si-pal">PAL</span>':''}
+          ${sage?'<span class="si-sage">SAGE</span>':''}
           <span class="si-oc oc-${ocClass(o)}">${o.toUpperCase()}</span>
         </span>
       </div>
@@ -838,7 +838,7 @@ function show(idx,options={}){
   const el=document.getElementById('i'+idx);if(el)el.classList.add('active');
   const s=logData[idx];
   const turns=s.chat_history?.value||[];
-  const pal=hasBridge(s);
+  const sage=hasBridge(s);
   const stages=buildStages(s);
   const turnsHtml=turns.map((t,ti)=>{
     const role=t.role==='agent'?'agent':'user';
@@ -851,7 +851,7 @@ function show(idx,options={}){
   document.getElementById('main').innerHTML=
     renderAnswerCard(s)+
     renderStageTimeline(stages)+
-    (pal?renderPalDetails(s):'')+
+    (sage?renderPalDetails(s):'')+
     `<div class="sec"><div class="sec-title">💬 Conversation (${turns.length} turns)</div>${turnsHtml}</div>`;
   writeState({si:String(s.sample_index??''),selectedSampleIndex:String(s.sample_index??'')});
   setHash(s.sample_index);
@@ -1211,14 +1211,14 @@ class ConfigUtility:
         )
 
 
-def _maybe_enable_pal_agent(raw_config: Mapping[str, Any]) -> dict[str, Any]:
-    if not ENABLE_PAL_AGENT:
+def _maybe_enable_sage_agent(raw_config: Mapping[str, Any]) -> dict[str, Any]:
+    if not ENABLE_SAGE_AGENT:
         return copy.deepcopy(raw_config)
 
     updated_raw_config = copy.deepcopy(raw_config)
-    pal_agent_component = ConfigLoader().load_from(PAL_AGENT_COMPONENT_CONFIG_PATH)
+    sage_agent_component = ConfigLoader().load_from(SAGE_AGENT_COMPONENT_CONFIG_PATH)
     updated_raw_config.setdefault("agent_dict", {})
-    updated_raw_config["agent_dict"].update(pal_agent_component)
+    updated_raw_config["agent_dict"].update(sage_agent_component)
 
     current_agent_info = updated_raw_config["assignment_config"].get("agent") or {}
     current_custom_parameters = current_agent_info.get("custom_parameters") or {}
@@ -1230,23 +1230,23 @@ def _maybe_enable_pal_agent(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         if assignment_language_model_list:
             language_model_name = assignment_language_model_list[0]["name"]
     if language_model_name is None:
-        raise ValueError("ENABLE_PAL_AGENT=1 requires an assignment language model.")
+        raise ValueError("ENABLE_SAGE_AGENT=1 requires an assignment language model.")
 
     inference_config_override: dict[str, Any] = {}
     raw_max_completion_tokens = os.environ.get(
-        PAL_AGENT_MAX_COMPLETION_TOKENS_ENV, ""
+        SAGE_AGENT_MAX_COMPLETION_TOKENS_ENV, ""
     ).strip()
     if raw_max_completion_tokens:
         inference_config_override["max_completion_tokens"] = int(
             raw_max_completion_tokens
         )
     raw_reasoning_effort = os.environ.get(
-        PAL_AGENT_REASONING_EFFORT_ENV, ""
+        SAGE_AGENT_REASONING_EFFORT_ENV, ""
     ).strip()
     if raw_reasoning_effort:
         inference_config_override["reasoning_effort"] = raw_reasoning_effort
     updated_raw_config["assignment_config"]["agent"] = {
-        "name": PAL_AGENT_NAME,
+        "name": SAGE_AGENT_NAME,
         "custom_parameters": {
             "language_model": language_model_name,
             "inference_config_dict": inference_config_override,
@@ -1261,7 +1261,7 @@ def main() -> None:
     parser.add_argument("--config_path", type=str)
     args = parser.parse_args()
     raw_config = ConfigLoader().load_from(args.config_path)
-    raw_config = _maybe_enable_pal_agent(raw_config)
+    raw_config = _maybe_enable_sage_agent(raw_config)
     assignment_config, environment_config, logger_config, path_config = (
         ConfigUtility.read_raw_config(raw_config, ConfigUtilityCaller.CLIENT)
     )

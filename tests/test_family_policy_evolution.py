@@ -8,7 +8,7 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.pal.family_policy_evolution import (
+from src.sage.family_policy_evolution import (
     ENV_DEDUP_SIGNATURE,
     ENV_ENABLE_EVOLUTION,
     ENV_ENABLED_FAMILIES,
@@ -21,12 +21,12 @@ from src.pal.family_policy_evolution import (
     bundle_from_dict,
     classify_family_failure,
 )
-from src.pal.reusable_tool_families import (
+from src.sage.reusable_tool_families import (
     get_baseline_reusable_family_policy_bundles,
     get_reusable_family_policy_bundle,
 )
 import scripts.run_kg_family_policy_evolution as family_policy_harness
-import scripts.pal_kg_batch_runner as kg_batch_runner
+import scripts.sage_kg_batch_runner as kg_batch_runner
 from scripts.run_kg_family_policy_evolution import _maybe_create_candidate_from_run_summary
 
 
@@ -114,7 +114,7 @@ def test_strict_update_mapping_limits_joined_count_to_validator_constraints(
         family_name="count_over_joined_set",
         scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.temperament",
         relation_names=["biology.animal_breed.temperament"],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "8"},
     )
@@ -143,7 +143,7 @@ def test_candidate_signature_dedup_skips_rejected_duplicate_bundle(
         family_name="count_over_joined_set",
         scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.temperament",
         relation_names=["biology.animal_breed.temperament"],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "8"},
     )
@@ -159,7 +159,7 @@ def test_candidate_signature_dedup_skips_rejected_duplicate_bundle(
         family_name="count_over_joined_set",
         scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.country_of_origin",
         relation_names=["biology.animal_breed.country_of_origin"],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "14"},
     )
@@ -194,7 +194,7 @@ def test_strict_update_mapping_keeps_single_anchor_validator_constraints(
         scaffold_signature="single_anchor_lookup|answer|royalty.kingdom.monarchs",
         relation_names=["royalty.kingdom.monarchs"],
         failure_reasons=[
-            "pal_query_not_accepted:repairable_anchor_not_found",
+            "sage_query_not_accepted:repairable_anchor_not_found",
             "anchor_not_found:'Saxe-Coburg-Gotha'",
         ],
         failure_class="weak_applicability_boundary",
@@ -308,7 +308,7 @@ def test_semantic_signature_dedup_skips_wording_only_single_anchor_variant(
         scaffold_signature="single_anchor_lookup|answer|royalty.kingdom.monarchs",
         relation_names=["royalty.kingdom.monarchs"],
         failure_reasons=[
-            "pal_query_not_accepted:repairable_anchor_not_found",
+            "sage_query_not_accepted:repairable_anchor_not_found",
             "anchor_not_found:'Saxe-Coburg-Gotha'",
         ],
         failure_class="weak_applicability_boundary",
@@ -342,7 +342,7 @@ def test_semantic_signature_dedup_skips_wording_only_single_anchor_variant(
         scaffold_signature="single_anchor_lookup|answer|royalty.kingdom.rulers",
         relation_names=["royalty.kingdom.rulers"],
         failure_reasons=[
-            "pal_query_not_accepted:repairable_anchor_not_found",
+            "sage_query_not_accepted:repairable_anchor_not_found",
             "anchor_not_found:'Saxe-Coburg-Gotha'",
         ],
         failure_class="weak_applicability_boundary",
@@ -364,7 +364,7 @@ def test_exact_duplicate_bundle_is_skipped_even_without_signature_flag(
         family_name="count_over_joined_set",
         scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.temperament",
         relation_names=["biology.animal_breed.temperament"],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "8"},
     )
@@ -380,7 +380,7 @@ def test_exact_duplicate_bundle_is_skipped_even_without_signature_flag(
         family_name="count_over_joined_set",
         scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.country_of_origin",
         relation_names=["biology.animal_breed.country_of_origin"],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "14"},
     )
@@ -574,7 +574,7 @@ def test_inline_promotion_gate_reuses_success_bank_with_extra_context_fields(
         family_name=family_name,
         scaffold_signature="count_over_direct_relation|disease|medicine.infectious_disease.vector",
         relation_names=["medicine.infectious_disease.vector"],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "15"},
     )
@@ -627,15 +627,15 @@ def test_inline_promotion_gate_reuses_success_bank_with_extra_context_fields(
 
 def test_harness_synthesizes_candidate_from_wrong_completed_run(tmp_path) -> None:
     run_dir = tmp_path / "run"
-    (run_dir / "pal_query_artifacts").mkdir(parents=True)
+    (run_dir / "sage_query_artifacts").mkdir(parents=True)
     (run_dir / "generated_tools.log").write_text(
         json.dumps(
             {
-                "event": "pal_attempt_decision_finalized",
+                "event": "sage_attempt_decision_finalized",
                 "sample_index": "2",
                 "selected_family": "count_over_direct_relation",
                 "family_bundle_version": "2026-03-31",
-                "tool_name": "pal_sparql_query_tool_demo",
+                "tool_name": "sage_sparql_query_tool_demo",
                 "dangerous_overreach": False,
                 "dangerous_overreach_reasons": [],
                 "materialization_denial_reasons": [],
@@ -644,7 +644,7 @@ def test_harness_synthesizes_candidate_from_wrong_completed_run(tmp_path) -> Non
         + "\n",
         encoding="utf-8",
     )
-    (run_dir / "pal_query_artifacts" / "pal_sparql_query_tool_demo.plan.json").write_text(
+    (run_dir / "sage_query_artifacts" / "sage_sparql_query_tool_demo.plan.json").write_text(
         json.dumps(
             {
                 "query_shape": "count_over_direct_relation",
@@ -696,7 +696,7 @@ def test_stage_a_screen_rejects_candidate_before_full_inline_evaluation(
         family_name=family_name,
         scaffold_signature="count_over_joined_set|candidate_set|biology.animal_breed.temperament",
         relation_names=["biology.animal_breed.temperament"],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "8"},
     )
@@ -756,23 +756,23 @@ def test_stage_a_screen_rejects_candidate_before_full_inline_evaluation(
     )
 
     assert evaluation["gate_stage"] == "stage_a_screen"
-    assert "failed_stage_a_pal_only_screen" in evaluation["promotion_gate"]["reasons"]
+    assert "failed_stage_a_sage_only_screen" in evaluation["promotion_gate"]["reasons"]
     assert evaluation["evaluation_stats"]["total_evaluation_requests"] == 2
 
 
 def test_harness_synthesizes_candidate_from_matching_sample_decision_only(tmp_path) -> None:
     run_dir = tmp_path / "run"
-    (run_dir / "pal_query_artifacts").mkdir(parents=True)
+    (run_dir / "sage_query_artifacts").mkdir(parents=True)
     (run_dir / "generated_tools.log").write_text(
         "\n".join(
             [
                 json.dumps(
                     {
-                        "event": "pal_attempt_decision_finalized",
+                        "event": "sage_attempt_decision_finalized",
                         "sample_index": "2",
                         "selected_family": "count_over_direct_relation",
                         "family_bundle_version": "2026-03-31",
-                        "tool_name": "pal_sparql_query_tool_sample_2",
+                        "tool_name": "sage_sparql_query_tool_sample_2",
                         "dangerous_overreach": False,
                         "dangerous_overreach_reasons": [],
                         "materialization_denial_reasons": [],
@@ -780,11 +780,11 @@ def test_harness_synthesizes_candidate_from_matching_sample_decision_only(tmp_pa
                 ),
                 json.dumps(
                     {
-                        "event": "pal_attempt_decision_finalized",
+                        "event": "sage_attempt_decision_finalized",
                         "sample_index": "11",
                         "selected_family": "count_over_direct_relation",
                         "family_bundle_version": "2026-03-31",
-                        "tool_name": "pal_sparql_query_tool_sample_11",
+                        "tool_name": "sage_sparql_query_tool_sample_11",
                         "dangerous_overreach": False,
                         "dangerous_overreach_reasons": [],
                         "materialization_denial_reasons": [],
@@ -795,7 +795,7 @@ def test_harness_synthesizes_candidate_from_matching_sample_decision_only(tmp_pa
         + "\n",
         encoding="utf-8",
     )
-    (run_dir / "pal_query_artifacts" / "pal_sparql_query_tool_sample_2.plan.json").write_text(
+    (run_dir / "sage_query_artifacts" / "sage_sparql_query_tool_sample_2.plan.json").write_text(
         json.dumps(
             {
                 "query_shape": "count_over_direct_relation",
@@ -810,7 +810,7 @@ def test_harness_synthesizes_candidate_from_matching_sample_decision_only(tmp_pa
         + "\n",
         encoding="utf-8",
     )
-    (run_dir / "pal_query_artifacts" / "pal_sparql_query_tool_sample_11.plan.json").write_text(
+    (run_dir / "sage_query_artifacts" / "sage_sparql_query_tool_sample_11.plan.json").write_text(
         json.dumps(
             {
                 "query_shape": "count_over_direct_relation",
@@ -857,17 +857,17 @@ def test_harness_synthesizes_candidate_from_nonfinal_decision_with_repair_reject
 ) -> None:
     monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
     run_dir = tmp_path / "run"
-    (run_dir / "pal_query_artifacts").mkdir(parents=True)
+    (run_dir / "sage_query_artifacts").mkdir(parents=True)
     (run_dir / "generated_tools.log").write_text(
         "\n".join(
             [
                 json.dumps(
                     {
-                        "event": "pal_attempt_decision",
+                        "event": "sage_attempt_decision",
                         "sample_index": "8",
                         "selected_family": "count_over_joined_set",
                         "family_bundle_version": "2026-03-31",
-                        "tool_name": "pal_sparql_query_tool_sample_8",
+                        "tool_name": "sage_sparql_query_tool_sample_8",
                         "dangerous_overreach": False,
                         "dangerous_overreach_reasons": [],
                         "materialization_denial_reasons": [],
@@ -875,7 +875,7 @@ def test_harness_synthesizes_candidate_from_nonfinal_decision_with_repair_reject
                 ),
                 json.dumps(
                     {
-                        "event": "pal_repair_loop_rejected",
+                        "event": "sage_repair_loop_rejected",
                         "sample_index": "8",
                         "final_verdict": "no_accepted_candidate",
                         "last_verdict": "repairable_bad_count_set",
@@ -887,11 +887,11 @@ def test_harness_synthesizes_candidate_from_nonfinal_decision_with_repair_reject
                 ),
                 json.dumps(
                     {
-                        "event": "pal_attempt_decision",
+                        "event": "sage_attempt_decision",
                         "sample_index": "8",
                         "selected_family": None,
                         "family_bundle_version": None,
-                        "tool_name": "pal_sparql_query_tool_sample_8",
+                        "tool_name": "sage_sparql_query_tool_sample_8",
                         "dangerous_overreach": False,
                         "dangerous_overreach_reasons": [],
                         "materialization_denial_reasons": [],
@@ -902,7 +902,7 @@ def test_harness_synthesizes_candidate_from_nonfinal_decision_with_repair_reject
         + "\n",
         encoding="utf-8",
     )
-    (run_dir / "pal_query_artifacts" / "pal_sparql_query_tool_sample_8.plan.json").write_text(
+    (run_dir / "sage_query_artifacts" / "sage_sparql_query_tool_sample_8.plan.json").write_text(
         json.dumps(
             {
                 "query_shape": "count_over_joined_set",
@@ -952,17 +952,17 @@ def test_harness_skips_single_anchor_candidate_for_low_trust_dynamic_fail_close(
 ) -> None:
     monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
     run_dir = tmp_path / "run"
-    (run_dir / "pal_query_artifacts").mkdir(parents=True)
+    (run_dir / "sage_query_artifacts").mkdir(parents=True)
     (run_dir / "generated_tools.log").write_text(
         "\n".join(
             [
                 json.dumps(
                     {
-                        "event": "pal_attempt_decision",
+                        "event": "sage_attempt_decision",
                         "sample_index": "18",
                         "selected_family": "single_anchor_lookup",
                         "family_bundle_version": "2026-03-31__cand0001__cand0001",
-                        "tool_name": "pal_sparql_query_tool_sample_18",
+                        "tool_name": "sage_sparql_query_tool_sample_18",
                         "dangerous_overreach": False,
                         "dangerous_overreach_reasons": [],
                         "materialization_denial_reasons": [],
@@ -970,7 +970,7 @@ def test_harness_skips_single_anchor_candidate_for_low_trust_dynamic_fail_close(
                 ),
                 json.dumps(
                     {
-                        "event": "pal_query_candidate_rejected",
+                        "event": "sage_query_candidate_rejected",
                         "sample_index": "18",
                         "rejection_reasons": [
                             "family_policy_single_anchor_low_trust_dynamic_alias_repair"
@@ -979,7 +979,7 @@ def test_harness_skips_single_anchor_candidate_for_low_trust_dynamic_fail_close(
                 ),
                 json.dumps(
                     {
-                        "event": "pal_repair_loop_rejected",
+                        "event": "sage_repair_loop_rejected",
                         "sample_index": "18",
                         "final_verdict": "no_accepted_candidate",
                         "last_verdict": "repairable_anchor_path_empty",
@@ -993,7 +993,7 @@ def test_harness_skips_single_anchor_candidate_for_low_trust_dynamic_fail_close(
         + "\n",
         encoding="utf-8",
     )
-    (run_dir / "pal_query_artifacts" / "pal_sparql_query_tool_sample_18.plan.json").write_text(
+    (run_dir / "sage_query_artifacts" / "sage_sparql_query_tool_sample_18.plan.json").write_text(
         json.dumps(
             {
                 "query_shape": "single_anchor_lookup",
@@ -1034,17 +1034,17 @@ def test_harness_skips_single_anchor_chain_candidate_for_low_trust_dynamic_fail_
 ) -> None:
     monkeypatch.setenv(ENV_STRICT_UPDATE_MAPPING, "1")
     run_dir = tmp_path / "run_chain"
-    (run_dir / "pal_query_artifacts").mkdir(parents=True)
+    (run_dir / "sage_query_artifacts").mkdir(parents=True)
     (run_dir / "generated_tools.log").write_text(
         "\n".join(
             [
                 json.dumps(
                     {
-                        "event": "pal_attempt_decision",
+                        "event": "sage_attempt_decision",
                         "sample_index": "18",
                         "selected_family": "single_anchor_chain_lookup",
                         "family_bundle_version": "2026-03-31__cand0001__cand0001",
-                        "tool_name": "pal_sparql_query_tool_sample_18",
+                        "tool_name": "sage_sparql_query_tool_sample_18",
                         "dangerous_overreach": False,
                         "dangerous_overreach_reasons": [],
                         "materialization_denial_reasons": [],
@@ -1052,7 +1052,7 @@ def test_harness_skips_single_anchor_chain_candidate_for_low_trust_dynamic_fail_
                 ),
                 json.dumps(
                     {
-                        "event": "pal_query_candidate_rejected",
+                        "event": "sage_query_candidate_rejected",
                         "sample_index": "18",
                         "rejection_reasons": [
                             "family_policy_single_anchor_low_trust_dynamic_alias_repair"
@@ -1061,7 +1061,7 @@ def test_harness_skips_single_anchor_chain_candidate_for_low_trust_dynamic_fail_
                 ),
                 json.dumps(
                     {
-                        "event": "pal_repair_loop_rejected",
+                        "event": "sage_repair_loop_rejected",
                         "sample_index": "18",
                         "final_verdict": "no_accepted_candidate",
                         "last_verdict": "repairable_anchor_path_empty",
@@ -1076,7 +1076,7 @@ def test_harness_skips_single_anchor_chain_candidate_for_low_trust_dynamic_fail_
         encoding="utf-8",
     )
     (
-        run_dir / "pal_query_artifacts" / "pal_sparql_query_tool_sample_18.plan.json"
+        run_dir / "sage_query_artifacts" / "sage_sparql_query_tool_sample_18.plan.json"
     ).write_text(
         json.dumps(
             {
@@ -1199,7 +1199,7 @@ def test_classify_repairable_count_failure_without_hardcoded_unknown_error_path(
         evaluation_outcome="",
         relation_names=["music.recording.artist"],
         failure_reasons=(
-            "pal_query_not_accepted:repairable_bad_count_set",
+            "sage_query_not_accepted:repairable_bad_count_set",
             "count_answer_target_unenforced:artist",
         ),
         dangerous_overreach=False,
@@ -1214,7 +1214,7 @@ def test_classify_repairable_anchor_grounding_failure_as_bad_routing() -> None:
         sample_status="",
         evaluation_outcome="",
         relation_names=["location.country.languages_spoken"],
-        failure_reasons=("pal_query_not_accepted:repairable_weak_grounding",),
+        failure_reasons=("sage_query_not_accepted:repairable_weak_grounding",),
         dangerous_overreach=False,
     )
 
@@ -1371,7 +1371,7 @@ def test_batch_runner_places_child_run_under_parent_output_dir(
         def __init__(self, command, **kwargs):
             del kwargs
             commands.append(list(command))
-            run_dir = tmp_path / "parent" / "pal_batch_demo_2"
+            run_dir = tmp_path / "parent" / "sage_batch_demo_2"
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "task_outcomes.json").write_text(
                 json.dumps(
@@ -1409,7 +1409,7 @@ def test_batch_runner_places_child_run_under_parent_output_dir(
     assert commands
     assert "m._run_one(" in commands[0][2]
     assert str((tmp_path / "parent").resolve()) in commands[0][2]
-    assert summary["run_dir"] == str(tmp_path / "parent" / "pal_batch_demo_2")
+    assert summary["run_dir"] == str(tmp_path / "parent" / "sage_batch_demo_2")
 
 
 def test_batch_runner_timeout_cleans_up_orphans(
@@ -1903,7 +1903,7 @@ def test_evaluate_candidate_non_regression_mode_replays_prior_success_without_tr
         family_name=family_name,
         scaffold_signature="count_over_joined_set|disease|medicine.infectious_disease.vector",
         relation_names=["medicine.infectious_disease.vector"],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "15"},
     )
@@ -1926,7 +1926,7 @@ def test_evaluate_candidate_non_regression_mode_replays_prior_success_without_tr
             active_version=active_version,
         ),
     )
-    monkeypatch.setenv("PAL_FAMILY_POLICY_PROMOTION_GATE_MODE", "non_regression")
+    monkeypatch.setenv("SAGE_FAMILY_POLICY_PROMOTION_GATE_MODE", "non_regression")
 
     calls: list[tuple[str, str]] = []
 
@@ -2021,7 +2021,7 @@ def test_inline_promotion_gate_soft_improvement_mode_rewards_safer_failure() -> 
 
 
 def test_inline_promotion_gate_soft_improvement_mode_can_be_enabled(monkeypatch) -> None:
-    monkeypatch.setenv("PAL_FAMILY_POLICY_PROMOTION_GATE_MODE", "soft_improvement")
+    monkeypatch.setenv("SAGE_FAMILY_POLICY_PROMOTION_GATE_MODE", "soft_improvement")
     gate = family_policy_harness._evaluate_inline_promotion_gate(
         trigger_baseline={
             "sample_index": "20",

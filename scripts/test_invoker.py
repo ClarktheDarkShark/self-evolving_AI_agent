@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from src.pal.invoker import invoke_pal_program
-from src.pal.parser import parse_pal_program
+from src.sage.invoker import invoke_sage_program
+from src.sage.parser import parse_sage_program
 
 
 class _FakeQueryResult:
@@ -78,8 +78,8 @@ def run_query(endpoint_url: str) -> dict:
     return sparql_client.query().convert()
 ###QUERY_END"""
 
-    parsed_program = parse_pal_program(raw_program)
-    result = invoke_pal_program(
+    parsed_program = parse_sage_program(raw_program)
+    result = invoke_sage_program(
         parsed_program,
         endpoint_url="http://127.0.0.1:3001/kb/sparql",
         sparqlwrapper_module=fake_sparqlwrapper_module,
@@ -91,7 +91,7 @@ def run_query(endpoint_url: str) -> dict:
         "m.tom_hanks"
     )
     assert result.payload["meta"]["endpoint_url"].endswith("/kb/sparql")
-    print("PAL invoker smoke test passed.")
+    print("SAGE invoker smoke test passed.")
     print(json.dumps(result.payload, indent=2, sort_keys=True))
 
 

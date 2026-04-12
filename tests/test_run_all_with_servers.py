@@ -23,13 +23,13 @@ from scripts.run_all_with_servers import (
     _resolve_family_policy_store_path,
     _run_one_with_sample_boundary_family_evolution,
 )
-from src.pal.family_policy_evolution import build_family_policy_store
-from src.pal.reusable_tool_families import get_baseline_reusable_family_policy_bundles
+from src.sage.family_policy_evolution import build_family_policy_store
+from src.sage.reusable_tool_families import get_baseline_reusable_family_policy_bundles
 
 
-def test_enable_pal_agent_flag_is_defined() -> None:
-    assert hasattr(run_all_with_servers, "ENABLE_PAL_AGENT")
-    assert isinstance(run_all_with_servers.ENABLE_PAL_AGENT, bool)
+def test_enable_sage_agent_flag_is_defined() -> None:
+    assert hasattr(run_all_with_servers, "ENABLE_SAGE_AGENT")
+    assert isinstance(run_all_with_servers.ENABLE_SAGE_AGENT, bool)
 
 
 def test_latest_selected_family_for_sample_falls_back_to_attempt_decision(
@@ -38,12 +38,12 @@ def test_latest_selected_family_for_sample_falls_back_to_attempt_decision(
     log_path = tmp_path / "generated_tools.log"
     rows = [
         {
-            "event": "pal_attempt_decision",
+            "event": "sage_attempt_decision",
             "sample_index": "15",
             "selected_family": "count_over_direct_relation",
         },
         {
-            "event": "pal_attempt_decision",
+            "event": "sage_attempt_decision",
             "sample_index": "11",
             "selected_family": "single_anchor_lookup",
         },
@@ -62,7 +62,7 @@ def test_latest_attempt_decision_for_sample_falls_back_to_attempt_decision(
     log_path = tmp_path / "generated_tools.log"
     rows = [
         {
-            "event": "pal_attempt_decision",
+            "event": "sage_attempt_decision",
             "sample_index": "15",
             "selected_family": "count_over_direct_relation",
             "family_bundle_version": "2026-03-31",
@@ -84,12 +84,12 @@ def test_latest_selected_family_for_sample_prefers_finalized_decision(
     log_path = tmp_path / "generated_tools.log"
     rows = [
         {
-            "event": "pal_attempt_decision",
+            "event": "sage_attempt_decision",
             "sample_index": "15",
             "selected_family": "count_over_direct_relation",
         },
         {
-            "event": "pal_attempt_decision_finalized",
+            "event": "sage_attempt_decision_finalized",
             "sample_index": "15",
             "selected_family": "count_over_joined_set",
         },
@@ -103,7 +103,7 @@ def test_latest_selected_family_for_sample_prefers_finalized_decision(
 
 
 def test_inline_family_evolution_defaults_to_all_families(monkeypatch) -> None:
-    monkeypatch.delenv("PAL_INLINE_FAMILY_EVOLUTION_FAMILIES", raising=False)
+    monkeypatch.delenv("SAGE_INLINE_FAMILY_EVOLUTION_FAMILIES", raising=False)
 
     assert _inline_family_evolution_allowed_for("count_over_direct_relation") is True
     assert _inline_family_evolution_allowed_for("multi_anchor_intersection") is True
@@ -115,7 +115,7 @@ def test_record_trusted_family_success_keeps_one_regression_guard(tmp_path: path
     log_path = output_dir / "generated_tools.log"
     rows = [
         {
-            "event": "pal_attempt_decision_finalized",
+            "event": "sage_attempt_decision_finalized",
             "sample_index": "11",
             "selected_family": "count_over_direct_relation",
             "family_bundle_version": "2026-03-31",
@@ -126,12 +126,12 @@ def test_record_trusted_family_success_keeps_one_regression_guard(tmp_path: path
             "tool_result_trusted_for_materialization": True,
         },
         {
-            "event": "pal_macro_solver_review",
+            "event": "sage_macro_solver_review",
             "sample_index": "11",
             "accepted_final": True,
         },
         {
-            "event": "pal_attempt_decision_finalized",
+            "event": "sage_attempt_decision_finalized",
             "sample_index": "241",
             "selected_family": "count_over_direct_relation",
             "family_bundle_version": "2026-03-31",
@@ -142,7 +142,7 @@ def test_record_trusted_family_success_keeps_one_regression_guard(tmp_path: path
             "tool_result_trusted_for_materialization": True,
         },
         {
-            "event": "pal_macro_solver_review",
+            "event": "sage_macro_solver_review",
             "sample_index": "241",
             "accepted_final": True,
         },
@@ -191,7 +191,7 @@ def test_record_trusted_family_success_ignores_partial_or_untrusted_tool_output(
     log_path = output_dir / "generated_tools.log"
     rows = [
         {
-            "event": "pal_attempt_decision_finalized",
+            "event": "sage_attempt_decision_finalized",
             "sample_index": "11",
             "selected_family": "count_over_direct_relation",
             "family_bundle_version": "2026-03-31",
@@ -224,7 +224,7 @@ def test_record_trusted_family_success_requires_solver_acceptance_when_review_ex
     log_path = output_dir / "generated_tools.log"
     rows = [
         {
-            "event": "pal_attempt_decision_finalized",
+            "event": "sage_attempt_decision_finalized",
             "sample_index": "11",
             "selected_family": "count_over_direct_relation",
             "family_bundle_version": "2026-03-31",
@@ -235,7 +235,7 @@ def test_record_trusted_family_success_requires_solver_acceptance_when_review_ex
             "tool_result_trusted_for_materialization": True,
         },
         {
-            "event": "pal_macro_solver_review",
+            "event": "sage_macro_solver_review",
             "sample_index": "11",
             "accepted_final": False,
         },
@@ -254,7 +254,7 @@ def test_record_trusted_family_success_requires_solver_acceptance_when_review_ex
     assert bank == []
 
 
-def test_record_trusted_family_success_allows_direct_pal_success_without_solver_review(
+def test_record_trusted_family_success_allows_direct_sage_success_without_solver_review(
     tmp_path: pathlib.Path,
 ) -> None:
     output_dir = tmp_path / "run"
@@ -262,7 +262,7 @@ def test_record_trusted_family_success_allows_direct_pal_success_without_solver_
     log_path = output_dir / "generated_tools.log"
     rows = [
         {
-            "event": "pal_attempt_decision_finalized",
+            "event": "sage_attempt_decision_finalized",
             "sample_index": "11",
             "selected_family": "count_over_direct_relation",
             "family_bundle_version": "2026-03-31",
@@ -295,7 +295,7 @@ def test_record_trusted_family_success_persists_reusable_run_summary(
     log_path = output_dir / "generated_tools.log"
     rows = [
         {
-            "event": "pal_attempt_decision_finalized",
+            "event": "sage_attempt_decision_finalized",
             "sample_index": "11",
             "selected_family": "count_over_direct_relation",
             "family_bundle_version": "2026-03-31",
@@ -340,10 +340,10 @@ def test_record_tool_evolution_signal_tracks_trusted_success_and_clean_failure(
     tmp_path: pathlib.Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("PAL_ENABLE_FAMILY_POLICY_EVOLUTION", "1")
+    monkeypatch.setenv("SAGE_ENABLE_FAMILY_POLICY_EVOLUTION", "1")
     output_dir = tmp_path / "run"
     output_dir.mkdir(parents=True, exist_ok=True)
-    artifacts_dir = output_dir / "pal_query_artifacts"
+    artifacts_dir = output_dir / "sage_query_artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     plan_path = artifacts_dir / "sample.plan.json"
     plan_path.write_text(
@@ -386,12 +386,12 @@ def test_record_tool_evolution_signal_tracks_trusted_success_and_clean_failure(
     log_path = output_dir / "generated_tools.log"
     rows = [
         {
-            "event": "pal_query_plan_generated",
+            "event": "sage_query_plan_generated",
             "sample_index": "11",
             "plan_artifact_path": str(plan_path),
         },
         {
-            "event": "pal_attempt_decision_finalized",
+            "event": "sage_attempt_decision_finalized",
             "sample_index": "11",
             "selected_family": "count_over_direct_relation",
             "family_bundle_version": "2026-03-31",
@@ -402,17 +402,17 @@ def test_record_tool_evolution_signal_tracks_trusted_success_and_clean_failure(
             "tool_result_trusted_for_materialization": True,
         },
         {
-            "event": "pal_macro_solver_review",
+            "event": "sage_macro_solver_review",
             "sample_index": "11",
             "accepted_final": True,
         },
         {
-            "event": "pal_query_plan_generated",
+            "event": "sage_query_plan_generated",
             "sample_index": "15",
             "plan_artifact_path": str(plan_path),
         },
         {
-            "event": "pal_attempt_decision_finalized",
+            "event": "sage_attempt_decision_finalized",
             "sample_index": "15",
             "selected_family": "count_over_direct_relation",
             "family_bundle_version": "2026-03-31",
@@ -446,7 +446,7 @@ def test_record_tool_evolution_signal_tracks_trusted_success_and_clean_failure(
         active_version="2026-03-31",
         session_record={
             "sample_status": "agent_unknown_error",
-            "finish_reason": "[AgentUnknownException] pal_tool_failure_bypassed:pal_query_not_accepted:repairable_bad_count_set",
+            "finish_reason": "[AgentUnknownException] sage_tool_failure_bypassed:sage_query_not_accepted:repairable_bad_count_set",
             "evaluation_record": {"outcome": "incorrect"},
         },
         progress_log_path=log_path,
@@ -467,11 +467,11 @@ def test_record_tool_evolution_signal_works_in_standard_family_evolution_mode(
     tmp_path: pathlib.Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("PAL_ENABLE_FAMILY_POLICY_EVOLUTION", raising=False)
-    monkeypatch.setenv("PAL_ENABLE_STANDARD_FAMILY_EVOLUTION", "1")
+    monkeypatch.delenv("SAGE_ENABLE_FAMILY_POLICY_EVOLUTION", raising=False)
+    monkeypatch.setenv("SAGE_ENABLE_STANDARD_FAMILY_EVOLUTION", "1")
     output_dir = tmp_path / "run"
     output_dir.mkdir(parents=True, exist_ok=True)
-    artifacts_dir = output_dir / "pal_query_artifacts"
+    artifacts_dir = output_dir / "sage_query_artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     plan_path = artifacts_dir / "sample.plan.json"
     plan_path.write_text(
@@ -504,14 +504,14 @@ def test_record_tool_evolution_signal_works_in_standard_family_evolution_mode(
             [
                 json.dumps(
                     {
-                        "event": "pal_query_plan_generated",
+                        "event": "sage_query_plan_generated",
                         "sample_index": "241",
                         "plan_artifact_path": str(plan_path),
                     }
                 ),
                 json.dumps(
                     {
-                        "event": "pal_attempt_decision_finalized",
+                        "event": "sage_attempt_decision_finalized",
                         "sample_index": "241",
                         "selected_family": "count_over_direct_relation",
                         "family_bundle_version": "2026-03-31",
@@ -555,9 +555,9 @@ def test_resolve_family_policy_store_path_defaults_to_persistent_store_for_evolu
     tmp_path: pathlib.Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("PAL_ENABLE_STANDARD_FAMILY_EVOLUTION", "1")
-    monkeypatch.delenv("PAL_FAMILY_POLICY_STORE_PATH", raising=False)
-    monkeypatch.delenv("PAL_PERSISTENT_FAMILY_POLICY_STORE", raising=False)
+    monkeypatch.setenv("SAGE_ENABLE_STANDARD_FAMILY_EVOLUTION", "1")
+    monkeypatch.delenv("SAGE_FAMILY_POLICY_STORE_PATH", raising=False)
+    monkeypatch.delenv("SAGE_PERSISTENT_FAMILY_POLICY_STORE", raising=False)
 
     store_path = _resolve_family_policy_store_path(
         repo_root=tmp_path,
@@ -607,7 +607,7 @@ def test_boundary_runner_revisits_pending_candidate_after_family_warms(
             "fictional_universe.fictional_setting.universe",
             "fictional_universe.fictional_universe.species",
         ],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "2"},
     )
@@ -745,7 +745,7 @@ def test_boundary_runner_prioritizes_current_bad_sample_over_older_pending_candi
             "fictional_universe.fictional_setting.universe",
             "fictional_universe.fictional_universe.species",
         ],
-        failure_reasons=["pal_query_not_accepted:repairable_bad_count_set"],
+        failure_reasons=["sage_query_not_accepted:repairable_bad_count_set"],
         failure_class="weak_applicability_boundary",
         trigger_context={"sample_index": "2"},
     )
@@ -895,8 +895,8 @@ def test_boundary_runner_uses_single_sample_config_directly(
     assert call["output_dir_override"] == (
         combined_dir / "knowledge_graph" / "dummy_single_sample_boundary"
     )
-    assert call["extra_env"]["PAL_ENABLE_FAMILY_POLICY_EVOLUTION"] == "1"
-    assert call["extra_env"]["PAL_ENABLE_FAMILY_POLICY_PROMOTION"] == "0"
+    assert call["extra_env"]["SAGE_ENABLE_FAMILY_POLICY_EVOLUTION"] == "1"
+    assert call["extra_env"]["SAGE_ENABLE_FAMILY_POLICY_PROMOTION"] == "0"
 
 
 def test_main_activates_standard_family_evolution_without_extra_family_flag(
@@ -907,9 +907,9 @@ def test_main_activates_standard_family_evolution_without_extra_family_flag(
         "LIFELONG_CONFIG_PATHS",
         "configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/standard.yaml",
     )
-    monkeypatch.delenv("PAL_ENABLE_FAMILY_POLICY_EVOLUTION", raising=False)
+    monkeypatch.delenv("SAGE_ENABLE_FAMILY_POLICY_EVOLUTION", raising=False)
     monkeypatch.setattr(run_all_with_servers, "ENABLE_STANDARD_FAMILY_EVOLUTION", True)
-    monkeypatch.setattr(run_all_with_servers, "ENABLE_PAL_AGENT", True)
+    monkeypatch.setattr(run_all_with_servers, "ENABLE_SAGE_AGENT", True)
     monkeypatch.setattr(
         run_all_with_servers,
         "_run_one_with_sample_boundary_family_evolution",

@@ -14,8 +14,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.pal_kg_batch_runner import PROJECT_ROOT, run_sample
-from src.pal.family_policy_evolution import (
+from scripts.sage_kg_batch_runner import PROJECT_ROOT, run_sample
+from src.sage.family_policy_evolution import (
     ENV_COMPARE_LOCK_FAMILY,
     ENV_ENABLE_EVOLUTION,
     ENV_ENABLE_PROMOTION,
@@ -27,31 +27,31 @@ from src.pal.family_policy_evolution import (
     summarize_sample_metrics,
     version_reuse_compatible,
 )
-from src.pal.reusable_tool_families import get_baseline_reusable_family_policy_bundles
+from src.sage.reusable_tool_families import get_baseline_reusable_family_policy_bundles
 
 
 PROMOTION_EVALUATION_MODE = "family_inline_promotion_gate"
 PROMOTION_EVALUATION_CONTRACT_VERSION = "2026-03-31__family_inline_promotion_gate_v1"
 MAX_PRIOR_SUCCESS_SAMPLES = 1
-ENV_PROMOTION_GATE_MODE = "PAL_FAMILY_POLICY_PROMOTION_GATE_MODE"
-ENV_STAGE_A_SCREEN = "PAL_INLINE_FAMILY_STAGE_A_SCREEN"
-PAL_ONLY_BYPASS_ENV = "PAL_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK"
-STAGE_A_EVALUATION_MODE = "family_inline_stage_a_pal_only"
+ENV_PROMOTION_GATE_MODE = "SAGE_FAMILY_POLICY_PROMOTION_GATE_MODE"
+ENV_STAGE_A_SCREEN = "SAGE_INLINE_FAMILY_STAGE_A_SCREEN"
+SAGE_ONLY_BYPASS_ENV = "SAGE_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK"
+STAGE_A_EVALUATION_MODE = "family_inline_stage_a_sage_only"
 POLICY_FINGERPRINT_FILES = (
-    PROJECT_ROOT / "src" / "agents" / "instance" / "pal_agent_controller.py",
-    PROJECT_ROOT / "src" / "pal" / "family_policy_evolution.py",
-    PROJECT_ROOT / "src" / "pal" / "kg_benchmark_adapter.py",
-    PROJECT_ROOT / "src" / "pal" / "plausibility_validator.py",
-    PROJECT_ROOT / "src" / "pal" / "policy_contracts.py",
-    PROJECT_ROOT / "src" / "pal" / "reusable_tool_families.py",
+    PROJECT_ROOT / "src" / "agents" / "instance" / "sage_agent_controller.py",
+    PROJECT_ROOT / "src" / "sage" / "family_policy_evolution.py",
+    PROJECT_ROOT / "src" / "sage" / "kg_benchmark_adapter.py",
+    PROJECT_ROOT / "src" / "sage" / "plausibility_validator.py",
+    PROJECT_ROOT / "src" / "sage" / "policy_contracts.py",
+    PROJECT_ROOT / "src" / "sage" / "reusable_tool_families.py",
     PROJECT_ROOT / "scripts" / "run_kg_family_policy_evolution.py",
 )
 EXECUTION_FINGERPRINT_FILES = (
-    PROJECT_ROOT / "scripts" / "pal_kg_batch_runner.py",
+    PROJECT_ROOT / "scripts" / "sage_kg_batch_runner.py",
     PROJECT_ROOT / "scripts" / "run_all_with_servers.py",
 )
 EXECUTION_ENV_KEYS = (
-    "ENABLE_PAL_AGENT",
+    "ENABLE_SAGE_AGENT",
     "LIFELONG_FUSEKI_IMAGE",
     "LIFELONG_FUSEKI_PORT",
     "LIFELONG_KG_CONTAINER_NAME",
@@ -198,7 +198,7 @@ def _extract_run_metrics(summary: dict[str, Any]) -> dict[str, Any]:
         if generated_tools_path.exists():
             dangerous_overreach_count = 0
             for payload in _load_json_lines(generated_tools_path):
-                if payload.get("event") == "pal_attempt_decision_finalized" and bool(
+                if payload.get("event") == "sage_attempt_decision_finalized" and bool(
                     payload.get("dangerous_overreach")
                 ):
                     dangerous_overreach_count += 1
@@ -235,9 +235,9 @@ def _latest_attempt_decision(run_dir: Path, *, sample_index: str) -> dict[str, A
     for payload in _load_json_lines(generated_tools_path):
         if str(payload.get("sample_index") or "").strip() != target_sample:
             continue
-        if payload.get("event") == "pal_attempt_decision_finalized":
+        if payload.get("event") == "sage_attempt_decision_finalized":
             latest_finalized = payload
-        elif payload.get("event") == "pal_attempt_decision":
+        elif payload.get("event") == "sage_attempt_decision":
             latest_attempt = payload
             if str(payload.get("selected_family") or "").strip():
                 latest_attempt_with_family = payload
@@ -251,7 +251,7 @@ def _latest_repair_loop_rejected(run_dir: Path, *, sample_index: str) -> dict[st
     for payload in _load_json_lines(generated_tools_path):
         if str(payload.get("sample_index") or "").strip() != target_sample:
             continue
-        if payload.get("event") == "pal_repair_loop_rejected":
+        if payload.get("event") == "sage_repair_loop_rejected":
             latest = payload
     return latest
 
@@ -267,7 +267,7 @@ def _latest_query_candidate_rejection_reasons(
     for payload in _load_json_lines(generated_tools_path):
         if str(payload.get("sample_index") or "").strip() != target_sample:
             continue
-        if payload.get("event") != "pal_query_candidate_rejected":
+        if payload.get("event") != "sage_query_candidate_rejected":
             continue
         for raw_value in payload.get("rejection_reasons") or []:
             cleaned = str(raw_value or "").strip()
@@ -280,7 +280,7 @@ def _load_query_plan_for_tool(run_dir: Path, tool_name: str) -> dict[str, Any]:
     cleaned_tool_name = str(tool_name or "").strip()
     if not cleaned_tool_name:
         return {}
-    plan_path = run_dir / "pal_query_artifacts" / f"{cleaned_tool_name}.plan.json"
+    plan_path = run_dir / "sage_query_artifacts" / f"{cleaned_tool_name}.plan.json"
     if not plan_path.exists():
         return {}
     try:
@@ -844,7 +844,7 @@ def _evaluate_candidate(
     if _stage_a_screen_enabled():
         stage_a_env = {
             ENV_COMPARE_LOCK_FAMILY: family_name,
-            PAL_ONLY_BYPASS_ENV: "1",
+            SAGE_ONLY_BYPASS_ENV: "1",
         }
         stage_a_baseline = _run_sample_with_policy(
             sample_index=trigger_sample,
@@ -922,7 +922,7 @@ def _evaluate_candidate(
                             for reason in (stage_a_gate.get("reasons") or [])
                             if reason != "awaiting_prior_trusted_success"
                         ],
-                        "failed_stage_a_pal_only_screen",
+                        "failed_stage_a_sage_only_screen",
                     ],
                 },
             }
@@ -936,7 +936,7 @@ def _evaluate_candidate(
                     family_name,
                     candidate_version=candidate_version,
                     evaluation_results=evaluation_payload,
-                    rejection_reason="failed_stage_a_pal_only_screen",
+                    rejection_reason="failed_stage_a_sage_only_screen",
                 )
             return evaluation_payload
 

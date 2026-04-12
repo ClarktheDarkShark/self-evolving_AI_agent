@@ -315,7 +315,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             summary_lines.append("Trusted final: no")
             summary_lines.append("Use manual solver fallback: yes")
         observation_is_boilerplate = observation.startswith(
-            "PAL benchmark bridge materialized "
+            "SAGE benchmark bridge materialized "
         )
         if (
             observation
@@ -509,18 +509,18 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
             return False
         if session.chat_history.get_value_length() < 4:
             return False
-        if not self._session_uses_pal_bridge(session):
+        if not self._session_uses_sage_bridge(session):
             return False
 
         self._resume_task_state_from_session(session)
         return True
 
-    def _session_uses_pal_bridge(self, session: Session) -> bool:
+    def _session_uses_sage_bridge(self, session: Session) -> bool:
         for idx in range(session.chat_history.get_value_length()):
             item = session.chat_history.get_item_deep_copy(idx)
             if item.role != Role.AGENT:
                 continue
-            if 'execute_macro("pal_benchmark_bridge_macro"' in (item.content or ""):
+            if 'execute_macro("sage_benchmark_bridge_macro"' in (item.content or ""):
                 return True
         return False
 
@@ -537,7 +537,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
         )
         self.reset(bootstrap_session)
         self.current_round = self._estimate_current_round_for_resume(session)
-        self._replay_completed_pal_bridge_actions(session)
+        self._replay_completed_sage_bridge_actions(session)
 
         logger.warning(
             "KG resumed interact state for sample=%s round=%s vars=%s",
@@ -554,32 +554,32 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                 agent_turn_count += 1
         return max(0, agent_turn_count - 2)
 
-    def _replay_completed_pal_bridge_actions(self, session: Session) -> None:
+    def _replay_completed_sage_bridge_actions(self, session: Session) -> None:
         current_dataset_item = self._get_current_dataset_item()
         for idx in range(session.chat_history.get_value_length() - 1):
             item = session.chat_history.get_item_deep_copy(idx)
             if item.role != Role.AGENT:
                 continue
             content = item.content or ""
-            if 'execute_macro("pal_benchmark_bridge_macro"' not in content:
+            if 'execute_macro("sage_benchmark_bridge_macro"' not in content:
                 continue
             next_item = session.chat_history.get_item_deep_copy(idx + 1)
             if next_item.role != Role.USER:
                 continue
             if not (next_item.content or "").startswith(
-                "Macro result: pal_benchmark_bridge_macro -> SUCCESS."
+                "Macro result: sage_benchmark_bridge_macro -> SUCCESS."
             ):
                 continue
             argument_str = KnowledgeGraph._extract_argument_str_from_agent_response(
                 content
             )
             if argument_str is None:
-                raise AssertionError("pal_bridge_resume_missing_argument_str")
+                raise AssertionError("sage_bridge_resume_missing_argument_str")
             tool_name, payload = KnowledgeGraph._parse_execute_macro_args(argument_str)
-            if tool_name != "pal_benchmark_bridge_macro" or not isinstance(
+            if tool_name != "sage_benchmark_bridge_macro" or not isinstance(
                 payload, Mapping
             ):
-                raise AssertionError("pal_bridge_resume_invalid_payload")
+                raise AssertionError("sage_bridge_resume_invalid_payload")
             temp_session = Session(
                 task_name=session.task_name,
                 sample_index=session.sample_index,
@@ -598,7 +598,7 @@ class KnowledgeGraph(Task[KnowledgeGraphDatasetItem]):
                 api_str=f"execute_macro({argument_str})",
             )
             if len(self.variable_list or []) <= previous_var_count:
-                raise AssertionError("pal_bridge_resume_replay_failed")
+                raise AssertionError("sage_bridge_resume_replay_failed")
 
     @staticmethod
     def _load_data(

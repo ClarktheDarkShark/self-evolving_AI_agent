@@ -1,4 +1,4 @@
-from src.pal.kg_benchmark_adapter import classify_execution_artifact
+from src.sage.kg_benchmark_adapter import classify_execution_artifact
 
 
 def test_numeric_raw_execution_with_count_head_is_count_scalar() -> None:

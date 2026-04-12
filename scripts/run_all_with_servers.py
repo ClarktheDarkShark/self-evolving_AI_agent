@@ -27,13 +27,13 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import kg_sparql_server
 import yaml
-from src.pal.family_policy_evolution import (
+from src.sage.family_policy_evolution import (
     build_family_policy_store,
     build_success_plan_archetype,
     merge_success_plan_archetypes,
     version_reuse_compatible,
 )
-from src.pal.reusable_tool_families import get_baseline_reusable_family_policy_bundles
+from src.sage.reusable_tool_families import get_baseline_reusable_family_policy_bundles
 
 CONFIG_PATHS = [
     # "configs/assignments/experiments/llama_31_8b_instruct/instance/os_interaction/instance/standard.yaml",
@@ -56,20 +56,20 @@ KG_DATA_DIR_ENV = "LIFELONG_KG_DATA_DIR"
 CLIENT_WALL_TIMEOUT_S = int(os.getenv("LIFELONG_CLIENT_TIMEOUT_S", "1800"))
 CLIENT_IDLE_TIMEOUT_S = int(os.getenv("LIFELONG_CLIENT_IDLE_TIMEOUT_S", "600"))
 CLIENT_WATCHDOG_POLL_S = float(os.getenv("LIFELONG_CLIENT_WATCHDOG_POLL_S", "5"))
-ENABLE_PAL_AGENT = os.getenv("ENABLE_PAL_AGENT") == "1"
+ENABLE_SAGE_AGENT = os.getenv("ENABLE_SAGE_AGENT") == "1"
 ENABLE_STANDARD_FAMILY_EVOLUTION = (
-    os.getenv("PAL_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
+    os.getenv("SAGE_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
 )
-FAMILY_EVOLUTION_ENV = "PAL_ENABLE_FAMILY_POLICY_EVOLUTION"
-FAMILY_PROMOTION_ENV = "PAL_ENABLE_FAMILY_POLICY_PROMOTION"
-FAMILY_ENABLED_FAMILIES_ENV = "PAL_FAMILY_POLICY_EVOLUTION_FAMILIES"
-FAMILY_STORE_PATH_ENV = "PAL_FAMILY_POLICY_STORE_PATH"
-PERSISTENT_FAMILY_STORE_ENV = "PAL_PERSISTENT_FAMILY_POLICY_STORE"
-RESET_FAMILY_STORE_ENV = "PAL_RESET_FAMILY_POLICY_STORE"
-TOOL_EVOLUTION_SIGNAL_ENV = "PAL_RECORD_TOOL_EVOLUTION_SIGNAL"
-INLINE_FAMILY_EVOLUTION_FAMILIES_ENV = "PAL_INLINE_FAMILY_EVOLUTION_FAMILIES"
+FAMILY_EVOLUTION_ENV = "SAGE_ENABLE_FAMILY_POLICY_EVOLUTION"
+FAMILY_PROMOTION_ENV = "SAGE_ENABLE_FAMILY_POLICY_PROMOTION"
+FAMILY_ENABLED_FAMILIES_ENV = "SAGE_FAMILY_POLICY_EVOLUTION_FAMILIES"
+FAMILY_STORE_PATH_ENV = "SAGE_FAMILY_POLICY_STORE_PATH"
+PERSISTENT_FAMILY_STORE_ENV = "SAGE_PERSISTENT_FAMILY_POLICY_STORE"
+RESET_FAMILY_STORE_ENV = "SAGE_RESET_FAMILY_POLICY_STORE"
+TOOL_EVOLUTION_SIGNAL_ENV = "SAGE_RECORD_TOOL_EVOLUTION_SIGNAL"
+INLINE_FAMILY_EVOLUTION_FAMILIES_ENV = "SAGE_INLINE_FAMILY_EVOLUTION_FAMILIES"
 INLINE_FAMILY_EVOLUTION_BUDGET_S = int(
-    os.getenv("PAL_STANDARD_FAMILY_EVOLUTION_BUDGET_S", "360")
+    os.getenv("SAGE_STANDARD_FAMILY_EVOLUTION_BUDGET_S", "360")
 )
 INLINE_TRUSTED_SUCCESS_BANK_SIZE = 1
 DEFAULT_FAMILY_REGRESSION_MANIFEST = (
@@ -115,7 +115,7 @@ def _persistent_family_store_enabled() -> bool:
     if configured:
         return configured == "1"
     return ENABLE_STANDARD_FAMILY_EVOLUTION or (
-        os.getenv("PAL_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
+        os.getenv("SAGE_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
     )
 
 
@@ -229,9 +229,9 @@ def _latest_selected_family_for_sample(output_dir: Path, sample_index: str) -> s
         cleaned_family = str(payload.get("selected_family") or "").strip()
         if not cleaned_family:
             continue
-        if payload.get("event") == "pal_attempt_decision_finalized":
+        if payload.get("event") == "sage_attempt_decision_finalized":
             selected_family = cleaned_family
-        elif payload.get("event") == "pal_attempt_decision" and not selected_family:
+        elif payload.get("event") == "sage_attempt_decision" and not selected_family:
             fallback_family = cleaned_family
     return selected_family or fallback_family
 
@@ -247,7 +247,7 @@ def _cleanup_family_evolution_artifacts(repo_root: Path, label: str) -> None:
         / "knowledge_graph"
         / "instance"
     )
-    for path in config_dir.glob(f"pal_batch_{label}*.yaml"):
+    for path in config_dir.glob(f"sage_batch_{label}*.yaml"):
         _delete_file_if_exists(path)
     outputs_root = repo_root / "outputs"
     for run_root in outputs_root.glob("run_all_*"):
@@ -258,7 +258,7 @@ def _cleanup_family_evolution_artifacts(repo_root: Path, label: str) -> None:
             continue
         matched = False
         for child in kg_dir.iterdir():
-            if child.is_dir() and child.name.startswith(f"pal_batch_{label}"):
+            if child.is_dir() and child.name.startswith(f"sage_batch_{label}"):
                 shutil.rmtree(child, ignore_errors=True)
                 matched = True
         if matched:
@@ -347,9 +347,9 @@ def _latest_attempt_decision_for_sample(output_dir: Path, sample_index: str) -> 
             continue
         if str(payload.get("sample_index") or "").strip() != str(sample_index or "").strip():
             continue
-        if payload.get("event") == "pal_attempt_decision":
+        if payload.get("event") == "sage_attempt_decision":
             fallback = payload
-        if payload.get("event") == "pal_attempt_decision_finalized":
+        if payload.get("event") == "sage_attempt_decision_finalized":
             latest = payload
     return latest or fallback
 
@@ -369,7 +369,7 @@ def _latest_macro_solver_review_for_sample(
             continue
         if str(payload.get("sample_index") or "").strip() != str(sample_index or "").strip():
             continue
-        if payload.get("event") == "pal_macro_solver_review":
+        if payload.get("event") == "sage_macro_solver_review":
             latest = payload
     return latest
 
@@ -386,7 +386,7 @@ def _latest_query_plan_for_sample(output_dir: Path, sample_index: str) -> dict[s
             continue
         if str(payload.get("sample_index") or "").strip() != str(sample_index or "").strip():
             continue
-        if payload.get("event") not in {"pal_query_artifact_saved", "pal_query_plan_generated"}:
+        if payload.get("event") not in {"sage_query_artifact_saved", "sage_query_plan_generated"}:
             continue
         plan_path = str(payload.get("plan_artifact_path") or "").strip()
         if plan_path:
@@ -560,7 +560,7 @@ def _record_trusted_family_success(
     _append_generated_tool_event(
         progress_log_path,
         {
-            "event": "pal_family_policy_trusted_success_recorded",
+            "event": "sage_family_policy_trusted_success_recorded",
             "family_name": family_name,
             "sample_index": str(sample_index or "").strip(),
             "active_version": active_version,
@@ -578,7 +578,7 @@ def _tool_evolution_phase_enabled() -> bool:
         return configured == "1"
     if os.getenv(FAMILY_EVOLUTION_ENV) == "1":
         return True
-    return os.getenv("PAL_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
+    return os.getenv("SAGE_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
 
 
 def _is_trusted_tool_success(
@@ -695,7 +695,7 @@ def _record_tool_evolution_signal(
     else:
         finish_reason = str(session_record.get("finish_reason") or "").strip()
         failure_labels: list[str] = []
-        bypass_prefix = "pal_tool_failure_bypassed:"
+        bypass_prefix = "sage_tool_failure_bypassed:"
         if bypass_prefix in finish_reason:
             failure_labels.extend(
                 _normalize_tool_evolution_failure_labels(
@@ -752,7 +752,7 @@ def _record_tool_evolution_signal(
     _append_generated_tool_event(
         progress_log_path,
         {
-            "event": "pal_tool_evolution_signal_recorded",
+            "event": "sage_tool_evolution_signal_recorded",
             "family_name": family_name,
             "sample_index": str(sample_index or "").strip(),
             "active_version": active_version,
@@ -821,12 +821,12 @@ def _run_between_sample_family_evolution(
         )
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
-    env["ENABLE_PAL_AGENT"] = "1"
+    env["ENABLE_SAGE_AGENT"] = "1"
     env[FAMILY_EVOLUTION_ENV] = "1"
     env[FAMILY_PROMOTION_ENV] = "1"
     env[FAMILY_STORE_PATH_ENV] = str(store_path)
     env[FAMILY_ENABLED_FAMILIES_ENV] = family_name
-    env["PAL_ENABLE_STANDARD_FAMILY_EVOLUTION"] = "0"
+    env["SAGE_ENABLE_STANDARD_FAMILY_EVOLUTION"] = "0"
     before_summary = _load_family_policy_store_summary(store_path, family_name)
     start_ts = time.monotonic()
     print(
@@ -840,7 +840,7 @@ def _run_between_sample_family_evolution(
     _append_generated_tool_event(
         progress_log_path,
         {
-            "event": "pal_family_policy_evaluation_started",
+            "event": "sage_family_policy_evaluation_started",
             "family_name": family_name,
             "sample_index": str(sample_index),
             "label": label,
@@ -887,7 +887,7 @@ def _run_between_sample_family_evolution(
                     _append_generated_tool_event(
                         progress_log_path,
                         {
-                            "event": "pal_family_policy_evaluation_budget_exceeded",
+                            "event": "sage_family_policy_evaluation_budget_exceeded",
                             "family_name": family_name,
                             "sample_index": str(sample_index),
                             "label": label,
@@ -920,7 +920,7 @@ def _run_between_sample_family_evolution(
                 _append_generated_tool_event(
                     progress_log_path,
                     {
-                        "event": "pal_family_policy_evaluation_heartbeat",
+                        "event": "sage_family_policy_evaluation_heartbeat",
                         "family_name": family_name,
                         "sample_index": str(sample_index),
                         "label": label,
@@ -953,7 +953,7 @@ def _run_between_sample_family_evolution(
     _append_generated_tool_event(
         progress_log_path,
         {
-            "event": "pal_family_policy_evaluation_finished",
+            "event": "sage_family_policy_evaluation_finished",
             "family_name": family_name,
             "sample_index": str(sample_index),
             "label": label,
@@ -1755,7 +1755,7 @@ def _run_one(
             env["KG_ONTOLOGY_DIR"] = ontology_dir
         if not env.get("LIFELONG_KG_ONTOLOGY_DIR"):
             env["LIFELONG_KG_ONTOLOGY_DIR"] = ontology_dir
-        env["PAL_SPARQL_ENDPOINT_URL"] = SPARQL_ENDPOINT
+        env["SAGE_SPARQL_ENDPOINT_URL"] = SPARQL_ENDPOINT
 
     recovered_timed_out_samples: set[str] = set()
     should_retry_client = True
@@ -2014,7 +2014,7 @@ def _run_one_with_sample_boundary_family_evolution(
                 _append_generated_tool_event(
                     aggregate_output_dir / "generated_tools.log",
                     {
-                        "event": "pal_family_policy_pending_candidate_reactivated",
+                        "event": "sage_family_policy_pending_candidate_reactivated",
                         "family_name": selected_family,
                         "boundary_sample_index": str(sample_index),
                         "trigger_sample_index": evaluation_target_sample,
@@ -2032,7 +2032,7 @@ def _run_one_with_sample_boundary_family_evolution(
                 _append_generated_tool_event(
                     aggregate_output_dir / "generated_tools.log",
                     {
-                        "event": "pal_family_policy_evaluation_skipped",
+                        "event": "sage_family_policy_evaluation_skipped",
                         "family_name": selected_family,
                         "sample_index": evaluation_target_sample,
                         "reason": "family_not_inline_eligible",
@@ -2048,7 +2048,7 @@ def _run_one_with_sample_boundary_family_evolution(
                 _append_generated_tool_event(
                     aggregate_output_dir / "generated_tools.log",
                     {
-                        "event": "pal_family_policy_evaluation_skipped",
+                        "event": "sage_family_policy_evaluation_skipped",
                         "family_name": selected_family,
                         "sample_index": evaluation_target_sample,
                         "reason": "trigger_session_missing",
@@ -2103,7 +2103,7 @@ def _run_one_with_sample_boundary_family_evolution(
                 _append_generated_tool_event(
                     aggregate_output_dir / "generated_tools.log",
                     {
-                        "event": "pal_family_policy_evaluation_timeout",
+                        "event": "sage_family_policy_evaluation_timeout",
                         "family_name": selected_family,
                         "sample_index": evaluation_target_sample,
                         "active_version": active_version,
@@ -2143,7 +2143,7 @@ def main() -> int:
     for config_path in configured_paths:
         use_sample_boundary_evolution = (
             ENABLE_STANDARD_FAMILY_EVOLUTION
-            and ENABLE_PAL_AGENT
+            and ENABLE_SAGE_AGENT
             and "knowledge_graph" in config_path
         )
         if use_sample_boundary_evolution:

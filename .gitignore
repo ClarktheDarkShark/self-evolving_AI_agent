@@ -15,7 +15,7 @@ __pycache__
 *.pdf
 *.docx
 *.doc
-configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/pal_batch_*.yaml
+configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/sage_batch_*.yaml
 configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/*__sample_*.yaml
 configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/tmp_*.yaml
 configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/inline_live_*.yaml

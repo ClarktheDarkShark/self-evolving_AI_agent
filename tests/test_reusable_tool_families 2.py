@@ -8,18 +8,18 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import src.agents.instance.pal_agent_controller as pal_agent_controller_module
-from src.agents.instance.pal_agent_controller import PALAgentController
-from src.pal.parser import extract_and_validate_code
-from src.pal.reusable_tool_families import (
+import src.agents.instance.sage_agent_controller as sage_agent_controller_module
+from src.agents.instance.sage_agent_controller import SAGEAgentController
+from src.sage.parser import extract_and_validate_code
+from src.sage.reusable_tool_families import (
     get_reusable_family_policy_bundle,
     render_reusable_tool,
     select_reusable_tool,
 )
 
 
-def _make_controller() -> PALAgentController:
-    controller = object.__new__(PALAgentController)
+def _make_controller() -> SAGEAgentController:
+    controller = object.__new__(SAGEAgentController)
     controller._emit_generated_tools_event = lambda payload: None
     return controller
 
@@ -146,7 +146,7 @@ def test_reusable_render_canonicalizes_role_swap_match_for_reverse_projection(
     monkeypatch,
 ) -> None:
     controller = _make_controller()
-    monkeypatch.setenv("PAL_RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION", "1")
+    monkeypatch.setenv("SAGE_RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION", "1")
 
     query_plan = {
         "answer_mode": "entity",
@@ -232,7 +232,7 @@ def test_reusable_render_does_not_rewrite_canonical_reverse_anchor_path(
     monkeypatch,
 ) -> None:
     controller = _make_controller()
-    monkeypatch.setenv("PAL_RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION", "1")
+    monkeypatch.setenv("SAGE_RUNTIME_REUSABLE_SWAP_RENDER_CANONICALIZATION", "1")
 
     query_plan = {
         "answer_mode": "entity",
@@ -587,7 +587,7 @@ def test_render_superlative_query_uses_terminal_ordering_value_when_chained() ->
 
 def test_render_entity_superlative_query_after_plan_renormalization() -> None:
     controller = _make_controller()
-    normalized_query_plan = controller._normalize_pal_query_plan(
+    normalized_query_plan = controller._normalize_sage_query_plan(
         {
             "answer_mode": "entity",
             "answer_type": "entity",
@@ -787,7 +787,7 @@ def test_superlative_renderer_uses_subquery_for_post_selection_answer_projection
     assert "?release_candidate_set fb:music.release.tracks ?answer ." in generated_code
 
 
-def test_generate_validated_pal_candidate_prefers_reusable_tool_before_llm() -> None:
+def test_generate_validated_sage_candidate_prefers_reusable_tool_before_llm() -> None:
     controller = _make_controller()
     controller._run_text_prompt = lambda system_prompt, user_prompt: pytest.fail(
         "LLM generator should not be called for reusable direct-count plan"
@@ -822,18 +822,18 @@ def test_generate_validated_pal_candidate_prefers_reusable_tool_before_llm() -> 
         "strategy": "count dialects for a language anchor",
     }
 
-    generated_code, metadata = controller._generate_validated_pal_candidate(
+    generated_code, metadata = controller._generate_validated_sage_candidate(
         task_question="Question: how many language dialects does southern min have?, Entities: ['Southern Min']",
         grounding_card="grounding",
         query_plan=query_plan,
-        generated_tool_name="pal_test_tool",
+        generated_tool_name="sage_test_tool",
     )
 
     assert "COUNT(DISTINCT ?dialect) AS ?count" in generated_code
     assert "language.language_dialect.language" in metadata["query_text"]
 
 
-def test_generate_validated_pal_candidate_falls_back_to_llm_when_reusable_query_is_rejected() -> None:
+def test_generate_validated_sage_candidate_falls_back_to_llm_when_reusable_query_is_rejected() -> None:
     controller = _make_controller()
     llm_calls: list[str] = []
 
@@ -890,7 +890,7 @@ def solve(endpoint_url):
     }
 
     with patch.object(
-        pal_agent_controller_module,
+        sage_agent_controller_module,
         "render_reusable_tool",
         return_value="""
 ###QUERY_START
@@ -908,11 +908,11 @@ def solve(endpoint_url):
 ###QUERY_END
 """,
     ):
-        generated_code, metadata = controller._generate_validated_pal_candidate(
+        generated_code, metadata = controller._generate_validated_sage_candidate(
             task_question="Question: how many language dialects does southern min have?, Entities: ['Southern Min']",
             grounding_card="grounding",
             query_plan=query_plan,
-            generated_tool_name="pal_test_tool",
+            generated_tool_name="sage_test_tool",
         )
 
     assert llm_calls

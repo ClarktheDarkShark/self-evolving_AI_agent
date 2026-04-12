@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import scripts.run_kg_family_policy_evolution as family_policy_harness
-from src.pal.candidate_compare import (
+from src.sage.candidate_compare import (
     aggregate_stage_metrics,
     baseline_satisfies_locked_family,
     compare_aggregate_metrics,
@@ -22,17 +22,17 @@ from src.pal.candidate_compare import (
     summarize_sample_semantic_metrics,
     write_archived_baseline_record,
 )
-from src.pal.family_policy_evolution import ENV_COMPARE_LOCK_FAMILY
-from src.pal.family_policy_evolution import (
+from src.sage.family_policy_evolution import ENV_COMPARE_LOCK_FAMILY
+from src.sage.family_policy_evolution import (
     build_candidate_signature,
     build_family_policy_store,
 )
-from src.pal.reusable_tool_families import get_baseline_reusable_family_policy_bundles
+from src.sage.reusable_tool_families import get_baseline_reusable_family_policy_bundles
 
 
 COMPARE_MODE_FULL = "family_locked_candidate_compare_full"
-COMPARE_MODE_PAL_ONLY = "family_locked_candidate_compare_pal_only"
-PAL_ONLY_BYPASS_ENV = "PAL_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK"
+COMPARE_MODE_SAGE_ONLY = "family_locked_candidate_compare_sage_only"
+SAGE_ONLY_BYPASS_ENV = "SAGE_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK"
 
 
 def _resolve_path(raw_path: str) -> Path:
@@ -49,16 +49,16 @@ def _load_sample_order_from_config(config_path: Path) -> list[str]:
     return [str(item or "").strip() for item in sample_order if str(item or "").strip()]
 
 
-def _comparison_mode(*, pal_only_screen: bool) -> str:
-    return COMPARE_MODE_PAL_ONLY if pal_only_screen else COMPARE_MODE_FULL
+def _comparison_mode(*, sage_only_screen: bool) -> str:
+    return COMPARE_MODE_SAGE_ONLY if sage_only_screen else COMPARE_MODE_FULL
 
 
-def _comparison_env(*, family_name: str, pal_only_screen: bool) -> dict[str, str]:
+def _comparison_env(*, family_name: str, sage_only_screen: bool) -> dict[str, str]:
     env = {
         ENV_COMPARE_LOCK_FAMILY: str(family_name or "").strip(),
     }
-    if pal_only_screen:
-        env[PAL_ONLY_BYPASS_ENV] = "1"
+    if sage_only_screen:
+        env[SAGE_ONLY_BYPASS_ENV] = "1"
     return env
 
 
@@ -132,7 +132,7 @@ def compare_family_candidate(
     summary_path: Path | None = None,
     baseline_archive_root: Path | None = None,
     parent_output_dir: Path | None = None,
-    pal_only_screen: bool = False,
+    sage_only_screen: bool = False,
     screen_unsatisfied_baseline: bool = False,
     stop_on_definitive_loss: bool = True,
     label: str = "",
@@ -142,10 +142,10 @@ def compare_family_candidate(
     cleaned_samples = [
         str(item or "").strip() for item in sample_indices if str(item or "").strip()
     ]
-    evaluation_mode = _comparison_mode(pal_only_screen=pal_only_screen)
+    evaluation_mode = _comparison_mode(sage_only_screen=sage_only_screen)
     comparison_env = _comparison_env(
         family_name=cleaned_family,
-        pal_only_screen=pal_only_screen,
+        sage_only_screen=sage_only_screen,
     )
     merged_extra_env = {
         **comparison_env,
@@ -232,7 +232,7 @@ def compare_family_candidate(
         ) or (
             screen_unsatisfied_baseline
             and str(baseline_run_summary.get("finish_reason") or "").strip().startswith(
-                "pal_query_plan_invalid:family_compare_locked_query_shape:"
+                "sage_query_plan_invalid:family_compare_locked_query_shape:"
             )
         ):
             screened_out_samples.append(
@@ -300,7 +300,7 @@ def compare_family_candidate(
         "sample_indices": cleaned_samples,
         "evaluated_sample_count": len(per_sample_rows),
         "evaluation_mode": evaluation_mode,
-        "pal_only_screen": bool(pal_only_screen),
+        "sage_only_screen": bool(sage_only_screen),
         "locked_family": cleaned_family,
         "extra_env": merged_extra_env,
         "store_path": str(store_path),
@@ -338,7 +338,7 @@ def main() -> int:
     parser.add_argument("--baseline-archive-root", default="")
     parser.add_argument("--parent-output-dir", default="")
     parser.add_argument("--label", default="")
-    parser.add_argument("--pal-only-screen", action="store_true")
+    parser.add_argument("--sage-only-screen", action="store_true")
     parser.add_argument("--screen-unsatisfied-baseline", action="store_true")
     parser.add_argument("--no-early-stop", action="store_true")
     parser.add_argument("--config-path", default="")
@@ -369,7 +369,7 @@ def main() -> int:
         parent_output_dir=(
             _resolve_path(args.parent_output_dir) if args.parent_output_dir else None
         ),
-        pal_only_screen=bool(args.pal_only_screen),
+        sage_only_screen=bool(args.sage_only_screen),
         screen_unsatisfied_baseline=bool(args.screen_unsatisfied_baseline),
         stop_on_definitive_loss=not bool(args.no_early_stop),
         label=args.label,
