@@ -642,8 +642,8 @@ class OpenaiLanguageModel(LanguageModel):
         sanitized_config.pop("allow_internal_tool_protocol", None)
         sanitized_config.pop("toolgen_extract_tool_calls", None)
         sanitized_config.pop("ollama_force_tool_calls", None)
-        # GPT-5-mini does not accept temperature values other than default.
-        if self.model_name == "gpt-5-mini":
+        # GPT-5 family models in this lane should use the server default temperature.
+        if self.model_name in {"gpt-5", "gpt-5-mini", "gpt-5-nano"}:
             sanitized_config.pop("temperature", None)
 
         # print(f"[LM] messages | base_len={len(base_messages)} request_len={len(request_messages)}")

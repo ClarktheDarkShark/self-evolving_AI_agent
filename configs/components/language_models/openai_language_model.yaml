@@ -22,9 +22,17 @@ gpt-oss:20b-120k:
     maximum_prompt_token_count: 120000   # override per model if needed
 
 
+gpt-5-nano:
+  parameters:
+    model_name: "gpt-5-nano"
+
 gpt-5-mini:
   parameters:
     model_name: "gpt-5-mini"
+
+gpt-5:
+  parameters:
+    model_name: "gpt-5"
 
 gpt-5.2:
   parameters:

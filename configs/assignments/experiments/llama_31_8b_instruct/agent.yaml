@@ -2,7 +2,8 @@ assignment_config:
   language_model_list:
   # - name: gpt-oss:20b-64k
   # - name: gpt-oss:20b-120k
-  - name: gpt-5-mini
+  - name: gpt-5-nano
+  # - name: gpt-5-mini
   # - name: gpt-5.2
 
   # agent:
@@ -17,7 +18,8 @@ assignment_config:
     custom_parameters:
       # language_model: gpt-oss:20b-64k
       # language_model: gpt-oss:20b-120k
-      language_model: gpt-5-mini
+      language_model: gpt-5-nano
+      # language_model: gpt-5-mini
       # language_model: gpt-5.2
       tool_registry_path: outputs/tool_library
       max_generated_tools_per_run: 30

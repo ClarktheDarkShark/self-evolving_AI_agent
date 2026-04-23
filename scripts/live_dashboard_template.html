@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LifelongAgentBench Live Dashboard</title>
+  <script>
+    /* Live Server smart-reload intercept — patches window.WebSocket before livereload.js runs */
+    (function(){
+      var _WS = window.WebSocket;
+      var _timer = null;
+      function _isLiveReloadUrl(url){
+        return /(35729|livereload|\/ws(?:$|[?#]))/i.test(String(url || ''));
+      }
+      function _smartReload(){
+        clearTimeout(_timer);
+        _timer = setTimeout(function(){
+          try{
+            if(typeof window.refresh === 'function'){
+              window.refresh();
+            }
+          }catch(_err){}
+        }, 250);
+      }
+      function wrapMsg(fn, ws){
+        return function(evt){
+          try{
+            if(evt && evt.data === 'reload'){
+              _smartReload();
+              return;
+            }
+            var d = JSON.parse(evt.data);
+            if(d && d.command === 'reload'){
+              _smartReload();
+              return;
+            }
+            if(d && d.command === 'refreshcss'){
+              return;
+            }
+          }catch(_err){}
+          fn && fn.call(ws, evt);
+        };
+      }
+      function PatchedWS(url, proto){
+        var ws = proto !== undefined ? new _WS(url, proto) : new _WS(url);
+        if(!_isLiveReloadUrl(url)) return ws;
+        var _omcb = null;
+        Object.defineProperty(ws, 'onmessage', {
+          configurable: true,
+          get: function(){ return _omcb; },
+          set: function(fn){
+            if(_omcb) ws.removeEventListener('message', _omcb);
+            _omcb = wrapMsg(fn, ws);
+            ws.addEventListener('message', _omcb);
+          }
+        });
+        var _ael = ws.addEventListener.bind(ws);
+        ws.addEventListener = function(type, fn, opts){
+          _ael(type, type === 'message' ? wrapMsg(fn, ws) : fn, opts);
+        };
+        return ws;
+      }
+      PatchedWS.prototype = _WS.prototype;
+      try{
+        Object.keys(_WS).forEach(function(k){ PatchedWS[k] = _WS[k]; });
+      }catch(_err){}
+      window.WebSocket = PatchedWS;
+    })();
+  </script>
+  <style>
+    :root{
+      --bg:#0b1020;--panel:#121935;--panel2:#172041;--text:#eef2ff;--muted:#9aa6d1;
+      --good:#3ddc97;--bad:#ff7a7a;--warn:#ffd166;--link:#7cc7ff;--border:#27345f;
+    }
+    *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#09101d,#10162c 35%,#0d1427);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
+    a{color:var(--link);text-decoration:none} a:hover{text-decoration:underline}
+    .wrap{max-width:1600px;margin:0 auto;padding:18px}
+    .header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:16px}
+    .title{font-size:26px;font-weight:700}
+    .sub{color:var(--muted);margin-top:4px}
+    .grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:14px}
+    .card{background:rgba(18,25,53,.92);border:1px solid var(--border);border-radius:14px;padding:12px 14px;min-height:82px}
+    .label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+    .value{font-size:24px;font-weight:700;margin-top:4px}
+    .small{font-size:13px;color:var(--muted);margin-top:6px}
+    .row{display:grid;grid-template-columns:360px minmax(0,1fr);gap:14px}
+    .panel{background:rgba(18,25,53,.92);border:1px solid var(--border);border-radius:14px;padding:14px}
+    .links{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+    iframe{width:100%;height:76vh;border:1px solid var(--border);border-radius:12px;background:white}
+    pre{margin:0;white-space:pre-wrap;word-break:break-word;color:var(--muted)}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+    @media (max-width:1200px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}.row{grid-template-columns:1fr}}
+    @media (max-width:720px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.header{flex-direction:column}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div>
+        <div class="title">LifelongAgentBench Live Dashboard</div>
+        <div class="sub" id="subtitle">Waiting for active run metadata...</div>
+      </div>
+      <div class="panel" style="min-width:320px">
+        <div class="label">Active Run</div>
+        <div class="small mono" id="runDir">No active run</div>
+        <div class="links" id="topLinks"></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="label">Current Sample</div><div class="value" id="sampleIndex">-</div><div class="small" id="sampleStatus">-</div></div>
+      <div class="card"><div class="label">Correct</div><div class="value" id="correctCount">-</div><div class="small" id="correctRate">-</div></div>
+      <div class="card"><div class="label">Completed</div><div class="value" id="completedCount">-</div><div class="small" id="notCompleted">-</div></div>
+      <div class="card"><div class="label">Requests</div><div class="value" id="requestCount">-</div><div class="small" id="tokenCount">-</div></div>
+      <div class="card"><div class="label">Run State</div><div class="value" id="runState">-</div><div class="small" id="modelName">-</div></div>
+      <div class="card"><div class="label">Last Result</div><div class="value" id="lastResult">-</div><div class="small" id="lastReason">-</div></div>
+    </div>
+
+    <div class="row">
+      <div class="panel">
+        <div class="label">Summary</div>
+        <div class="small mono" id="summaryBox">Waiting for data...</div>
+        <div class="label" style="margin-top:14px">Current Session</div>
+        <pre class="mono" id="sessionBox">Waiting for current_session.json...</pre>
+      </div>
+      <div class="panel">
+        <div class="label">Live Trace Viewer</div>
+        <div class="links" id="traceLinks"></div>
+        <iframe id="traceFrame" title="Live Trace Viewer"></iframe>
+      </div>
+    </div>
+  </div>
+<script>
+const ACTIVE_URL = './live_dashboard_active_run.json';
+let lastFrame = '';
+
+function fmtPct(v){
+  if(v === null || v === undefined || Number.isNaN(Number(v))) return '-';
+  return (Number(v) * 100).toFixed(1) + '%';
+}
+function fmtNum(v){
+  if(v === null || v === undefined || v === '') return '-';
+  return Number(v).toLocaleString();
+}
+function setText(id, text){
+  const el = document.getElementById(id);
+  if(el) el.textContent = text;
+}
+function link(label, href){
+  return `<a href="${href}" target="_blank" rel="noopener">${label}</a>`;
+}
+async function getJson(url){
+  const resp = await fetch(url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now(), {cache:'no-store'});
+  if(!resp.ok) throw new Error(`fetch_failed:${resp.status}:${url}`);
+  return resp.json();
+}
+async function getJsonOrNull(url){
+  if(!url) return null;
+  try{
+    return await getJson(url);
+  }catch(_err){
+    return null;
+  }
+}
+function runStateFromSession(currentSession){
+  if(!currentSession) return '-';
+  return currentSession.sample_status || '-';
+}
+function outcomeFromRun(run){
+  return run && (run.evaluation_outcome || ((run.evaluation_record || {}).outcome) || null);
+}
+function normalizeResults(outcomes, runs){
+  if(outcomes && Array.isArray(outcomes.results)) return outcomes.results;
+  if(!Array.isArray(runs)) return [];
+  return runs.map(run => ({
+    sample_index: run.sample_index,
+    sample_status: run.sample_status,
+    evaluation_outcome: outcomeFromRun(run),
+    completed: run.sample_status === 'completed',
+    correct: outcomeFromRun(run) === 'correct',
+    not_completed_reason: run.not_completed_reason || run.tool_result_failure_reason || ''
+  }));
+}
+function countCorrect(results){
+  return results.filter(item => item && (item.correct || item.evaluation_outcome === 'correct')).length;
+}
+function countCompleted(results){
+  return results.filter(item => item && (item.completed || item.sample_status === 'completed')).length;
+}
+function countNotCompleted(results){
+  return results.filter(item => item && item.sample_status && item.sample_status !== 'completed').length;
+}
+function outcomeLabel(item){
+  if(!item) return '-';
+  if(item.correct) return 'correct';
+  if(item.evaluation_outcome === 'correct') return 'correct';
+  if(item.completed) return 'incorrect';
+  if(item.sample_status === 'completed') return item.evaluation_outcome || 'completed';
+  return 'not completed';
+}
+async function refresh(){
+  try{
+    const active = await getJson(ACTIVE_URL);
+    const [currentSession, outcomes, metric, runs] = await Promise.all([
+      getJsonOrNull(active.current_session_url),
+      getJsonOrNull(active.task_outcomes_url),
+      getJsonOrNull(active.metric_url),
+      getJsonOrNull(active.runs_url || `${active.run_dir_url}/runs.json`)
+    ]);
+
+    const overall = (metric && metric.overall) || {};
+    const evals = overall.evaluation_outcome || {};
+    const usage = overall.llm_usage || {};
+    const results = normalizeResults(outcomes, runs);
+    const last = results.length ? results[results.length - 1] : null;
+    const currentSample = String((currentSession && currentSession.sample_index) || '0');
+    const traceUrl = `${active.trace_viewer_base_url}#sample=${encodeURIComponent(currentSample)}`;
+    const totalSamples = (outcomes && outcomes.total_samples) || active.total_samples || '-';
+    const completedCount = (outcomes && outcomes.completed_count) ?? countCompleted(results);
+    const notCompletedCount = (outcomes && outcomes.not_completed_count) ?? countNotCompleted(results);
+    const correctCount = countCorrect(results);
+
+    setText('subtitle', `${active.label || active.config_name || 'active run'} • auto-refreshing`);
+    setText('runDir', active.run_dir || '-');
+    setText('sampleIndex', currentSample);
+    setText('sampleStatus', runStateFromSession(currentSession));
+    setText('correctCount', `${correctCount}/${totalSamples}`);
+    setText('correctRate', fmtPct(evals.correct));
+    setText('completedCount', `${completedCount} / ${totalSamples}`);
+    setText('notCompleted', `not completed: ${notCompletedCount}`);
+    setText('requestCount', fmtNum(usage.request_count));
+    setText('tokenCount', `tokens: ${fmtNum(usage.total_tokens)}`);
+    setText('runState', runStateFromSession(currentSession));
+    setText('modelName', active.model_name || '-');
+    setText('lastResult', outcomeLabel(last));
+    setText('lastReason', (last && last.not_completed_reason) ? last.not_completed_reason : ' ');
+
+    const summary = [
+      `config: ${active.config_name || '-'}`,
+      `task: ${active.task_name || '-'}`,
+      `current sample: ${currentSample}`,
+      `completed: ${completedCount}/${totalSamples}`,
+      `correct so far: ${correctCount}`,
+      `incorrect so far: ${Math.max(0, completedCount - correctCount)}`,
+      `not completed so far: ${notCompletedCount}`,
+    ].join('\n');
+    setText('summaryBox', summary);
+    document.getElementById('sessionBox').textContent = currentSession ? JSON.stringify({
+      sample_index: currentSession.sample_index,
+      sample_status: currentSession.sample_status,
+      evaluation_outcome: ((currentSession.evaluation_record || {}).outcome || 'unset')
+    }, null, 2) : 'Waiting for current_session.json...';
+
+    document.getElementById('topLinks').innerHTML = [
+      link('Run Dir', active.run_dir_url),
+      link('Current Session', active.current_session_url),
+      link('Task Outcomes', active.task_outcomes_url),
+      link('Metric', active.metric_url),
+      link('Runs', active.runs_url || `${active.run_dir_url}/runs.json`),
+      link('Trace Viewer', traceUrl)
+    ].join('');
+    document.getElementById('traceLinks').innerHTML = [
+      link('Open current sample', traceUrl),
+      link('Open sample 0', `${active.trace_viewer_base_url}#sample=0`),
+      link('Sessions JSON', active.trace_sessions_url)
+    ].join('');
+
+    if(lastFrame !== traceUrl){
+      document.getElementById('traceFrame').src = traceUrl;
+      lastFrame = traceUrl;
+    }
+  }catch(err){
+    setText('subtitle', 'Dashboard refresh failed');
+    setText('summaryBox', String(err));
+  }
+}
+refresh();
+window.refresh = refresh;
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>

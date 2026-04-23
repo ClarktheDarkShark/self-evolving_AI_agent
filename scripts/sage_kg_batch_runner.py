@@ -225,7 +225,75 @@ def _summarize_run_dir(run_dir: Path) -> dict[str, Any]:
                 sample_index=sample_index,
             )
         )
+    if sample_index:
+        summary.update(
+            _extract_sage_terminal_resolution(
+                run_dir=run_dir,
+                sample_index=sample_index,
+            )
+        )
     return summary
+
+
+def _extract_sage_terminal_resolution(
+    *,
+    run_dir: Path,
+    sample_index: str,
+) -> dict[str, Any]:
+    runs_path = run_dir / "runs.json"
+    if not runs_path.exists():
+        return {}
+    try:
+        runs_payload = _load_json(runs_path)
+    except Exception:
+        return {}
+    if not isinstance(runs_payload, list):
+        return {}
+    target_sample = str(sample_index or "").strip()
+    run_row = None
+    for candidate in runs_payload:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("sample_index") or "").strip() == target_sample:
+            run_row = candidate
+            break
+    if not isinstance(run_row, dict):
+        return {}
+    history = ((run_row.get("chat_history") or {}).get("value") or [])
+    if not isinstance(history, list):
+        return {}
+
+    bridge_index = -1
+    for idx, item in enumerate(history):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "")
+        if role == "user" and content.startswith(
+            "Macro result: sage_benchmark_bridge_macro -> SUCCESS."
+        ):
+            bridge_index = idx
+    if bridge_index < 0:
+        return {}
+
+    next_agent_index = -1
+    next_agent_content = ""
+    later_agent_count = 0
+    for idx in range(bridge_index + 1, len(history)):
+        item = history[idx]
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "").strip().lower() != "agent":
+            continue
+        later_agent_count += 1
+        if next_agent_index < 0:
+            next_agent_index = idx
+            next_agent_content = str(item.get("content") or "").strip()
+    if next_agent_index < 0:
+        return {"sage_terminal_resolution": "bridge_without_agent_followup"}
+    if next_agent_content.startswith("Final Answer:") and later_agent_count == 1:
+        return {"sage_terminal_resolution": "direct_bridge_final"}
+    return {"sage_terminal_resolution": "post_bridge_continued"}
 
 
 def _extract_sage_typed_summary(
@@ -235,17 +303,26 @@ def _extract_sage_typed_summary(
 ) -> dict[str, Any]:
     latest_finalized: dict[str, Any] = {}
     latest_rejected: dict[str, Any] = {}
+    latest_manual_fallback: dict[str, Any] = {}
+    latest_finalized_index = -1
+    latest_manual_fallback_index = -1
+    manual_fallback_count = 0
     target_sample = str(sample_index or "").strip()
-    for payload in _load_json_lines(generated_tools_path):
+    for payload_index, payload in enumerate(_load_json_lines(generated_tools_path)):
         payload_sample = str(payload.get("sample_index") or "").strip()
         if target_sample and payload_sample and payload_sample != target_sample:
             continue
         event = str(payload.get("event") or "").strip()
         if event == "sage_attempt_decision_finalized":
             latest_finalized = payload
+            latest_finalized_index = payload_index
         elif event == "sage_repair_loop_rejected":
             latest_rejected = payload
-    if not latest_finalized and not latest_rejected:
+        elif event == "sage_manual_solver_fallback_used":
+            latest_manual_fallback = payload
+            latest_manual_fallback_index = payload_index
+            manual_fallback_count += 1
+    if not latest_finalized and not latest_rejected and not latest_manual_fallback:
         return {}
 
     typed_outcome = latest_finalized.get("typed_outcome") or {}
@@ -271,11 +348,26 @@ def _extract_sage_typed_summary(
         "sage_verdict_reasons": list(typed_outcome.get("verdict_reasons") or ()),
         "sage_repair_attempt_count": typed_outcome.get("repair_attempt_count"),
     }
+    if manual_fallback_count > 0:
+        summary["sage_manual_fallback_used"] = True
+        summary["sage_manual_fallback_count"] = manual_fallback_count
+        summary["sage_manual_fallback_mode"] = latest_manual_fallback.get("mode")
     if latest_rejected:
         summary["sage_last_rejected_verdict"] = latest_rejected.get("last_verdict")
         summary["sage_last_rejected_reasons"] = list(
             latest_rejected.get("last_reasons") or ()
         )
+    if latest_manual_fallback and latest_manual_fallback_index > latest_finalized_index:
+        summary["sage_pre_fallback_completion_state"] = summary.get(
+            "sage_completion_state"
+        )
+        summary["sage_pre_fallback_stop_reason"] = summary.get("sage_stop_reason")
+        summary["sage_pre_fallback_primary_failure_kind"] = summary.get(
+            "sage_primary_failure_kind"
+        )
+        summary["sage_completion_state"] = "manual_fallback"
+        summary["sage_stop_reason"] = "manual_solver_fallback"
+        summary["sage_primary_failure_kind"] = "manual_fallback"
     return summary
 
 
@@ -310,6 +402,19 @@ def _infer_runner_level_sage_outcome(summary: dict[str, Any]) -> dict[str, Any]:
 
 def _finalize_summary_row(summary: dict[str, Any]) -> dict[str, Any]:
     finalized = dict(summary)
+    terminal_resolution = str(finalized.get("sage_terminal_resolution") or "").strip()
+    if terminal_resolution == "direct_bridge_final":
+        pre_completion_state = str(
+            finalized.get("sage_pre_fallback_completion_state") or ""
+        ).strip()
+        if pre_completion_state:
+            finalized["sage_completion_state"] = pre_completion_state
+            finalized["sage_stop_reason"] = finalized.get(
+                "sage_pre_fallback_stop_reason"
+            )
+            finalized["sage_primary_failure_kind"] = finalized.get(
+                "sage_pre_fallback_primary_failure_kind"
+            )
     finalized.update(_infer_runner_level_sage_outcome(finalized))
     return finalized
 
@@ -346,6 +451,7 @@ def _build_summary_report(
         "execution_shape_failure_count": 0,
         "semantic_family_failure_count": 0,
         "solver_handoff_failure_count": 0,
+        "manual_fallback_count": 0,
         "infrastructure_failure_count": 0,
         "typed_outcome_count": 0,
         "runner_inferred_count": 0,
@@ -386,6 +492,8 @@ def _build_summary_report(
                 aggregate["semantic_family_failure_count"] += 1
             elif primary_failure_kind == "solver_handoff_failure":
                 aggregate["solver_handoff_failure_count"] += 1
+            elif primary_failure_kind == "manual_fallback":
+                aggregate["manual_fallback_count"] += 1
             elif primary_failure_kind == "infrastructure_failure":
                 aggregate["infrastructure_failure_count"] += 1
         repair_attempt_count = row.get("sage_repair_attempt_count")

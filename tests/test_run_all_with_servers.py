@@ -32,6 +32,54 @@ def test_enable_sage_agent_flag_is_defined() -> None:
     assert isinstance(run_all_with_servers.ENABLE_SAGE_AGENT, bool)
 
 
+def test_precreate_trace_viewer_writes_html_shell(tmp_path: pathlib.Path) -> None:
+    run_dir = tmp_path / "run"
+    run_all_with_servers._precreate_trace_viewer(run_dir)
+
+    assert (run_dir / "html_traces" / "trace_viewer.html").exists()
+    assert (run_dir / "html_traces" / "sessions.json").exists()
+
+
+def test_write_live_dashboard_files_creates_active_metadata(tmp_path: pathlib.Path) -> None:
+    repo_root = tmp_path
+    run_output_dir = repo_root / "outputs" / "run_all_test" / "knowledge_graph" / "standard"
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    (run_output_dir / "config.yaml").write_text(
+        """
+assignment_config:
+  language_model_list:
+    - name: gpt-5-mini
+  agent:
+    name: sage_agent_controller
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    run_all_with_servers._write_live_dashboard_files(
+        repo_root=repo_root,
+        run_output_dir=run_output_dir,
+        config_path="configs/assignments/experiments/llama_31_8b_instruct/instance/knowledge_graph/instance/standard.yaml",
+        task_name="knowledge_graph",
+    )
+
+    tracking_dir = repo_root / "outputs" / "benchmark_tracking"
+    assert (tracking_dir / "live_dashboard.html").exists()
+    dashboard_html = (tracking_dir / "live_dashboard.html").read_text(encoding="utf-8")
+    assert "Live Server smart-reload intercept" in dashboard_html
+    assert "/ws(?:$|[?#])" in dashboard_html
+    assert "evt && evt.data === 'reload'" in dashboard_html
+    assert "window.refresh = refresh;" in dashboard_html
+
+    metadata = json.loads((tracking_dir / "live_dashboard_active_run.json").read_text(encoding="utf-8"))
+    assert metadata["task_name"] == "knowledge_graph"
+    assert metadata["config_name"] == "standard"
+    assert metadata["model_name"] == "gpt-5-mini"
+    assert metadata["trace_viewer_base_url"].endswith(
+        "/outputs/run_all_test/knowledge_graph/standard/html_traces/trace_viewer.html"
+    )
+
+
 def test_latest_selected_family_for_sample_falls_back_to_attempt_decision(
     tmp_path: pathlib.Path,
 ) -> None:

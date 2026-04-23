@@ -1,0 +1,24 @@
+import:
+- ../task.yaml
+- ../../../agent.yaml
+- ../../../../../../definition.yaml
+assignment_config:
+  callback_dict:
+    callback_0:
+      name: current_session_saving_callback
+    callback_1:
+      name: consecutive_abnormal_agent_inference_process_handling_callback
+  output_dir: outputs/{TIMESTAMP}
+  sample_order:
+  - '80'
+environment_config:
+  use_task_client_flag: true
+task_dict:
+  knowledge_graph:
+    parameters:
+      ontology_dir_path: null
+      data_source: huggingface
+      hf_dataset_name: csyq/LifelongAgentBench
+      hf_dataset_config: default
+      hf_data_dir: knowledge_graph
+      hf_split: train

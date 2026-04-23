@@ -14,9 +14,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import socket
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -57,6 +59,22 @@ CLIENT_WALL_TIMEOUT_S = int(os.getenv("LIFELONG_CLIENT_TIMEOUT_S", "1800"))
 CLIENT_IDLE_TIMEOUT_S = int(os.getenv("LIFELONG_CLIENT_IDLE_TIMEOUT_S", "600"))
 CLIENT_WATCHDOG_POLL_S = float(os.getenv("LIFELONG_CLIENT_WATCHDOG_POLL_S", "5"))
 ENABLE_SAGE_AGENT = os.getenv("ENABLE_SAGE_AGENT") == "1"
+OPEN_BROWSER_BY_DEFAULT = os.getenv("LIFELONG_OPEN_BROWSER", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+ENABLE_TRACE_VIEWER_SERVER = os.getenv("LIFELONG_TRACE_VIEWER_SERVER", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+TRACE_VIEWER_PORT = int(os.getenv("LIFELONG_TRACE_VIEWER_PORT", "5500"))
+TRACE_VIEWER_HOST = os.getenv("LIFELONG_TRACE_VIEWER_HOST", "127.0.0.1").strip() or "127.0.0.1"
+TRACE_VIEWER_URL_OVERRIDE = os.getenv("LIFELONG_BROWSER_URL", "").strip()
+BROWSER_MODE = (os.getenv("LIFELONG_BROWSER_MODE", "dashboard").strip().lower() or "dashboard")
 ENABLE_STANDARD_FAMILY_EVOLUTION = (
     os.getenv("SAGE_ENABLE_STANDARD_FAMILY_EVOLUTION") == "1"
 )
@@ -79,6 +97,13 @@ DEFAULT_FAMILY_REGRESSION_MANIFEST = (
     / "knowledge_graph_family_regression.json"
 )
 _RESETTED_FAMILY_STORE_PATHS: set[str] = set()
+_TRACE_SERVER_PROC: subprocess.Popen[str] | None = None
+_TRACE_VIEWER_OPENED = False
+LIVE_DASHBOARD_HTML = (
+    (SCRIPT_DIR / "live_dashboard_template.html").read_text(encoding="utf-8")
+    if (SCRIPT_DIR / "live_dashboard_template.html").exists()
+    else "<!DOCTYPE html><html><body>Missing live dashboard template.</body></html>"
+)
 
 
 @dataclass(frozen=True)
@@ -167,6 +192,49 @@ def _load_sample_order_from_config(config_path: Path) -> list[str] | None:
         return None
     cleaned = [str(item or "").strip() for item in sample_order if str(item or "").strip()]
     return cleaned or None
+
+
+def _load_model_name_from_config(config_path: Path) -> str:
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    assignment_config = payload.get("assignment_config") or {}
+    if not isinstance(assignment_config, dict):
+        return ""
+    agent = assignment_config.get("agent") or {}
+    if isinstance(agent, dict):
+        custom_parameters = agent.get("custom_parameters") or {}
+        if isinstance(custom_parameters, dict):
+            model_name = str(custom_parameters.get("language_model") or "").strip()
+            if model_name:
+                return model_name
+    language_model_list = assignment_config.get("language_model_list") or []
+    if isinstance(language_model_list, list):
+        for item in language_model_list:
+            if isinstance(item, dict):
+                model_name = str(item.get("name") or "").strip()
+                if model_name:
+                    return model_name
+    return ""
+
+
+def _config_uses_sage_agent(config_path: Path) -> bool:
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    assignment_config = payload.get("assignment_config") or {}
+    if not isinstance(assignment_config, dict):
+        return False
+    agent = assignment_config.get("agent") or {}
+    if not isinstance(agent, dict):
+        return False
+    return str(agent.get("name") or "").strip() == "sage_agent_controller"
 
 
 def _write_single_sample_config(
@@ -1098,6 +1166,190 @@ def _wait_for_server(url: str, timeout_s: int = 60) -> bool:
     return False
 
 
+def _open_browser_if_enabled(url: str) -> None:
+    global _TRACE_VIEWER_OPENED
+    cleaned_url = str(url or "").strip()
+    if not OPEN_BROWSER_BY_DEFAULT or not cleaned_url or _TRACE_VIEWER_OPENED:
+        return
+    try:
+        opened = webbrowser.open(cleaned_url, new=2)
+        if opened:
+            _TRACE_VIEWER_OPENED = True
+            print(f"[run_all_with_servers] Opened browser: {cleaned_url}")
+            return
+    except Exception:
+        pass
+
+    if sys.platform == "darwin":
+        try:
+            subprocess.Popen(
+                ["open", cleaned_url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _TRACE_VIEWER_OPENED = True
+            print(f"[run_all_with_servers] Opened browser via open: {cleaned_url}")
+        except Exception:
+            pass
+
+
+def _port_is_open(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _ensure_trace_viewer_server(repo_root: Path) -> None:
+    global _TRACE_SERVER_PROC
+    if not ENABLE_TRACE_VIEWER_SERVER:
+        return
+    if _port_is_open(TRACE_VIEWER_HOST, TRACE_VIEWER_PORT):
+        return
+    if _TRACE_SERVER_PROC is not None and _TRACE_SERVER_PROC.poll() is None:
+        return
+    _TRACE_SERVER_PROC = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "http.server",
+            str(TRACE_VIEWER_PORT),
+            "--bind",
+            TRACE_VIEWER_HOST,
+            "--directory",
+            str(repo_root),
+        ],
+        cwd=repo_root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if _port_is_open(TRACE_VIEWER_HOST, TRACE_VIEWER_PORT):
+            return
+        time.sleep(0.2)
+
+
+def _precreate_trace_viewer(run_dir: Path) -> None:
+    try:
+        from src.run_experiment import _export_html_trace
+
+        _export_html_trace(str(run_dir), [])
+    except Exception:
+        pass
+
+
+def _trace_viewer_url(repo_root: Path, run_dir: Path, sample_index: str = "0") -> str:
+    if TRACE_VIEWER_URL_OVERRIDE:
+        return TRACE_VIEWER_URL_OVERRIDE
+    relative = run_dir.resolve().relative_to(repo_root.resolve())
+    relative_path = relative.as_posix()
+    return (
+        f"http://{TRACE_VIEWER_HOST}:{TRACE_VIEWER_PORT}/"
+        f"{relative_path}/html_traces/trace_viewer.html#sample={urllib.parse.quote(str(sample_index or '0'))}"
+    )
+
+
+def _benchmark_tracking_dir(repo_root: Path) -> Path:
+    return repo_root / "outputs" / "benchmark_tracking"
+
+
+def _repo_relative_url(repo_root: Path, path: Path) -> str:
+    try:
+        relative = path.resolve().relative_to(repo_root.resolve())
+        return "/" + relative.as_posix()
+    except Exception:
+        return ""
+
+
+def _should_publish_live_dashboard(run_output_dir: Path, task_name: str) -> bool:
+    return (
+        str(task_name or "").strip() == "knowledge_graph"
+        and run_output_dir.name == "standard"
+        and run_output_dir.parent.name == "knowledge_graph"
+    )
+
+
+def _write_live_dashboard_files(
+    *,
+    repo_root: Path,
+    run_output_dir: Path,
+    config_path: str,
+    task_name: str,
+) -> None:
+    if not _should_publish_live_dashboard(run_output_dir, task_name):
+        return
+
+    tracking_dir = _benchmark_tracking_dir(repo_root)
+    tracking_dir.mkdir(parents=True, exist_ok=True)
+    config_file_path = run_output_dir / "config.yaml"
+    if not config_file_path.exists():
+        config_file_path = Path(config_path)
+        if not config_file_path.is_absolute():
+            config_file_path = repo_root / config_file_path
+
+    dashboard_path = tracking_dir / "live_dashboard.html"
+    current_text = ""
+    if dashboard_path.exists():
+        current_text = dashboard_path.read_text(encoding="utf-8", errors="replace")
+    if current_text != LIVE_DASHBOARD_HTML:
+        dashboard_path.write_text(LIVE_DASHBOARD_HTML, encoding="utf-8")
+
+    config_name = Path(config_path).stem
+    relative_run_url = _repo_relative_url(repo_root, run_output_dir)
+    trace_base_url = (
+        f"http://{TRACE_VIEWER_HOST}:{TRACE_VIEWER_PORT}"
+        f"{relative_run_url}/html_traces/trace_viewer.html"
+    )
+    metadata = {
+        "updated_at_utc": datetime.utcnow().isoformat() + "Z",
+        "label": "kg_standard_live",
+        "config_name": config_name,
+        "task_name": task_name,
+        "model_name": _load_model_name_from_config(config_file_path),
+        "total_samples": len(_load_sample_order_from_config(config_file_path) or []),
+        "run_dir": str(run_output_dir),
+        "run_dir_url": f"http://{TRACE_VIEWER_HOST}:{TRACE_VIEWER_PORT}{relative_run_url}",
+        "current_session_url": f"http://{TRACE_VIEWER_HOST}:{TRACE_VIEWER_PORT}{relative_run_url}/current_session.json",
+        "runs_url": f"http://{TRACE_VIEWER_HOST}:{TRACE_VIEWER_PORT}{relative_run_url}/runs.json",
+        "task_outcomes_url": f"http://{TRACE_VIEWER_HOST}:{TRACE_VIEWER_PORT}{relative_run_url}/task_outcomes.json",
+        "metric_url": f"http://{TRACE_VIEWER_HOST}:{TRACE_VIEWER_PORT}{relative_run_url}/metric.json",
+        "trace_viewer_base_url": trace_base_url,
+        "trace_sessions_url": f"{trace_base_url.rsplit('/', 1)[0]}/sessions.json",
+    }
+
+    (tracking_dir / "live_dashboard_active_run.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+    (tracking_dir / "active_standard_run.json").write_text(
+        json.dumps(
+            {
+                "launched_at_utc": metadata["updated_at_utc"],
+                "config_path": config_path,
+                "model": metadata["model_name"],
+                "sage_enabled": _config_uses_sage_agent(config_file_path),
+                "run_dir": metadata["run_dir"],
+                "dashboard_url": f"http://{TRACE_VIEWER_HOST}:{TRACE_VIEWER_PORT}/outputs/benchmark_tracking/live_dashboard.html",
+                "trace_viewer_url": f"{trace_base_url}#sample=0",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _live_dashboard_url() -> str:
+    return f"http://{TRACE_VIEWER_HOST}:{TRACE_VIEWER_PORT}/outputs/benchmark_tracking/live_dashboard.html"
+
+
+def _browser_launch_url(repo_root: Path, run_dir: Path, sample_index: str = "0") -> str:
+    if BROWSER_MODE == "trace":
+        return _trace_viewer_url(repo_root, run_dir, sample_index=sample_index)
+    return _live_dashboard_url()
+
+
 def _tail_file(path: Path, n_lines: int = 200) -> str:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -1747,6 +1999,14 @@ def _run_one(
         output_dir_override or (combined_dir / task_name / config_name)
     )
     env["LIFELONG_OUTPUT_TAG"] = ""
+    run_output_dir = Path(env["LIFELONG_OUTPUT_DIR"])
+    _precreate_trace_viewer(run_output_dir)
+    _write_live_dashboard_files(
+        repo_root=repo_root,
+        run_output_dir=run_output_dir,
+        config_path=config_path,
+        task_name=task_name,
+    )
     for key, value in (extra_env or {}).items():
         env[key] = value
     if is_kg:
@@ -1792,6 +2052,11 @@ def _run_one(
                     print(_tail_file(log_path))
                     return 1
 
+                _ensure_trace_viewer_server(repo_root)
+                _open_browser_if_enabled(
+                    _browser_launch_url(repo_root, run_output_dir, sample_index="0")
+                )
+
                 if is_kg:
                     ok = _ensure_kg_endpoint_available(
                         repo_root,
@@ -1822,7 +2087,7 @@ def _run_one(
                     client_cmd,
                     cwd=repo_root,
                     env=env,
-                    output_dir=Path(env["LIFELONG_OUTPUT_DIR"]),
+                    output_dir=run_output_dir,
                     log_path=log_path,
                     wall_timeout_s=CLIENT_WALL_TIMEOUT_S,
                     idle_timeout_s=CLIENT_IDLE_TIMEOUT_S,
@@ -1835,7 +2100,7 @@ def _run_one(
 
                 if result.timed_out_reason:
                     recovered_sample_index = _record_timed_out_current_session(
-                        Path(env["LIFELONG_OUTPUT_DIR"]),
+                        run_output_dir,
                         result.timed_out_reason,
                     )
                     if recovered_sample_index and recovered_sample_index not in recovered_timed_out_samples:

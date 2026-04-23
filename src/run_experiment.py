@@ -45,6 +45,8 @@ ENABLE_SAGE_AGENT = os.environ.get("ENABLE_SAGE_AGENT") == "1"
 SAGE_AGENT_NAME = "sage_agent_controller"
 SAGE_AGENT_MAX_COMPLETION_TOKENS_ENV = "SAGE_AGENT_MAX_COMPLETION_TOKENS"
 SAGE_AGENT_REASONING_EFFORT_ENV = "SAGE_AGENT_REASONING_EFFORT"
+LANGUAGE_MODEL_OVERRIDE_ENV = "LIFELONG_MODEL"
+LANGUAGE_MODEL_OVERRIDE_FALLBACK_ENV = "OPENAI_MODEL"
 SAGE_AGENT_COMPONENT_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "configs",
@@ -1255,12 +1257,53 @@ def _maybe_enable_sage_agent(raw_config: Mapping[str, Any]) -> dict[str, Any]:
     return updated_raw_config
 
 
+def _get_language_model_override_name() -> Optional[str]:
+    for env_name in (
+        LANGUAGE_MODEL_OVERRIDE_ENV,
+        LANGUAGE_MODEL_OVERRIDE_FALLBACK_ENV,
+    ):
+        raw_value = str(os.environ.get(env_name) or "").strip()
+        if raw_value:
+            return raw_value
+    return None
+
+
+def _maybe_override_language_model(raw_config: Mapping[str, Any]) -> dict[str, Any]:
+    override_name = _get_language_model_override_name()
+    if not override_name:
+        return copy.deepcopy(raw_config)
+
+    updated_raw_config = copy.deepcopy(raw_config)
+    language_model_dict = updated_raw_config.get("language_model_dict") or {}
+    if override_name not in language_model_dict:
+        raise ValueError(
+            "Language model override "
+            f"'{override_name}' not found in language_model_dict."
+        )
+
+    assignment_config = updated_raw_config.setdefault("assignment_config", {})
+    assignment_config["language_model_list"] = [{"name": override_name}]
+
+    current_agent_info = assignment_config.get("agent") or {}
+    if current_agent_info:
+        current_agent_info = copy.deepcopy(current_agent_info)
+        current_custom_parameters = copy.deepcopy(
+            current_agent_info.get("custom_parameters") or {}
+        )
+        current_custom_parameters["language_model"] = override_name
+        current_agent_info["custom_parameters"] = current_custom_parameters
+        assignment_config["agent"] = current_agent_info
+
+    return updated_raw_config
+
+
 def main() -> None:
     # region Prepare variables
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str)
     args = parser.parse_args()
     raw_config = ConfigLoader().load_from(args.config_path)
+    raw_config = _maybe_override_language_model(raw_config)
     raw_config = _maybe_enable_sage_agent(raw_config)
     assignment_config, environment_config, logger_config, path_config = (
         ConfigUtility.read_raw_config(raw_config, ConfigUtilityCaller.CLIENT)
