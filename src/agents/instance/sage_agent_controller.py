@@ -1299,6 +1299,69 @@ class SAGEAgentController(Agent):
                 lines.append(f"{section_name}=" + " | ".join(rendered))
         return lines
 
+    def _format_family_evolution_context_guidance(
+        self,
+        *,
+        family_name: str,
+    ) -> list[str]:
+        """Return compact guidance derived from stored tool-evolution context."""
+        cleaned_family = str(family_name or "").strip()
+        if not cleaned_family or not family_policy_enabled_for(cleaned_family):
+            return []
+        try:
+            store = self._get_family_policy_store()
+            active_bundle = store.get_active_bundle(cleaned_family)
+            context = store.get_tool_evolution_context(cleaned_family)
+        except Exception:
+            return []
+        baseline_bundle = getattr(store, "baseline_bundles", {}).get(cleaned_family)
+        if (
+            active_bundle is not None
+            and baseline_bundle is not None
+            and str(getattr(active_bundle, "version", "") or "").strip()
+            == str(getattr(baseline_bundle, "version", "") or "").strip()
+        ):
+            return []
+        if not isinstance(context, Mapping) or not context:
+            return []
+
+        lines: list[str] = []
+        preferred = [
+            item
+            for item in (context.get("preferred_patterns") or [])
+            if isinstance(item, Mapping)
+        ]
+        for pattern in preferred[:2]:
+            skeleton = [
+                str(step or "").strip()
+                for step in (pattern.get("relation_role_skeleton") or [])
+                if str(step or "").strip()
+            ]
+            if skeleton:
+                lines.append("prefer_pattern=" + "->".join(skeleton))
+            notes = [
+                str(step or "").strip()
+                for step in (pattern.get("structural_notes") or [])
+                if str(step or "").strip()
+            ]
+            for note in notes[:1]:
+                lines.append("prefer_note=" + note)
+
+        avoid = [
+            item
+            for item in (context.get("avoid_patterns") or [])
+            if isinstance(item, Mapping)
+        ]
+        for pattern in avoid[:1]:
+            labels = [
+                str(step or "").strip()
+                for step in (pattern.get("failure_labels") or [])
+                if str(step or "").strip()
+            ]
+            if labels:
+                lines.append("avoid_pattern_labeled=" + ",".join(labels[:2]))
+        return lines
+
     def _collect_family_policy_failure_reasons(
         self,
         *,
@@ -16260,6 +16323,9 @@ class SAGEAgentController(Agent):
         active_family_policy = self._format_active_family_policy_guidance(
             family_name=query_shape,
         )
+        family_evolution_context = self._format_family_evolution_context_guidance(
+            family_name=query_shape,
+        )
         lines = [
             "SAGE grounding hints:",
             f"- question_text: {question_text}",
@@ -16403,6 +16469,10 @@ class SAGEAgentController(Agent):
             lines.append("- active_family_policy:")
             for policy_line in active_family_policy:
                 lines.append(f"  - {policy_line}")
+        if family_evolution_context:
+            lines.append("- family_evolution_context:")
+            for ctx_line in family_evolution_context:
+                lines.append(f"  - {ctx_line}")
         lines.extend(
             [
                 "- guidance:",

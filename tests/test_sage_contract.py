@@ -360,6 +360,145 @@ def test_grounding_card_surfaces_active_family_policy(monkeypatch) -> None:
     )
 
 
+def test_grounding_card_hides_unpromoted_family_evolution_context(monkeypatch) -> None:
+    controller = _make_controller()
+    monkeypatch.setenv("SAGE_ENABLE_FAMILY_POLICY_EVOLUTION", "1")
+
+    class _FakeBundle:
+        def __init__(self, version: str):
+            self.version = version
+
+    class _FakeStore:
+        baseline_bundles = {
+            "count_over_joined_set": _FakeBundle("2026-03-31"),
+        }
+
+        def get_active_bundle(self, family_name: str):
+            assert family_name == "count_over_joined_set"
+            return _FakeBundle("2026-03-31")
+
+        def get_tool_evolution_context(self, family_name: str):
+            assert family_name == "count_over_joined_set"
+            return {
+                "source_version": "2026-03-31",
+                "preferred_patterns": [
+                    {
+                        "relation_role_skeleton": [
+                            "count_set->anchor_a:dynamic_probe",
+                            "count_set->anchor_b:dynamic_probe",
+                        ],
+                        "structural_notes": [
+                            "preserve_multiple_anchor_constraints",
+                        ],
+                    }
+                ],
+                "avoid_patterns": [
+                    {
+                        "failure_labels": [
+                            "plausibility_validation_failed",
+                        ]
+                    }
+                ],
+            }
+
+    controller._get_family_policy_store = lambda: _FakeStore()
+    monkeypatch.setattr(
+        controller,
+        "_infer_query_shape",
+        lambda **kwargs: "count_over_joined_set",
+    )
+    monkeypatch.setattr(
+        controller,
+        "_build_question_interpretation",
+        lambda **kwargs: {"question_inputs": [], "preferred_scaffolds": []},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_refine_question_interpretation_with_grounding",
+        lambda **kwargs: kwargs["question_interpretation"],
+    )
+
+    grounding_card = controller._build_sage_grounding_card(
+        "Question: how many spacecrafts did cnes and astrium make?, Entities: ['CNES', 'Astrium']",
+        relation_grounding=[],
+    )
+
+    assert "- family_evolution_context:" not in grounding_card
+
+
+def test_grounding_card_surfaces_family_evolution_context_for_nonbaseline_bundle(
+    monkeypatch,
+) -> None:
+    controller = _make_controller()
+    monkeypatch.setenv("SAGE_ENABLE_FAMILY_POLICY_EVOLUTION", "1")
+
+    class _FakeBundle:
+        def __init__(self, version: str):
+            self.version = version
+
+    class _FakeStore:
+        baseline_bundles = {
+            "count_over_joined_set": _FakeBundle("2026-03-31"),
+        }
+
+        def get_active_bundle(self, family_name: str):
+            assert family_name == "count_over_joined_set"
+            return _FakeBundle("2026-03-31__cand0001")
+
+        def get_tool_evolution_context(self, family_name: str):
+            assert family_name == "count_over_joined_set"
+            return {
+                "source_version": "2026-03-31",
+                "preferred_patterns": [
+                    {
+                        "relation_role_skeleton": [
+                            "count_set->anchor_a:dynamic_probe",
+                            "count_set->anchor_b:dynamic_probe",
+                        ],
+                        "structural_notes": [
+                            "preserve_multiple_anchor_constraints",
+                        ],
+                    }
+                ],
+                "avoid_patterns": [
+                    {
+                        "failure_labels": [
+                            "plausibility_validation_failed",
+                        ]
+                    }
+                ],
+            }
+
+    controller._get_family_policy_store = lambda: _FakeStore()
+    monkeypatch.setattr(
+        controller,
+        "_infer_query_shape",
+        lambda **kwargs: "count_over_joined_set",
+    )
+    monkeypatch.setattr(
+        controller,
+        "_build_question_interpretation",
+        lambda **kwargs: {"question_inputs": [], "preferred_scaffolds": []},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_refine_question_interpretation_with_grounding",
+        lambda **kwargs: kwargs["question_interpretation"],
+    )
+
+    grounding_card = controller._build_sage_grounding_card(
+        "Question: how many spacecrafts did cnes and astrium make?, Entities: ['CNES', 'Astrium']",
+        relation_grounding=[],
+    )
+
+    assert "- family_evolution_context:" in grounding_card
+    assert (
+        "prefer_pattern=count_set->anchor_a:dynamic_probe->count_set->anchor_b:dynamic_probe"
+        in grounding_card
+    )
+    assert "avoid_pattern_labeled=plausibility_validation_failed" in grounding_card
+
+
 def test_attribute_value_alias_candidates_include_singular_profession_forms() -> None:
     controller = _make_controller()
 
