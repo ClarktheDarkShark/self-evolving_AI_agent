@@ -157,7 +157,7 @@ def test_inline_family_evolution_defaults_to_all_families(monkeypatch) -> None:
     assert _inline_family_evolution_allowed_for("multi_anchor_intersection") is True
 
 
-def test_record_trusted_family_success_keeps_one_regression_guard(tmp_path: pathlib.Path) -> None:
+def test_record_trusted_family_success_keeps_required_regression_guards(tmp_path: pathlib.Path) -> None:
     output_dir = tmp_path / "run"
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "generated_tools.log"
@@ -216,13 +216,13 @@ def test_record_trusted_family_success_keeps_one_regression_guard(tmp_path: path
         active_version="2026-03-31",
         progress_log_path=log_path,
     )
-    assert bank == ["241"]
+    assert bank == ["11", "241"]
 
     store = build_family_policy_store(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),
         store_path=store_path,
     )
-    assert store.get_trusted_success_bank("count_over_direct_relation") == ["241"]
+    assert store.get_trusted_success_bank("count_over_direct_relation") == ["11", "241"]
     assert store.get_trusted_success_bank_metadata("count_over_direct_relation")[
         "evaluation_context"
     ] == _build_trusted_success_bank_context(
@@ -752,7 +752,7 @@ def test_boundary_runner_revisits_pending_candidate_after_family_warms(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),
         store_path=store_path,
     )
-    assert store.get_trusted_success_bank("count_over_direct_relation") == ["241"]
+    assert store.get_trusted_success_bank("count_over_direct_relation") == ["11", "241"]
     assert calls == [
         {
             "family_name": "count_over_direct_relation",

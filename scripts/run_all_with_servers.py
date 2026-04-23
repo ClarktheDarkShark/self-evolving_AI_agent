@@ -90,6 +90,12 @@ INLINE_FAMILY_EVOLUTION_BUDGET_S = int(
     os.getenv("SAGE_STANDARD_FAMILY_EVOLUTION_BUDGET_S", "360")
 )
 INLINE_TRUSTED_SUCCESS_BANK_SIZE = 1
+STRICT_INLINE_TRUSTED_SUCCESS_FAMILIES = frozenset(
+    {
+        "single_anchor_lookup",
+        "count_over_direct_relation",
+    }
+)
 DEFAULT_FAMILY_REGRESSION_MANIFEST = (
     Path(__file__).resolve().parents[1]
     / "configs"
@@ -569,6 +575,11 @@ def _record_trusted_family_success(
         store_path=store_path,
     )
     metadata = store.get_trusted_success_bank_metadata(family_name)
+    bank_limit = (
+        2
+        if str(family_name or "").strip() in STRICT_INLINE_TRUSTED_SUCCESS_FAMILIES
+        else INLINE_TRUSTED_SUCCESS_BANK_SIZE
+    )
     existing_ids: list[str] = []
     existing_archetypes: list[dict[str, object]] = []
     if version_reuse_compatible(
@@ -592,7 +603,7 @@ def _record_trusted_family_success(
     for sample_id in updated_ids:
         if sample_id not in deduped:
             deduped.append(sample_id)
-    deduped = deduped[-INLINE_TRUSTED_SUCCESS_BANK_SIZE:]
+    deduped = deduped[-bank_limit:]
     query_plan = _latest_query_plan_for_sample(output_dir, sample_index)
     success_archetypes = existing_archetypes
     if query_plan:
@@ -633,7 +644,8 @@ def _record_trusted_family_success(
             "sample_index": str(sample_index or "").strip(),
             "active_version": active_version,
             "trusted_success_bank": deduped,
-            "trusted_success_bank_ready": len(deduped) >= INLINE_TRUSTED_SUCCESS_BANK_SIZE,
+            "trusted_success_bank_ready": len(deduped) >= bank_limit,
+            "trusted_success_bank_required": bank_limit,
             "success_plan_archetype_count": len(success_archetypes),
         },
     )

@@ -553,7 +553,7 @@ def test_inline_promotion_gate_reuses_success_bank_with_extra_context_fields(
     tmp_path,
     monkeypatch,
 ) -> None:
-    family_name = "count_over_direct_relation"
+    family_name = "superlative_chain"
     store = build_family_policy_store(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),
         store_path=tmp_path,
@@ -1518,7 +1518,7 @@ def test_evaluate_candidate_fails_fast_when_trigger_not_improved(
     tmp_path,
     monkeypatch,
 ) -> None:
-    family_name = "count_over_direct_relation"
+    family_name = "superlative_chain"
     store = build_family_policy_store(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),
         store_path=tmp_path / "store",
@@ -1594,7 +1594,7 @@ def test_evaluate_candidate_rejects_when_trigger_not_improved_with_regression_gu
     tmp_path,
     monkeypatch,
 ) -> None:
-    family_name = "count_over_direct_relation"
+    family_name = "superlative_chain"
     store_path = tmp_path / "store"
     store = build_family_policy_store(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),
@@ -1762,6 +1762,78 @@ def test_evaluate_candidate_fails_fast_on_prior_success_regression(
     ]
 
 
+def test_evaluate_candidate_strict_family_waits_for_second_prior_success(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    family_name = "count_over_direct_relation"
+    store = build_family_policy_store(
+        baseline_bundles=get_baseline_reusable_family_policy_bundles(),
+        store_path=tmp_path / "store",
+    )
+    candidate = store.create_candidate_update(
+        family_name=family_name,
+        scaffold_signature="count_over_direct_relation|candidate_set|cvg.game_version.publisher",
+        relation_names=["cvg.game_version.publisher"],
+        failure_reasons=["trusted_incorrect_completion"],
+        failure_class="weak_applicability_boundary",
+        trigger_context={"sample_index": "20"},
+    )
+    assert candidate is not None
+    active_version = store.get_active_version(family_name)
+    store.set_trusted_success_bank(
+        family_name,
+        sample_ids=["11"],
+        source_version=active_version,
+        evaluation_results={
+            "run_summary": {
+                "sample_index": "11",
+                "sample_status": "completed",
+                "evaluation_outcome": "correct",
+                "dangerous_overreach_count": 0,
+            }
+        },
+        evaluation_context=family_policy_harness._build_success_bank_context(
+            family_name=family_name,
+            active_version=active_version,
+        ),
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_run_sample_with_policy(**kwargs):
+        calls.append(
+            (
+                str(kwargs["sample_index"]),
+                str(kwargs.get("override_version") or ""),
+            )
+        )
+        raise AssertionError("strict family should not evaluate before second trusted success")
+
+    monkeypatch.setattr(family_policy_harness, "_run_sample_with_policy", fake_run_sample_with_policy)
+
+    evaluation = family_policy_harness._evaluate_candidate(
+        family_name=family_name,
+        candidate_version=candidate.candidate_version,
+        promote=False,
+        store_path=tmp_path / "store",
+        label_prefix="strict_waits_for_second_success",
+        trigger_baseline_summary={
+            "sample_index": "20",
+            "sample_status": "completed",
+            "evaluation_outcome": "incorrect",
+            "run_dir": str(tmp_path / "baseline_run"),
+        },
+    )
+
+    assert evaluation["promotion_gate"]["promote"] is False
+    assert "awaiting_prior_trusted_success" in evaluation["promotion_gate"]["reasons"]
+    assert evaluation["evaluation_stats"]["prior_success_required"] == 2
+    assert evaluation["evaluation_stats"]["prior_success_available"] == 1
+    assert evaluation["evaluation_stats"]["prior_success_evaluated"] == 0
+    assert calls == []
+
+
 def test_inline_promotion_gate_rejects_invalid_evaluations() -> None:
     gate = family_policy_harness._evaluate_inline_promotion_gate(
         trigger_baseline={
@@ -1804,7 +1876,7 @@ def test_evaluate_candidate_promotes_when_trigger_and_prior_success_pass(
     tmp_path,
     monkeypatch,
 ) -> None:
-    family_name = "count_over_direct_relation"
+    family_name = "superlative_chain"
     store_path = tmp_path / "store"
     store = build_family_policy_store(
         baseline_bundles=get_baseline_reusable_family_policy_bundles(),

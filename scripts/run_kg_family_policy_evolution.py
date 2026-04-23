@@ -32,7 +32,14 @@ from src.sage.reusable_tool_families import get_baseline_reusable_family_policy_
 
 PROMOTION_EVALUATION_MODE = "family_inline_promotion_gate"
 PROMOTION_EVALUATION_CONTRACT_VERSION = "2026-03-31__family_inline_promotion_gate_v1"
-MAX_PRIOR_SUCCESS_SAMPLES = 1
+DEFAULT_PRIOR_SUCCESS_SAMPLES = 1
+STRICT_PROMOTION_PRIOR_SUCCESS_SAMPLES = 2
+STRICT_PROMOTION_GUARD_FAMILIES = frozenset(
+    {
+        "single_anchor_lookup",
+        "count_over_direct_relation",
+    }
+)
 ENV_PROMOTION_GATE_MODE = "SAGE_FAMILY_POLICY_PROMOTION_GATE_MODE"
 ENV_STAGE_A_SCREEN = "SAGE_INLINE_FAMILY_STAGE_A_SCREEN"
 SAGE_ONLY_BYPASS_ENV = "SAGE_TOOL_EVOLUTION_SKIP_MANUAL_FALLBACK"
@@ -151,6 +158,23 @@ def _promotion_gate_mode() -> str:
     if mode in {"soft_improvement", "non_regression"}:
         return mode
     return "trigger_first"
+
+
+def _required_prior_success_samples(family_name: str) -> int:
+    if str(family_name or "").strip() in STRICT_PROMOTION_GUARD_FAMILIES:
+        return STRICT_PROMOTION_PRIOR_SUCCESS_SAMPLES
+    return DEFAULT_PRIOR_SUCCESS_SAMPLES
+
+
+def _potential_evaluation_requests(
+    *,
+    required_prior_success_samples: int,
+    include_stage_a: bool = False,
+) -> int:
+    requests = 1 + max(0, int(required_prior_success_samples)) * 2
+    if include_stage_a:
+        requests += 2
+    return requests
 
 
 def _stage_a_screen_enabled() -> bool:
@@ -750,6 +774,7 @@ def _evaluate_candidate(
     trigger_sample = str(
         (candidate_payload.get("trigger_context") or {}).get("sample_index") or ""
     ).strip()
+    required_prior_success_samples = _required_prior_success_samples(family_name)
     trigger_baseline = _extract_run_metrics(dict(trigger_baseline_summary))
     prior_success_baseline: list[dict[str, Any]] = []
     prior_success_candidate: list[dict[str, Any]] = []
@@ -782,8 +807,8 @@ def _evaluate_candidate(
                 sample_id
                 for sample_id in success_bank
                 if sample_id and sample_id != trigger_sample
-            ][:MAX_PRIOR_SUCCESS_SAMPLES]
-    if not prior_success_samples:
+            ][:required_prior_success_samples]
+    if len(prior_success_samples) < required_prior_success_samples:
         evaluation_payload = {
             "family_name": family_name,
             "active_version": active_version,
@@ -806,9 +831,16 @@ def _evaluate_candidate(
                 "cache_misses": 0,
                 "executed_runs": 0,
                 "total_evaluation_requests": 0,
-                "potential_max_requests": 3,
+                "potential_max_requests": _potential_evaluation_requests(
+                    required_prior_success_samples=required_prior_success_samples,
+                ),
                 "prior_success_evaluated": 0,
-                "prior_success_skipped": MAX_PRIOR_SUCCESS_SAMPLES,
+                "prior_success_required": required_prior_success_samples,
+                "prior_success_available": len(prior_success_samples),
+                "prior_success_skipped": max(
+                    0,
+                    required_prior_success_samples - len(prior_success_samples),
+                ),
                 "regression_guard_available": False,
                 "stage_reached": "awaiting_prior_success",
             },
@@ -907,9 +939,14 @@ def _evaluate_candidate(
                     "executed_runs": int(not bool(stage_a_baseline.get("evaluation_cache_hit")))
                     + int(not bool(stage_a_candidate.get("evaluation_cache_hit"))),
                     "total_evaluation_requests": 2,
-                    "potential_max_requests": 5,
+                    "potential_max_requests": _potential_evaluation_requests(
+                        required_prior_success_samples=required_prior_success_samples,
+                        include_stage_a=True,
+                    ),
                     "prior_success_evaluated": 0,
-                    "prior_success_skipped": MAX_PRIOR_SUCCESS_SAMPLES,
+                    "prior_success_required": required_prior_success_samples,
+                    "prior_success_available": len(prior_success_samples),
+                    "prior_success_skipped": required_prior_success_samples,
                     "regression_guard_available": False,
                     "prior_success_baseline_reused": False,
                     "stage_reached": "stage_a_screen_rejected",
@@ -974,23 +1011,20 @@ def _evaluate_candidate(
             },
         }
     elif gate_result["gate_checks"]["trigger_gate_passed"]:
-        sample_id = prior_success_samples[0]
         cached_success_summary = (
             (bank_metadata.get("evaluation_results") or {}).get("run_summary")
             if isinstance(bank_metadata, Mapping)
             else None
         )
-        if (
-            isinstance(cached_success_summary, Mapping)
-            and str(cached_success_summary.get("sample_index") or "").strip() == sample_id
-        ):
-            prior_success_baseline.append(
-                _extract_run_metrics(dict(cached_success_summary))
-            )
-            prior_success_baseline_reused = True
-        else:
-            prior_success_baseline.append(
-                _run_sample_with_policy(
+        for sample_id in prior_success_samples:
+            if (
+                isinstance(cached_success_summary, Mapping)
+                and str(cached_success_summary.get("sample_index") or "").strip() == sample_id
+            ):
+                baseline_summary = _extract_run_metrics(dict(cached_success_summary))
+                prior_success_baseline_reused = True
+            else:
+                baseline_summary = _run_sample_with_policy(
                     sample_index=sample_id,
                     label=f"{label_prefix}_baseline_success",
                     family_name=family_name,
@@ -999,9 +1033,7 @@ def _evaluate_candidate(
                     override_version=active_version,
                     parent_output_dir=parent_output_dir,
                 )
-            )
-        prior_success_candidate.append(
-            _run_sample_with_policy(
+            candidate_summary = _run_sample_with_policy(
                 sample_index=sample_id,
                 label=f"{label_prefix}_candidate_success",
                 family_name=family_name,
@@ -1010,15 +1042,17 @@ def _evaluate_candidate(
                 override_version=candidate_version,
                 parent_output_dir=parent_output_dir,
             )
-        )
-        gate_result = _evaluate_inline_promotion_gate(
-            trigger_baseline=trigger_baseline,
-            trigger_candidate=trigger_candidate,
-            prior_success_baseline=prior_success_baseline,
-            prior_success_candidate=prior_success_candidate,
-        )
-        all_results.extend(prior_success_baseline)
-        all_results.extend(prior_success_candidate)
+            prior_success_baseline.append(baseline_summary)
+            prior_success_candidate.append(candidate_summary)
+            gate_result = _evaluate_inline_promotion_gate(
+                trigger_baseline=trigger_baseline,
+                trigger_candidate=trigger_candidate,
+                prior_success_baseline=[baseline_summary],
+                prior_success_candidate=[candidate_summary],
+            )
+            all_results.extend([baseline_summary, candidate_summary])
+            if not gate_result["promote"]:
+                break
     evaluation_results = {
         "family_name": family_name,
         "active_version": active_version,
@@ -1049,9 +1083,16 @@ def _evaluate_candidate(
             "cache_misses": cache_misses,
             "executed_runs": cache_misses,
             "total_evaluation_requests": total_evaluation_requests,
-            "potential_max_requests": 3,
+            "potential_max_requests": _potential_evaluation_requests(
+                required_prior_success_samples=required_prior_success_samples,
+            ),
             "prior_success_evaluated": len(prior_success_candidate),
-            "prior_success_skipped": max(0, MAX_PRIOR_SUCCESS_SAMPLES - len(prior_success_candidate)),
+            "prior_success_required": required_prior_success_samples,
+            "prior_success_available": len(prior_success_samples),
+            "prior_success_skipped": max(
+                0,
+                required_prior_success_samples - len(prior_success_candidate),
+            ),
             "regression_guard_available": bool(prior_success_candidate),
             "prior_success_baseline_reused": prior_success_baseline_reused,
             "stage_reached": (
