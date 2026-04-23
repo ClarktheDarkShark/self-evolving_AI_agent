@@ -16774,6 +16774,67 @@ def test_plausibility_rejects_dynamic_entity_lookup_without_answer_target_semant
     assert "entity_answer_target_unenforced:wine producer" in verdict.reasons
 
 
+def test_plausibility_accepts_direct_entity_lookup_when_answer_target_has_trailing_punctuation() -> None:
+    verdict = validate_sage_execution(
+        query_plan={
+            "answer_mode": "entity",
+            "answer_target_phrase": "format?",
+            "query_shape": "single_anchor_lookup",
+            "anchored_entities": [
+                {
+                    "surface": "Samsung S1050",
+                    "chosen_alias": "m.03q2r11",
+                    "role": "anchor",
+                }
+            ],
+            "shared_answer_variable": "format",
+            "candidate_set_variable": "format",
+            "relation_paths": [
+                {
+                    "relation": "digicams.digital_camera.format",
+                    "direction": "forward",
+                    "from": "m.03q2r11",
+                    "to": "format",
+                    "from_role": "anchor",
+                    "to_role": "answer",
+                    "grounding_source": "dynamic_probe",
+                }
+            ],
+            "allow_exploratory_predicates": False,
+        },
+        query_text=(
+            "SELECT DISTINCT ?format WHERE { "
+            "fb:m.03q2r11 fb:digicams.digital_camera.format ?format . "
+            "}"
+        ),
+        result_dict={
+            "results": {
+                "bindings": [
+                    {
+                        "format": {
+                            "type": "uri",
+                            "value": "http://rdf.freebase.com/ns/m.01xrfxm",
+                        }
+                    }
+                ]
+            }
+        },
+        entities=["Samsung S1050"],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Samsung S1050",
+                entity_count=1,
+                path_count=1,
+                relation_probed="digicams.digital_camera.format",
+                anchor_position="subject",
+                resolved_entity_id="m.03q2r11",
+            )
+        ],
+    )
+
+    assert verdict.verdict == VERDICT_ACCEPTED
+
+
 def test_plausibility_repairs_generic_type_only_zero_count_with_optional_anchor_probe() -> None:
     verdict = validate_sage_execution(
         query_plan={

@@ -1633,6 +1633,18 @@ def _singularize_token(token: str) -> str:
     return value
 
 
+def _answer_target_semantic_tokens(answer_target_phrase: str) -> list[str]:
+    tokens: list[str] = []
+    for raw_token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower()):
+        cleaned = re.sub(r"^[^a-z0-9]+|[^a-z0-9]+$", "", str(raw_token or ""))
+        if not cleaned:
+            continue
+        singular = _singularize_token(cleaned)
+        if singular:
+            tokens.append(singular)
+    return tokens
+
+
 def _constraint_value_probe_is_optional(
     *,
     anchored_entity: Mapping[str, Any] | None,
@@ -1673,11 +1685,7 @@ def _constraint_value_probe_is_optional(
 
 
 def _count_answer_target_requires_explicit_semantics(answer_target_phrase: str) -> bool:
-    tokens = [
-        _singularize_token(token)
-        for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
-        if token.strip()
-    ]
+    tokens = _answer_target_semantic_tokens(answer_target_phrase)
     if not tokens:
         return False
     generic_tokens = {
@@ -1717,11 +1725,7 @@ def _extract_answer_target_head_token(answer_target_phrase: str) -> str:
         maxsplit=1,
     )[0]
     phrase = leading_segment or phrase
-    tokens = [
-        _singularize_token(token)
-        for token in re.split(r"[\s_/.\-]+", phrase)
-        if token.strip()
-    ]
+    tokens = _answer_target_semantic_tokens(phrase)
     if not tokens:
         return ""
     modifier_tokens = {
@@ -1741,11 +1745,7 @@ def _extract_answer_target_head_token(answer_target_phrase: str) -> str:
 
 
 def _answer_target_is_type_like(answer_target_phrase: str) -> bool:
-    tokens = [
-        _singularize_token(token)
-        for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
-        if token.strip()
-    ]
+    tokens = _answer_target_semantic_tokens(answer_target_phrase)
     informative = [token for token in tokens if token not in {"amount", "number", "total"}]
     if len(informative) < 2:
         return False
@@ -1755,11 +1755,7 @@ def _answer_target_is_type_like(answer_target_phrase: str) -> bool:
 def _extract_type_like_answer_target_qualifier_tokens(
     answer_target_phrase: str,
 ) -> list[str]:
-    tokens = [
-        _singularize_token(token)
-        for token in re.split(r"[\s_/.\-]+", str(answer_target_phrase or "").lower())
-        if token.strip()
-    ]
+    tokens = _answer_target_semantic_tokens(answer_target_phrase)
     informative = [
         token
         for token in tokens
