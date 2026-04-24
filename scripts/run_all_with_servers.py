@@ -2199,7 +2199,7 @@ def _run_one_with_sample_boundary_family_evolution(
         if len(sample_order) == 1:
             temp_config_paths[str(sample_index)] = full_path
             continue
-        temp_stem = f"{config_name}__sample_{sample_index}"
+        temp_stem = f"{config_name}__{combined_dir.name}__sample_{sample_index}"
         temp_config_path = _write_single_sample_config(
             source_config_path=full_path,
             sample_index=str(sample_index),
