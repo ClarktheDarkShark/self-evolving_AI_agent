@@ -10064,6 +10064,7 @@ class SAGEAgentController(Agent):
                     query_plan=working_query_plan,
                     relation_grounding=working_relation_grounding,
                     anchor_probe_results=anchor_probe_results,
+                    repair_feedback=cumulative_plan_feedback,
                 )
                 if rewritten_query_plan is not None:
                     working_query_plan = rewritten_query_plan
@@ -10145,6 +10146,7 @@ class SAGEAgentController(Agent):
                             query_plan=working_query_plan,
                             relation_grounding=working_relation_grounding,
                             anchor_probe_results=anchor_probe_results,
+                            repair_feedback=cumulative_plan_feedback,
                         )
                         if rewritten_after_alias_refresh is not None:
                             working_query_plan = rewritten_after_alias_refresh
@@ -10331,6 +10333,7 @@ class SAGEAgentController(Agent):
         query_plan: Mapping[str, Any],
         relation_grounding: Sequence[Mapping[str, str]],
         anchor_probe_results: Sequence[AnchorProbeResult] | None,
+        repair_feedback: Sequence[str] = (),
     ) -> tuple[Optional[dict[str, Any]], str]:
         rewrite_builders: tuple[
             tuple[str, Callable[[], Optional[dict[str, Any]]]],
@@ -10403,6 +10406,7 @@ class SAGEAgentController(Agent):
                     query_plan=query_plan,
                     relation_grounding=relation_grounding,
                     anchor_probe_results=anchor_probe_results,
+                    repair_feedback=repair_feedback,
                 ),
             ),
         )
@@ -12455,6 +12459,7 @@ class SAGEAgentController(Agent):
         query_plan: Mapping[str, Any],
         relation_grounding: Sequence[Mapping[str, str]] = (),
         anchor_probe_results: Sequence[AnchorProbeResult] | None = None,
+        repair_feedback: Sequence[str] = (),
     ) -> Optional[dict[str, Any]]:
         if str(query_plan.get("query_shape") or "").strip().lower() != "count_over_direct_relation":
             return None
@@ -12486,13 +12491,25 @@ class SAGEAgentController(Agent):
         if not dead_relation:
             return None
 
-        direct_dynamic_plan = self._build_direct_dynamic_count_repair_plan(
-            query_plan=query_plan,
-            relation_grounding=relation_grounding,
-            anchor_probe_results=anchor_probe_results,
+        normalized_feedback = self._canonicalize_feedback_items(repair_feedback)
+        preserve_family_after_pivot = any(
+            item.startswith("repair_hint:preserve_count_target_family_after_pivot")
+            for item in normalized_feedback
+        ) and bool(
+            self._extract_feedback_prefixed_values(
+                normalized_feedback,
+                prefix="relation_still_available_in_other_roles:",
+            )
         )
-        if direct_dynamic_plan is not None:
-            return direct_dynamic_plan
+
+        if not preserve_family_after_pivot:
+            direct_dynamic_plan = self._build_direct_dynamic_count_repair_plan(
+                query_plan=query_plan,
+                relation_grounding=relation_grounding,
+                anchor_probe_results=anchor_probe_results,
+            )
+            if direct_dynamic_plan is not None:
+                return direct_dynamic_plan
 
         relation_paths = [
             dict(path)
@@ -12522,6 +12539,12 @@ class SAGEAgentController(Agent):
             dead_path=dead_path,
         )
         if pivot_candidate is None or preserved_target_candidate is None:
+            if preserve_family_after_pivot:
+                return self._build_direct_dynamic_count_repair_plan(
+                    query_plan=query_plan,
+                    relation_grounding=relation_grounding,
+                    anchor_probe_results=anchor_probe_results,
+                )
             return None
 
         pivot_variable = self._candidate_non_anchor_endpoint_token(pivot_candidate)

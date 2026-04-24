@@ -15825,6 +15825,105 @@ def test_pivot_preserving_count_repair_prefers_live_direct_dynamic_count_relatio
     assert rewritten["count_set_variable"] == "disease"
 
 
+def test_pivot_preserving_count_repair_prefers_preserved_family_when_feedback_requires_it() -> None:
+    controller = _make_controller()
+    query_plan = controller._normalize_sage_query_plan(
+        {
+            "answer_type": "count",
+            "answer_mode": "count",
+            "query_shape": "count_over_direct_relation",
+            "anchored_entities": [
+                {
+                    "surface": "Aedes aegypti",
+                    "chosen_alias": "Aedes aegypti",
+                    "role": "anchor",
+                }
+            ],
+            "shared_answer_variable": "candidate_set",
+            "candidate_set_variable": "candidate_set",
+            "count_set_variable": "candidate_set",
+            "join_structure": {
+                "type": "count",
+                "anchor_constraints": [
+                    {
+                        "anchor_role": "anchor",
+                        "constrains_variable": "candidate_set",
+                    }
+                ],
+            },
+            "relation_paths": [
+                {
+                    "relation": "biology.organism.diseases_transmitted",
+                    "direction": "forward",
+                    "from": "organism",
+                    "to": "disease",
+                    "from_role": "anchor",
+                    "to_role": "count_set",
+                    "grounding_source": "curated",
+                }
+            ],
+            "projection": ["count"],
+        }
+    )
+
+    rewritten = controller._build_pivot_preserving_count_repair_plan(
+        query_plan=query_plan,
+        relation_grounding=[
+            {
+                "relation": "medicine.infectious_disease.vector",
+                "direction": "reverse",
+                "from": "disease",
+                "to": "Aedes aegypti",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+            },
+            {
+                "relation": "type.type.instance",
+                "direction": "reverse",
+                "from": "type",
+                "to": "Aedes aegypti",
+                "from_role": "candidate_set",
+                "to_role": "anchor",
+                "grounding_source": "dynamic_probe",
+                "support": "dynamic_probe_incoming",
+            },
+            {
+                "relation": "biology.organism.diseases_transmitted",
+                "direction": "forward",
+                "from": "pivot",
+                "to": "disease",
+                "from_role": "candidate_set",
+                "to_role": "count_set",
+                "grounding_source": "curated",
+            },
+        ],
+        anchor_probe_results=[
+            AnchorProbeResult(
+                anchor_name="Aedes aegypti",
+                entity_count=12,
+                path_count=0,
+                relation_probed="biology.organism.diseases_transmitted",
+                anchor_position="subject",
+            )
+        ],
+        repair_feedback=[
+            "repair_hint:preserve_count_target_family_after_pivot",
+            "relation_still_available_in_other_roles:biology.organism.diseases_transmitted",
+        ],
+    )
+
+    assert rewritten is not None
+    assert [path["relation"] for path in rewritten["relation_paths"]] == [
+        "medicine.infectious_disease.vector",
+        "biology.organism.diseases_transmitted",
+    ]
+    assert "Preserve the counted target family" in str(
+        " ".join(rewritten.get("plan_rationale") or [])
+    )
+
+
 def test_direct_count_repair_prefers_live_dynamic_family_before_curated_inverse_fallback() -> None:
     controller = _make_controller()
     query_plan = controller._normalize_sage_query_plan(
